@@ -11,6 +11,14 @@ path = "src/lib.rs"
 name = "repo-scan"
 path = "src/main.rs"
 
+[[bench]]
+name = "walk_compare"
+harness = false
+
+[[bench]]
+name = "scan_cycle"
+harness = false
+
 [features]
 default = []
 # Phase 1: no optional runtime features. Platform backends are cfg-gated

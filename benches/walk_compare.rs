@@ -58,13 +58,19 @@ fn build_scope(holder: &tempfile::TempDir) -> std::path::PathBuf {
     {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
+        // APFS rejects invalid-UTF-8 names (EILSEQ): probe first and skip
+        // loudly where the filesystem cannot represent them, mirroring the
+        // acceptance tests.
         let weird = scope.join(OsString::from_vec(b"bad-\xff-dir".to_vec()));
-        fs::create_dir(&weird).expect("non-utf8 dir");
-        fs::write(
-            weird.join(OsString::from_vec(b"ctrl-\x01.txt".to_vec())),
-            b"x",
-        )
-        .expect("non-utf8 file");
+        if fs::create_dir(&weird).is_err() {
+            eprintln!("walk_compare: filesystem rejects non-UTF-8 names; skipping");
+        } else {
+            fs::write(
+                weird.join(OsString::from_vec(b"ctrl-\x01.txt".to_vec())),
+                b"x",
+            )
+            .expect("non-utf8 file");
+        }
     }
     scope
 }

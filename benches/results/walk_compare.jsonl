@@ -1,0 +1,6 @@
+{"arch":"aarch64","bench":"walk_compare","dua_core":"4.1.0","os":"macos","profile":"release","record":"env","repo_scan_version":"0.1.0","turso":"0.8.1"}
+{"arch":"aarch64","bench":"walk_compare","dua_core":"4.1.0","os":"macos","profile":"release","record":"env","repo_scan_version":"0.1.0","turso":"0.8.1"}
+{"adapter":"ignore","dirs":172,"entries":891,"equivalent_to_baseline":true,"errors":0,"peak_rss_bytes":7929856,"record":"adapter","wall_ms":9.060209}
+{"adapter":"std-escape","dirs":172,"entries":891,"equivalent_to_baseline":true,"errors":0,"peak_rss_bytes":8142848,"record":"adapter","wall_ms":3.7950839999999997}
+{"adapter":"dua","dirs":172,"entries":891,"equivalent_to_baseline":true,"errors":0,"peak_rss_bytes":8290304,"record":"adapter","wall_ms":2.989958}
+{"adapters":["ignore","std-escape","dua"],"baseline_dirs":172,"baseline_entries":891,"baseline_errors":0,"equivalent":true,"record":"verdict"}

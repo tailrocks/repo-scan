@@ -1,0 +1,6 @@
+{"arch":"aarch64","bench":"scan_cycle","dua_core":"4.1.0","os":"macos","profile":"release","record":"env","repo_scan_version":"0.1.0","turso":"0.8.1"}
+{"adapter":"dua","cold_wall_ms":1.339667,"dirs":50,"entries":630,"errors":0,"peak_rss_bytes":8355840,"record":"traversal","warm_wall_ms":0.972459}
+{"mean_wall_ms":0.09074823999999997,"record":"cached_query","reps":50,"total_wall_ms":4.537411999999998}
+{"new_revision":1,"pending_after":1,"record":"invalidate","wall_ms":4.472041000000001}
+{"claimed":501,"enqueue_wall_ms":2068.811708,"enqueued":500,"record":"resume","recover_claim_wall_ms":55.937291,"recovered_to_pending":0}
+{"peak_rss_bytes":17711104,"record":"footprint"}

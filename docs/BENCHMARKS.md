@@ -31,7 +31,9 @@ Record the hardware, OS, filesystem, dataset, and build versions alongside every
 
 | date | host / OS / fs | adapter | wall_ms | dirs | entries | errors | equivalent_to_baseline | peak_rss_bytes |
 | ---- | -------------- | ------- | ------- | ---- | ------- | ------ | ---------------------- | -------------- |
-|      |                |         |         |      |         |        |                        |              |
+| 2026-10-01 | Apple M5 Max / macOS 27.0 / APFS | ignore | 9.06 | 172 | 891 | 0 | true | 7929856 |
+| 2026-10-01 | Apple M5 Max / macOS 27.0 / APFS | std-escape | 3.80 | 172 | 891 | 0 | true | 8142848 |
+| 2026-10-01 | Apple M5 Max / macOS 27.0 / APFS | dua | 2.99 | 172 | 891 | 0 | true | 8290304 |
 
 Verdict record: `adapters`, `equivalent`, `baseline_dirs/entries/errors`.
 
@@ -39,11 +41,11 @@ Verdict record: `adapters`, `equivalent`, `baseline_dirs/entries/errors`.
 
 | date | host / OS / fs | record | cold_wall_ms | warm_wall_ms | dirs | entries | errors | mean_wall_ms | reps | new_revision | pending_after | enqueued | claimed | peak_rss_bytes |
 | ---- | -------------- | ------ | ------------ | ------------ | ---- | ------- | ------ | ------------ | ---- | ------------ | ------------- | -------- | ------- | -------------- |
-|      |                | traversal |           |              |      |         |        | —            | —    | —            | —             | —        | —       |              |
-|      |                | cached_query | —      | —            | —    | —       | —      |              |      | —            | —             | —        | —       | —            |
-|      |                | invalidate | —        | —            | —    | —       | —      | —            | —    |              |               | —        | —       | —            |
-|      |                | resume | —            | —            | —    | —       | —      | —            | —    | —            | —             |          |         | —            |
-|      |                | footprint | —         | —            | —    | —       | —      | —            | —    | —            | —             | —        | —       |              |
+| 2026-10-01 | M5 Max / macOS 27.0 / APFS | traversal | 1.34 | 0.97 | 50 | 630 | 0 | — | — | — | — | — | — | 8355840 |
+| 2026-10-01 | M5 Max / macOS 27.0 / APFS | cached_query | — | — | — | — | — | 0.091 | 50 | — | — | — | — | — |
+| 2026-10-01 | M5 Max / macOS 27.0 / APFS | invalidate | — | — | — | — | — | — | — | 1 | 1 | — | — | 4.47 ms wall |
+| 2026-10-01 | M5 Max / macOS 27.0 / APFS | resume | — | — | — | — | — | — | — | — | — | 500 | 501 | enqueue 2068.81 ms, recover+claim 55.94 ms, recovered_to_pending 0 |
+| 2026-10-01 | M5 Max / macOS 27.0 / APFS | footprint | — | — | — | — | — | — | — | — | — | — | — | 17711104 |
 
 PERF-02/03 gates (declared corpus, ≥30 s sustained measurement, 512 MiB injection)
 have no harness yet — see [docs/CHECKLIST.md](/Users/donbeave/Projects/repo-scan/docs/CHECKLIST.md).
