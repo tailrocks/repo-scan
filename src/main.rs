@@ -1755,23 +1755,28 @@ async fn persist_probe(
         Some(_) => "missing",
         None => "present",
     };
-    store
-        .upsert_checkout(
-            &NewCheckout {
-                id: &main_checkout_id,
-                instance_id: &instance_id,
-                root_path: root_bytes.as_deref(),
-                git_path: &git_bytes,
-                relationship,
-                availability,
-                head_state,
-                head_ref: head_ref.as_deref(),
-                head_oid: head_oid.as_deref(),
-                head_algo: head_algo.as_deref(),
-            },
-            now_ms,
-        )
-        .await?;
+    let main_checkout = NewCheckout {
+        id: &main_checkout_id,
+        instance_id: &instance_id,
+        root_path: root_bytes.as_deref(),
+        git_path: &git_bytes,
+        relationship,
+        availability,
+        head_state,
+        head_ref: head_ref.as_deref(),
+        head_oid: head_oid.as_deref(),
+        head_algo: head_algo.as_deref(),
+    };
+    // A worktree-less angle on an instance (bare-dir probe of a git dir
+    // that a pointer probe links to a worktree) must not erase the rooted
+    // row: insert only when absent, independent of probe order.
+    if root_bytes.is_none() {
+        store
+            .insert_checkout_if_absent(&main_checkout, now_ms)
+            .await?;
+    } else {
+        store.upsert_checkout(&main_checkout, now_ms).await?;
+    }
     runner.counters.db_writes += 1;
 
     // Registered linked worktrees: own checkout rows plus explicit probes
@@ -1779,6 +1784,16 @@ async fn persist_probe(
     let mut checkout_ids = vec![main_checkout_id];
     if let Ok(worktrees) = runner.inspector.worktrees(instance) {
         for wt in &worktrees {
+            // Never list an instance as its own linked worktree: opening a
+            // linked-worktree git dir reports the shared registry, which
+            // includes this very checkout.
+            if instance.work_dir.as_ref() == Some(&wt.base) {
+                continue;
+            }
+            // A present worktree is probed directly below, which persists
+            // the real checkout row; only absent/broken registrations need
+            // a placeholder row of their own.
+            let placeholder = !matches!(wt.availability, git::WorktreeAvailability::Present);
             let wt_id = format!(
                 "co:{checkout_hex}:wt:{}",
                 config::encode_hex(wt.id.as_bytes())
@@ -1791,26 +1806,28 @@ async fn persist_probe(
             };
             let wt_git = config::path_as_bytes(&instance.common_dir.join("worktrees").join(&wt.id));
             let wt_root = config::path_as_bytes(&wt.base);
-            store
-                .upsert_checkout(
-                    &NewCheckout {
-                        id: &wt_id,
-                        instance_id: &instance_id,
-                        root_path: Some(&wt_root),
-                        git_path: &wt_git,
-                        relationship: "linked",
-                        availability: wt_availability,
-                        head_state: "unknown",
-                        head_ref: None,
-                        head_oid: None,
-                        head_algo: None,
-                    },
-                    now_ms,
-                )
-                .await?;
-            runner.counters.db_writes += 1;
+            if placeholder {
+                store
+                    .upsert_checkout(
+                        &NewCheckout {
+                            id: &wt_id,
+                            instance_id: &instance_id,
+                            root_path: Some(&wt_root),
+                            git_path: &wt_git,
+                            relationship: "linked",
+                            availability: wt_availability,
+                            head_state: "unknown",
+                            head_ref: None,
+                            head_oid: None,
+                            head_algo: None,
+                        },
+                        now_ms,
+                    )
+                    .await?;
+                runner.counters.db_writes += 1;
+                checkout_ids.push(wt_id);
+            }
             enqueue_probe_task_for_path(store, runner, generation, &wt.base, now_ms).await?;
-            checkout_ids.push(wt_id);
         }
     }
 

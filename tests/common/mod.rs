@@ -9,5 +9,11 @@
 //! `tests/fixtures_impl.rs` asserts every builder produces the layout it
 //! claims. Benches cannot import this module (integration-test scope), so
 //! `benches/support.rs` carries its own minimal copy of the git runner.
+//!
+//! Each integration-test binary compiles this module but uses only a subset
+//! of builders; per-binary unused warnings would be noise, so dead code is
+//! allowed here by design.
+
+#![allow(dead_code)]
 
 pub mod fixture;

@@ -1893,6 +1893,41 @@ impl TursoStore {
     }
 
     /// Idempotent checkout upsert keyed by stable id.
+    /// Insert a checkout row only when its id is absent. Used for
+    /// worktree-less observations of an instance (a bare-angle probe of a
+    /// git dir that another probe already linked to a worktree root): the
+    /// rootless row must never clobber the rooted one, regardless of probe
+    /// completion order.
+    pub async fn insert_checkout_if_absent(
+        &self,
+        checkout: &NewCheckout<'_>,
+        observed_ms: i64,
+    ) -> crate::Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO checkouts (id, instance_id, root_path, git_path, \
+                    relationship, availability, head_state, head_ref, head_oid, \
+                    head_algo, observed_at_ms) \
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                vec![
+                    v_text(checkout.id),
+                    v_text(checkout.instance_id),
+                    v_opt_blob(checkout.root_path.map(<[u8]>::to_vec)),
+                    v_blob(checkout.git_path.to_vec()),
+                    v_text(checkout.relationship),
+                    v_text(checkout.availability),
+                    v_text(checkout.head_state),
+                    v_opt_blob(checkout.head_ref.map(<[u8]>::to_vec)),
+                    v_opt_blob(checkout.head_oid.map(<[u8]>::to_vec)),
+                    v_opt_text(checkout.head_algo.map(str::to_string)),
+                    v_int(observed_ms),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
     pub async fn upsert_checkout(
         &self,
         checkout: &NewCheckout<'_>,
