@@ -900,3 +900,43 @@ fn report_02_symlink_destination_is_refused() {
     assert_eq!(std::fs::read(&target).expect("read"), b"do not touch");
     assert!(PathBuf::from(stdout_line(&out, "snapshot")).is_file());
 }
+
+#[test]
+fn report_01_live_report_validates_against_real_json_schema() {
+    if !git_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).expect("mkdir");
+    fixture::normal_clone(&root, "repo");
+    let root_str = root.to_str().expect("utf8").to_string();
+
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            root_str.as_str(),
+            "--report",
+            "report.json",
+        ],
+        dir.path(),
+        &state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let report = load_json(&dir.path().join("report.json"));
+
+    let schema = schema_doc();
+    let validator = jsonschema::validator_for(&schema).expect("shipped schema compiles");
+    let errors: Vec<String> = validator
+        .iter_errors(&report)
+        .map(|e| e.to_string())
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "live report schema violations:\n{}",
+        errors.join("\n")
+    );
+}

@@ -8,6 +8,12 @@
 //!
 //! The git runner here is a minimal copy of `tests/common/fixture.rs` (bench
 //! targets cannot import integration-test helpers).
+//!
+//! Each bench binary includes this file separately and uses only a subset;
+//! per-binary unused warnings would be noise, so dead code is allowed here
+//! by design.
+
+#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};

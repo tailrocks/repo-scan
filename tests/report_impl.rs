@@ -762,3 +762,55 @@ fn caller_owned_sections_stream() {
         .expect_err("dangling repo refused");
     assert!(err.to_string().contains("repo-missing"), "{err}");
 }
+
+// ---------------------------------------------------------------------------
+// REPORT-01: real JSON-Schema validation via the `jsonschema` crate
+// ---------------------------------------------------------------------------
+
+/// Compile the shipped Draft 2020-12 schema. Local `$ref`s only, so this
+/// performs no network I/O.
+fn schema_validator() -> jsonschema::Validator {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/schemas/report-v1.schema.json");
+    let bytes = std::fs::read(path).expect("read shipped schema");
+    let schema: serde_json::Value = serde_json::from_slice(&bytes).expect("schema parses");
+    jsonschema::validator_for(&schema).expect("shipped schema compiles")
+}
+
+/// Assert `value` validates; render every violation on failure.
+fn assert_json_schema_valid(validator: &jsonschema::Validator, value: &serde_json::Value) {
+    let errors: Vec<String> = validator
+        .iter_errors(value)
+        .map(|e| e.to_string())
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "schema violations:\n{}",
+        errors.join("\n")
+    );
+}
+
+#[test]
+fn shipped_example_validates_against_real_json_schema() {
+    let validator = schema_validator();
+    let bytes = include_bytes!("data/example-report.json");
+    let report: serde_json::Value = serde_json::from_slice(bytes).expect("example parses");
+    assert_json_schema_valid(&validator, &report);
+}
+
+#[test]
+fn real_json_schema_rejects_broken_reports() {
+    let validator = schema_validator();
+    let bytes = include_bytes!("data/example-report.json");
+    let mut report: serde_json::Value = serde_json::from_slice(bytes).expect("example parses");
+    // Drop a required top-level record: the validator must notice.
+    report.as_object_mut().expect("object").remove("scan");
+    assert!(
+        !validator.is_valid(&report),
+        "report missing required `scan` must fail validation"
+    );
+    let errors: Vec<String> = validator
+        .iter_errors(&report)
+        .map(|e| e.to_string())
+        .collect();
+    assert!(!errors.is_empty(), "violations must be reported");
+}

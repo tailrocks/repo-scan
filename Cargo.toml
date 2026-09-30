@@ -19,6 +19,10 @@ harness = false
 name = "scan_cycle"
 harness = false
 
+[[bench]]
+name = "perf_gates"
+harness = false
+
 [features]
 default = []
 # Phase 1: no optional runtime features. Platform backends are cfg-gated
@@ -57,3 +61,6 @@ objc2-core-foundation = "0.3"
 # DispatchRetained for FSEventStreamSetDispatchQueue scheduling; the runloop
 # API is deprecated macOS 13+). objc2-core-services does not re-export it.
 dispatch2 = "0.3"
+
+[dev-dependencies]
+jsonschema = "0.58.3"
