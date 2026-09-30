@@ -1,6 +1,19 @@
 //! The one durable scheduler (spec §§4, 12). No backend owns a job
 //! universe; the owner claims bounded work, sends it to helpers, and accepts
 //! only results matching the current epoch and lease.
+//!
+//! Submodules: [`admission`] (spec §5 hard limits), [`durable`] (durable
+//! claim/complete/revision/circuit-breaker semantics over a
+//! [`durable::SchedulerStore`]).
+
+pub mod admission;
+pub mod durable;
+
+pub use admission::{Admission, AdmissionSnapshot, OpClass, Permit};
+pub use durable::{
+    backoff_for_attempt, CircuitBreaker, CompletionDisposition, DurableScheduler, GapRecord,
+    MemorySchedulerStore, SchedulerStore,
+};
 
 use crate::model::{Epoch, GenerationId, TaskState};
 use serde::{Deserialize, Serialize};
@@ -82,11 +95,49 @@ pub trait Scheduler: Send {
     fn pending_count(&self, generation: GenerationId) -> crate::Result<u64>;
 }
 
+/// One directory (or scope) discovered by an enumeration task. Carried in
+/// the completion so children persist before the parent completes
+/// (spec §12). The store assigns `expected_revision` from the scope's
+/// current revision at insert and dedupes on `idempotency_key`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredChild {
+    /// Scope key of the discovered child (store key, not a raw path).
+    pub scope_key: String,
+    /// Operation kind the child needs (usually `EnumerateDir`).
+    pub kind: TaskKind,
+    /// Traversal generation the child belongs to.
+    pub generation: GenerationId,
+    /// Idempotency key: duplicate batches upsert safely.
+    pub idempotency_key: String,
+}
+
+/// One Git candidate discovered at its exact path. Carried in the
+/// completion so candidates persist before the parent completes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredCandidate {
+    /// Store key of the candidate path.
+    pub path_key: String,
+    /// Why this path is a Git candidate.
+    pub reason: String,
+}
+
 /// Outcome of one leased task execution.
+///
+/// NOTE (spec-forced change): `Complete` carries the discovered children
+/// and candidates so the scheduler persists them before marking the parent
+/// enumeration complete (spec §12). The stub's bare `Complete` unit variant
+/// could not express that ordering.
 #[derive(Debug, Clone)]
 pub enum TaskOutcome {
-    /// End-of-enumeration reached with revision validation.
-    Complete,
+    /// End-of-enumeration reached with revision validation. Children and
+    /// candidates persist first; then the parent completes only if its
+    /// expected revision is still current, else it requeues (stale).
+    Complete {
+        /// Discovered child scopes to persist before completing.
+        children: Vec<DiscoveredChild>,
+        /// Discovered Git candidates to persist before completing.
+        candidates: Vec<DiscoveredCandidate>,
+    },
     /// Partial progress plus a preserved gap; task returns to pending/retry.
     Partial {
         /// Stable error category for the gap record.

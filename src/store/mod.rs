@@ -12,6 +12,27 @@
 //! - Report streaming uses `prepare` + `Rows::next()`; never buffering
 //!   `batch()` APIs. No recursive CTEs for scheduler traversal. FTS5 is
 //!   unavailable (no `fts` feature): plain tables + indexes only.
+//!
+//! [`TursoStore`] is the owner-held implementation: transactions, frontier
+//! leases, invalidation revisions with a stale-completion guard, idempotent
+//! upserts, writer batching, crash recovery, and checkpoint coordination.
+//! [`OwnerGuard`] holds the coordination lock outside the payload namespace.
+
+pub mod catalog;
+pub mod owner;
+pub mod schema;
+pub mod writer;
+
+pub use catalog::{
+    task_state_as_str, task_state_from_str, CheckoutRow, ClaimedTask, DirObservation, DirRecord,
+    ErrorRow, EventRow, FrontierTask, GenerationRow, GitInstanceRow, NewCheckout, NewGitInstance,
+    NewRef, NewRemote, NewScan, NewStatus, NewTask, NewVolume, RecoveryReport, RefRow, RemoteRow,
+    ReportSnapshotRow, ScanRow, StatusRow, TaskOutcome, TursoStore, VolumeRow, WalStatus,
+};
+pub use owner::{catalog_db_path, lock_path, payload_dir, OwnerGuard};
+pub use writer::{
+    PendingOp, WriterBatch, WRITER_BATCH_BYTES, WRITER_BATCH_MAX_AGE, WRITER_BATCH_ROWS,
+};
 
 /// Current catalog schema version. Migrations are append-only.
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
@@ -27,14 +48,12 @@ pub struct Migration {
     pub sql: &'static str,
 }
 
-/// Ordered migration chain. TODO(phase-2): author the real DDL for the
-/// spec §11 entities (catalog metadata, scan requests, generations, volumes,
-/// directories, frontier tasks, observations, git instances, checkouts,
-/// remotes/refs, status, event journal, errors, report snapshots) with the
-/// required indexes; test against realistic data.
+/// Ordered migration chain: spec §11 entities (catalog metadata, scan
+/// requests, generations, volumes, directories, frontier tasks,
+/// observations, Git instances, checkouts, remotes/refs, status, event
+/// journal, errors, report snapshots) with the required lookup indexes.
 pub fn migrations() -> &'static [Migration] {
-    // TODO(phase-2): return the real migration list.
-    &[]
+    &schema::MIGRATIONS
 }
 
 /// Durable catalog contract. Only the owner implements this; enumeration and
@@ -79,4 +98,14 @@ pub struct DurabilityProof {
     /// `PRAGMA fullfsync;` must be `1` on macOS; `None` elsewhere
     /// (name does not parse on Linux; cfg-gated).
     pub fullfsync: Option<i64>,
+}
+
+/// Unix time in milliseconds for TIMESTAMP columns. Tests pass explicit
+/// values for determinism; production passes this clock.
+pub fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
 }

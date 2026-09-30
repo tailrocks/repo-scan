@@ -1,0 +1,2685 @@
+//! Owner-held Turso catalog: open sequence, transactions, frontier
+//! leases, invalidation revisions, idempotent upserts, crash recovery, and
+//! checkpoint coordination (spec §§10-12).
+//!
+//! Concurrency model: one owner process holds the database. All writer work
+//! runs through one [`TursoStore`] on a dedicated storage execution context;
+//! enumeration and Git helpers never open the database (spec §4). The writer
+//! connection is used by one logical actor at a time — methods take `&self`
+//! because the Turso API is `&self`, but concurrent calls from multiple
+//! tasks would interleave transactions and must be serialized by the owner.
+//!
+//! Every multi-statement mutation goes through [`TursoStore::with_tx`]:
+//! explicit `BEGIN IMMEDIATE`, explicit awaited `COMMIT`/`ROLLBACK`, then an
+//! `is_autocommit()` assertion. Dropping is never treated as cleanup.
+
+use crate::error::Error;
+use crate::model::TaskState;
+use crate::store::owner::OwnerGuard;
+use crate::store::writer::WriterBatch;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
+
+/// Owner-held catalog handle. Only the owner constructs this.
+pub struct TursoStore {
+    db: turso::Database,
+    conn: turso::Connection,
+    db_path: PathBuf,
+    epoch: u64,
+    schema_version: u32,
+}
+
+/// Monotonic in-process lease-token source, mixed with the pid so tokens
+/// are unique per owner incarnation. All leases are requeued on open, so
+/// in-process uniqueness is sufficient.
+static LEASE_TOKENS: AtomicI64 = AtomicI64::new(1);
+
+fn fresh_token() -> i64 {
+    let base = (std::process::id() as i64) << 48;
+    let token = base ^ LEASE_TOKENS.fetch_add(1, Ordering::Relaxed);
+    if token == 0 {
+        1
+    } else {
+        token
+    }
+}
+
+fn store_err(error: turso::Error) -> Error {
+    Error::Store(error.to_string())
+}
+
+fn v_int(value: i64) -> turso::Value {
+    turso::Value::Integer(value)
+}
+
+fn v_text(value: impl Into<String>) -> turso::Value {
+    turso::Value::Text(value.into())
+}
+
+fn v_blob(value: Vec<u8>) -> turso::Value {
+    turso::Value::Blob(value)
+}
+
+fn v_opt_int(value: Option<i64>) -> turso::Value {
+    value.map_or(turso::Value::Null, turso::Value::Integer)
+}
+
+fn v_opt_text(value: Option<String>) -> turso::Value {
+    value.map_or(turso::Value::Null, turso::Value::Text)
+}
+
+fn v_opt_blob(value: Option<Vec<u8>>) -> turso::Value {
+    value.map_or(turso::Value::Null, turso::Value::Blob)
+}
+
+fn req_i64(row: &turso::Row, idx: usize) -> crate::Result<i64> {
+    match row.get_value(idx).map_err(store_err)? {
+        turso::Value::Integer(value) => Ok(value),
+        other => Err(Error::Store(format!(
+            "column {idx} expected INTEGER, got {other:?}"
+        ))),
+    }
+}
+
+fn opt_i64(row: &turso::Row, idx: usize) -> crate::Result<Option<i64>> {
+    match row.get_value(idx).map_err(store_err)? {
+        turso::Value::Null => Ok(None),
+        turso::Value::Integer(value) => Ok(Some(value)),
+        other => Err(Error::Store(format!(
+            "column {idx} expected INTEGER or NULL, got {other:?}"
+        ))),
+    }
+}
+
+fn req_text(row: &turso::Row, idx: usize) -> crate::Result<String> {
+    match row.get_value(idx).map_err(store_err)? {
+        turso::Value::Text(value) => Ok(value),
+        other => Err(Error::Store(format!(
+            "column {idx} expected TEXT, got {other:?}"
+        ))),
+    }
+}
+
+fn opt_text(row: &turso::Row, idx: usize) -> crate::Result<Option<String>> {
+    match row.get_value(idx).map_err(store_err)? {
+        turso::Value::Null => Ok(None),
+        turso::Value::Text(value) => Ok(Some(value)),
+        other => Err(Error::Store(format!(
+            "column {idx} expected TEXT or NULL, got {other:?}"
+        ))),
+    }
+}
+
+fn req_blob(row: &turso::Row, idx: usize) -> crate::Result<Vec<u8>> {
+    match row.get_value(idx).map_err(store_err)? {
+        turso::Value::Blob(value) => Ok(value),
+        other => Err(Error::Store(format!(
+            "column {idx} expected BLOB, got {other:?}"
+        ))),
+    }
+}
+
+fn opt_blob(row: &turso::Row, idx: usize) -> crate::Result<Option<Vec<u8>>> {
+    match row.get_value(idx).map_err(store_err)? {
+        turso::Value::Null => Ok(None),
+        turso::Value::Blob(value) => Ok(Some(value)),
+        other => Err(Error::Store(format!(
+            "column {idx} expected BLOB or NULL, got {other:?}"
+        ))),
+    }
+}
+
+/// Persisted `frontier_tasks.state` spelling (spec §12).
+pub fn task_state_as_str(state: TaskState) -> &'static str {
+    match state {
+        TaskState::Pending => "pending",
+        TaskState::Leased => "leased",
+        TaskState::Complete => "complete",
+        TaskState::RetryWait => "retry_wait",
+        TaskState::Unavailable => "unavailable",
+        TaskState::Unsupported => "unsupported",
+        TaskState::Cancelled => "cancelled",
+        TaskState::Superseded => "superseded",
+    }
+}
+
+/// Parse a persisted task state; unknown spellings are catalog corruption.
+pub fn task_state_from_str(value: &str) -> crate::Result<TaskState> {
+    match value {
+        "pending" => Ok(TaskState::Pending),
+        "leased" => Ok(TaskState::Leased),
+        "complete" => Ok(TaskState::Complete),
+        "retry_wait" => Ok(TaskState::RetryWait),
+        "unavailable" => Ok(TaskState::Unavailable),
+        "unsupported" => Ok(TaskState::Unsupported),
+        "cancelled" => Ok(TaskState::Cancelled),
+        "superseded" => Ok(TaskState::Superseded),
+        other => Err(Error::Store(format!("unknown task state: {other}"))),
+    }
+}
+
+/// One durable frontier task (spec §12).
+#[derive(Debug, Clone)]
+pub struct FrontierTask {
+    /// Stable deduplication key.
+    pub id: String,
+    /// Operation kind (`enumerate_dir`, `probe_git`, `status`, `reconcile`).
+    pub kind: String,
+    /// Traversal generation this task belongs to.
+    pub generation: u64,
+    /// Directory covered, if the task is directory-scoped.
+    pub dir_id: Option<i64>,
+    /// Invalidation scope; revisions live in `scope_revisions`.
+    pub scope_key: String,
+    /// Revision the claim observed; a completion at any other revision is
+    /// stale and must not erase the newer invalidation.
+    pub expected_rev: u64,
+    /// Lifecycle state.
+    pub state: TaskState,
+    /// Current lease token, if leased.
+    pub lease_token: Option<i64>,
+    /// Epoch the lease was granted under.
+    pub lease_epoch: Option<u64>,
+    /// Lease expiry in unix milliseconds.
+    pub lease_expires_ms: Option<i64>,
+    /// Idempotency key: duplicate batches after restart apply once.
+    pub idempotency_key: String,
+    /// Earliest re-eligibility for `retry_wait` tasks.
+    pub retry_after_ms: Option<i64>,
+    /// Times this task has been claimed.
+    pub attempts: u64,
+}
+
+impl FrontierTask {
+    fn from_row(row: &turso::Row) -> crate::Result<Self> {
+        Ok(Self {
+            id: req_text(row, 0)?,
+            kind: req_text(row, 1)?,
+            generation: req_i64(row, 2)? as u64,
+            dir_id: opt_i64(row, 3)?,
+            scope_key: req_text(row, 4)?,
+            expected_rev: req_i64(row, 5)? as u64,
+            state: task_state_from_str(&req_text(row, 6)?)?,
+            lease_token: opt_i64(row, 7)?,
+            lease_epoch: opt_i64(row, 8)?.map(|epoch| epoch as u64),
+            lease_expires_ms: opt_i64(row, 9)?,
+            idempotency_key: req_text(row, 10)?,
+            retry_after_ms: opt_i64(row, 11)?,
+            attempts: req_i64(row, 12)? as u64,
+        })
+    }
+}
+
+/// Columns selected by [`FrontierTask::from_row`], in order.
+const TASK_COLUMNS: &str = "id, kind, generation, dir_id, scope_key, expected_rev, \
+    state, lease_token, lease_epoch, lease_expires_ms, idempotency_key, \
+    retry_after_ms, attempts";
+
+/// A task plus the lease just granted for it.
+#[derive(Debug, Clone)]
+pub struct ClaimedTask {
+    /// Task state at claim time (state is `leased`).
+    pub task: FrontierTask,
+    /// Lease token; completions must present it.
+    pub token: i64,
+    /// Lease expiry in unix milliseconds.
+    pub expires_ms: i64,
+}
+
+/// Outcome of one leased task execution.
+#[derive(Debug, Clone)]
+pub enum TaskOutcome {
+    /// End-of-enumeration reached with revision validation.
+    Complete,
+    /// Partial progress plus a preserved gap; task returns to `retry_wait`.
+    Retry {
+        /// Stable error category for the gap record.
+        category: String,
+        /// Human-readable detail.
+        detail: String,
+        /// Re-eligibility in unix milliseconds.
+        retry_after_ms: i64,
+    },
+    /// Scope parked durably; `state` must be `unavailable` or `unsupported`.
+    Parked {
+        /// Target state: `unavailable` or `unsupported`.
+        state: TaskState,
+        /// Reason recorded on the gap.
+        reason: String,
+    },
+}
+
+/// New task for [`TursoStore::enqueue_task`] (insert is idempotent).
+#[derive(Debug, Clone)]
+pub struct NewTask<'a> {
+    /// Stable deduplication key.
+    pub id: &'a str,
+    /// Operation kind.
+    pub kind: &'a str,
+    /// Traversal generation.
+    pub generation: u64,
+    /// Directory covered, if directory-scoped.
+    pub dir_id: Option<i64>,
+    /// Invalidation scope.
+    pub scope_key: &'a str,
+    /// Revision observed at enqueue time.
+    pub expected_rev: u64,
+    /// Idempotency key (unique across tasks).
+    pub idempotency_key: &'a str,
+}
+
+/// Crash-recovery report from open (spec §12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryReport {
+    /// Leased tasks returned to `pending` (dead epoch or expired lease).
+    pub requeued: u64,
+    /// `uncertain` batch markers dropped (work preserved via requeued tasks).
+    pub uncertain_dropped: u64,
+}
+
+/// WAL checkpoint status: `(busy, log_frames, checkpointed_frames)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalStatus {
+    /// Nonzero when a reader blocked the checkpoint; caller retries.
+    pub busy: u64,
+    /// WAL frames present.
+    pub log_frames: u64,
+    /// Frames checkpointed by this call.
+    pub checkpointed_frames: u64,
+}
+
+impl TursoStore {
+    /// Open-or-create the owner catalog at `state_dir/payload/catalog.db`,
+    /// holding the coordination lock at `state_dir/instance.lock`, claiming
+    /// a fresh epoch, and running crash recovery.
+    pub async fn open_owned(state_dir: &Path) -> crate::Result<(OwnerGuard, Self)> {
+        let mut guard = OwnerGuard::acquire(state_dir)?;
+        let store = Self::open_inner(&guard.db_path()).await?;
+        guard.set_epoch(store.epoch());
+        Ok((guard, store))
+    }
+
+    /// Fencing epoch claimed by this incarnation.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Database file this handle opened.
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+
+    /// Owner-only writer connection. Report streaming uses `prepare` plus
+    /// `Rows::next()` on this or a dedicated reader; never buffering batch
+    /// APIs. The owner serializes writer use.
+    pub fn connection(&self) -> &turso::Connection {
+        &self.conn
+    }
+
+    /// Open (or create) the catalog at `db_path`: parent directories,
+    /// `Builder::new_local` + `connect`, durability PRAGMAs with asserted
+    /// query-backs, migrations, epoch claim, and crash recovery.
+    async fn open_inner(db_path: &Path) -> crate::Result<Self> {
+        if let Some(parent) = db_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let path_str = db_path.to_str().ok_or_else(|| {
+            Error::Store(format!("database path is not UTF-8: {}", db_path.display()))
+        })?;
+        let db = turso::Builder::new_local(path_str)
+            .build()
+            .await
+            .map_err(store_err)?;
+        let conn = db.connect().map_err(store_err)?;
+        Self::apply_pragmas(&conn).await?;
+        let schema_version = Self::migrate(&conn).await?;
+        let epoch = Self::with_tx_on(&conn, |tx| async move {
+            let current = Self::read_meta_i64(tx, "epoch").await?.unwrap_or(0);
+            let next = current + 1;
+            Self::write_meta_i64(tx, "epoch", next).await?;
+            Ok::<i64, Error>(next)
+        })
+        .await? as u64;
+        let now = crate::store::now_ms();
+        Self::with_tx_on(&conn, |tx| async move {
+            Self::recover_on(tx, epoch, now).await?;
+            Ok::<(), Error>(())
+        })
+        .await?;
+        Self::assert_autocommit(&conn)?;
+        Ok(Self {
+            db,
+            conn,
+            db_path: db_path.to_path_buf(),
+            epoch,
+            schema_version,
+        })
+    }
+
+    /// Explicit transaction helper: `BEGIN IMMEDIATE`, run `f`, then an
+    /// awaited `COMMIT` on success or an awaited `ROLLBACK` on error or
+    /// commit failure, followed by an `is_autocommit()` assertion. Never
+    /// hold the transaction across filesystem, Git, helper, or external
+    /// waits (spec §10).
+    pub async fn with_tx<'a, T, F, Fut>(&'a self, f: F) -> crate::Result<T>
+    where
+        F: FnOnce(&'a turso::Connection) -> Fut,
+        Fut: std::future::Future<Output = crate::Result<T>>,
+    {
+        Self::with_tx_on(&self.conn, f).await
+    }
+
+    async fn with_tx_on<'a, T, F, Fut>(conn: &'a turso::Connection, f: F) -> crate::Result<T>
+    where
+        F: FnOnce(&'a turso::Connection) -> Fut,
+        Fut: std::future::Future<Output = crate::Result<T>>,
+    {
+        conn.execute("BEGIN IMMEDIATE", ())
+            .await
+            .map_err(store_err)?;
+        match f(conn).await {
+            Ok(value) => {
+                if let Err(error) = conn.execute("COMMIT", ()).await {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    Self::assert_autocommit(conn)?;
+                    return Err(store_err(error));
+                }
+                Self::assert_autocommit(conn)?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Self::assert_autocommit(conn)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn assert_autocommit(conn: &turso::Connection) -> crate::Result<()> {
+        let autocommit = conn.is_autocommit().map_err(store_err)?;
+        if autocommit {
+            Ok(())
+        } else {
+            Err(Error::Store(
+                "connection left inside a transaction after commit/rollback".to_string(),
+            ))
+        }
+    }
+
+    /// Open sequence: durability PRAGMAs, then asserted query-backs
+    /// (spec §10, DB-04). A set without a matching query-back is a failure,
+    /// never silent acceptance.
+    async fn apply_pragmas(conn: &turso::Connection) -> crate::Result<()> {
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(store_err)?;
+        Self::pragma_assign(conn, "journal_mode = WAL").await?;
+        Self::pragma_assign(conn, "synchronous = FULL").await?;
+        // Required: without data_sync_retry, a WAL-commit fsync failure
+        // panics the engine instead of returning an error.
+        Self::pragma_assign(conn, "data_sync_retry = ON").await?;
+        #[cfg(target_os = "macos")]
+        Self::pragma_assign(conn, "fullfsync = ON").await?;
+        let proof = Self::proof_on(conn).await?;
+        if proof.synchronous != 2 {
+            return Err(Error::Store(format!(
+                "PRAGMA synchronous query-back is {}, want 2 (FULL)",
+                proof.synchronous
+            )));
+        }
+        if proof.data_sync_retry != 1 {
+            return Err(Error::Store(format!(
+                "PRAGMA data_sync_retry query-back is {}, want 1",
+                proof.data_sync_retry
+            )));
+        }
+        if proof.journal_mode.to_lowercase() != "wal" {
+            return Err(Error::Store(format!(
+                "PRAGMA journal_mode query-back is {:?}, want wal",
+                proof.journal_mode
+            )));
+        }
+        #[cfg(target_os = "macos")]
+        if proof.fullfsync != Some(1) {
+            return Err(Error::Store(format!(
+                "PRAGMA fullfsync query-back is {:?}, want 1",
+                proof.fullfsync
+            )));
+        }
+        Ok(())
+    }
+
+    async fn proof_on(conn: &turso::Connection) -> crate::Result<crate::store::DurabilityProof> {
+        let synchronous = Self::pragma_i64(conn, "synchronous").await?;
+        let data_sync_retry = Self::pragma_i64(conn, "data_sync_retry").await?;
+        let journal_mode = Self::pragma_text(conn, "journal_mode").await?;
+        #[cfg(target_os = "macos")]
+        let fullfsync = Some(Self::pragma_i64(conn, "fullfsync").await?);
+        #[cfg(not(target_os = "macos"))]
+        let fullfsync = None;
+        Ok(crate::store::DurabilityProof {
+            synchronous,
+            data_sync_retry,
+            journal_mode,
+            fullfsync,
+        })
+    }
+
+    /// Assignment PRAGMA (`PRAGMA name = value`) via the query path,
+    /// draining the reported row(s). turso's `execute` rejects statements
+    /// that return rows ("unexpected row during execution"), and assignment
+    /// PRAGMAs report their new value as a row — so every set goes through
+    /// `query` here. The asserted query-backs in the callers stay the proof
+    /// of effect.
+    async fn pragma_assign(conn: &turso::Connection, assignment: &str) -> crate::Result<()> {
+        let sql = format!("PRAGMA {assignment}");
+        let mut rows = conn.query(sql.as_str(), ()).await.map_err(store_err)?;
+        while rows.next().await.map_err(store_err)?.is_some() {}
+        Ok(())
+    }
+
+    async fn pragma_i64(conn: &turso::Connection, name: &str) -> crate::Result<i64> {
+        let sql = format!("PRAGMA {name}");
+        let mut rows = conn.query(sql.as_str(), ()).await.map_err(store_err)?;
+        let row = rows
+            .next()
+            .await
+            .map_err(store_err)?
+            .ok_or_else(|| Error::Store(format!("PRAGMA {name} returned no rows")))?;
+        req_i64(&row, 0)
+    }
+
+    async fn pragma_text(conn: &turso::Connection, name: &str) -> crate::Result<String> {
+        let sql = format!("PRAGMA {name}");
+        let mut rows = conn.query(sql.as_str(), ()).await.map_err(store_err)?;
+        let row = rows
+            .next()
+            .await
+            .map_err(store_err)?
+            .ok_or_else(|| Error::Store(format!("PRAGMA {name} returned no rows")))?;
+        req_text(&row, 0)
+    }
+
+    /// Apply every pending migration, each inside one transaction, then seed
+    /// catalog-identity rows. Refuses a catalog newer than this binary.
+    async fn migrate(conn: &turso::Connection) -> crate::Result<u32> {
+        let mut current: u32 = 0;
+        if Self::has_table(conn, "meta").await? {
+            if let Some(raw) = Self::read_meta_text(conn, "schema_version").await? {
+                current = raw.parse::<u32>().map_err(|_| {
+                    Error::Store(format!("catalog schema_version is not a number: {raw:?}"))
+                })?;
+            }
+        }
+        if current > crate::store::CURRENT_SCHEMA_VERSION {
+            return Err(Error::Store(format!(
+                "catalog schema version {current} is newer than this binary (v{})",
+                crate::store::CURRENT_SCHEMA_VERSION
+            )));
+        }
+        for migration in crate::store::migrations() {
+            if migration.version <= current {
+                continue;
+            }
+            Self::with_tx_on(conn, |tx| async move {
+                tx.execute_batch(migration.sql).await.map_err(store_err)?;
+                Self::write_meta_text(tx, "schema_version", &migration.version.to_string()).await?;
+                Ok::<(), Error>(())
+            })
+            .await?;
+            current = migration.version;
+        }
+        Self::with_tx_on(conn, |tx| async move { Self::seed_meta(tx).await }).await?;
+        Ok(current)
+    }
+
+    async fn has_table(conn: &turso::Connection, name: &str) -> crate::Result<bool> {
+        let mut rows = conn
+            .query(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                vec![v_text(name)],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(rows.next().await.map_err(store_err)?.is_some())
+    }
+
+    async fn seed_meta(conn: &turso::Connection) -> crate::Result<()> {
+        let db_id = format!(
+            "db-{:x}-{:x}-{}",
+            std::process::id(),
+            crate::store::now_ms(),
+            fresh_token()
+        );
+        for (name, value) in [
+            ("db_id", db_id.as_str()),
+            ("epoch", "0"),
+            ("committed_revision", "0"),
+            ("engine_qual", crate::store::schema::ENGINE_QUAL),
+        ] {
+            conn.execute(
+                "INSERT OR IGNORE INTO meta (name, value) VALUES (?1, ?2)",
+                vec![v_text(name), v_text(value)],
+            )
+            .await
+            .map_err(store_err)?;
+        }
+        Ok(())
+    }
+
+    async fn read_meta_text(conn: &turso::Connection, name: &str) -> crate::Result<Option<String>> {
+        let mut rows = conn
+            .query("SELECT value FROM meta WHERE name = ?1", vec![v_text(name)])
+            .await
+            .map_err(store_err)?;
+        match rows.next().await.map_err(store_err)? {
+            None => Ok(None),
+            Some(row) => Ok(Some(req_text(&row, 0)?)),
+        }
+    }
+
+    async fn read_meta_i64(conn: &turso::Connection, name: &str) -> crate::Result<Option<i64>> {
+        match Self::read_meta_text(conn, name).await? {
+            None => Ok(None),
+            Some(raw) => raw.parse::<i64>().map(Some).map_err(|_| {
+                Error::Store(format!("catalog meta {name:?} is not a number: {raw:?}"))
+            }),
+        }
+    }
+
+    async fn write_meta_text(
+        conn: &turso::Connection,
+        name: &str,
+        value: &str,
+    ) -> crate::Result<()> {
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (name, value) VALUES (?1, ?2)",
+            vec![v_text(name), v_text(value)],
+        )
+        .await
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn write_meta_i64(conn: &turso::Connection, name: &str, value: i64) -> crate::Result<()> {
+        Self::write_meta_text(conn, name, &value.to_string()).await
+    }
+
+    /// Crash recovery (spec §12): requeue leases held under dead epochs or
+    /// past expiry, and drop `uncertain` batch markers whose work survives
+    /// via the requeued tasks. Runs inside the caller's transaction.
+    async fn recover_on(
+        conn: &turso::Connection,
+        epoch: u64,
+        now_ms: i64,
+    ) -> crate::Result<RecoveryReport> {
+        let requeued = conn
+            .execute(
+                "UPDATE frontier_tasks SET state = 'pending', lease_token = NULL, \
+                    lease_epoch = NULL, lease_expires_ms = NULL, updated_at_ms = ?1 \
+                    WHERE state = 'leased' AND (lease_epoch IS NULL OR lease_epoch != ?2 \
+                    OR (lease_expires_ms IS NOT NULL AND lease_expires_ms <= ?1))",
+                vec![v_int(now_ms), v_int(epoch as i64)],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM batches WHERE state = 'uncertain'", ())
+            .await
+            .map_err(store_err)?;
+        let uncertain = match rows.next().await.map_err(store_err)? {
+            None => 0,
+            Some(row) => req_i64(&row, 0)? as u64,
+        };
+        conn.execute("DELETE FROM batches WHERE state = 'uncertain'", ())
+            .await
+            .map_err(store_err)?;
+        Ok(RecoveryReport {
+            requeued,
+            uncertain_dropped: uncertain,
+        })
+    }
+
+    /// Run crash recovery now (same rules as open) and report what moved.
+    pub async fn recover_now(&self, now_ms: i64) -> crate::Result<RecoveryReport> {
+        let epoch = self.epoch;
+        self.with_tx(|conn| async move { Self::recover_on(conn, epoch, now_ms).await })
+            .await
+    }
+}
+
+impl TursoStore {
+    /// Enqueue a task idempotently (`INSERT OR IGNORE` on the dedup key).
+    /// Returns true when the task was newly inserted.
+    pub async fn enqueue_task(&self, task: &NewTask<'_>, now_ms: i64) -> crate::Result<bool> {
+        let rows = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO frontier_tasks (id, kind, generation, dir_id, \
+                    scope_key, expected_rev, state, idempotency_key, attempts, \
+                    updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, 0, ?8)",
+                vec![
+                    v_text(task.id),
+                    v_text(task.kind),
+                    v_int(task.generation as i64),
+                    v_opt_int(task.dir_id),
+                    v_text(task.scope_key),
+                    v_int(task.expected_rev as i64),
+                    v_text(task.idempotency_key),
+                    v_int(now_ms),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(rows == 1)
+    }
+
+    /// Fetch one task by id.
+    pub async fn get_task(&self, id: &str) -> crate::Result<Option<FrontierTask>> {
+        Self::get_task_on(&self.conn, id).await
+    }
+
+    async fn get_task_on(
+        conn: &turso::Connection,
+        id: &str,
+    ) -> crate::Result<Option<FrontierTask>> {
+        let sql = format!("SELECT {TASK_COLUMNS} FROM frontier_tasks WHERE id = ?1");
+        let mut rows = conn
+            .query(sql.as_str(), vec![v_text(id)])
+            .await
+            .map_err(store_err)?;
+        match rows.next().await.map_err(store_err)? {
+            None => Ok(None),
+            Some(row) => Ok(Some(FrontierTask::from_row(&row)?)),
+        }
+    }
+
+    /// Durably claim up to `limit` eligible tasks for `epoch` (expired
+    /// leases return to `pending` first, inside the same transaction).
+    /// Leases last `ttl_ms` from `now_ms`. Bounded: at most 1,024 claims.
+    pub async fn claim_tasks(
+        &self,
+        epoch: u64,
+        limit: usize,
+        ttl_ms: i64,
+        now_ms: i64,
+    ) -> crate::Result<Vec<ClaimedTask>> {
+        let limit = limit.clamp(1, 1024);
+        self.with_tx(|conn| async move {
+            Self::expire_leases_on(conn, now_ms).await?;
+            // Bound literal is interpolated (numeric, owner-controlled) so
+            // the query needs no bound LIMIT support.
+            let sql = format!(
+                "SELECT {TASK_COLUMNS} FROM frontier_tasks WHERE state = 'pending' \
+                    OR (state = 'retry_wait' AND retry_after_ms IS NOT NULL \
+                    AND retry_after_ms <= ?1) ORDER BY generation ASC, id ASC LIMIT {limit}"
+            );
+            let mut rows = conn
+                .query(sql.as_str(), vec![v_int(now_ms)])
+                .await
+                .map_err(store_err)?;
+            let mut tasks = Vec::new();
+            while let Some(row) = rows.next().await.map_err(store_err)? {
+                tasks.push(FrontierTask::from_row(&row)?);
+            }
+            let mut claimed = Vec::with_capacity(tasks.len());
+            for task in &tasks {
+                let token = fresh_token();
+                let expires = now_ms + ttl_ms;
+                let rows = conn
+                    .execute(
+                        "UPDATE frontier_tasks SET state = 'leased', lease_token = ?1, \
+                            lease_epoch = ?2, lease_expires_ms = ?3, \
+                            attempts = attempts + 1, updated_at_ms = ?4 WHERE id = ?5 \
+                            AND (state = 'pending' OR state = 'retry_wait')",
+                        vec![
+                            v_int(token),
+                            v_int(epoch as i64),
+                            v_int(expires),
+                            v_int(now_ms),
+                            v_text(task.id.clone()),
+                        ],
+                    )
+                    .await
+                    .map_err(store_err)?;
+                if rows == 1 {
+                    let mut leased = task.clone();
+                    leased.state = TaskState::Leased;
+                    leased.lease_token = Some(token);
+                    leased.lease_epoch = Some(epoch);
+                    leased.lease_expires_ms = Some(expires);
+                    leased.attempts += 1;
+                    claimed.push(ClaimedTask {
+                        task: leased,
+                        token,
+                        expires_ms: expires,
+                    });
+                }
+            }
+            Ok::<Vec<ClaimedTask>, Error>(claimed)
+        })
+        .await
+    }
+
+    /// Extend a live lease. Returns false when the lease is gone, expired
+    /// into another incarnation, or held under a different token/epoch.
+    pub async fn renew_lease(
+        &self,
+        task_id: &str,
+        token: i64,
+        epoch: u64,
+        ttl_ms: i64,
+        now_ms: i64,
+    ) -> crate::Result<bool> {
+        let rows = self
+            .conn
+            .execute(
+                "UPDATE frontier_tasks SET lease_expires_ms = ?1, updated_at_ms = ?2 \
+                    WHERE id = ?3 AND state = 'leased' AND lease_token = ?4 \
+                    AND lease_epoch = ?5",
+                vec![
+                    v_int(now_ms + ttl_ms),
+                    v_int(now_ms),
+                    v_text(task_id),
+                    v_int(token),
+                    v_int(epoch as i64),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(rows == 1)
+    }
+
+    /// Return expired leases to `pending`; reports how many moved.
+    pub async fn expire_leases(&self, now_ms: i64) -> crate::Result<u64> {
+        self.with_tx(|conn| async move { Self::expire_leases_on(conn, now_ms).await })
+            .await
+    }
+
+    async fn expire_leases_on(conn: &turso::Connection, now_ms: i64) -> crate::Result<u64> {
+        let rows = conn
+            .execute(
+                "UPDATE frontier_tasks SET state = 'pending', lease_token = NULL, \
+                    lease_epoch = NULL, lease_expires_ms = NULL, updated_at_ms = ?1 \
+                    WHERE state = 'leased' AND lease_expires_ms IS NOT NULL \
+                    AND lease_expires_ms <= ?1",
+                vec![v_int(now_ms)],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(rows)
+    }
+
+    /// Accept a completion only when the task is still leased to this exact
+    /// token and epoch and the scope revision still matches. A completion
+    /// that arrives after an invalidation is stale: the task is requeued
+    /// with the fresh revision (never marked complete) and a
+    /// `stale-completion` scheduler error is returned. A token/epoch
+    /// mismatch returns `lease-mismatch`. Stale results never erase
+    /// newer invalidations (spec §12).
+    pub async fn complete_task(
+        &self,
+        task_id: &str,
+        token: i64,
+        epoch: u64,
+        outcome: &TaskOutcome,
+        now_ms: i64,
+    ) -> crate::Result<()> {
+        let stale = self
+            .with_tx(|conn| async move {
+                Self::complete_task_on(conn, task_id, token, epoch, outcome, now_ms).await
+            })
+            .await?;
+        // The stale requeue above committed; report it now. Returning the
+        // error from inside the transaction would roll the requeue back.
+        match stale {
+            None => Ok(()),
+            Some(message) => Err(Error::Scheduler(message)),
+        }
+    }
+
+    /// Returns the stale-completion message when the task was requeued
+    /// (committed by the caller), `None` on a clean completion. Lease and
+    /// parked-state errors return before any write, so their rollback is a
+    /// no-op; only the stale path writes-then-reports.
+    async fn complete_task_on(
+        conn: &turso::Connection,
+        task_id: &str,
+        token: i64,
+        epoch: u64,
+        outcome: &TaskOutcome,
+        now_ms: i64,
+    ) -> crate::Result<Option<String>> {
+        let task = Self::get_task_on(conn, task_id)
+            .await?
+            .ok_or_else(|| Error::Scheduler(format!("unknown-task: {task_id}")))?;
+        if task.state != TaskState::Leased
+            || task.lease_token != Some(token)
+            || task.lease_epoch != Some(epoch)
+        {
+            return Err(Error::Scheduler(format!(
+                "lease-mismatch: task {task_id} is not leased to epoch {epoch} token {token}"
+            )));
+        }
+        let current_rev = Self::scope_rev_on(conn, &task.scope_key).await?;
+        if current_rev != task.expected_rev {
+            conn.execute(
+                "UPDATE frontier_tasks SET state = 'pending', lease_token = NULL, \
+                    lease_epoch = NULL, lease_expires_ms = NULL, expected_rev = ?1, \
+                    updated_at_ms = ?2 WHERE id = ?3",
+                vec![v_int(current_rev as i64), v_int(now_ms), v_text(task_id)],
+            )
+            .await
+            .map_err(store_err)?;
+            return Ok(Some(format!(
+                "stale-completion: task {task_id} expected rev {} but scope {:?} \
+                    is at rev {current_rev}; task requeued",
+                task.expected_rev, task.scope_key
+            )));
+        }
+        match outcome {
+            TaskOutcome::Complete => {
+                conn.execute(
+                    "UPDATE frontier_tasks SET state = 'complete', lease_token = NULL, \
+                        lease_epoch = NULL, lease_expires_ms = NULL, updated_at_ms = ?1 \
+                        WHERE id = ?2",
+                    vec![v_int(now_ms), v_text(task_id)],
+                )
+                .await
+                .map_err(store_err)?;
+            }
+            TaskOutcome::Retry {
+                category,
+                detail,
+                retry_after_ms,
+            } => {
+                conn.execute(
+                    "UPDATE frontier_tasks SET state = 'retry_wait', lease_token = NULL, \
+                        lease_epoch = NULL, lease_expires_ms = NULL, \
+                        retry_after_ms = ?1, updated_at_ms = ?2 WHERE id = ?3",
+                    vec![v_int(*retry_after_ms), v_int(now_ms), v_text(task_id)],
+                )
+                .await
+                .map_err(store_err)?;
+                let gap_id = format!("gap:{task_id}");
+                Self::record_error_on(
+                    conn,
+                    &gap_id,
+                    &task.scope_key,
+                    category,
+                    detail,
+                    Some(*retry_after_ms),
+                    now_ms,
+                )
+                .await?;
+            }
+            TaskOutcome::Parked { state, reason } => {
+                if !matches!(state, TaskState::Unavailable | TaskState::Unsupported) {
+                    return Err(Error::Scheduler(format!(
+                        "invalid-parked-state: {state:?} (want unavailable or unsupported)"
+                    )));
+                }
+                conn.execute(
+                    "UPDATE frontier_tasks SET state = ?1, lease_token = NULL, \
+                        lease_epoch = NULL, lease_expires_ms = NULL, updated_at_ms = ?2 \
+                        WHERE id = ?3",
+                    vec![
+                        v_text(task_state_as_str(*state)),
+                        v_int(now_ms),
+                        v_text(task_id),
+                    ],
+                )
+                .await
+                .map_err(store_err)?;
+                let gap_id = format!("gap:{task_id}");
+                Self::record_error_on(
+                    conn,
+                    &gap_id,
+                    &task.scope_key,
+                    task_state_as_str(*state),
+                    reason,
+                    None,
+                    now_ms,
+                )
+                .await?;
+            }
+        }
+        Ok(None)
+    }
+
+    /// Durably invalidate a scope: bump its revision, mirror directory
+    /// scopes into `directories.invalidation_rev`, and schedule one
+    /// reconciliation task for the new revision. Returns the new revision.
+    /// Invalidation success never claims the rescan is complete (spec §3).
+    pub async fn invalidate_scope(
+        &self,
+        scope_key: &str,
+        generation: u64,
+        now_ms: i64,
+    ) -> crate::Result<u64> {
+        self.with_tx(|conn| async move {
+            let next = Self::scope_rev_on(conn, scope_key).await? + 1;
+            conn.execute(
+                "INSERT OR REPLACE INTO scope_revisions (scope_key, rev, updated_at_ms) \
+                    VALUES (?1, ?2, ?3)",
+                vec![v_text(scope_key), v_int(next as i64), v_int(now_ms)],
+            )
+            .await
+            .map_err(store_err)?;
+            if let Some(raw) = scope_key.strip_prefix("dir:") {
+                if let Ok(dir_id) = raw.parse::<i64>() {
+                    conn.execute(
+                        "UPDATE directories SET invalidation_rev = ?1 WHERE id = ?2",
+                        vec![v_int(next as i64), v_int(dir_id)],
+                    )
+                    .await
+                    .map_err(store_err)?;
+                }
+            }
+            let task_id = format!("reconcile:{scope_key}:{next}");
+            let idempotency = format!("idem:{task_id}");
+            conn.execute(
+                "INSERT OR IGNORE INTO frontier_tasks (id, kind, generation, dir_id, \
+                    scope_key, expected_rev, state, idempotency_key, attempts, \
+                    updated_at_ms) VALUES (?1, 'reconcile', ?2, NULL, ?3, ?4, \
+                    'pending', ?5, 0, ?6)",
+                vec![
+                    v_text(task_id),
+                    v_int(generation as i64),
+                    v_text(scope_key),
+                    v_int(next as i64),
+                    v_text(idempotency),
+                    v_int(now_ms),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+            Ok::<u64, Error>(next)
+        })
+        .await
+    }
+
+    /// Current revision of a scope (0 when never invalidated).
+    pub async fn scope_rev(&self, scope_key: &str) -> crate::Result<u64> {
+        Self::scope_rev_on(&self.conn, scope_key).await
+    }
+
+    async fn scope_rev_on(conn: &turso::Connection, scope_key: &str) -> crate::Result<u64> {
+        let mut rows = conn
+            .query(
+                "SELECT rev FROM scope_revisions WHERE scope_key = ?1",
+                vec![v_text(scope_key)],
+            )
+            .await
+            .map_err(store_err)?;
+        match rows.next().await.map_err(store_err)? {
+            None => Ok(0),
+            Some(row) => Ok(req_i64(&row, 0)? as u64),
+        }
+    }
+
+    /// Tasks in `generation` that still need scheduler action (any
+    /// non-terminal state), for run-boundary accounting.
+    pub async fn pending_count(&self, generation: u64) -> crate::Result<u64> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM frontier_tasks WHERE generation = ?1 \
+                    AND state NOT IN ('complete', 'unsupported', 'cancelled', 'superseded')",
+                vec![v_int(generation as i64)],
+            )
+            .await
+            .map_err(store_err)?;
+        match rows.next().await.map_err(store_err)? {
+            None => Ok(0),
+            Some(row) => Ok(req_i64(&row, 0)? as u64),
+        }
+    }
+}
+
+/// One durable directory record: parent/component path plus native identity.
+#[derive(Debug, Clone)]
+pub struct DirRecord {
+    /// Row id, referenced by tasks and observations.
+    pub id: i64,
+    /// Parent directory row, if known.
+    pub parent_id: Option<i64>,
+    /// Final path component, exact bytes.
+    pub component: Vec<u8>,
+    /// Escaped presentation text.
+    pub display: String,
+    /// Owning volume id.
+    pub volume_id: String,
+    /// Filesystem object identity.
+    pub object_id: String,
+    /// Incarnation guard against identifier reuse.
+    pub incarnation: String,
+    /// Last observation time, if observed.
+    pub last_observed_ms: Option<i64>,
+    /// Invalidation revision mirrored from `scope_revisions`.
+    pub invalidation_rev: u64,
+}
+
+impl DirRecord {
+    fn from_row(row: &turso::Row) -> crate::Result<Self> {
+        Ok(Self {
+            id: req_i64(row, 0)?,
+            parent_id: opt_i64(row, 1)?,
+            component: req_blob(row, 2)?,
+            display: req_text(row, 3)?,
+            volume_id: req_text(row, 4)?,
+            object_id: req_text(row, 5)?,
+            incarnation: req_text(row, 6)?,
+            last_observed_ms: opt_i64(row, 7)?,
+            invalidation_rev: req_i64(row, 8)? as u64,
+        })
+    }
+}
+
+/// Enumeration observation for one directory in one generation.
+#[derive(Debug, Clone)]
+pub struct DirObservation {
+    /// Directory row id.
+    pub dir_id: i64,
+    /// Traversal generation.
+    pub generation: u64,
+    /// End-of-enumeration reached with revision validation.
+    pub completed: bool,
+    /// Entry generation counter for change detection.
+    pub entry_generation: u64,
+    /// Entries seen during enumeration.
+    pub entries_seen: u64,
+    /// Enumeration error, if the observation is partial.
+    pub error: Option<String>,
+    /// Observation time.
+    pub observed_at_ms: i64,
+}
+
+impl DirObservation {
+    fn from_row(row: &turso::Row) -> crate::Result<Self> {
+        Ok(Self {
+            dir_id: req_i64(row, 0)?,
+            generation: req_i64(row, 1)? as u64,
+            completed: req_i64(row, 2)? != 0,
+            entry_generation: req_i64(row, 3)? as u64,
+            entries_seen: req_i64(row, 4)? as u64,
+            error: opt_text(row, 5)?,
+            observed_at_ms: req_i64(row, 6)?,
+        })
+    }
+}
+
+/// One durable Git instance (common storage).
+#[derive(Debug, Clone)]
+pub struct GitInstanceRow {
+    /// Stable instance id.
+    pub id: String,
+    /// Git directory path, exact bytes.
+    pub git_path: Vec<u8>,
+    /// Common directory path, exact bytes.
+    pub common_path: Vec<u8>,
+    /// Incarnation guard.
+    pub incarnation: String,
+    /// Storage format marker.
+    pub format: String,
+    /// Bare flag, if known.
+    pub bare: Option<bool>,
+    /// Object format (`sha1`, `sha256`).
+    pub object_format: String,
+    /// Identity disposition under the matching policy.
+    pub disposition: String,
+    /// Evidence JSON.
+    pub evidence_json: String,
+    /// Observation time.
+    pub observed_at_ms: i64,
+}
+
+impl GitInstanceRow {
+    fn from_row(row: &turso::Row) -> crate::Result<Self> {
+        Ok(Self {
+            id: req_text(row, 0)?,
+            git_path: req_blob(row, 1)?,
+            common_path: req_blob(row, 2)?,
+            incarnation: req_text(row, 3)?,
+            format: req_text(row, 4)?,
+            bare: opt_i64(row, 5)?.map(|flag| flag != 0),
+            object_format: req_text(row, 6)?,
+            disposition: req_text(row, 7)?,
+            evidence_json: req_text(row, 8)?,
+            observed_at_ms: req_i64(row, 9)?,
+        })
+    }
+}
+
+/// New Git instance for [`TursoStore::upsert_git_instance`].
+#[derive(Debug, Clone)]
+pub struct NewGitInstance<'a> {
+    /// Stable instance id.
+    pub id: &'a str,
+    /// Git directory path, exact bytes.
+    pub git_path: &'a [u8],
+    /// Common directory path, exact bytes.
+    pub common_path: &'a [u8],
+    /// Incarnation guard.
+    pub incarnation: &'a str,
+    /// Storage format marker.
+    pub format: &'a str,
+    /// Bare flag, if known.
+    pub bare: Option<bool>,
+    /// Object format.
+    pub object_format: &'a str,
+    /// Identity disposition.
+    pub disposition: &'a str,
+    /// Evidence JSON.
+    pub evidence_json: &'a str,
+}
+
+/// One durable checkout (working tree) record.
+#[derive(Debug, Clone)]
+pub struct CheckoutRow {
+    /// Stable checkout id.
+    pub id: String,
+    /// Owning instance id.
+    pub instance_id: String,
+    /// Worktree root path, exact bytes (absent for bare stores).
+    pub root_path: Option<Vec<u8>>,
+    /// Git directory path, exact bytes.
+    pub git_path: Vec<u8>,
+    /// Instance relationship (`main`, `linked`, `submodule`, `unknown`).
+    pub relationship: String,
+    /// Availability (`present`, `missing`, `inaccessible`, `broken`).
+    pub availability: String,
+    /// HEAD state (`branch`, `detached`, `unborn`, `invalid`, `unknown`).
+    pub head_state: String,
+    /// HEAD ref name, exact bytes, when on a branch.
+    pub head_ref: Option<Vec<u8>>,
+    /// HEAD object id, exact bytes, when known.
+    pub head_oid: Option<Vec<u8>>,
+    /// HEAD object-id algorithm, when known.
+    pub head_algo: Option<String>,
+    /// Observation time.
+    pub observed_at_ms: i64,
+}
+
+impl CheckoutRow {
+    fn from_row(row: &turso::Row) -> crate::Result<Self> {
+        Ok(Self {
+            id: req_text(row, 0)?,
+            instance_id: req_text(row, 1)?,
+            root_path: opt_blob(row, 2)?,
+            git_path: req_blob(row, 3)?,
+            relationship: req_text(row, 4)?,
+            availability: req_text(row, 5)?,
+            head_state: req_text(row, 6)?,
+            head_ref: opt_blob(row, 7)?,
+            head_oid: opt_blob(row, 8)?,
+            head_algo: opt_text(row, 9)?,
+            observed_at_ms: req_i64(row, 10)?,
+        })
+    }
+}
+
+/// New checkout for [`TursoStore::upsert_checkout`].
+#[derive(Debug, Clone)]
+pub struct NewCheckout<'a> {
+    /// Stable checkout id.
+    pub id: &'a str,
+    /// Owning instance id.
+    pub instance_id: &'a str,
+    /// Worktree root path, exact bytes.
+    pub root_path: Option<&'a [u8]>,
+    /// Git directory path, exact bytes.
+    pub git_path: &'a [u8],
+    /// Instance relationship.
+    pub relationship: &'a str,
+    /// Availability.
+    pub availability: &'a str,
+    /// HEAD state.
+    pub head_state: &'a str,
+    /// HEAD ref name, exact bytes.
+    pub head_ref: Option<&'a [u8]>,
+    /// HEAD object id, exact bytes.
+    pub head_oid: Option<&'a [u8]>,
+    /// HEAD object-id algorithm.
+    pub head_algo: Option<&'a str>,
+}
+
+/// One durable effective-remote observation.
+#[derive(Debug, Clone)]
+pub struct RemoteRow {
+    /// Stable remote id.
+    pub id: String,
+    /// Owning instance id.
+    pub instance_id: String,
+    /// Checkout scope, when checkout-specific.
+    pub checkout_scope_id: Option<String>,
+    /// Remote name, exact bytes.
+    pub name: Vec<u8>,
+    /// Effective role (`fetch` or `push`).
+    pub role: String,
+    /// Redacted URL, exact bytes.
+    pub url: Vec<u8>,
+    /// Normalized canonical URL, exact bytes, when supported.
+    pub canonical_url: Option<Vec<u8>>,
+    /// Observation time.
+    pub observed_at_ms: i64,
+}
+
+impl RemoteRow {
+    fn from_row(row: &turso::Row) -> crate::Result<Self> {
+        Ok(Self {
+            id: req_text(row, 0)?,
+            instance_id: req_text(row, 1)?,
+            checkout_scope_id: opt_text(row, 2)?,
+            name: req_blob(row, 3)?,
+            role: req_text(row, 4)?,
+            url: req_blob(row, 5)?,
+            canonical_url: opt_blob(row, 6)?,
+            observed_at_ms: req_i64(row, 7)?,
+        })
+    }
+}
+
+/// New remote for [`TursoStore::upsert_remote`].
+#[derive(Debug, Clone)]
+pub struct NewRemote<'a> {
+    /// Stable remote id.
+    pub id: &'a str,
+    /// Owning instance id.
+    pub instance_id: &'a str,
+    /// Checkout scope, when checkout-specific.
+    pub checkout_scope_id: Option<&'a str>,
+    /// Remote name, exact bytes.
+    pub name: &'a [u8],
+    /// Effective role.
+    pub role: &'a str,
+    /// Redacted URL, exact bytes.
+    pub url: &'a [u8],
+    /// Normalized canonical URL, exact bytes.
+    pub canonical_url: Option<&'a [u8]>,
+}
+
+/// One durable reference observation.
+#[derive(Debug, Clone)]
+pub struct RefRow {
+    /// Stable ref id.
+    pub id: String,
+    /// Owning instance id.
+    pub instance_id: String,
+    /// Checkout scope, when checkout-specific.
+    pub checkout_scope_id: Option<String>,
+    /// Reference kind (`local`, `remote_tracking`, `other`).
+    pub kind: String,
+    /// Full ref name, exact bytes.
+    pub name: Vec<u8>,
+    /// Object id, exact bytes, when known.
+    pub oid: Option<Vec<u8>>,
+    /// Object-id algorithm, when known.
+    pub algo: Option<String>,
+    /// Symbolic target, exact bytes, when symbolic.
+    pub symbolic_target: Option<Vec<u8>>,
+    /// Upstream ref, exact bytes, when known.
+    pub upstream: Option<Vec<u8>>,
+    /// Reference state (`valid`, `unborn`, `invalid`, `unsupported`).
+    pub state: String,
+    /// Observation time.
+    pub observed_at_ms: i64,
+}
+
+impl RefRow {
+    fn from_row(row: &turso::Row) -> crate::Result<Self> {
+        Ok(Self {
+            id: req_text(row, 0)?,
+            instance_id: req_text(row, 1)?,
+            checkout_scope_id: opt_text(row, 2)?,
+            kind: req_text(row, 3)?,
+            name: req_blob(row, 4)?,
+            oid: opt_blob(row, 5)?,
+            algo: opt_text(row, 6)?,
+            symbolic_target: opt_blob(row, 7)?,
+            upstream: opt_blob(row, 8)?,
+            state: req_text(row, 9)?,
+            observed_at_ms: req_i64(row, 10)?,
+        })
+    }
+}
+
+/// New ref for [`TursoStore::upsert_ref`].
+#[derive(Debug, Clone)]
+pub struct NewRef<'a> {
+    /// Stable ref id.
+    pub id: &'a str,
+    /// Owning instance id.
+    pub instance_id: &'a str,
+    /// Checkout scope, when checkout-specific.
+    pub checkout_scope_id: Option<&'a str>,
+    /// Reference kind.
+    pub kind: &'a str,
+    /// Full ref name, exact bytes.
+    pub name: &'a [u8],
+    /// Object id, exact bytes.
+    pub oid: Option<&'a [u8]>,
+    /// Object-id algorithm.
+    pub algo: Option<&'a str>,
+    /// Symbolic target, exact bytes.
+    pub symbolic_target: Option<&'a [u8]>,
+    /// Upstream ref, exact bytes.
+    pub upstream: Option<&'a [u8]>,
+    /// Reference state.
+    pub state: &'a str,
+}
+
+/// One durable working-state observation.
+#[derive(Debug, Clone)]
+pub struct StatusRow {
+    /// Row id.
+    pub id: i64,
+    /// Observed checkout id.
+    pub checkout_id: String,
+    /// Inspection mode (`metadata`, `summary`, `full`).
+    pub mode: String,
+    /// Observation state.
+    pub state: String,
+    /// Probe start, when probed.
+    pub started_ms: Option<i64>,
+    /// Probe finish, when probed.
+    pub finished_ms: Option<i64>,
+    /// Staged tracked paths, when known.
+    pub staged: Option<i64>,
+    /// Unstaged tracked paths, when known.
+    pub unstaged: Option<i64>,
+    /// Untracked entries, when known.
+    pub untracked: Option<i64>,
+    /// Untracked count units.
+    pub untracked_units: String,
+    /// Submodule coverage.
+    pub submodules: String,
+    /// Unknown-fields JSON.
+    pub unknown_fields: String,
+    /// Input fingerprint (HEAD/index/config observations).
+    pub input_fingerprint: Option<Vec<u8>>,
+    /// Observation revision (dedup key with checkout).
+    pub observed_rev: u64,
+    /// Observation time.
+    pub observed_at_ms: i64,
+}
+
+impl StatusRow {
+    fn from_row(row: &turso::Row) -> crate::Result<Self> {
+        Ok(Self {
+            id: req_i64(row, 0)?,
+            checkout_id: req_text(row, 1)?,
+            mode: req_text(row, 2)?,
+            state: req_text(row, 3)?,
+            started_ms: opt_i64(row, 4)?,
+            finished_ms: opt_i64(row, 5)?,
+            staged: opt_i64(row, 6)?,
+            unstaged: opt_i64(row, 7)?,
+            untracked: opt_i64(row, 8)?,
+            untracked_units: req_text(row, 9)?,
+            submodules: req_text(row, 10)?,
+            unknown_fields: req_text(row, 11)?,
+            input_fingerprint: opt_blob(row, 12)?,
+            observed_rev: req_i64(row, 13)? as u64,
+            observed_at_ms: req_i64(row, 14)?,
+        })
+    }
+}
+
+/// New status observation for [`TursoStore::record_status`].
+#[derive(Debug, Clone)]
+pub struct NewStatus<'a> {
+    /// Observed checkout id.
+    pub checkout_id: &'a str,
+    /// Inspection mode.
+    pub mode: &'a str,
+    /// Observation state.
+    pub state: &'a str,
+    /// Probe start.
+    pub started_ms: Option<i64>,
+    /// Probe finish.
+    pub finished_ms: Option<i64>,
+    /// Staged tracked paths.
+    pub staged: Option<i64>,
+    /// Unstaged tracked paths.
+    pub unstaged: Option<i64>,
+    /// Untracked entries.
+    pub untracked: Option<i64>,
+    /// Untracked count units.
+    pub untracked_units: &'a str,
+    /// Submodule coverage.
+    pub submodules: &'a str,
+    /// Unknown-fields JSON.
+    pub unknown_fields: &'a str,
+    /// Input fingerprint.
+    pub input_fingerprint: Option<&'a [u8]>,
+    /// Observation revision (dedup key with checkout).
+    pub observed_rev: u64,
+}
+
+/// One durable scan request.
+#[derive(Debug, Clone)]
+pub struct ScanRow {
+    /// Scan id.
+    pub id: String,
+    /// Target URL, exact bytes as supplied.
+    pub url_raw: Vec<u8>,
+    /// Canonical URL, exact bytes, when supported.
+    pub url_canonical: Option<Vec<u8>>,
+    /// Requested scope.
+    pub scope: String,
+    /// Status mode.
+    pub status_mode: String,
+    /// Absolute report destination, exact bytes, when requested.
+    pub report_dest: Option<Vec<u8>>,
+    /// Request state.
+    pub state: String,
+    /// Terminal outcome, when finished.
+    pub outcome: Option<String>,
+    /// Successor scan id, when superseded.
+    pub successor_id: Option<String>,
+    /// Creation time.
+    pub created_at_ms: i64,
+    /// Last update time.
+    pub updated_at_ms: i64,
+}
+
+impl ScanRow {
+    fn from_row(row: &turso::Row) -> crate::Result<Self> {
+        Ok(Self {
+            id: req_text(row, 0)?,
+            url_raw: req_blob(row, 1)?,
+            url_canonical: opt_blob(row, 2)?,
+            scope: req_text(row, 3)?,
+            status_mode: req_text(row, 4)?,
+            report_dest: opt_blob(row, 5)?,
+            state: req_text(row, 6)?,
+            outcome: opt_text(row, 7)?,
+            successor_id: opt_text(row, 8)?,
+            created_at_ms: req_i64(row, 9)?,
+            updated_at_ms: req_i64(row, 10)?,
+        })
+    }
+}
+
+/// New scan request for [`TursoStore::create_scan_request`].
+#[derive(Debug, Clone)]
+pub struct NewScan<'a> {
+    /// Scan id.
+    pub id: &'a str,
+    /// Target URL, exact bytes.
+    pub url_raw: &'a [u8],
+    /// Canonical URL, exact bytes.
+    pub url_canonical: Option<&'a [u8]>,
+    /// Requested scope.
+    pub scope: &'a str,
+    /// Status mode.
+    pub status_mode: &'a str,
+    /// Absolute report destination, exact bytes.
+    pub report_dest: Option<&'a [u8]>,
+}
+
+/// One immutable report snapshot.
+#[derive(Debug, Clone)]
+pub struct ReportSnapshotRow {
+    /// Snapshot/report id.
+    pub id: String,
+    /// Report schema version.
+    pub schema_version: String,
+    /// Catalog revision streamed.
+    pub catalog_rev: u64,
+    /// Traversal generation covered.
+    pub generation: u64,
+    /// Publication state.
+    pub publication_state: String,
+    /// Content checksum, exact bytes, when computed.
+    pub checksum: Option<Vec<u8>>,
+    /// Creation time.
+    pub created_at_ms: i64,
+}
+
+impl ReportSnapshotRow {
+    fn from_row(row: &turso::Row) -> crate::Result<Self> {
+        Ok(Self {
+            id: req_text(row, 0)?,
+            schema_version: req_text(row, 1)?,
+            catalog_rev: req_i64(row, 2)? as u64,
+            generation: req_i64(row, 3)? as u64,
+            publication_state: req_text(row, 4)?,
+            checksum: opt_blob(row, 5)?,
+            created_at_ms: req_i64(row, 6)?,
+        })
+    }
+}
+
+/// One durable error/gap record.
+#[derive(Debug, Clone)]
+pub struct ErrorRow {
+    /// Stable error id.
+    pub id: String,
+    /// Scope the error belongs to.
+    pub scope_key: String,
+    /// Stable category.
+    pub category: String,
+    /// Human-readable detail.
+    pub detail: String,
+    /// Times recorded.
+    pub attempts: u64,
+    /// First-seen time.
+    pub first_seen_ms: i64,
+    /// Last-seen time.
+    pub last_seen_ms: i64,
+    /// Next retry eligibility, when scheduled.
+    pub next_retry_ms: Option<i64>,
+    /// True while the gap is open.
+    pub open: bool,
+}
+
+impl ErrorRow {
+    fn from_row(row: &turso::Row) -> crate::Result<Self> {
+        Ok(Self {
+            id: req_text(row, 0)?,
+            scope_key: req_text(row, 1)?,
+            category: req_text(row, 2)?,
+            detail: req_text(row, 3)?,
+            attempts: req_i64(row, 4)? as u64,
+            first_seen_ms: req_i64(row, 5)?,
+            last_seen_ms: req_i64(row, 6)?,
+            next_retry_ms: opt_i64(row, 7)?,
+            open: req_i64(row, 8)? != 0,
+        })
+    }
+}
+
+/// One durable event-journal record.
+#[derive(Debug, Clone)]
+pub struct EventRow {
+    /// Row id.
+    pub id: i64,
+    /// Volume id.
+    pub volume_id: String,
+    /// Event-history UUID.
+    pub history_uuid: String,
+    /// History cursor (opaque).
+    pub cursor: String,
+    /// Receipt time.
+    pub received_ms: i64,
+    /// True when the event invalidated scope.
+    pub invalidated: bool,
+    /// True when durably ingested.
+    pub ingested: bool,
+    /// True when reconciliation work is satisfied.
+    pub reconciled: bool,
+}
+
+impl EventRow {
+    fn from_row(row: &turso::Row) -> crate::Result<Self> {
+        Ok(Self {
+            id: req_i64(row, 0)?,
+            volume_id: req_text(row, 1)?,
+            history_uuid: req_text(row, 2)?,
+            cursor: req_text(row, 3)?,
+            received_ms: req_i64(row, 4)?,
+            invalidated: req_i64(row, 5)? != 0,
+            ingested: req_i64(row, 6)? != 0,
+            reconciled: req_i64(row, 7)? != 0,
+        })
+    }
+}
+
+/// One durable volume record.
+#[derive(Debug, Clone)]
+pub struct VolumeRow {
+    /// Opaque volume id.
+    pub id: String,
+    /// Native identity, when known.
+    pub native_identity: Option<String>,
+    /// Mount namespace.
+    pub namespace: String,
+    /// Filesystem name, when known.
+    pub filesystem: Option<String>,
+    /// Volume kind (`local`, `network`, `virtual`, `unknown`).
+    pub kind: String,
+    /// Access state.
+    pub state: String,
+    /// Last observation time.
+    pub observed_at_ms: Option<i64>,
+}
+
+impl VolumeRow {
+    fn from_row(row: &turso::Row) -> crate::Result<Self> {
+        Ok(Self {
+            id: req_text(row, 0)?,
+            native_identity: opt_text(row, 1)?,
+            namespace: req_text(row, 2)?,
+            filesystem: opt_text(row, 3)?,
+            kind: req_text(row, 4)?,
+            state: req_text(row, 5)?,
+            observed_at_ms: opt_i64(row, 6)?,
+        })
+    }
+}
+
+/// New volume for [`TursoStore::upsert_volume`].
+#[derive(Debug, Clone)]
+pub struct NewVolume<'a> {
+    /// Opaque volume id.
+    pub id: &'a str,
+    /// Native identity.
+    pub native_identity: Option<&'a str>,
+    /// Mount namespace.
+    pub namespace: &'a str,
+    /// Filesystem name.
+    pub filesystem: Option<&'a str>,
+    /// Volume kind.
+    pub kind: &'a str,
+    /// Access state.
+    pub state: &'a str,
+}
+
+/// One durable traversal generation.
+#[derive(Debug, Clone)]
+pub struct GenerationRow {
+    /// Generation id.
+    pub id: u64,
+    /// Scope policy.
+    pub scope_policy: String,
+    /// Completion state.
+    pub state: String,
+    /// Prior generation, when superseding.
+    pub prior_generation: Option<u64>,
+    /// Creation time.
+    pub created_at_ms: i64,
+}
+
+impl GenerationRow {
+    fn from_row(row: &turso::Row) -> crate::Result<Self> {
+        Ok(Self {
+            id: req_i64(row, 0)? as u64,
+            scope_policy: req_text(row, 1)?,
+            state: req_text(row, 2)?,
+            prior_generation: opt_i64(row, 3)?.map(|prior| prior as u64),
+            created_at_ms: req_i64(row, 4)?,
+        })
+    }
+}
+
+impl TursoStore {
+    /// Idempotent directory upsert keyed by physical identity
+    /// (`volume_id`, `object_id`, `incarnation`). Returns the row id.
+    /// Repeated calls with the same identity return the same id.
+    // Parameters mirror the table columns 1:1; grouping would churn callers.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_dir(
+        &self,
+        parent_id: Option<i64>,
+        component: &[u8],
+        display: &str,
+        volume_id: &str,
+        object_id: &str,
+        incarnation: &str,
+        observed_ms: i64,
+    ) -> crate::Result<i64> {
+        self.with_tx(|conn| async move {
+            conn.execute(
+                "INSERT OR IGNORE INTO directories (parent_id, component, display, \
+                    volume_id, object_id, incarnation, last_observed_ms, \
+                    invalidation_rev) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+                vec![
+                    v_opt_int(parent_id),
+                    v_blob(component.to_vec()),
+                    v_text(display),
+                    v_text(volume_id),
+                    v_text(object_id),
+                    v_text(incarnation),
+                    v_int(observed_ms),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+            conn.execute(
+                "UPDATE directories SET parent_id = ?1, display = ?2, \
+                    last_observed_ms = ?3 WHERE volume_id = ?4 AND object_id = ?5 \
+                    AND incarnation = ?6",
+                vec![
+                    v_opt_int(parent_id),
+                    v_text(display),
+                    v_int(observed_ms),
+                    v_text(volume_id),
+                    v_text(object_id),
+                    v_text(incarnation),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+            let mut rows = conn
+                .query(
+                    "SELECT id FROM directories WHERE volume_id = ?1 AND object_id = ?2 \
+                        AND incarnation = ?3",
+                    vec![v_text(volume_id), v_text(object_id), v_text(incarnation)],
+                )
+                .await
+                .map_err(store_err)?;
+            let row = rows
+                .next()
+                .await
+                .map_err(store_err)?
+                .ok_or_else(|| Error::Store("directory upsert left no row".to_string()))?;
+            req_i64(&row, 0)
+        })
+        .await
+    }
+
+    /// Fetch one directory by row id.
+    pub async fn get_dir(&self, id: i64) -> crate::Result<Option<DirRecord>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, parent_id, component, display, volume_id, object_id, \
+                    incarnation, last_observed_ms, invalidation_rev \
+                    FROM directories WHERE id = ?1",
+                vec![v_int(id)],
+            )
+            .await
+            .map_err(store_err)?;
+        match rows.next().await.map_err(store_err)? {
+            None => Ok(None),
+            Some(row) => Ok(Some(DirRecord::from_row(&row)?)),
+        }
+    }
+
+    /// Idempotent enumeration observation keyed by (`dir_id`, `generation`).
+    // Parameters mirror the table columns 1:1; grouping would churn callers.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_dir_observation(
+        &self,
+        dir_id: i64,
+        generation: u64,
+        completed: bool,
+        entry_generation: u64,
+        entries_seen: u64,
+        error: Option<&str>,
+        observed_ms: i64,
+    ) -> crate::Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO dir_observations (dir_id, generation, completed, \
+                    entry_generation, entries_seen, error, observed_at_ms) \
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                vec![
+                    v_int(dir_id),
+                    v_int(generation as i64),
+                    v_int(i64::from(completed)),
+                    v_int(entry_generation as i64),
+                    v_int(entries_seen as i64),
+                    v_opt_text(error.map(str::to_string)),
+                    v_int(observed_ms),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Fetch one directory observation.
+    pub async fn get_dir_observation(
+        &self,
+        dir_id: i64,
+        generation: u64,
+    ) -> crate::Result<Option<DirObservation>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT dir_id, generation, completed, entry_generation, entries_seen, \
+                    error, observed_at_ms FROM dir_observations \
+                    WHERE dir_id = ?1 AND generation = ?2",
+                vec![v_int(dir_id), v_int(generation as i64)],
+            )
+            .await
+            .map_err(store_err)?;
+        match rows.next().await.map_err(store_err)? {
+            None => Ok(None),
+            Some(row) => Ok(Some(DirObservation::from_row(&row)?)),
+        }
+    }
+
+    /// Idempotent Git-instance upsert keyed by stable id.
+    pub async fn upsert_git_instance(
+        &self,
+        instance: &NewGitInstance<'_>,
+        observed_ms: i64,
+    ) -> crate::Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO git_instances (id, git_path, common_path, \
+                    incarnation, format, bare, object_format, disposition, evidence, \
+                    observed_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                vec![
+                    v_text(instance.id),
+                    v_blob(instance.git_path.to_vec()),
+                    v_blob(instance.common_path.to_vec()),
+                    v_text(instance.incarnation),
+                    v_text(instance.format),
+                    v_opt_int(instance.bare.map(i64::from)),
+                    v_text(instance.object_format),
+                    v_text(instance.disposition),
+                    v_text(instance.evidence_json),
+                    v_int(observed_ms),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Fetch one Git instance by id.
+    pub async fn get_git_instance(&self, id: &str) -> crate::Result<Option<GitInstanceRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, git_path, common_path, incarnation, format, bare, \
+                    object_format, disposition, evidence, observed_at_ms \
+                    FROM git_instances WHERE id = ?1",
+                vec![v_text(id)],
+            )
+            .await
+            .map_err(store_err)?;
+        match rows.next().await.map_err(store_err)? {
+            None => Ok(None),
+            Some(row) => Ok(Some(GitInstanceRow::from_row(&row)?)),
+        }
+    }
+
+    /// Idempotent checkout upsert keyed by stable id.
+    pub async fn upsert_checkout(
+        &self,
+        checkout: &NewCheckout<'_>,
+        observed_ms: i64,
+    ) -> crate::Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO checkouts (id, instance_id, root_path, git_path, \
+                    relationship, availability, head_state, head_ref, head_oid, \
+                    head_algo, observed_at_ms) \
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                vec![
+                    v_text(checkout.id),
+                    v_text(checkout.instance_id),
+                    v_opt_blob(checkout.root_path.map(<[u8]>::to_vec)),
+                    v_blob(checkout.git_path.to_vec()),
+                    v_text(checkout.relationship),
+                    v_text(checkout.availability),
+                    v_text(checkout.head_state),
+                    v_opt_blob(checkout.head_ref.map(<[u8]>::to_vec)),
+                    v_opt_blob(checkout.head_oid.map(<[u8]>::to_vec)),
+                    v_opt_text(checkout.head_algo.map(str::to_string)),
+                    v_int(observed_ms),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Fetch one checkout by id.
+    pub async fn get_checkout(&self, id: &str) -> crate::Result<Option<CheckoutRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, instance_id, root_path, git_path, relationship, availability, \
+                    head_state, head_ref, head_oid, head_algo, observed_at_ms \
+                    FROM checkouts WHERE id = ?1",
+                vec![v_text(id)],
+            )
+            .await
+            .map_err(store_err)?;
+        match rows.next().await.map_err(store_err)? {
+            None => Ok(None),
+            Some(row) => Ok(Some(CheckoutRow::from_row(&row)?)),
+        }
+    }
+
+    /// Idempotent remote upsert keyed by stable id.
+    pub async fn upsert_remote(
+        &self,
+        remote: &NewRemote<'_>,
+        observed_ms: i64,
+    ) -> crate::Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO remotes (id, instance_id, checkout_scope_id, name, \
+                    role, url, canonical_url, observed_at_ms) \
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                vec![
+                    v_text(remote.id),
+                    v_text(remote.instance_id),
+                    v_opt_text(remote.checkout_scope_id.map(str::to_string)),
+                    v_blob(remote.name.to_vec()),
+                    v_text(remote.role),
+                    v_blob(remote.url.to_vec()),
+                    v_opt_blob(remote.canonical_url.map(<[u8]>::to_vec)),
+                    v_int(observed_ms),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// List remotes for one instance, ordered by id.
+    pub async fn list_remotes(&self, instance_id: &str) -> crate::Result<Vec<RemoteRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, instance_id, checkout_scope_id, name, role, url, \
+                    canonical_url, observed_at_ms FROM remotes \
+                    WHERE instance_id = ?1 ORDER BY id ASC",
+                vec![v_text(instance_id)],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            out.push(RemoteRow::from_row(&row)?);
+        }
+        Ok(out)
+    }
+
+    /// Idempotent ref upsert keyed by stable id.
+    pub async fn upsert_ref(&self, reference: &NewRef<'_>, observed_ms: i64) -> crate::Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO refs (id, instance_id, checkout_scope_id, kind, \
+                    name, oid, algo, symbolic_target, upstream, state, observed_at_ms) \
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                vec![
+                    v_text(reference.id),
+                    v_text(reference.instance_id),
+                    v_opt_text(reference.checkout_scope_id.map(str::to_string)),
+                    v_text(reference.kind),
+                    v_blob(reference.name.to_vec()),
+                    v_opt_blob(reference.oid.map(<[u8]>::to_vec)),
+                    v_opt_text(reference.algo.map(str::to_string)),
+                    v_opt_blob(reference.symbolic_target.map(<[u8]>::to_vec)),
+                    v_opt_blob(reference.upstream.map(<[u8]>::to_vec)),
+                    v_text(reference.state),
+                    v_int(observed_ms),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// List refs for one instance, ordered by id.
+    pub async fn list_refs(&self, instance_id: &str) -> crate::Result<Vec<RefRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, instance_id, checkout_scope_id, kind, name, oid, algo, \
+                    symbolic_target, upstream, state, observed_at_ms FROM refs \
+                    WHERE instance_id = ?1 ORDER BY id ASC",
+                vec![v_text(instance_id)],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            out.push(RefRow::from_row(&row)?);
+        }
+        Ok(out)
+    }
+
+    /// Idempotent status observation keyed by (`checkout_id`, `observed_rev`).
+    /// Returns true when newly inserted.
+    pub async fn record_status(
+        &self,
+        status: &NewStatus<'_>,
+        observed_ms: i64,
+    ) -> crate::Result<bool> {
+        let rows = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO status_observations (checkout_id, mode, state, \
+                    started_ms, finished_ms, staged, unstaged, untracked, \
+                    untracked_units, submodules, unknown_fields, input_fingerprint, \
+                    observed_rev, observed_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, \
+                    ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                vec![
+                    v_text(status.checkout_id),
+                    v_text(status.mode),
+                    v_text(status.state),
+                    v_opt_int(status.started_ms),
+                    v_opt_int(status.finished_ms),
+                    v_opt_int(status.staged),
+                    v_opt_int(status.unstaged),
+                    v_opt_int(status.untracked),
+                    v_text(status.untracked_units),
+                    v_text(status.submodules),
+                    v_text(status.unknown_fields),
+                    v_opt_blob(status.input_fingerprint.map(<[u8]>::to_vec)),
+                    v_int(status.observed_rev as i64),
+                    v_int(observed_ms),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(rows == 1)
+    }
+
+    /// List status observations for one checkout, newest revision first.
+    pub async fn list_statuses(&self, checkout_id: &str) -> crate::Result<Vec<StatusRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, checkout_id, mode, state, started_ms, finished_ms, staged, \
+                    unstaged, untracked, untracked_units, submodules, unknown_fields, \
+                    input_fingerprint, observed_rev, observed_at_ms \
+                    FROM status_observations WHERE checkout_id = ?1 \
+                    ORDER BY observed_rev DESC",
+                vec![v_text(checkout_id)],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            out.push(StatusRow::from_row(&row)?);
+        }
+        Ok(out)
+    }
+
+    /// Create a scan request idempotently. Returns true when newly inserted.
+    pub async fn create_scan_request(
+        &self,
+        scan: &NewScan<'_>,
+        now_ms: i64,
+    ) -> crate::Result<bool> {
+        let rows = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO scan_requests (id, url_raw, url_canonical, scope, \
+                    status_mode, report_dest, state, created_at_ms, updated_at_ms) \
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?7)",
+                vec![
+                    v_text(scan.id),
+                    v_blob(scan.url_raw.to_vec()),
+                    v_opt_blob(scan.url_canonical.map(<[u8]>::to_vec)),
+                    v_text(scan.scope),
+                    v_text(scan.status_mode),
+                    v_opt_blob(scan.report_dest.map(<[u8]>::to_vec)),
+                    v_int(now_ms),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(rows == 1)
+    }
+
+    /// Update a scan request's terminal-ish fields.
+    pub async fn update_scan_state(
+        &self,
+        id: &str,
+        state: &str,
+        outcome: Option<&str>,
+        successor_id: Option<&str>,
+        now_ms: i64,
+    ) -> crate::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE scan_requests SET state = ?1, outcome = ?2, successor_id = ?3, \
+                    updated_at_ms = ?4 WHERE id = ?5",
+                vec![
+                    v_text(state),
+                    v_opt_text(outcome.map(str::to_string)),
+                    v_opt_text(successor_id.map(str::to_string)),
+                    v_int(now_ms),
+                    v_text(id),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Fetch one scan request by id.
+    pub async fn get_scan(&self, id: &str) -> crate::Result<Option<ScanRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, url_raw, url_canonical, scope, status_mode, report_dest, \
+                    state, outcome, successor_id, created_at_ms, updated_at_ms \
+                    FROM scan_requests WHERE id = ?1",
+                vec![v_text(id)],
+            )
+            .await
+            .map_err(store_err)?;
+        match rows.next().await.map_err(store_err)? {
+            None => Ok(None),
+            Some(row) => Ok(Some(ScanRow::from_row(&row)?)),
+        }
+    }
+
+    /// Save an immutable report snapshot (`INSERT OR IGNORE` by id: a saved
+    /// snapshot is never mutated; a new scan produces a new id).
+    // Parameters mirror the table columns 1:1; grouping would churn callers.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn save_report_snapshot(
+        &self,
+        id: &str,
+        schema_version: &str,
+        catalog_rev: u64,
+        generation: u64,
+        publication_state: &str,
+        checksum: Option<&[u8]>,
+        now_ms: i64,
+    ) -> crate::Result<bool> {
+        let rows = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO report_snapshots (id, schema_version, catalog_rev, \
+                    generation, publication_state, checksum, created_at_ms) \
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                vec![
+                    v_text(id),
+                    v_text(schema_version),
+                    v_int(catalog_rev as i64),
+                    v_int(generation as i64),
+                    v_text(publication_state),
+                    v_opt_blob(checksum.map(<[u8]>::to_vec)),
+                    v_int(now_ms),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(rows == 1)
+    }
+
+    /// Update a snapshot's publication state (e.g. `published` after the
+    /// external write succeeds, or `failed` with the snapshot retained).
+    pub async fn set_snapshot_publication(
+        &self,
+        id: &str,
+        publication_state: &str,
+    ) -> crate::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE report_snapshots SET publication_state = ?1 WHERE id = ?2",
+                vec![v_text(publication_state), v_text(id)],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Fetch one report snapshot by id.
+    pub async fn get_report_snapshot(&self, id: &str) -> crate::Result<Option<ReportSnapshotRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, schema_version, catalog_rev, generation, publication_state, \
+                    checksum, created_at_ms FROM report_snapshots WHERE id = ?1",
+                vec![v_text(id)],
+            )
+            .await
+            .map_err(store_err)?;
+        match rows.next().await.map_err(store_err)? {
+            None => Ok(None),
+            Some(row) => Ok(Some(ReportSnapshotRow::from_row(&row)?)),
+        }
+    }
+
+    /// Record an error/gap: insert on first sight, otherwise bump attempts
+    /// and refresh detail, retry, and last-seen. Gaps stay open until
+    /// explicitly resolved, so failed scans never remove old findings.
+    pub async fn record_error(
+        &self,
+        id: &str,
+        scope_key: &str,
+        category: &str,
+        detail: &str,
+        next_retry_ms: Option<i64>,
+        now_ms: i64,
+    ) -> crate::Result<()> {
+        self.with_tx(|conn| async move {
+            Self::record_error_on(conn, id, scope_key, category, detail, next_retry_ms, now_ms)
+                .await
+        })
+        .await
+    }
+
+    async fn record_error_on(
+        conn: &turso::Connection,
+        id: &str,
+        scope_key: &str,
+        category: &str,
+        detail: &str,
+        next_retry_ms: Option<i64>,
+        now_ms: i64,
+    ) -> crate::Result<()> {
+        let rows = conn
+            .execute(
+                "UPDATE errors SET attempts = attempts + 1, detail = ?1, \
+                    last_seen_ms = ?2, next_retry_ms = ?3, open = 1 WHERE id = ?4",
+                vec![
+                    v_text(detail),
+                    v_int(now_ms),
+                    v_opt_int(next_retry_ms),
+                    v_text(id),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        if rows == 0 {
+            conn.execute(
+                "INSERT OR IGNORE INTO errors (id, scope_key, category, detail, attempts, \
+                    first_seen_ms, last_seen_ms, next_retry_ms, open) \
+                    VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5, ?6, 1)",
+                vec![
+                    v_text(id),
+                    v_text(scope_key),
+                    v_text(category),
+                    v_text(detail),
+                    v_int(now_ms),
+                    v_opt_int(next_retry_ms),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        }
+        Ok(())
+    }
+
+    /// Close a gap without deleting its evidence.
+    pub async fn resolve_error(&self, id: &str, now_ms: i64) -> crate::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE errors SET open = 0, last_seen_ms = ?1 WHERE id = ?2",
+                vec![v_int(now_ms), v_text(id)],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Fetch one error record by id.
+    pub async fn get_error(&self, id: &str) -> crate::Result<Option<ErrorRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, scope_key, category, detail, attempts, first_seen_ms, \
+                    last_seen_ms, next_retry_ms, open FROM errors WHERE id = ?1",
+                vec![v_text(id)],
+            )
+            .await
+            .map_err(store_err)?;
+        match rows.next().await.map_err(store_err)? {
+            None => Ok(None),
+            Some(row) => Ok(Some(ErrorRow::from_row(&row)?)),
+        }
+    }
+
+    /// Append an event-journal record idempotently
+    /// (dedup key: volume, history UUID, cursor). Returns true when new.
+    pub async fn append_event(
+        &self,
+        volume_id: &str,
+        history_uuid: &str,
+        cursor: &str,
+        invalidated: bool,
+        now_ms: i64,
+    ) -> crate::Result<bool> {
+        let rows = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO event_journal (volume_id, history_uuid, cursor, \
+                    received_ms, invalidated, ingested, reconciled) \
+                    VALUES (?1, ?2, ?3, ?4, ?5, 1, 0)",
+                vec![
+                    v_text(volume_id),
+                    v_text(history_uuid),
+                    v_text(cursor),
+                    v_int(now_ms),
+                    v_int(i64::from(invalidated)),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(rows == 1)
+    }
+
+    /// Mark one journal record reconciled (reconciliation work satisfied).
+    pub async fn mark_event_reconciled(&self, id: i64) -> crate::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE event_journal SET reconciled = 1 WHERE id = ?1",
+                vec![v_int(id)],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// List journal records for one volume/history, ordered by row id.
+    pub async fn list_events(
+        &self,
+        volume_id: &str,
+        history_uuid: &str,
+    ) -> crate::Result<Vec<EventRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, volume_id, history_uuid, cursor, received_ms, invalidated, \
+                    ingested, reconciled FROM event_journal \
+                    WHERE volume_id = ?1 AND history_uuid = ?2 ORDER BY id ASC",
+                vec![v_text(volume_id), v_text(history_uuid)],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            out.push(EventRow::from_row(&row)?);
+        }
+        Ok(out)
+    }
+
+    /// Idempotent volume upsert keyed by stable id.
+    pub async fn upsert_volume(
+        &self,
+        volume: &NewVolume<'_>,
+        observed_ms: Option<i64>,
+    ) -> crate::Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO volumes (id, native_identity, namespace, \
+                    filesystem, kind, state, observed_at_ms) \
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                vec![
+                    v_text(volume.id),
+                    v_opt_text(volume.native_identity.map(str::to_string)),
+                    v_text(volume.namespace),
+                    v_opt_text(volume.filesystem.map(str::to_string)),
+                    v_text(volume.kind),
+                    v_text(volume.state),
+                    v_opt_int(observed_ms),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Fetch one volume by id.
+    pub async fn get_volume(&self, id: &str) -> crate::Result<Option<VolumeRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, native_identity, namespace, filesystem, kind, state, \
+                    observed_at_ms FROM volumes WHERE id = ?1",
+                vec![v_text(id)],
+            )
+            .await
+            .map_err(store_err)?;
+        match rows.next().await.map_err(store_err)? {
+            None => Ok(None),
+            Some(row) => Ok(Some(VolumeRow::from_row(&row)?)),
+        }
+    }
+
+    /// Create a traversal generation; returns its id.
+    pub async fn create_generation(
+        &self,
+        scope_policy: &str,
+        state: &str,
+        prior_generation: Option<u64>,
+        now_ms: i64,
+    ) -> crate::Result<u64> {
+        self.conn
+            .execute(
+                "INSERT INTO generations (scope_policy, state, prior_generation, \
+                    created_at_ms) VALUES (?1, ?2, ?3, ?4)",
+                vec![
+                    v_text(scope_policy),
+                    v_text(state),
+                    v_opt_int(prior_generation.map(|prior| prior as i64)),
+                    v_int(now_ms),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(self.conn.last_insert_rowid() as u64)
+    }
+
+    /// Update a generation's completion state.
+    pub async fn set_generation_state(&self, id: u64, state: &str) -> crate::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE generations SET state = ?1 WHERE id = ?2",
+                vec![v_text(state), v_int(id as i64)],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Fetch one generation by id.
+    pub async fn get_generation(&self, id: u64) -> crate::Result<Option<GenerationRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, scope_policy, state, prior_generation, created_at_ms \
+                    FROM generations WHERE id = ?1",
+                vec![v_int(id as i64)],
+            )
+            .await
+            .map_err(store_err)?;
+        match rows.next().await.map_err(store_err)? {
+            None => Ok(None),
+            Some(row) => Ok(Some(GenerationRow::from_row(&row)?)),
+        }
+    }
+}
+
+impl TursoStore {
+    /// Current committed catalog revision (for report envelopes).
+    pub async fn current_revision(&self) -> crate::Result<u64> {
+        Ok(Self::read_meta_i64(&self.conn, "committed_revision")
+            .await?
+            .unwrap_or(0) as u64)
+    }
+
+    /// Advance the committed catalog revision; returns the new revision.
+    pub async fn next_revision(&self) -> crate::Result<u64> {
+        self.with_tx(|conn| async move {
+            let next = Self::read_meta_i64(conn, "committed_revision")
+                .await?
+                .unwrap_or(0)
+                + 1;
+            Self::write_meta_i64(conn, "committed_revision", next).await?;
+            Ok::<u64, Error>(next as u64)
+        })
+        .await
+    }
+
+    /// Reconcile a batch idempotency key after a lost acknowledgment
+    /// (spec §12): true means the batch committed — do not apply it again;
+    /// false means it is safe to apply. Never assume an unobserved
+    /// acknowledgment proves the transaction did not commit.
+    pub async fn reconcile_idempotency_key(&self, key: &str) -> crate::Result<bool> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT idempotency_key FROM batches WHERE idempotency_key = ?1",
+                vec![v_text(key)],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(rows.next().await.map_err(store_err)?.is_some())
+    }
+
+    /// Best-effort marker for a batch whose commit outcome is uncertain
+    /// (lost acknowledgment). Crash recovery drops these markers after
+    /// requeueing the underlying work.
+    pub async fn note_uncertain_batch(&self, key: &str, now_ms: i64) -> crate::Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO batches (idempotency_key, state, created_at_ms) \
+                    VALUES (?1, 'uncertain', ?2)",
+                vec![v_text(key), v_int(now_ms)],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Commit a writer batch atomically together with its idempotency
+    /// marker. A duplicate key (restart replay) skips the batch and
+    /// returns 0. Returns the number of applied ops.
+    pub async fn commit_batch(
+        &self,
+        idempotency_key: &str,
+        batch: &mut WriterBatch,
+        now_ms: i64,
+    ) -> crate::Result<usize> {
+        if self.reconcile_idempotency_key(idempotency_key).await? {
+            batch.drain();
+            return Ok(0);
+        }
+        let ops = batch.drain();
+        let count = ops.len();
+        if count == 0 {
+            return Ok(0);
+        }
+        let key = idempotency_key.to_string();
+        self.with_tx(move |conn| async move {
+            conn.execute(
+                "INSERT OR IGNORE INTO batches (idempotency_key, state, created_at_ms) \
+                    VALUES (?1, 'committed', ?2)",
+                vec![v_text(key), v_int(now_ms)],
+            )
+            .await
+            .map_err(store_err)?;
+            for op in ops {
+                conn.execute(op.sql.as_str(), op.params)
+                    .await
+                    .map_err(store_err)?;
+            }
+            Ok::<(), Error>(())
+        })
+        .await?;
+        Ok(count)
+    }
+
+    /// Commit a writer batch in one transaction without an idempotency
+    /// marker. Returns the number of applied ops.
+    pub async fn flush(&self, batch: &mut WriterBatch) -> crate::Result<usize> {
+        let ops = batch.drain();
+        let count = ops.len();
+        if count == 0 {
+            return Ok(0);
+        }
+        self.with_tx(move |conn| async move {
+            for op in ops {
+                conn.execute(op.sql.as_str(), op.params)
+                    .await
+                    .map_err(store_err)?;
+            }
+            Ok::<(), Error>(())
+        })
+        .await?;
+        Ok(count)
+    }
+
+    /// Explicit `PRAGMA wal_checkpoint(TRUNCATE)`; returns
+    /// `(busy, log_frames, checkpointed_frames)`. Coordinate with readers:
+    /// a nonzero `busy` means a reader held the WAL — keep serving reads
+    /// and retry the checkpoint later instead of blocking them.
+    pub async fn checkpoint_truncate(&self) -> crate::Result<(u64, u64, u64)> {
+        Self::wal_checkpoint(&self.conn, "TRUNCATE").await
+    }
+
+    /// Checkpoint progress probe that never blocks readers: runs
+    /// `PRAGMA wal_checkpoint(PASSIVE)` and reports WAL depth. Use it to
+    /// measure WAL growth and decide when to coordinate a truncate.
+    pub async fn wal_status(&self) -> crate::Result<WalStatus> {
+        let (busy, log_frames, checkpointed_frames) =
+            Self::wal_checkpoint(&self.conn, "PASSIVE").await?;
+        Ok(WalStatus {
+            busy,
+            log_frames,
+            checkpointed_frames,
+        })
+    }
+
+    async fn wal_checkpoint(
+        conn: &turso::Connection,
+        mode: &str,
+    ) -> crate::Result<(u64, u64, u64)> {
+        debug_assert!(mode == "TRUNCATE" || mode == "PASSIVE");
+        let sql = format!("PRAGMA wal_checkpoint({mode})");
+        let mut rows = conn.query(sql.as_str(), ()).await.map_err(store_err)?;
+        let row =
+            rows.next().await.map_err(store_err)?.ok_or_else(|| {
+                Error::Store("PRAGMA wal_checkpoint returned no rows".to_string())
+            })?;
+        // turso reports only `busy` when the checkpoint cannot proceed
+        // (busy=1, NULL counters), unlike SQLite which reports counts. The
+        // counters surface as 0 there; callers key off `busy`.
+        Ok((
+            req_i64(&row, 0)? as u64,
+            opt_i64(&row, 1)?.unwrap_or(0) as u64,
+            opt_i64(&row, 2)?.unwrap_or(0) as u64,
+        ))
+    }
+
+    /// Open a same-process read connection with the same durability
+    /// PRAGMAs (plus a busy timeout for writer contention). Report
+    /// streaming uses `prepare` plus `Rows::next()` on a dedicated
+    /// reader; a reader must be drained or dropped before checkpoint
+    /// coordination expects a non-busy truncate.
+    pub async fn open_reader(&self) -> crate::Result<turso::Connection> {
+        let conn = self.db.connect().map_err(store_err)?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(store_err)?;
+        Self::pragma_assign(&conn, "synchronous = FULL").await?;
+        Self::pragma_assign(&conn, "data_sync_retry = ON").await?;
+        #[cfg(target_os = "macos")]
+        Self::pragma_assign(&conn, "fullfsync = ON").await?;
+        let journal_mode = Self::pragma_text(&conn, "journal_mode").await?;
+        if journal_mode.to_lowercase() != "wal" {
+            return Err(Error::Store(format!(
+                "reader journal_mode query-back is {journal_mode:?}, want wal"
+            )));
+        }
+        Ok(conn)
+    }
+
+    /// Best-effort final checkpoint, then release the database handles.
+    /// A busy checkpoint (a same-process reader holds the WAL) is an
+    /// expected coordination state, not a close failure: durability never
+    /// depends on the final checkpoint, so its outcome is ignored.
+    pub async fn close(self) -> crate::Result<()> {
+        let _ = Self::wal_checkpoint(&self.conn, "TRUNCATE").await;
+        drop(self);
+        Ok(())
+    }
+}
+
+impl crate::store::Store for TursoStore {
+    async fn open(db_path: &std::path::Path) -> crate::Result<Self> {
+        Self::open_inner(db_path).await
+    }
+
+    fn schema_version(&self) -> crate::Result<u32> {
+        Ok(self.schema_version)
+    }
+
+    async fn checkpoint(&self) -> crate::Result<(u64, u64, u64)> {
+        self.checkpoint_truncate().await
+    }
+
+    async fn durability_proof(&self) -> crate::Result<crate::store::DurabilityProof> {
+        Self::proof_on(&self.conn).await
+    }
+}

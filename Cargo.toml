@@ -45,3 +45,7 @@ libc = "0.2"
 # per-volume streams). Replaces fsevent-sys, which lacks CopyUUIDForDevice.
 objc2-core-services = { version = "0.3", features = ["FSEvents", "libc", "dispatch2"] }
 objc2-core-foundation = "0.3"
+# MACOS_QUAL §1.1: direct dispatch-queue use (DispatchQueue::new +
+# DispatchRetained for FSEventStreamSetDispatchQueue scheduling; the runloop
+# API is deprecated macOS 13+). objc2-core-services does not re-export it.
+dispatch2 = "0.3"

@@ -75,3 +75,28 @@ pub trait EventBatchIter: Send {
     /// Next batch, or `None` when caught up to the boundary.
     fn next_batch(&mut self) -> crate::Result<Option<EventBatch>>;
 }
+
+/// Shared volume-kind classifier used by every [`MountTable`]
+/// implementation so fixtures and native code agree (spec §7; report
+/// `Volume.kind`).
+pub fn classify_volume_kind(is_local: bool, fstype: &str, mntfrom: &str) -> VolumeKind {
+    if !is_local {
+        return VolumeKind::Network;
+    }
+    let fstype = fstype.to_ascii_lowercase();
+    match fstype.as_str() {
+        // Synthetic or kernel-provided filesystems, never user data roots.
+        // tmpfs/shm/overlay stay Local: /tmp and exposed container layers
+        // hold real data and remain in scope.
+        "devfs" | "autofs" | "mtmfs" | "proc" | "sysfs" | "cgroup" | "cgroup2" | "devpts"
+        | "securityfs" | "debugfs" | "tracefs" | "configfs" | "fusectl" | "mqueue"
+        | "hugetlbfs" => VolumeKind::Virtual,
+        _ => {
+            if mntfrom.starts_with("map ") {
+                VolumeKind::Virtual
+            } else {
+                VolumeKind::Local
+            }
+        }
+    }
+}
