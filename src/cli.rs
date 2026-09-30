@@ -51,6 +51,12 @@ pub struct ScanArgs {
     /// Working-state inspection depth (spec §9).
     #[arg(long, value_enum, default_value = "summary")]
     pub status: StatusMode,
+    /// Explicit roots to scan (repeatable). When present, the scan covers
+    /// exactly these paths and the scope is recorded as `roots`; otherwise
+    /// `--scope` applies. This optional control never changes the meaning
+    /// of the six spec §3 commands.
+    #[arg(long)]
+    pub root: Vec<PathBuf>,
 }
 
 #[derive(Debug, Args)]

@@ -48,6 +48,23 @@ pub enum Error {
     /// Interrupted by the user after bounded progress save (exit 130).
     #[error("interrupted")]
     Interrupted,
+    /// Another owner holds the state-directory lock after a bounded wait;
+    /// this process refuses an independent database open (exit 1).
+    #[error("owner busy: {0}")]
+    OwnerBusy(String),
+    /// A resume scan ID names no saved request (exit 2).
+    #[error("unknown scan: {0}")]
+    UnknownScan(String),
+    /// A scheduler completion names no durable task (exit 1).
+    #[error("unknown task: {0}")]
+    UnknownTask(String),
+    /// A completion's epoch/token does not match the current lease (exit 1).
+    #[error("lease mismatch: {0}")]
+    LeaseMismatch(String),
+    /// A completion arrived after a newer invalidation; the task was
+    /// requeued and the invalidation kept (exit 1 when it escapes the loop).
+    #[error("stale completion: {0}")]
+    StaleCompletion(String),
 }
 
 impl Error {
@@ -55,7 +72,9 @@ impl Error {
     #[must_use]
     pub fn exit_code(&self) -> ExitCode {
         match self {
-            Error::InvalidArgs(_) | Error::Config(_) => ExitCode::InvalidArgs,
+            Error::InvalidArgs(_) | Error::Config(_) | Error::UnknownScan(_) => {
+                ExitCode::InvalidArgs
+            }
             Error::Superseded(_)
             | Error::Incomplete(_)
             | Error::UnresolvableIdentity(_)
@@ -74,6 +93,7 @@ impl Error {
                 | Error::UnresolvableIdentity(_)
                 | Error::Incomplete(_)
                 | Error::Events(_)
+                | Error::StaleCompletion(_)
         )
     }
 }

@@ -7,6 +7,17 @@
 //! temporary sibling + atomic replacement. Failed publication retries the
 //! saved snapshot without repeating discovery.
 
+pub mod builder;
+pub mod encode;
+pub mod model;
+pub mod publish;
+pub mod render;
+pub mod stream;
+pub mod validate;
+
+pub use builder::{ReportInputs, ReportPipeline, StreamStats};
+pub use model::Report;
+
 use crate::model::{ScanId, StatusMode};
 
 /// What to publish.
