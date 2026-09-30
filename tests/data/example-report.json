@@ -1,0 +1,68 @@
+{
+  "schema_version": "1.0.0",
+  "report_id": "report-example-1",
+  "created_at": "2026-09-30T12:00:00Z",
+  "tool": {"name": "repo-scan", "version": "0.1.0", "source_commit": null},
+  "scan": {
+    "id": "scan-example-1", "generation": 1, "epoch": 1,
+    "catalog_revision": 12,
+    "target_url": "https://github.com/OWNER/REPO",
+    "canonical_url": "https://github.com/owner/repo",
+    "matching_policy": "github-effective-remotes-v1",
+    "scope": "roots", "state": "complete",
+    "started_at": "2026-09-30T11:59:58Z",
+    "finished_at": "2026-09-30T12:00:00Z",
+    "superseded_by": null, "cached": false, "status_mode": "summary"
+  },
+  "coverage": {
+    "filesystem": "complete", "identity": "complete_under_policy",
+    "status": "complete", "directories_complete": 4,
+    "tasks_pending": 0, "gaps": 0, "unresolvable_candidates": 0,
+    "scope_boundaries": ["Only the explicit fixture root was requested."]
+  },
+  "resources": {
+    "profile": "conservative", "cpu_target_cores": 1,
+    "rss_target_bytes": 268435456, "peak_rss_bytes": null,
+    "cpu_seconds": null, "enumerated_entries": 8,
+    "db_transactions": 3, "db_sync_calls": null
+  },
+  "volumes": [{
+    "id": "volume-fixture", "native_identity": "fixture-volume-1",
+    "namespace": "fixture-mount-1", "filesystem": "fixture",
+    "kind": "local", "state": "available",
+    "observed_at": "2026-09-30T12:00:00Z", "error_ids": []
+  }],
+  "paths": [{
+    "id": "path-bare", "display": "/fixture/cache/store",
+    "encoding": "utf8", "value": "/fixture/cache/store",
+    "volume_id": "volume-fixture", "object_id": "100", "incarnation": "1"
+  }],
+  "roots": [{
+    "id": "root-fixture", "path_id": "path-bare", "volume_id": "volume-fixture",
+    "state": "complete", "observed_at": "2026-09-30T12:00:00Z",
+    "event_history_uuid": null, "ingested_cursor": null,
+    "reconciled_cursor": null, "error_ids": []
+  }],
+  "repositories": [{
+    "id": "repo-fixture", "git_path_id": "path-bare", "common_path_id": "path-bare",
+    "bare": true, "format": "git-files", "object_format": "sha1",
+    "match": "confirmed", "evidence": ["Effective origin fetch URL matches the target."],
+    "observed_at": "2026-09-30T11:59:59Z", "tool_managed": null, "error_ids": []
+  }],
+  "checkouts": [],
+  "branches": [{
+    "id": "branch-main", "repository_id": "repo-fixture", "checkout_scope_id": null, "kind": "local",
+    "name": {"display": "refs/heads/main", "encoding": "utf8", "value": "refs/heads/main"},
+    "oid": {"algorithm": "sha1", "hex": "1111111111111111111111111111111111111111"},
+    "symbolic_target": null, "upstream": null, "state": "valid",
+    "observed_at": "2026-09-30T11:59:59Z", "error_ids": []
+  }],
+  "remotes": [{
+    "id": "remote-origin", "repository_id": "repo-fixture", "checkout_scope_id": null,
+    "name": {"display": "origin", "encoding": "utf8", "value": "origin"},
+    "role": "fetch", "url": "https://github.com/owner/repo.git",
+    "canonical_url": "https://github.com/owner/repo", "observed_at": "2026-09-30T11:59:59Z"
+  }],
+  "storage_links": [], "aliases": [], "candidates": [], "errors": [],
+  "generated_artifacts": []
+}

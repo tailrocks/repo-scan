@@ -1,0 +1,47 @@
+[package]
+name = "repo-scan"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "repo_scan"
+path = "src/lib.rs"
+
+[[bin]]
+name = "repo-scan"
+path = "src/main.rs"
+
+[features]
+default = []
+# Phase 1: no optional runtime features. Platform backends are cfg-gated
+# (macOS native vs portable fixtures), not feature-gated.
+
+[dependencies]
+# TURSO_QUAL: exact pin, no default features (no mimalloc/fts), no
+# experimental flags (no multiprocess WAL, no WITHOUT ROWID, no MVCC).
+turso = { version = "=0.8.1", default-features = false }
+# WALKER_QUAL §1: pinned primary macOS reader (one-dir iterator only).
+dua-core = "=4.1.0"
+# WALKER_QUAL §2: fallback/comparison backend (shallow sequential only).
+ignore = "0.4"
+# GIT_QUAL: minimal read-only shape. No default features (forbids unaudited
+# library parallelism per spec §5), no network features. sha1+sha256 hash
+# backends both enabled.
+gix = { version = "=0.88.0", default-features = false, features = [
+  "status", "dirwalk", "index", "excludes", "attributes",
+  "sha1", "sha256",
+] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+tempfile = "3"
+# MACOS_QUAL §1.3: direct libc for getfsstat/getattrlist/getattrlistbulk.
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# MACOS_QUAL §1.1: full FSEvents history surface (UUID + dispatch queue +
+# per-volume streams). Replaces fsevent-sys, which lacks CopyUUIDForDevice.
+objc2-core-services = { version = "0.3", features = ["FSEvents", "libc", "dispatch2"] }
+objc2-core-foundation = "0.3"
