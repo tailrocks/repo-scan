@@ -13,16 +13,21 @@
 use clap::Parser;
 use repo_scan::cli::{CacheAction, Cli, Command};
 use repo_scan::config;
+use repo_scan::events::{self, CursorJournal};
 use repo_scan::git::{self, GitInspect};
 use repo_scan::identity;
 use repo_scan::model::{ExitCode, Scope, StatusMode, TaskState};
 use repo_scan::platform::MountTable;
+use repo_scan::report::builder::{
+    AliasInput, ArtifactInput, CandidateInput, ReportInputs as LibReportInputs, ReportPipeline,
+    RootInput, StorageLinkInput,
+};
 use repo_scan::scheduler::{backoff_for_attempt, Admission, CircuitBreaker, OpClass};
 use repo_scan::store::{
-    self, ClaimedTask, NewCheckout, NewGitInstance, NewRef, NewRemote, NewScan, NewStatus, NewTask,
-    NewVolume, OwnerGuard, Store, TaskOutcome, TursoStore,
+    self, ClaimedTask, EventRow, NewCheckout, NewGitInstance, NewRef, NewRemote, NewScan,
+    NewStatus, NewTask, NewVolume, OwnerGuard, Store, TaskOutcome, TursoStore,
 };
-use repo_scan::walk::roots::{plan_machine_roots, PlannedRoot};
+use repo_scan::walk::roots::{plan_machine_roots, PlannedRoot, RootPriority};
 use repo_scan::walk::topology::{resolve_symlink, PhysicalDirId, ResolveError, Topology};
 use repo_scan::walk::{ChildKind, ListOptions};
 use std::collections::{HashMap, HashSet};
@@ -48,14 +53,29 @@ const LEASE_TTL_MS: i64 = 60_000;
 const MAX_ATTEMPTS: u64 = 5;
 /// Per-task soft watchdog: slower tasks emit a stderr diagnostic.
 const SLOW_TASK_SECS: u64 = 30;
+/// Per-operation no-progress watchdog grace (R9): an admitted operation that
+/// makes no progress for this long is contained (enumeration aborts its
+/// admitted portion with a preserved gap; other operations trip the volume
+/// breaker after they return). Bounded: at most one grace period of stall
+/// per operation before containment engages.
+const WATCHDOG_GRACE_SECS: u64 = 120;
 /// Circuit-breaker threshold and cooldown per volume (spec §14).
 const BREAKER_THRESHOLD: u32 = 3;
 const BREAKER_COOLDOWN: Duration = Duration::from_secs(60);
-/// Cap on error records streamed into one report; the true total stays in
-/// `coverage.gaps` plus a scope-boundary note when capped.
-const REPORT_ERROR_CAP: usize = 10_000;
-/// Largest pre-existing destination file inspected for safe replacement.
-const DEST_INSPECT_CAP: u64 = 64 * 1024 * 1024;
+/// Tool-ownership marker filename inside the payload namespace (R15). Written
+/// on every owned open; verified before any destructive `cache clear`.
+const OWNER_MARKER_NAME: &str = "owner.marker";
+/// Marker format tag (first line of the marker file).
+const OWNER_MARKER_TAG: &str = "repo-scan-owner-v1";
+/// Pending-outcome exit sentinel (R14): a scan row carrying this exit in its
+/// outcome column has no terminal outcome yet; the outcome only binds the
+/// traversal generation the scan runs in.
+const PENDING_EXIT: i32 = -1;
+/// Cap on report-ID restage attempts for one scan (R16): every staging
+/// attempt gets an immutable snapshot ID; suffixes beyond this are a bug.
+const MAX_REPORT_ATTEMPTS: u32 = 1_000;
+/// Bytes of the engine file scanned for catalog schema markers (R15).
+const DB_IDENTITY_SCAN_BYTES: u64 = 64 * 1024;
 
 fn main() {
     std::process::exit(dispatch().code());
@@ -156,7 +176,46 @@ async fn open_owned_with_wait(state_dir: &Path) -> repo_scan::Result<(OwnerGuard
     let mut guard = acquire_guard(state_dir)?;
     let store = TursoStore::open(&guard.db_path()).await?;
     guard.set_epoch(store.epoch());
+    // Bind the ownership marker to the live catalog identity (R15): `cache
+    // clear` later requires this marker (or tool-shaped bytes) before
+    // removing the engine file. Best-effort: a marker write failure must
+    // not fail the command that owns real work.
+    if let Err(e) = write_owner_marker(&store, state_dir).await {
+        eprintln!("repo-scan: warning: cannot write ownership marker: {e}");
+    }
     Ok((guard, store))
+}
+
+/// Marker path inside the payload namespace.
+fn owner_marker_path(state_dir: &Path) -> PathBuf {
+    store::owner::payload_dir(state_dir).join(OWNER_MARKER_NAME)
+}
+
+/// (Re)bind `<state_dir>/payload/owner.marker` to the open catalog's `db_id`
+/// meta value. The marker proves this payload was opened by this tool; it is
+/// verified (not trusted blindly) by `cache clear` alongside the database
+/// identity checks.
+async fn write_owner_marker(store: &TursoStore, state_dir: &Path) -> repo_scan::Result<()> {
+    let mut rows = store
+        .connection()
+        .query("SELECT value FROM meta WHERE name = 'db_id'", ())
+        .await
+        .map_err(store_err)?;
+    let db_id = match rows.next().await.map_err(store_err)? {
+        Some(row) => cell_text(&row, 0)?,
+        None => String::from("unknown"),
+    };
+    let contents = format!(
+        "{OWNER_MARKER_TAG}\ndb_id={db_id}\nwritten_ms={}\npid={}\n",
+        store::now_ms(),
+        std::process::id(),
+    );
+    let path = owner_marker_path(state_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, contents)?;
+    Ok(())
 }
 
 /// Unix milliseconds as RFC 3339 UTC (`Time` in spec §16), without a
@@ -199,31 +258,6 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
-/// Standard Base64 with padding (spec §16 non-UTF-8 path encoding).
-fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = u32::from(chunk[0]);
-        let b1 = u32::from(chunk.get(1).copied().unwrap_or(0));
-        let b2 = u32::from(chunk.get(2).copied().unwrap_or(0));
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[(triple >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(triple >> 12) as usize & 63] as char);
-        if chunk.len() > 1 {
-            out.push(ALPHABET[(triple >> 6) as usize & 63] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(ALPHABET[triple as usize & 63] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
-}
-
 /// Presentation text with terminal control characters escaped (lossy display
 /// only; `value` always carries the exact bytes).
 fn escape_display(bytes: &[u8]) -> String {
@@ -231,35 +265,6 @@ fn escape_display(bytes: &[u8]) -> String {
         .chars()
         .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
         .collect()
-}
-
-/// Spec §16 `EncodedName` / path value pair for exact `bytes`.
-fn encoded_name(bytes: &[u8]) -> serde_json::Value {
-    match std::str::from_utf8(bytes) {
-        Ok(text) => serde_json::json!({
-            "display": escape_display(bytes),
-            "encoding": "utf8",
-            "value": text,
-        }),
-        Err(_) => serde_json::json!({
-            "display": escape_display(bytes),
-            "encoding": "base64",
-            "value": base64_encode(bytes),
-        }),
-    }
-}
-
-/// Spec §16 `ObjectId` from stored hex bytes, or null when the bytes are
-/// not well-formed lowercase hex (never emit an invalid OID shape).
-fn oid_value(algorithm: &str, hex_bytes: &[u8]) -> serde_json::Value {
-    let Ok(hex) = std::str::from_utf8(hex_bytes) else {
-        return serde_json::Value::Null;
-    };
-    let hex = hex.to_lowercase();
-    if hex.is_empty() || hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return serde_json::Value::Null;
-    }
-    serde_json::json!({"algorithm": algorithm, "hex": hex})
 }
 
 fn status_mode_str(mode: StatusMode) -> &'static str {
@@ -287,6 +292,66 @@ fn disposition_str(d: identity::MatchDisposition) -> &'static str {
         identity::MatchDisposition::Nonmatch => "nonmatch",
         identity::MatchDisposition::UnresolvableIdentity => "unresolvable_identity",
     }
+}
+
+/// Reclassify every stored instance against THIS scan's canonical target
+/// from stored remotes (R1): dispositions are per (instance, target) at
+/// report time, so scanning URL-B after URL-A never leaks URL-A's matches
+/// into URL-B's report (or vice versa). Probe-structural evidence is kept;
+/// stale match verdicts are replaced by fresh ones. Only disposition +
+/// evidence are rewritten — observation times are untouched.
+async fn reclassify_for_target(
+    store: &TursoStore,
+    canonical: &str,
+    counters: &mut RunCounters,
+) -> repo_scan::Result<()> {
+    let mut rows = store
+        .connection()
+        .query("SELECT id, evidence FROM git_instances", ())
+        .await
+        .map_err(store_err)?;
+    let mut instances: Vec<(String, String)> = Vec::new();
+    while let Some(row) = rows.next().await.map_err(store_err)? {
+        instances.push((cell_text(&row, 0)?, cell_text(&row, 1)?));
+    }
+    for (id, evidence_json) in &instances {
+        let remotes = store.list_remotes(id).await?;
+        let pairs: Vec<(String, String)> = remotes
+            .iter()
+            .map(|r| (String::from_utf8_lossy(&r.url).into_owned(), r.role.clone()))
+            .collect();
+        let borrowed: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(url, role)| (url.as_str(), role.as_str()))
+            .collect();
+        let (disposition, mut fresh) = identity::classify_remotes(canonical, borrowed);
+        let mut evidence: Vec<String> = serde_json::from_str(evidence_json).unwrap_or_default();
+        evidence.retain(|line| {
+            !(line.starts_with("Effective ")
+                || line.starts_with("No effective remotes")
+                || line.starts_with("reclassified for target "))
+        });
+        evidence.push(format!(
+            "reclassified for target {canonical} at report time"
+        ));
+        evidence.append(&mut fresh);
+        let evidence_json = serde_json::to_string(&evidence)
+            .map_err(|e| repo_scan::Error::Report(e.to_string()))?;
+        store
+            .connection()
+            .execute(
+                "UPDATE git_instances SET disposition = ?1, evidence = ?2 WHERE id = ?3",
+                vec![
+                    turso::Value::Text(disposition_str(disposition).to_string()),
+                    turso::Value::Text(evidence_json),
+                    turso::Value::Text(id.clone()),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        counters.db_transactions += 1;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -326,11 +391,45 @@ async fn run_scan_inner(
     let (policy, roots, state_roots) = plan_roots(args)?;
     let (_guard, store) = open_owned_with_wait(&cfg.state_dir).await?;
     let epoch = store.epoch();
+    let mut runner = Runner::new(&cfg.resources);
+    // Event monitoring opens before any traversal decision (R5).
+    let mut events = open_event_session(&store, &cfg.state_dir, &policy, &roots).await?;
     // One fresh catalog revision per run: status observations keyed by it
     // refresh matching metadata on every scan without duplicating rows.
     let run_rev = store.next_revision().await?;
+    runner.counters.db_transactions += 1;
     let now = store::now_ms();
-    let generation = pick_generation(&store, &policy, args.force_rescan, now).await?;
+    // Resume honors the saved generation (R14); a history loss forces a
+    // fresh one exactly like `--force-rescan`.
+    let saved_generation = resumed.as_ref().and_then(|r| r.generation);
+    let generation = match saved_generation {
+        Some(saved) if store.get_generation(saved).await?.is_some() => {
+            store.set_generation_state(saved, "running").await?;
+            runner.counters.db_transactions += 1;
+            saved
+        }
+        Some(saved) => {
+            eprintln!("repo-scan: resume: saved generation {saved} is gone; picking a live one",);
+            pick_generation(
+                &store,
+                &policy,
+                args.force_rescan,
+                now,
+                &mut runner.counters,
+            )
+            .await?
+        }
+        None => {
+            let force = args.force_rescan || events.history_invalid;
+            if events.history_invalid && !args.force_rescan {
+                eprintln!(
+                    "repo-scan: events: history loss forced a fresh traversal generation; \
+                     prior findings stay provisional until replaced"
+                );
+            }
+            pick_generation(&store, &policy, force, now, &mut runner.counters).await?
+        }
+    };
     if args.force_rescan {
         eprintln!(
             "repo-scan: force rescan: fresh generation {generation}; \
@@ -347,6 +446,7 @@ async fn run_scan_inner(
                 &policy,
                 args.status,
                 &report_dest,
+                &mut runner.counters,
             )
             .await?
         }
@@ -356,22 +456,58 @@ async fn run_scan_inner(
         None => now,
     };
     if resumed.is_none() {
-        supersede_stale_scans(&store, &canonical, &policy, &scan_id, now).await?;
+        supersede_stale_scans(
+            &store,
+            &canonical,
+            &policy,
+            &scan_id,
+            now,
+            &mut runner.counters,
+        )
+        .await?;
     }
+    // Bind the generation on the running row (R14): the pending outcome
+    // carries no terminal verdict (`exit=-1`), only the generation, so an
+    // interleaving force-rescan can never divert this scan's resume.
+    let pending_outcome = config::encode_outcome(
+        PENDING_EXIT,
+        None,
+        &config::report_id_for_scan(&scan_id),
+        false,
+        Some(generation),
+    );
     store
         .update_scan_state(
             &scan_id,
             &config::scan_state_name("running", state_roots.as_deref()),
-            None,
+            Some(&pending_outcome),
             None,
             now,
         )
         .await?;
-    upsert_volumes(&store, &policy, &roots, now).await?;
-    seed_root_tasks(&store, generation, &roots, now).await?;
-    enqueue_status_refresh(&store, generation, run_rev, now).await?;
+    runner.counters.db_transactions += 1;
+    upsert_volumes(&store, &policy, &roots, now, &mut runner.counters).await?;
+    // Ingest available event history before traversal (R5).
+    let drain = ingest_available_events(
+        &mut events,
+        &store,
+        generation,
+        &roots,
+        &mut runner.counters,
+    )
+    .await?;
+    if drain.batches > 0 {
+        eprintln!(
+            "repo-scan: events: ingested {} batch(es), {} scope(s) invalidated",
+            drain.batches, drain.scopes,
+        );
+    }
+    seed_root_tasks(&store, &mut runner, generation, &roots, now).await?;
+    // Per-target dispositions before traversal and staging (R1): status
+    // refresh, probes, and the report all classify this scan's target.
+    reclassify_for_target(&store, &canonical, &mut runner.counters).await?;
+    enqueue_status_refresh(&store, generation, run_rev, now, &mut runner.counters).await?;
 
-    let mut runner = Runner::new(&cfg.resources);
     let outcome = run_until_boundary(
         &mut runner,
         &store,
@@ -383,6 +519,25 @@ async fn run_scan_inner(
         &scan_id,
     )
     .await?;
+    if runner.watchdog.tripped > 0 {
+        eprintln!(
+            "repo-scan: watchdog tripped {} time(s) this run; stalled scopes were contained",
+            runner.watchdog.tripped,
+        );
+    }
+    if drain.mount_changed {
+        // A mount change during ingest asked for fresh volume rows (R5).
+        upsert_volumes(
+            &store,
+            &policy,
+            &roots,
+            store::now_ms(),
+            &mut runner.counters,
+        )
+        .await?;
+    }
+    // Advance reconciled cursors over satisfied work (R5).
+    let cursors = reconcile_event_cursors(&mut events, &store).await?;
 
     let finished_ms = store::now_ms();
     let gen_state = if outcome.interrupted {
@@ -393,9 +548,16 @@ async fn run_scan_inner(
         "complete"
     };
     store.set_generation_state(generation, gen_state).await?;
+    runner.counters.db_transactions += 1;
     let discovery_code = if outcome.has_gaps() { 3 } else { 0 };
-    let report_id = config::report_id_for_scan(&scan_id);
-    let inputs = ReportInputs {
+    // Stage first, publish second through the tested lib pipeline (R3): a
+    // failed publication retains the saved snapshot and can be retried
+    // without repeating discovery.
+    let report_id = fresh_report_id(&store, &cfg.state_dir, &scan_id).await?;
+    let catalog_rev = store.current_revision().await?;
+    let dirs_complete = count_dirs_complete(&store, generation).await?;
+    let snapshot_path = snapshots_dir(&cfg.state_dir).join(format!("{report_id}.json"));
+    let inputs = ScanReportInputs {
         scan_id: scan_id.clone(),
         generation,
         epoch,
@@ -410,64 +572,87 @@ async fn run_scan_inner(
         roots: roots.clone(),
         counters: runner.counters.clone(),
         pending: outcome.pending,
-        open_gaps: outcome.open_gaps,
-        unresolvable: outcome.unresolvable,
         status_pending: outcome.status_pending,
+        aliases: runner.aliases.clone(),
+        root_cursors: root_cursors_for(&roots, &events, &cursors),
+        event_note: events.note(),
     };
-    // Stage first, publish second: a failed publication retains the saved
-    // snapshot and can be retried without repeating discovery.
-    let staged = stage_report(&store, &cfg.state_dir, &inputs).await?;
-    let checksum = fnv1a_hex(&std::fs::read(&staged)?);
-    store
-        .save_report_snapshot(
-            &report_id,
-            "1.0.0",
-            store.current_revision().await?,
-            generation,
-            "staged",
-            Some(checksum.as_bytes()),
-            finished_ms,
-        )
-        .await?;
+    let lib_inputs = build_lib_inputs(
+        &store,
+        &inputs,
+        &report_id,
+        catalog_rev,
+        dirs_complete,
+        &snapshot_path,
+    )
+    .await?;
     let published = match &report_dest {
-        Some(dest) => match publish_to_dest(&staged, dest, &cfg.state_dir) {
-            Ok(()) => {
-                store
-                    .set_snapshot_publication(&report_id, "published")
-                    .await?;
-                true
+        Some(dest) => {
+            match emit_file_report(&store, &lib_inputs, dest, &cfg.state_dir, finished_ms).await {
+                Ok(_) => true,
+                Err(e) => {
+                    eprintln!("repo-scan: report publication failed: {e}");
+                    store
+                        .update_scan_state(
+                            &scan_id,
+                            &config::scan_state_name("failed", state_roots.as_deref()),
+                            Some(&config::encode_outcome(
+                                1,
+                                Some(discovery_code),
+                                &report_id,
+                                false,
+                                Some(generation),
+                            )),
+                            None,
+                            store::now_ms(),
+                        )
+                        .await?;
+                    let _ = store.close().await;
+                    println!("scan_id: {scan_id}");
+                    println!("report_id: {report_id}");
+                    println!("snapshot: {}", snapshot_path.display());
+                    return Ok(ExitCode::OperationalFailure);
+                }
             }
-            Err(e) => {
-                eprintln!("repo-scan: report publication failed: {e}");
-                store.set_snapshot_publication(&report_id, "failed").await?;
-                store
-                    .update_scan_state(
-                        &scan_id,
-                        &config::scan_state_name("failed", state_roots.as_deref()),
-                        Some(&config::encode_outcome(
-                            1,
-                            Some(discovery_code),
-                            &report_id,
-                            false,
-                            Some(generation),
-                        )),
-                        None,
-                        store::now_ms(),
-                    )
-                    .await?;
-                let _ = store.close().await;
-                println!("scan_id: {scan_id}");
-                println!("report_id: {report_id}");
-                println!("snapshot: {}", staged.display());
-                return Ok(ExitCode::OperationalFailure);
-            }
-        },
+        }
         None => {
-            store
-                .set_snapshot_publication(&report_id, "published")
-                .await?;
-            print_terminal_report(&store, &inputs, &staged).await?;
-            true
+            let stdout = std::io::stdout();
+            let mut terminal = stdout.lock();
+            match ReportPipeline::emit_to_terminal(
+                &store,
+                &lib_inputs,
+                &staging_dir(&cfg.state_dir),
+                &snapshots_dir(&cfg.state_dir),
+                finished_ms,
+                &mut terminal,
+            )
+            .await
+            {
+                Ok(_) => true,
+                Err(e) => {
+                    eprintln!("repo-scan: terminal report failed: {e}");
+                    store
+                        .update_scan_state(
+                            &scan_id,
+                            &config::scan_state_name("failed", state_roots.as_deref()),
+                            Some(&config::encode_outcome(
+                                1,
+                                Some(discovery_code),
+                                &report_id,
+                                false,
+                                Some(generation),
+                            )),
+                            None,
+                            store::now_ms(),
+                        )
+                        .await?;
+                    let _ = store.close().await;
+                    println!("scan_id: {scan_id}");
+                    println!("report_id: {report_id}");
+                    println!("snapshot: {}", snapshot_path.display());
+                    return Ok(ExitCode::OperationalFailure);
+                }
+            }
         }
     };
     let exit = if outcome.interrupted {
@@ -526,7 +711,7 @@ async fn run_scan_inner(
     println!("scan_id: {scan_id}");
     println!("generation: {generation}");
     println!("report_id: {report_id}");
-    println!("snapshot: {}", staged.display());
+    println!("snapshot: {}", snapshot_path.display());
     if let Some(dest) = &report_dest {
         println!("report: {}", dest.display());
     }
@@ -538,6 +723,8 @@ async fn run_scan_inner(
 struct ResumedRequest {
     scan_id: String,
     started_ms: i64,
+    /// Traversal generation bound on the scan row (R14).
+    generation: Option<u64>,
 }
 
 /// Resolve scan roots: explicit `--root`s (absolute, recorded as `roots`
@@ -587,6 +774,7 @@ async fn pick_generation(
     policy: &str,
     force: bool,
     now_ms: i64,
+    counters: &mut RunCounters,
 ) -> repo_scan::Result<u64> {
     let mut rows = store
         .connection()
@@ -608,18 +796,22 @@ async fn pick_generation(
         for (id, _) in &generations {
             if store.pending_count(*id).await? > 0 {
                 store.set_generation_state(*id, "running").await?;
+                counters.db_transactions += 1;
                 return Ok(*id);
             }
         }
         if let Some((id, _)) = generations.first() {
             store.set_generation_state(*id, "running").await?;
+            counters.db_transactions += 1;
             return Ok(*id);
         }
     }
     let prior = generations.first().map(|(id, _)| *id);
-    store
+    let generation = store
         .create_generation(policy, "running", prior, now_ms)
-        .await
+        .await?;
+    counters.db_transactions += 1;
+    Ok(generation)
 }
 
 /// Mint a scan ID and persist the request row (raw + canonical URL, scope,
@@ -631,6 +823,7 @@ async fn mint_scan_id(
     policy: &str,
     status: StatusMode,
     report_dest: &Option<PathBuf>,
+    counters: &mut RunCounters,
 ) -> repo_scan::Result<String> {
     let now = store::now_ms();
     let dest_bytes = report_dest.as_ref().map(|p| config::path_as_bytes(p));
@@ -649,6 +842,7 @@ async fn mint_scan_id(
                 now,
             )
             .await?;
+        counters.db_transactions += 1;
         if inserted {
             return Ok(id);
         }
@@ -668,6 +862,7 @@ async fn supersede_stale_scans(
     policy: &str,
     successor: &str,
     now_ms: i64,
+    counters: &mut RunCounters,
 ) -> repo_scan::Result<()> {
     store
         .connection()
@@ -684,6 +879,7 @@ async fn supersede_stale_scans(
         )
         .await
         .map_err(|e| repo_scan::Error::Store(e.to_string()))?;
+    counters.db_transactions += 1;
     Ok(())
 }
 
@@ -703,6 +899,7 @@ async fn upsert_volumes(
     policy: &str,
     roots: &[PlannedRoot],
     now_ms: i64,
+    counters: &mut RunCounters,
 ) -> repo_scan::Result<()> {
     if policy == "roots" {
         store
@@ -718,6 +915,7 @@ async fn upsert_volumes(
                 Some(now_ms),
             )
             .await?;
+        counters.db_transactions += 1;
         return Ok(());
     }
     #[cfg(target_os = "macos")]
@@ -738,6 +936,7 @@ async fn upsert_volumes(
                 Some(now_ms),
             )
             .await?;
+        counters.db_transactions += 1;
     }
     let _ = roots;
     Ok(())
@@ -748,6 +947,7 @@ async fn upsert_volumes(
 /// already reconciled roots and only adds genuinely new scope.
 async fn seed_root_tasks(
     store: &TursoStore,
+    runner: &mut Runner,
     generation: u64,
     roots: &[PlannedRoot],
     now_ms: i64,
@@ -757,7 +957,7 @@ async fn seed_root_tasks(
         let id = enum_task_id_for_path(generation, &root.path);
         let expected_rev = store.scope_rev(&scope_key).await?;
         let idempotency = format!("idem:{id}");
-        store
+        let inserted = store
             .enqueue_task(
                 &NewTask {
                     id: &id,
@@ -771,19 +971,37 @@ async fn seed_root_tasks(
                 now_ms,
             )
             .await?;
+        runner.counters.db_transactions += 1;
+        if !inserted {
+            // Two requested roots name the same object: shared results
+            // plus a preserved alias (R7).
+            note_enum_alias(
+                store,
+                runner,
+                &id,
+                &scope_key,
+                &root.path,
+                "same_object",
+                now_ms,
+            )
+            .await?;
+        }
     }
     Ok(())
 }
 
 /// Stable enumeration task ID from physical identity when the path stats,
 /// else from the path bytes (execution then records the gap durably).
+/// Identity follows symlinks (R7) so alias spellings share one task and
+/// its results; the `(0, 0)` fallback (non-unix) never shares an ID.
 fn enum_task_id_for_path(generation: u64, path: &Path) -> String {
-    match std::fs::symlink_metadata(path) {
-        Ok(md) => {
-            let (dev, ino) = dir_identity(&md);
-            format!("enum:{generation}:d{dev}:i{ino}")
-        }
-        Err(_) => format!(
+    let identity = std::fs::metadata(path)
+        .ok()
+        .map(|md| dir_identity(&md))
+        .filter(|key| *key != (0, 0));
+    match identity {
+        Some((dev, ino)) => format!("enum:{generation}:d{dev}:i{ino}"),
+        None => format!(
             "enum:{generation}:path:{}",
             config::encode_hex(&config::path_as_bytes(path))
         ),
@@ -810,6 +1028,7 @@ async fn enqueue_status_refresh(
     generation: u64,
     run_rev: u64,
     now_ms: i64,
+    counters: &mut RunCounters,
 ) -> repo_scan::Result<()> {
     let mut rows = store
         .connection()
@@ -826,7 +1045,7 @@ async fn enqueue_status_refresh(
         .map_err(|e| repo_scan::Error::Store(e.to_string()))?
     {
         let checkout_id = cell_text(&row, 0)?;
-        enqueue_status_task(store, generation, run_rev, &checkout_id, now_ms).await?;
+        enqueue_status_task(store, generation, run_rev, &checkout_id, now_ms, counters).await?;
     }
     Ok(())
 }
@@ -837,6 +1056,7 @@ async fn enqueue_status_task(
     run_rev: u64,
     checkout_id: &str,
     now_ms: i64,
+    counters: &mut RunCounters,
 ) -> repo_scan::Result<()> {
     let scope_key = config::scope_key_for_status(checkout_id);
     let id = format!("status:{checkout_id}:{run_rev}");
@@ -856,7 +1076,570 @@ async fn enqueue_status_task(
             now_ms,
         )
         .await?;
+    counters.db_transactions += 1;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Event-history ingest + reconcile wiring (R5)
+// ---------------------------------------------------------------------------
+//
+// Scan, resume (via the scan path), and invalidate all run this protocol:
+// open per-volume history streams BEFORE the initial traversal
+// (monitor-before-traverse), ingest available batches into durable
+// invalidations with persisted cursors, traverse, then advance reconciled
+// cursors only over satisfied work. History loss invalidates the volume
+// scope and forces a fresh traversal generation. macOS uses the live
+// FSEvents history surface; other platforms degrade honestly to
+// traversal-only with null cursors and an explicit boundary note (never
+// fabricated events, never silent completeness).
+
+/// Live event session for one command.
+struct EventSession {
+    reconciler: events::Reconciler<events::MemoryCursorJournal>,
+    monitored: Vec<events::MonitoredVolume>,
+    /// Mount path per monitored volume key (root mapping + UUID lookup).
+    mounts: HashMap<String, PathBuf>,
+    /// Dir scopes applied per volume this run (reconcile satisfaction).
+    applied_scopes: HashMap<String, Vec<String>>,
+    /// True when a history loss forced a fresh traversal generation.
+    history_invalid: bool,
+    /// Volumes that degraded (no live history): named in the report note.
+    degraded: Vec<String>,
+    /// Whether any volume is live-monitored.
+    live: bool,
+}
+
+/// One scanned volume: stable key plus its mount path.
+#[cfg(target_os = "macos")]
+struct ScanVolume {
+    key: String,
+    mount: PathBuf,
+}
+
+/// Volumes behind this command: every mount for machine scope, the mounts
+/// containing the explicit roots for roots scope.
+#[cfg(target_os = "macos")]
+fn scan_volumes(policy: &str, roots: &[PlannedRoot]) -> repo_scan::Result<Vec<ScanVolume>> {
+    let table = repo_scan::platform::macos::MacOsMountTable;
+    let mounts = table.mounts()?;
+    if policy == "roots" {
+        let mut out: Vec<ScanVolume> = Vec::new();
+        for root in roots {
+            let deepest = mounts
+                .iter()
+                .filter(|m| root.path.starts_with(&m.mount_path))
+                .max_by_key(|m| m.mount_path.as_os_str().len());
+            if let Some(mount) = deepest {
+                if !out.iter().any(|v| v.key == mount.volume.0) {
+                    out.push(ScanVolume {
+                        key: mount.volume.0.clone(),
+                        mount: mount.mount_path.clone(),
+                    });
+                }
+            }
+        }
+        return Ok(out);
+    }
+    Ok(mounts
+        .into_iter()
+        .map(|m| ScanVolume {
+            key: m.volume.0,
+            mount: m.mount_path,
+        })
+        .collect())
+}
+
+/// Durable per-volume cursors from every journal row, grouped by volume.
+async fn load_stored_cursors(
+    store: &TursoStore,
+) -> repo_scan::Result<HashMap<String, events::VolumeCursor>> {
+    let mut rows = store
+        .connection()
+        .query(
+            "SELECT id, volume_id, history_uuid, cursor, received_ms, invalidated, \
+             ingested, reconciled FROM event_journal ORDER BY id ASC",
+            (),
+        )
+        .await
+        .map_err(store_err)?;
+    let mut all: Vec<EventRow> = Vec::new();
+    while let Some(row) = rows.next().await.map_err(store_err)? {
+        all.push(EventRow {
+            id: cell_int(&row, 0)?,
+            volume_id: cell_text(&row, 1)?,
+            history_uuid: cell_text(&row, 2)?,
+            cursor: cell_text(&row, 3)?,
+            received_ms: cell_int(&row, 4)?,
+            invalidated: cell_int(&row, 5)? != 0,
+            ingested: cell_int(&row, 6)? != 0,
+            reconciled: cell_int(&row, 7)? != 0,
+        });
+    }
+    let mut keys: Vec<String> = all.iter().map(|r| r.volume_id.clone()).collect();
+    keys.sort();
+    keys.dedup();
+    let mut out = HashMap::new();
+    for key in keys {
+        if let Some(cursor) = events::volume_cursor_from_rows(&key, &all) {
+            out.insert(key, cursor);
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(target_os = "macos")]
+fn live_history_uuid_for(mount: &Path) -> Option<events::HistoryUuid> {
+    let dev = events::native::device_of(mount).ok()?;
+    events::native::live_history_uuid(dev)
+}
+
+/// Open per-volume history streams before any traversal. Stream-open
+/// failures degrade that volume (stderr + report note), never the command:
+/// the traversal is the source of truth and events only accelerate it.
+async fn open_event_session(
+    store: &TursoStore,
+    state_dir: &Path,
+    policy: &str,
+    roots: &[PlannedRoot],
+) -> repo_scan::Result<EventSession> {
+    let stored = load_stored_cursors(store).await?;
+    let mut session = EventSession {
+        reconciler: events::Reconciler::new(events::MemoryCursorJournal::new()),
+        monitored: Vec::new(),
+        mounts: HashMap::new(),
+        applied_scopes: HashMap::new(),
+        history_invalid: false,
+        degraded: Vec::new(),
+        live: false,
+    };
+    // Tool-owned writes must never come back as foreign invalidations.
+    let _ = session.reconciler.own_bookkeeping_mut().register(state_dir);
+    #[cfg(target_os = "macos")]
+    {
+        let volumes = scan_volumes(policy, roots)?;
+        let mut source = repo_scan::platform::macos::FsEventsSource;
+        for volume in &volumes {
+            let vid = repo_scan::platform::VolumeId(volume.key.clone());
+            match events::monitor_volumes(&mut source, std::slice::from_ref(&vid), &stored) {
+                Ok(mut opened) => {
+                    let live_uuid = live_history_uuid_for(&volume.mount);
+                    let live_id = events::native::current_event_id().0;
+                    for m in opened.drain(..) {
+                        let decision = session.reconciler.note_stream_opened(
+                            &volume.key,
+                            stored.get(&volume.key),
+                            live_uuid.as_ref(),
+                            live_id,
+                            m.boundary,
+                        );
+                        if decision.history_invalid() {
+                            session.history_invalid = true;
+                            eprintln!(
+                                "repo-scan: events: history loss on volume {}; \
+                                 volume scope will be invalidated",
+                                volume.key,
+                            );
+                        }
+                        session
+                            .mounts
+                            .insert(volume.key.clone(), volume.mount.clone());
+                        session.monitored.push(m);
+                    }
+                    session.live = true;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "repo-scan: events: volume {} degraded ({}); traversal covers it",
+                        volume.key, e,
+                    );
+                    session.degraded.push(volume.key.clone());
+                }
+            }
+        }
+        if session.live {
+            session.reconciler.begin_traversal()?;
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (policy, roots, stored);
+        session.degraded.push(String::from("all volumes"));
+    }
+    Ok(session)
+}
+
+impl EventSession {
+    /// Honest event-history boundary note for the report.
+    fn note(&self) -> String {
+        if self.live {
+            format!(
+                "Event-history reconciliation: {} volume(s) monitored live, {} degraded \
+                 (full traversal covers all scope; cursors recorded per root).",
+                self.monitored.len(),
+                self.degraded.len(),
+            )
+        } else if cfg!(target_os = "macos") {
+            String::from(
+                "Event-history monitoring unavailable for this run (all volumes degraded); \
+                 full traversal only, cursors not recorded.",
+            )
+        } else {
+            String::from(
+                "Event history unavailable on this platform (no FSEvents); full traversal \
+                 only, cursors not recorded.",
+            )
+        }
+    }
+}
+
+/// What one ingest drain applied.
+#[derive(Debug, Default)]
+struct IngestApplied {
+    batches: usize,
+    scopes: usize,
+    mount_changed: bool,
+}
+
+/// Drain available batches from every monitored stream (bounded per call)
+/// and apply them: persist cursors, invalidate scopes. Non-blocking: only
+/// already-delivered history is consumed; later arrivals stay queued past
+/// the pinned boundaries.
+async fn ingest_available_events(
+    session: &mut EventSession,
+    store: &TursoStore,
+    generation: u64,
+    roots: &[PlannedRoot],
+    counters: &mut RunCounters,
+) -> repo_scan::Result<IngestApplied> {
+    let mut applied = IngestApplied::default();
+    let mut batches: Vec<events::EventBatch> = Vec::new();
+    for m in session.monitored.iter_mut() {
+        for _ in 0..16 {
+            match m.batches.next_batch() {
+                Ok(Some(batch)) => batches.push(batch),
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("repo-scan: events: batch error on {}: {e}", m.volume_key,);
+                    break;
+                }
+            }
+        }
+    }
+    // Scope fence in both spellings: event paths are physical while
+    // roots may carry an unclean spelling (`/var` vs `/private/var`).
+    let fence: Vec<PathBuf> = roots
+        .iter()
+        .flat_map(|r| {
+            let canon = r.path.canonicalize().unwrap_or_else(|_| r.path.clone());
+            if canon == r.path {
+                vec![canon]
+            } else {
+                vec![r.path.clone(), canon]
+            }
+        })
+        .collect();
+    for batch in &batches {
+        apply_event_batch(
+            session,
+            store,
+            generation,
+            roots,
+            &fence,
+            counters,
+            batch,
+            &mut applied,
+        )
+        .await?;
+    }
+    Ok(applied)
+}
+
+/// True when `path` sits inside the scan's planned roots (canonical fence).
+fn in_scan_scope(fence: &[PathBuf], path: &Path) -> bool {
+    fence.iter().any(|root| path.starts_with(root))
+}
+
+/// Apply one batch: durable ingest (cursor persisted with its
+/// invalidations) plus scope invalidation. History loss invalidates the
+/// volume scope and flags a fresh generation; path changes invalidate the
+/// path and parent dir scopes so created/moved-in entries are discovered.
+/// Path invalidations are fenced to the scan's planned roots: events are
+/// volume-wide, but scheduling work outside the requested scope would leak
+/// other trees' findings (and gaps) into this report.
+#[allow(clippy::too_many_arguments)]
+async fn apply_event_batch(
+    session: &mut EventSession,
+    store: &TursoStore,
+    generation: u64,
+    roots: &[PlannedRoot],
+    fence: &[PathBuf],
+    counters: &mut RunCounters,
+    batch: &events::EventBatch,
+    applied: &mut IngestApplied,
+) -> repo_scan::Result<()> {
+    let outcome = session.reconciler.ingest(batch)?;
+    applied.batches += 1;
+    let now = store::now_ms();
+    if outcome.history_invalid {
+        session.history_invalid = true;
+        let scope = events::volume_scope_key(&outcome.volume_key);
+        store.invalidate_scope(&scope, generation, now).await?;
+        counters.db_transactions += 1;
+        applied.scopes += 1;
+        eprintln!(
+            "repo-scan: events: history loss on volume {}; scope invalidated",
+            outcome.volume_key,
+        );
+        return Ok(());
+    }
+    if !outcome.duplicate && batch.high_water.0 != 0 {
+        let uuid = session
+            .reconciler
+            .journal()
+            .load(&outcome.volume_key)
+            .and_then(|c| c.uuid);
+        if let Some(uuid) = uuid {
+            store
+                .append_event(
+                    &outcome.volume_key,
+                    &uuid.0,
+                    &events::journal_cursor_string(batch.high_water),
+                    !outcome.plans.is_empty(),
+                    now,
+                )
+                .await?;
+            counters.db_transactions += 1;
+        }
+    }
+    let mut scopes: Vec<String> = Vec::new();
+    for plan in &outcome.plans {
+        if plan.scope_key.starts_with("volume:") || plan.scope_key == events::mounts_scope_key() {
+            scopes.push(plan.scope_key.clone());
+            if plan.scope_key == events::mounts_scope_key() {
+                applied.mount_changed = true;
+            }
+        }
+    }
+    // Path plans become dir-scope invalidations (path + parent, mirroring
+    // the continuity plan): the scheduler re-enumerates exactly those dirs.
+    // Recursive (MustScanSubDirs) subtrees re-enumerate one level here;
+    // deeper changes carry their own events. Out-of-scope paths are
+    // dropped: the journal still records the cursor, but no work is
+    // scheduled outside the requested roots.
+    for path in &batch.invalidations {
+        if !in_scan_scope(fence, path) {
+            continue;
+        }
+        scopes.push(config::scope_key_for_dir(path));
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() && in_scan_scope(fence, parent) {
+                scopes.push(config::scope_key_for_dir(parent));
+            }
+        }
+    }
+    scopes.sort();
+    scopes.dedup();
+    if scopes.len() > events::MAX_PENDING_INVALIDATIONS {
+        scopes = roots
+            .iter()
+            .map(|r| config::scope_key_for_dir(&r.path))
+            .collect();
+        scopes.sort();
+        scopes.dedup();
+        eprintln!(
+            "repo-scan: events: invalidation overflow; rescanning {} root(s)",
+            scopes.len(),
+        );
+    }
+    session
+        .applied_scopes
+        .entry(outcome.volume_key.clone())
+        .or_default()
+        .extend(scopes.iter().cloned());
+    for scope in &scopes {
+        store.invalidate_scope(scope, generation, now).await?;
+        counters.db_transactions += 1;
+        applied.scopes += 1;
+    }
+    Ok(())
+}
+
+/// Non-terminal scheduler work outstanding for one scope.
+async fn scope_pending_work(store: &TursoStore, scope_key: &str) -> repo_scan::Result<u64> {
+    count_query(
+        store,
+        "SELECT COUNT(*) FROM frontier_tasks WHERE scope_key = ?1 AND state NOT IN \
+         ('complete', 'unsupported', 'cancelled', 'superseded')",
+        vec![turso::Value::Text(scope_key.to_string())],
+    )
+    .await
+}
+
+/// Advance reconciled cursors post-traversal, only over satisfied work,
+/// and report per-volume cursors from durable rows (current UUID only).
+async fn reconcile_event_cursors(
+    session: &mut EventSession,
+    store: &TursoStore,
+) -> repo_scan::Result<HashMap<String, RootCursors>> {
+    let keys: Vec<String> = session
+        .monitored
+        .iter()
+        .map(|m| m.volume_key.clone())
+        .collect();
+    for key in &keys {
+        let pending = session.reconciler.journal().pending(key);
+        for boundary in pending {
+            let mut scopes = boundary.scopes.clone();
+            if let Some(applied) = session.applied_scopes.get(key) {
+                scopes.extend(applied.iter().cloned());
+            }
+            scopes.sort();
+            scopes.dedup();
+            let mut satisfied = true;
+            for scope in &scopes {
+                if scope_pending_work(store, scope).await? > 0 {
+                    satisfied = false;
+                    break;
+                }
+            }
+            if !satisfied {
+                break;
+            }
+            session
+                .reconciler
+                .journal_mut()
+                .mark_reconciled_through(key, boundary.cursor)?;
+            mark_events_reconciled_through(store, key, boundary.cursor).await?;
+        }
+    }
+    report_cursors_from_store(store, session).await
+}
+
+/// Mark journal rows at or below `through` reconciled (current UUID only).
+async fn mark_events_reconciled_through(
+    store: &TursoStore,
+    volume: &str,
+    through: events::EventCursorId,
+) -> repo_scan::Result<()> {
+    let mut rows = store
+        .connection()
+        .query(
+            "SELECT id, history_uuid, cursor FROM event_journal WHERE volume_id = ?1 ORDER BY id ASC",
+            vec![turso::Value::Text(volume.to_string())],
+        )
+        .await
+        .map_err(store_err)?;
+    let mut pending: Vec<(i64, String, String)> = Vec::new();
+    while let Some(row) = rows.next().await.map_err(store_err)? {
+        pending.push((cell_int(&row, 0)?, cell_text(&row, 1)?, cell_text(&row, 2)?));
+    }
+    let Some(current) = pending.last().map(|(_, uuid, _)| uuid.clone()) else {
+        return Ok(());
+    };
+    for (id, uuid, cursor) in pending {
+        if uuid != current {
+            continue;
+        }
+        let covered = events::parse_journal_cursor(&cursor).is_some_and(|c| c.0 <= through.0);
+        if covered {
+            store.mark_event_reconciled(id).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Per-volume report cursors from durable rows (current UUID only):
+/// monitored volumes plus any volume with persisted history.
+async fn report_cursors_from_store(
+    store: &TursoStore,
+    session: &EventSession,
+) -> repo_scan::Result<HashMap<String, RootCursors>> {
+    let mut out = HashMap::new();
+    let mut keys: Vec<String> = session
+        .monitored
+        .iter()
+        .map(|m| m.volume_key.clone())
+        .collect();
+    let mut rows = store
+        .connection()
+        .query("SELECT DISTINCT volume_id FROM event_journal", ())
+        .await
+        .map_err(store_err)?;
+    while let Some(row) = rows.next().await.map_err(store_err)? {
+        let key = cell_text(&row, 0)?;
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    for key in keys {
+        let mut rows = store
+            .connection()
+            .query(
+                "SELECT id, volume_id, history_uuid, cursor, received_ms, invalidated, \
+                 ingested, reconciled FROM event_journal WHERE volume_id = ?1 ORDER BY id ASC",
+                vec![turso::Value::Text(key.clone())],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut all: Vec<EventRow> = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            all.push(EventRow {
+                id: cell_int(&row, 0)?,
+                volume_id: cell_text(&row, 1)?,
+                history_uuid: cell_text(&row, 2)?,
+                cursor: cell_text(&row, 3)?,
+                received_ms: cell_int(&row, 4)?,
+                invalidated: cell_int(&row, 5)? != 0,
+                ingested: cell_int(&row, 6)? != 0,
+                reconciled: cell_int(&row, 7)? != 0,
+            });
+        }
+        let Some(current) = all.last().map(|r| r.history_uuid.clone()) else {
+            continue;
+        };
+        let current_rows: Vec<EventRow> = all
+            .into_iter()
+            .filter(|r| r.history_uuid == current)
+            .collect();
+        if let Some(cursor) = events::volume_cursor_from_rows(&key, &current_rows) {
+            out.insert(
+                key,
+                RootCursors {
+                    history_uuid: cursor.uuid.map(|u| u.0),
+                    ingested: cursor.ingested.map(|c| c.0.to_string()),
+                    reconciled: cursor.reconciled.map(|c| c.0.to_string()),
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// Per-root cursors aligned with `roots`, via the root's mount volume.
+fn root_cursors_for(
+    roots: &[PlannedRoot],
+    session: &EventSession,
+    cursors: &HashMap<String, RootCursors>,
+) -> Vec<RootCursors> {
+    roots
+        .iter()
+        .map(|root| {
+            if let Some(volume) = &root.volume {
+                if let Some(c) = cursors.get(&volume.0) {
+                    return c.clone();
+                }
+            }
+            let deepest = session
+                .mounts
+                .iter()
+                .filter(|(_, mount)| root.path.starts_with(mount))
+                .max_by_key(|(_, mount)| mount.as_os_str().len());
+            deepest
+                .and_then(|(key, _)| cursors.get(key).cloned())
+                .unwrap_or_default()
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -869,8 +1652,21 @@ struct RunCounters {
     claimed: u64,
     dirs_complete: u64,
     entries: u64,
-    db_writes: u64,
+    /// Real store transactions (R13): incremented once per mutating store
+    /// call (one autocommit statement or one `with_tx` each), never per
+    /// logical row. This is what the report's `db_transactions` carries.
+    db_transactions: u64,
     stale_requeued: u64,
+}
+
+/// One observed pathname alias (R7): `path` names the same filesystem object
+/// as `target` (verified by `(dev, ino)` identity at `verified_at_ms`).
+#[derive(Debug, Clone)]
+struct ObservedAlias {
+    path: Vec<u8>,
+    target: Vec<u8>,
+    kind: &'static str,
+    verified_at_ms: i64,
 }
 
 /// Boundary verdict for one run.
@@ -898,6 +1694,15 @@ struct Runner {
     fallback: Option<git::fallback::FallbackGit>,
     fallback_probed: bool,
     counters: RunCounters,
+    /// Pathname aliases observed this run (R7), emitted as `Alias` records.
+    aliases: Vec<ObservedAlias>,
+    /// Git-directory identities already persisted this run (R7):
+    /// `(dev, ino)` of `instance.git_dir` to the first spelling's bytes.
+    /// A second spelling of the same object records an alias instead of a
+    /// duplicate instance.
+    probed_git_ids: HashMap<(u64, u64), Vec<u8>>,
+    /// Per-operation no-progress watchdog (R9).
+    watchdog: Watchdog,
 }
 
 impl Runner {
@@ -910,6 +1715,9 @@ impl Runner {
             fallback: None,
             fallback_probed: false,
             counters: RunCounters::default(),
+            aliases: Vec::new(),
+            probed_git_ids: HashMap::new(),
+            watchdog: Watchdog::new(Duration::from_secs(WATCHDOG_GRACE_SECS)),
         }
     }
 
@@ -927,6 +1735,38 @@ impl Runner {
             }
         }
         self.fallback.as_ref()
+    }
+}
+
+/// Per-operation no-progress watchdog (R9) with bounded grace.
+///
+/// Attributed to the specific admitted operation: grace runs from admission,
+/// and only that operation's own completion counts as progress. On expiry
+/// the operation is contained (enumeration aborts its admitted portion with
+/// a preserved gap; other operations trip the volume breaker once they
+/// return), so one stalled scope cannot silently stall the run.
+///
+/// Honest single-owner limits: this process is the only worker and executes
+/// operations synchronously, so a hard-hung `stat`/list/Git syscall cannot
+/// be preempted — there is no helper to kill and no thread to cancel. The
+/// watchdog therefore bounds *detected* stalls: chunk-interruptible work
+/// (enumeration) is aborted in place, and every other over-grace operation
+/// is contained after the fact (breaker + preserved gap + stderr). It never
+/// claims cancellation it cannot perform.
+struct Watchdog {
+    grace: Duration,
+    tripped: u64,
+}
+
+impl Watchdog {
+    fn new(grace: Duration) -> Self {
+        Self { grace, tripped: 0 }
+    }
+
+    /// True when the operation admitted at `admitted` has exhausted its
+    /// no-progress grace at `now`. Pure and unit-testable.
+    fn exceeded(&self, admitted: Instant, now: Instant) -> bool {
+        now.duration_since(admitted) > self.grace
     }
 }
 
@@ -953,6 +1793,7 @@ async fn run_until_boundary(
         let claimed = store
             .claim_tasks(epoch, CLAIM_BATCH, LEASE_TTL_MS, now)
             .await?;
+        runner.counters.db_transactions += 1;
         if claimed.is_empty() {
             break;
         }
@@ -962,10 +1803,17 @@ async fn run_until_boundary(
                 break;
             }
             let volume = breaker_key_for_task(&item.task.scope_key);
-            if let Some(breaker) = runner.breakers.get(&volume) {
-                if !breaker.allow(SystemTime::now()) {
-                    continue;
-                }
+            let breaker_closed = runner
+                .breakers
+                .get(&volume)
+                .is_some_and(|breaker| !breaker.allow(SystemTime::now()));
+            if breaker_closed {
+                // The lease is explicitly released (R4): breaker-held
+                // work returns to `pending` immediately instead of
+                // leaking until the 60 s TTL, so a prompt resume can
+                // proceed the moment the breaker re-admits.
+                release_claim(store, &mut runner.counters, item, epoch).await?;
+                continue;
             }
             let class = match item.task.kind.as_str() {
                 KIND_ENUM | KIND_RECONCILE => OpClass::Enumerate,
@@ -973,6 +1821,8 @@ async fn run_until_boundary(
                 _ => OpClass::Other,
             };
             let Some(permit) = runner.admission.try_acquire(class) else {
+                // Same explicit release for admission denials (R4).
+                release_claim(store, &mut runner.counters, item, epoch).await?;
                 continue;
             };
             progressed = true;
@@ -995,6 +1845,21 @@ async fn run_until_boundary(
                     "repo-scan: slow task: {} ({}s)",
                     item.task.id,
                     elapsed.as_secs()
+                );
+            }
+            if runner.watchdog.exceeded(started, Instant::now()) {
+                // No-progress grace exhausted: contain the scope (R9). The
+                // operation already returned, so containment isolates the
+                // volume for the rest of the run instead of pretending to
+                // cancel in flight.
+                runner.watchdog.tripped += 1;
+                runner.breaker_failure(&volume);
+                runner.breaker_failure(&volume);
+                runner.breaker_failure(&volume);
+                eprintln!(
+                    "repo-scan: watchdog: {} made no progress within {}s; \
+                     volume {volume} contained (breaker opened)",
+                    item.task.id, WATCHDOG_GRACE_SECS,
                 );
             }
             match result {
@@ -1036,6 +1901,37 @@ async fn run_until_boundary(
         unresolvable,
         status_pending,
     })
+}
+
+/// Explicitly release one claimed task back to `pending` (R4) when a
+/// breaker or admission gate denies it after the claim. The release verifies
+/// the exact lease token/epoch (never touching another owner's lease) and
+/// does not bump attempts: gate denial is scheduler state, not task failure.
+/// One transaction, counted as such.
+async fn release_claim(
+    store: &TursoStore,
+    counters: &mut RunCounters,
+    claimed: &ClaimedTask,
+    epoch: u64,
+) -> repo_scan::Result<()> {
+    store
+        .connection()
+        .execute(
+            "UPDATE frontier_tasks SET state = 'pending', lease_token = NULL, \
+             lease_epoch = NULL, lease_expires_ms = NULL, updated_at_ms = ?1 \
+             WHERE id = ?2 AND state = 'leased' AND lease_token = ?3 \
+             AND lease_epoch = ?4",
+            vec![
+                turso::Value::Integer(store::now_ms()),
+                turso::Value::Text(claimed.task.id.clone()),
+                turso::Value::Integer(claimed.token),
+                turso::Value::Integer(epoch as i64),
+            ],
+        )
+        .await
+        .map_err(store_err)?;
+    counters.db_transactions += 1;
+    Ok(())
 }
 
 impl Runner {
@@ -1091,6 +1987,24 @@ async fn execute_task(
     status_mode: StatusMode,
     claimed: &ClaimedTask,
 ) -> repo_scan::Result<()> {
+    // Event-continuity marker scopes (R5: `volume:`/`mounts:`) carry no
+    // directory to re-enumerate; the enclosing traversal (or the fresh
+    // generation a history loss forced) satisfies them, so they complete
+    // without a gap. Directory reconciles re-enumerate below.
+    if claimed.task.kind == KIND_RECONCILE
+        && !matches!(
+            config::parse_scope_key(&claimed.task.scope_key),
+            Some(config::ScopeRef::Dir(_))
+        )
+    {
+        match complete_claimed(store, runner, claimed, epoch, &TaskOutcome::Complete).await? {
+            CompletionApplied::Applied => {}
+            CompletionApplied::StaleRequeued => {
+                runner.counters.stale_requeued += 1;
+            }
+        }
+        return Ok(());
+    }
     let outcome = match claimed.task.kind.as_str() {
         KIND_ENUM | KIND_RECONCILE => exec_enumerate(runner, store, generation, claimed).await?,
         KIND_PROBE => exec_probe(runner, store, generation, run_rev, canonical, claimed).await?,
@@ -1107,7 +2021,7 @@ async fn execute_task(
                     store::now_ms(),
                 )
                 .await?;
-            runner.counters.db_writes += 1;
+            runner.counters.db_transactions += 1;
             TaskOutcome::Parked {
                 state: TaskState::Unsupported,
                 reason: detail,
@@ -1148,11 +2062,11 @@ async fn complete_claimed(
         .await
     {
         Ok(()) => {
-            runner.counters.db_writes += 1;
+            runner.counters.db_transactions += 1;
             Ok(CompletionApplied::Applied)
         }
         Err(repo_scan::Error::Scheduler(message)) if message.starts_with("stale-completion:") => {
-            runner.counters.db_writes += 1;
+            runner.counters.db_transactions += 1;
             Ok(CompletionApplied::StaleRequeued)
         }
         Err(repo_scan::Error::Scheduler(message)) if message.starts_with("lease-mismatch:") => {
@@ -1249,6 +2163,7 @@ async fn exec_enumerate(
         namespace: volume_tag.clone(),
     });
     let now = store::now_ms();
+    let admitted = Instant::now();
     let component = path
         .file_name()
         .map(|n| config::path_as_bytes(Path::new(n)))
@@ -1264,7 +2179,7 @@ async fn exec_enumerate(
             now,
         )
         .await?;
-    runner.counters.db_writes += 1;
+    runner.counters.db_transactions += 1;
 
     let adapter = repo_scan::walk::primary_adapter();
     let listing = match adapter.list_dir(
@@ -1279,6 +2194,7 @@ async fn exec_enumerate(
             store
                 .record_dir_observation(dir_id, generation, false, 1, 0, Some(&detail), now)
                 .await?;
+            runner.counters.db_transactions += 1;
             if let Some(state) = classify_io_error(&e) {
                 return Ok(TaskOutcome::Parked {
                     state,
@@ -1306,6 +2222,23 @@ async fn exec_enumerate(
     for item in listing {
         if interrupted() {
             mid_error = Some(String::from("interrupted; partial enumeration"));
+            break;
+        }
+        // No-progress watchdog (R9): chunk-interruptible work aborts its
+        // admitted portion in place once grace expires. The partial
+        // observation is recorded below and the task retries with backoff,
+        // so the stall is bounded instead of open-ended.
+        if runner.watchdog.exceeded(admitted, Instant::now()) {
+            runner.watchdog.tripped += 1;
+            runner.breaker_failure(&volume_tag);
+            mid_error = Some(format!(
+                "watchdog: no progress within {WATCHDOG_GRACE_SECS}s; \
+                 partial enumeration contained",
+            ));
+            eprintln!(
+                "repo-scan: watchdog: enumeration of {} exceeded grace; contained",
+                path.display(),
+            );
             break;
         }
         let child = match item {
@@ -1362,18 +2295,23 @@ async fn exec_enumerate(
             store::now_ms(),
         )
         .await?;
-    runner.counters.db_writes += 1;
+    runner.counters.db_transactions += 1;
     if completed {
         runner.counters.dirs_complete += 1;
         Ok(TaskOutcome::Complete)
     } else {
         let detail = mid_error.unwrap_or_else(|| String::from("partial enumeration"));
+        let category = if detail.starts_with("watchdog:") {
+            "watchdog-no-progress"
+        } else {
+            "enumerate-error"
+        };
         fail_task(
             runner,
             store,
             claimed,
             ExecFail {
-                category: String::from("enumerate-error"),
+                category: String::from(category),
                 detail,
             },
         )
@@ -1428,7 +2366,7 @@ async fn enqueue_enum_child(
     let scope_key = config::scope_key_for_dir(child_path);
     let expected_rev = store.scope_rev(&scope_key).await?;
     let idempotency = format!("idem:{id}");
-    store
+    let inserted = store
         .enqueue_task(
             &NewTask {
                 id: &id,
@@ -1442,7 +2380,50 @@ async fn enqueue_enum_child(
             now_ms,
         )
         .await?;
-    runner.counters.db_writes += 1;
+    runner.counters.db_transactions += 1;
+    if !inserted {
+        // Identity-deduped: the same object is already scheduled under
+        // another spelling. Results are shared (not dropped), and the
+        // alternate pathname is preserved as an alias (R7).
+        note_enum_alias(
+            store,
+            runner,
+            &id,
+            &scope_key,
+            child_path,
+            "same_object",
+            now_ms,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Record a pathname alias when an enumeration task for `path` already
+/// exists under a different scope key (R7). Same-path re-enqueues (roots
+/// reseeded, children rediscovered) are not aliases and record nothing.
+async fn note_enum_alias(
+    store: &TursoStore,
+    runner: &mut Runner,
+    task_id: &str,
+    scope_key: &str,
+    path: &Path,
+    kind: &'static str,
+    now_ms: i64,
+) -> repo_scan::Result<()> {
+    let existing = match store.get_task(task_id).await? {
+        Some(task) if task.scope_key != scope_key => task,
+        _ => return Ok(()),
+    };
+    let Some(config::ScopeRef::Dir(first)) = config::parse_scope_key(&existing.scope_key) else {
+        return Ok(());
+    };
+    runner.aliases.push(ObservedAlias {
+        path: config::path_as_bytes(path),
+        target: config::path_as_bytes(&first),
+        kind,
+        verified_at_ms: now_ms,
+    });
     Ok(())
 }
 
@@ -1468,7 +2449,7 @@ async fn enqueue_symlink_target(
             let scope_key = config::scope_key_for_dir(&target.path);
             let expected_rev = store.scope_rev(&scope_key).await?;
             let idempotency = format!("idem:{id}");
-            store
+            let inserted = store
                 .enqueue_task(
                     &NewTask {
                         id: &id,
@@ -1482,7 +2463,29 @@ async fn enqueue_symlink_target(
                     now_ms,
                 )
                 .await?;
-            runner.counters.db_writes += 1;
+            runner.counters.db_transactions += 1;
+            // The link pathname is an alias of its target pathname (R7),
+            // whether or not this enqueue won the shared task.
+            runner.aliases.push(ObservedAlias {
+                path: config::path_as_bytes(link_path),
+                target: config::path_as_bytes(&target.path),
+                kind: "symlink",
+                verified_at_ms: now_ms,
+            });
+            if !inserted {
+                // The target itself is scheduled under another spelling:
+                // preserve that pair too.
+                note_enum_alias(
+                    store,
+                    runner,
+                    &id,
+                    &scope_key,
+                    &target.path,
+                    "same_object",
+                    now_ms,
+                )
+                .await?;
+            }
             Ok(())
         }
         Err(ResolveError::Cycle(p) | ResolveError::TooDeep(p)) => {
@@ -1499,7 +2502,7 @@ async fn enqueue_symlink_target(
                     now_ms,
                 )
                 .await?;
-            runner.counters.db_writes += 1;
+            runner.counters.db_transactions += 1;
             Ok(())
         }
         Err(ResolveError::Io(e)) => {
@@ -1516,7 +2519,7 @@ async fn enqueue_symlink_target(
                     now_ms,
                 )
                 .await?;
-            runner.counters.db_writes += 1;
+            runner.counters.db_transactions += 1;
             Ok(())
         }
     }
@@ -1556,7 +2559,7 @@ async fn enqueue_probe_task(
             now_ms,
         )
         .await?;
-    runner.counters.db_writes += 1;
+    runner.counters.db_transactions += 1;
     Ok(())
 }
 
@@ -1602,7 +2605,7 @@ async fn exec_probe(
                     now,
                 )
                 .await?;
-            runner.counters.db_writes += 1;
+            runner.counters.db_transactions += 1;
             return Ok(TaskOutcome::Complete);
         }
     };
@@ -1613,6 +2616,7 @@ async fn exec_probe(
     {
         Ok(()) => {
             store.resolve_error(&gap_id, store::now_ms()).await?;
+            runner.counters.db_transactions += 1;
             Ok(TaskOutcome::Complete)
         }
         // Operational Git failures retry with backoff, then park with the
@@ -1657,6 +2661,31 @@ async fn persist_probe(
             format!("d{dev}i{ino}")
         })
         .unwrap_or_default();
+
+    // A second pathname spelling of an already-persisted object records an
+    // alias instead of a duplicate instance (R7). Identity follows
+    // symlinks; the `(0, 0)` fallback (non-unix) never dedupes.
+    let git_identity = std::fs::metadata(&instance.git_dir)
+        .ok()
+        .map(|md| dir_identity(&md))
+        .filter(|key| *key != (0, 0));
+    if let Some(key) = git_identity {
+        match runner.probed_git_ids.get(&key).cloned() {
+            Some(first) if first != git_bytes => {
+                runner.aliases.push(ObservedAlias {
+                    path: git_bytes.clone(),
+                    target: first,
+                    kind: "same_object",
+                    verified_at_ms: now_ms,
+                });
+                return Ok(());
+            }
+            Some(_) => {}
+            None => {
+                runner.probed_git_ids.insert(key, git_bytes.clone());
+            }
+        }
+    }
 
     let mut evidence = validated.evidence.clone();
     evidence.push(format!("matching-policy: {}", identity::MATCHING_POLICY));
@@ -1710,7 +2739,7 @@ async fn persist_probe(
             now_ms,
         )
         .await?;
-    runner.counters.db_writes += 1;
+    runner.counters.db_transactions += 1;
     for remote in &remotes {
         let role = match remote.role {
             git::RemoteRole::Fetch => "fetch",
@@ -1736,7 +2765,7 @@ async fn persist_probe(
                 now_ms,
             )
             .await?;
-        runner.counters.db_writes += 1;
+        runner.counters.db_transactions += 1;
     }
 
     let head = observed_head(runner, instance)?;
@@ -1777,7 +2806,7 @@ async fn persist_probe(
     } else {
         store.upsert_checkout(&main_checkout, now_ms).await?;
     }
-    runner.counters.db_writes += 1;
+    runner.counters.db_transactions += 1;
 
     // Registered linked worktrees: own checkout rows plus explicit probes
     // for bases outside already discovered paths.
@@ -1824,7 +2853,7 @@ async fn persist_probe(
                         now_ms,
                     )
                     .await?;
-                runner.counters.db_writes += 1;
+                runner.counters.db_transactions += 1;
                 checkout_ids.push(wt_id);
             }
             enqueue_probe_task_for_path(store, runner, generation, &wt.base, now_ms).await?;
@@ -1832,6 +2861,10 @@ async fn persist_probe(
     }
 
     let refs = observed_refs(runner, instance, &mut evidence)?;
+    // Upstream tracking evidence from the repo config (R16), read once per
+    // probe; absent/unreadable config yields no upstreams, never fake ones.
+    let branch_upstreams = load_branch_upstreams(&instance.common_dir);
+    let known: HashSet<&[u8]> = refs.iter().map(|r| r.name.as_slice()).collect();
     for reference in &refs {
         let name_text = String::from_utf8_lossy(&reference.name);
         let kind = if name_text.starts_with("refs/heads/") {
@@ -1868,13 +2901,13 @@ async fn persist_probe(
                     oid,
                     algo,
                     symbolic_target: symbolic,
-                    upstream: None,
-                    state: "valid",
+                    upstream: upstream_for_ref(&branch_upstreams, &reference.name).as_deref(),
+                    state: ref_state_for(reference, &known),
                 },
                 now_ms,
             )
             .await?;
-        runner.counters.db_writes += 1;
+        runner.counters.db_transactions += 1;
     }
     for broken in runner.inspector.reference_errors(instance) {
         store
@@ -1887,7 +2920,7 @@ async fn persist_probe(
                 now_ms,
             )
             .await?;
-        runner.counters.db_writes += 1;
+        runner.counters.db_transactions += 1;
     }
 
     // Detailed working state only for matching candidates (spec §9).
@@ -1898,10 +2931,115 @@ async fn persist_probe(
             | identity::MatchDisposition::Probable
     ) {
         for checkout_id in &checkout_ids {
-            enqueue_status_task(store, generation, run_rev, checkout_id, now_ms).await?;
+            enqueue_status_task(
+                store,
+                generation,
+                run_rev,
+                checkout_id,
+                now_ms,
+                &mut runner.counters,
+            )
+            .await?;
         }
     }
     Ok(())
+}
+
+/// Upstream (`remote/branch`) per local branch from the repo config (R16):
+/// `[branch "X"]` with `remote = R` and `merge = refs/heads/Y` means local
+/// `X` tracks `R/Y`. Best-effort INI scan: only `[branch "<name>"]`
+/// sections are read (first `remote`/`merge` each); anything unparseable
+/// yields no upstreams rather than fake ones.
+fn load_branch_upstreams(common_dir: &Path) -> HashMap<String, Vec<u8>> {
+    fn flush(
+        branch: &Option<String>,
+        remote: &Option<String>,
+        merge: &Option<String>,
+        out: &mut HashMap<String, Vec<u8>>,
+    ) {
+        if let (Some(name), Some(remote_name), Some(merge_ref)) = (branch, remote, merge) {
+            let leaf = merge_ref.strip_prefix("refs/heads/").unwrap_or(merge_ref);
+            out.entry(name.clone())
+                .or_insert_with(|| format!("{remote_name}/{leaf}").into_bytes());
+        }
+    }
+
+    let mut out = HashMap::new();
+    let bytes = match std::fs::read(common_dir.join("config")) {
+        Ok(bytes) => bytes,
+        Err(_) => return out,
+    };
+    let mut branch: Option<String> = None;
+    let mut remote: Option<String> = None;
+    let mut merge: Option<String> = None;
+    for raw_line in String::from_utf8_lossy(&bytes).lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') {
+            flush(&branch, &remote, &merge, &mut out);
+            branch = None;
+            remote = None;
+            merge = None;
+            let inner = line
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .unwrap_or("");
+            let mut parts = inner.splitn(2, char::is_whitespace);
+            if parts
+                .next()
+                .is_some_and(|h| h.eq_ignore_ascii_case("branch"))
+            {
+                if let Some(name) = parts.next() {
+                    let name = name.trim().trim_matches('"').to_string();
+                    if !name.is_empty() {
+                        branch = Some(name);
+                    }
+                }
+            }
+            continue;
+        }
+        if branch.is_none() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"').to_string();
+        match key.trim().to_ascii_lowercase().as_str() {
+            "remote" if remote.is_none() => {
+                remote = Some(value);
+            }
+            "merge" if merge.is_none() => {
+                merge = Some(value);
+            }
+            _ => {}
+        }
+    }
+    flush(&branch, &remote, &merge, &mut out);
+    out
+}
+
+/// Upstream bytes for one ref, if it is a local branch with config tracking.
+fn upstream_for_ref(upstreams: &HashMap<String, Vec<u8>>, name: &[u8]) -> Option<Vec<u8>> {
+    let name = std::str::from_utf8(name).ok()?;
+    let short = name.strip_prefix("refs/heads/")?;
+    upstreams.get(short).cloned()
+}
+
+/// Honest ref state (R16): directly observed targets are valid, as is
+/// any symbolic ref whose target exists in the same observation (peel data
+/// is backend-optional, never the validity proof). Only a dangling
+/// symbolic ref is non-valid: unborn for a branch target, invalid else.
+fn ref_state_for(reference: &git::RefObservation, known: &HashSet<&[u8]>) -> &'static str {
+    match &reference.target {
+        git::RefTarget::Object(_) => "valid",
+        git::RefTarget::Symbolic(_) if reference.peeled.is_some() => "valid",
+        git::RefTarget::Symbolic(target) if known.contains(target.as_slice()) => "valid",
+        git::RefTarget::Symbolic(target) if target.starts_with(b"refs/heads/") => "unborn",
+        git::RefTarget::Symbolic(_) => "invalid",
+    }
 }
 
 /// Enqueue a probe for an explicitly related path (linked-worktree base).
@@ -1931,7 +3069,7 @@ async fn enqueue_probe_task_for_path(
             now_ms,
         )
         .await?;
-    runner.counters.db_writes += 1;
+    runner.counters.db_transactions += 1;
     Ok(())
 }
 
@@ -2046,7 +3184,7 @@ async fn exec_status(
                 now,
             )
             .await?;
-        runner.counters.db_writes += 1;
+        runner.counters.db_transactions += 1;
         return Ok(TaskOutcome::Complete);
     };
     // Observation revision: the run revision would need threading through;
@@ -2062,6 +3200,7 @@ async fn exec_status(
             None,
             None,
             None,
+            "not_requested",
             "not_requested",
             &[],
             now,
@@ -2085,6 +3224,7 @@ async fn exec_status(
                 None,
                 None,
                 status_units(mode),
+                "unknown",
                 &[e.to_string()],
                 now,
                 now,
@@ -2126,6 +3266,13 @@ async fn exec_status(
         }
     };
     let finished = store::now_ms();
+    // Submodule coverage (R16): examined through the inspector alongside
+    // the status probe — `checked` when the submodule relationships were
+    // actually read, `unknown` when they could not be.
+    let submodules = match runner.inspector.submodules(&instance) {
+        Ok(_) => "checked",
+        Err(_) => "unknown",
+    };
     match observation {
         None => {
             record_status_row(
@@ -2138,6 +3285,7 @@ async fn exec_status(
                 None,
                 None,
                 status_units(mode),
+                submodules,
                 &["status unsupported in both backends".to_string()],
                 started,
                 finished,
@@ -2157,6 +3305,7 @@ async fn exec_status(
                 obs.unstaged.map(|c| c.min(i64::MAX as u64) as i64),
                 obs.untracked.map(|c| c.min(i64::MAX as u64) as i64),
                 status_units(mode),
+                submodules,
                 &obs.unknown_fields,
                 started,
                 finished,
@@ -2226,6 +3375,7 @@ async fn record_status_row(
     unstaged: Option<i64>,
     untracked: Option<i64>,
     units: &str,
+    submodules: &str,
     unknown_fields: &[String],
     started_ms: i64,
     finished_ms: i64,
@@ -2245,7 +3395,7 @@ async fn record_status_row(
                 unstaged,
                 untracked,
                 untracked_units: units,
-                submodules: "not_requested",
+                submodules,
                 unknown_fields: &unknown_json,
                 input_fingerprint: None,
                 observed_rev,
@@ -2253,7 +3403,7 @@ async fn record_status_row(
             finished_ms,
         )
         .await?;
-    runner.counters.db_writes += 1;
+    runner.counters.db_transactions += 1;
     Ok(())
 }
 
@@ -2317,16 +3467,6 @@ fn cell_text(row: &turso::Row, idx: usize) -> repo_scan::Result<String> {
     }
 }
 
-fn cell_opt_text(row: &turso::Row, idx: usize) -> repo_scan::Result<Option<String>> {
-    match row.get_value(idx).map_err(store_err)? {
-        turso::Value::Null => Ok(None),
-        turso::Value::Text(value) => Ok(Some(value)),
-        other => Err(repo_scan::Error::Store(format!(
-            "column {idx} expected TEXT or NULL, got {other:?}"
-        ))),
-    }
-}
-
 fn cell_int(row: &turso::Row, idx: usize) -> repo_scan::Result<i64> {
     match row.get_value(idx).map_err(store_err)? {
         turso::Value::Integer(value) => Ok(value),
@@ -2355,288 +3495,6 @@ fn cell_blob(row: &turso::Row, idx: usize) -> repo_scan::Result<Vec<u8>> {
     }
 }
 
-fn cell_opt_blob(row: &turso::Row, idx: usize) -> repo_scan::Result<Option<Vec<u8>>> {
-    match row.get_value(idx).map_err(store_err)? {
-        turso::Value::Null => Ok(None),
-        turso::Value::Blob(value) => Ok(Some(value)),
-        other => Err(repo_scan::Error::Store(format!(
-            "column {idx} expected BLOB or NULL, got {other:?}"
-        ))),
-    }
-}
-
-struct VolInfo {
-    id: String,
-    native_identity: Option<String>,
-    namespace: String,
-    filesystem: Option<String>,
-    kind: String,
-    state: String,
-    observed_at_ms: Option<i64>,
-}
-
-struct InstInfo {
-    id: String,
-    git_path: Vec<u8>,
-    common_path: Vec<u8>,
-    bare: Option<bool>,
-    object_format: String,
-    disposition: String,
-    evidence_json: String,
-    observed_at_ms: i64,
-}
-
-struct CoInfo {
-    id: String,
-    instance_id: String,
-    root_path: Option<Vec<u8>>,
-    git_path: Vec<u8>,
-    relationship: String,
-    availability: String,
-    head_state: String,
-    head_ref: Option<Vec<u8>>,
-    head_oid: Option<Vec<u8>>,
-    head_algo: Option<String>,
-    observed_at_ms: i64,
-}
-
-struct RemInfo {
-    id: String,
-    instance_id: String,
-    checkout_scope_id: Option<String>,
-    name: Vec<u8>,
-    role: String,
-    url: Vec<u8>,
-    canonical_url: Option<Vec<u8>>,
-    observed_at_ms: i64,
-}
-
-struct RefInfo {
-    id: String,
-    instance_id: String,
-    checkout_scope_id: Option<String>,
-    kind: String,
-    name: Vec<u8>,
-    oid: Option<Vec<u8>>,
-    algo: Option<String>,
-    symbolic_target: Option<Vec<u8>>,
-    upstream: Option<Vec<u8>>,
-    state: String,
-    observed_at_ms: i64,
-}
-
-struct StatusInfo {
-    mode: String,
-    state: String,
-    started_ms: Option<i64>,
-    finished_ms: Option<i64>,
-    staged: Option<i64>,
-    unstaged: Option<i64>,
-    untracked: Option<i64>,
-    untracked_units: String,
-    submodules: String,
-    unknown_fields: String,
-}
-
-struct ErrInfo {
-    id: String,
-    scope_key: String,
-    category: String,
-    detail: String,
-    attempts: u64,
-    first_seen_ms: i64,
-    last_seen_ms: i64,
-    next_retry_ms: Option<i64>,
-}
-
-async fn load_volumes(store: &TursoStore) -> repo_scan::Result<Vec<VolInfo>> {
-    let mut rows = store
-        .connection()
-        .query(
-            "SELECT id, native_identity, namespace, filesystem, kind, state, \
-             observed_at_ms FROM volumes ORDER BY id ASC",
-            (),
-        )
-        .await
-        .map_err(store_err)?;
-    let mut out = Vec::new();
-    while let Some(row) = rows.next().await.map_err(store_err)? {
-        out.push(VolInfo {
-            id: cell_text(&row, 0)?,
-            native_identity: cell_opt_text(&row, 1)?,
-            namespace: cell_text(&row, 2)?,
-            filesystem: cell_opt_text(&row, 3)?,
-            kind: cell_text(&row, 4)?,
-            state: cell_text(&row, 5)?,
-            observed_at_ms: cell_opt_int(&row, 6)?,
-        });
-    }
-    Ok(out)
-}
-
-/// Matching (non-`nonmatch`) instances: the report's subject rows. Durable
-/// `nonmatch` observations stay in the catalog for other URLs.
-async fn load_instances(store: &TursoStore) -> repo_scan::Result<Vec<InstInfo>> {
-    let mut rows = store
-        .connection()
-        .query(
-            "SELECT id, git_path, common_path, incarnation, format, bare, object_format, \
-             disposition, evidence, observed_at_ms FROM git_instances \
-             WHERE disposition != 'nonmatch' ORDER BY id ASC",
-            (),
-        )
-        .await
-        .map_err(store_err)?;
-    let mut out = Vec::new();
-    while let Some(row) = rows.next().await.map_err(store_err)? {
-        out.push(InstInfo {
-            id: cell_text(&row, 0)?,
-            git_path: cell_blob(&row, 1)?,
-            common_path: cell_blob(&row, 2)?,
-            bare: cell_opt_int(&row, 5)?.map(|b| b != 0),
-            object_format: cell_text(&row, 6)?,
-            disposition: cell_text(&row, 7)?,
-            evidence_json: cell_text(&row, 8)?,
-            observed_at_ms: cell_int(&row, 9)?,
-        });
-    }
-    Ok(out)
-}
-
-/// Checkouts for the report's instances, filtered in SQL (chunked `IN`).
-async fn load_checkouts_for(
-    store: &TursoStore,
-    instance_ids: &[String],
-) -> repo_scan::Result<Vec<CoInfo>> {
-    let mut out = Vec::new();
-    for chunk in instance_ids.chunks(400) {
-        let placeholders: Vec<String> = (1..=chunk.len()).map(|n| format!("?{n}")).collect();
-        let sql = format!(
-            "SELECT id, instance_id, root_path, git_path, relationship, availability, \
-             head_state, head_ref, head_oid, head_algo, observed_at_ms FROM checkouts \
-             WHERE instance_id IN ({}) ORDER BY id ASC",
-            placeholders.join(","),
-        );
-        let params: Vec<turso::Value> = chunk
-            .iter()
-            .map(|id| turso::Value::Text(id.clone()))
-            .collect();
-        let mut rows = store
-            .connection()
-            .query(sql.as_str(), params)
-            .await
-            .map_err(store_err)?;
-        while let Some(row) = rows.next().await.map_err(store_err)? {
-            out.push(CoInfo {
-                id: cell_text(&row, 0)?,
-                instance_id: cell_text(&row, 1)?,
-                root_path: cell_opt_blob(&row, 2)?,
-                git_path: cell_blob(&row, 3)?,
-                relationship: cell_text(&row, 4)?,
-                availability: cell_text(&row, 5)?,
-                head_state: cell_text(&row, 6)?,
-                head_ref: cell_opt_blob(&row, 7)?,
-                head_oid: cell_opt_blob(&row, 8)?,
-                head_algo: cell_opt_text(&row, 9)?,
-                observed_at_ms: cell_int(&row, 10)?,
-            });
-        }
-    }
-    Ok(out)
-}
-
-async fn load_remotes_for(
-    store: &TursoStore,
-    instance_id: &str,
-) -> repo_scan::Result<Vec<RemInfo>> {
-    let mut out = Vec::new();
-    for row in store.list_remotes(instance_id).await? {
-        out.push(RemInfo {
-            id: row.id,
-            instance_id: row.instance_id,
-            checkout_scope_id: row.checkout_scope_id,
-            name: row.name,
-            role: row.role,
-            url: row.url,
-            canonical_url: row.canonical_url,
-            observed_at_ms: row.observed_at_ms,
-        });
-    }
-    Ok(out)
-}
-
-async fn load_refs_for(store: &TursoStore, instance_id: &str) -> repo_scan::Result<Vec<RefInfo>> {
-    let mut out = Vec::new();
-    for row in store.list_refs(instance_id).await? {
-        out.push(RefInfo {
-            id: row.id,
-            instance_id: row.instance_id,
-            checkout_scope_id: row.checkout_scope_id,
-            kind: row.kind,
-            name: row.name,
-            oid: row.oid,
-            algo: row.algo,
-            symbolic_target: row.symbolic_target,
-            upstream: row.upstream,
-            state: row.state,
-            observed_at_ms: row.observed_at_ms,
-        });
-    }
-    Ok(out)
-}
-
-async fn load_latest_status(
-    store: &TursoStore,
-    checkout_id: &str,
-) -> repo_scan::Result<Option<StatusInfo>> {
-    Ok(store
-        .list_statuses(checkout_id)
-        .await?
-        .into_iter()
-        .next()
-        .map(|row| StatusInfo {
-            mode: row.mode,
-            state: row.state,
-            started_ms: row.started_ms,
-            finished_ms: row.finished_ms,
-            staged: row.staged,
-            unstaged: row.unstaged,
-            untracked: row.untracked,
-            untracked_units: row.untracked_units,
-            submodules: row.submodules,
-            unknown_fields: row.unknown_fields,
-        }))
-}
-
-/// Open gaps, oldest first, bounded for report streaming (the true total
-/// stays in `coverage.gaps`).
-async fn load_open_errors(store: &TursoStore) -> repo_scan::Result<Vec<ErrInfo>> {
-    let sql = format!(
-        "SELECT id, scope_key, category, detail, attempts, first_seen_ms, last_seen_ms, \
-         next_retry_ms, open FROM errors WHERE open = 1 ORDER BY id ASC LIMIT {}",
-        REPORT_ERROR_CAP + 1,
-    );
-    let mut rows = store
-        .connection()
-        .query(sql.as_str(), ())
-        .await
-        .map_err(store_err)?;
-    let mut out = Vec::new();
-    while let Some(row) = rows.next().await.map_err(store_err)? {
-        out.push(ErrInfo {
-            id: cell_text(&row, 0)?,
-            scope_key: cell_text(&row, 1)?,
-            category: cell_text(&row, 2)?,
-            detail: cell_text(&row, 3)?,
-            attempts: cell_int(&row, 4)? as u64,
-            first_seen_ms: cell_int(&row, 5)?,
-            last_seen_ms: cell_int(&row, 6)?,
-            next_retry_ms: cell_opt_int(&row, 7)?,
-        });
-    }
-    Ok(out)
-}
-
 async fn count_dirs_complete(store: &TursoStore, generation: u64) -> repo_scan::Result<u64> {
     count_query(
         store,
@@ -2647,10 +3505,29 @@ async fn count_dirs_complete(store: &TursoStore, generation: u64) -> repo_scan::
 }
 
 // ---------------------------------------------------------------------------
-// Report staging, validation, publication
+// Report assembly through the tested lib path (R3)
 // ---------------------------------------------------------------------------
+//
+// Scan/resume stage and publish exclusively through `report::builder` +
+// `report::publish` (+ `report::stream` underneath): the same code the
+// REPORT-01/02 suite exercises. The binary contributes only caller-owned
+// sections (roots, aliases, storage links, candidates, artifacts) plus run
+// accounting; every catalog-backed section streams row-by-row from one
+// pinned revision with bounded memory, staging uses `create_new` sibling
+// files with pre-rename revalidation, staged bytes are fsync'd, checksums
+// stream, and prior reports require a nonempty `report_id`.
 
-struct ReportInputs {
+/// Per-root event cursors for the report (R5).
+#[derive(Debug, Clone, Default)]
+struct RootCursors {
+    history_uuid: Option<String>,
+    ingested: Option<String>,
+    reconciled: Option<String>,
+}
+
+/// Scan-owned report inputs: run accounting plus caller-owned sections for
+/// the lib builder. Catalog-backed sections stream straight from the store.
+struct ScanReportInputs {
     scan_id: String,
     generation: u64,
     epoch: u64,
@@ -2665,296 +3542,114 @@ struct ReportInputs {
     roots: Vec<PlannedRoot>,
     counters: RunCounters,
     pending: u64,
-    open_gaps: u64,
-    unresolvable: u64,
     status_pending: u64,
+    aliases: Vec<ObservedAlias>,
+    /// Per-root event cursors, aligned with `roots` (R5).
+    root_cursors: Vec<RootCursors>,
+    /// Honest event-history boundary note (R5).
+    event_note: String,
 }
 
-/// Deduplicating path table: exact bytes in, stable `path-N` IDs out.
-struct PathTable {
-    ids: HashMap<Vec<u8>, String>,
-    ordered: Vec<(String, Vec<u8>)>,
-}
-
-impl PathTable {
-    fn new() -> Self {
-        Self {
-            ids: HashMap::new(),
-            ordered: Vec::new(),
-        }
+fn truncate_str(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
     }
+    let mut out: String = text.chars().take(max_chars).collect();
+    out.push('…');
+    out
+}
 
-    fn intern(&mut self, bytes: &[u8]) -> String {
-        if let Some(id) = self.ids.get(bytes) {
-            return id.clone();
-        }
-        let id = format!("path-{}", self.ordered.len() + 1);
-        self.ids.insert(bytes.to_vec(), id.clone());
-        self.ordered.push((id.clone(), bytes.to_vec()));
-        id
+/// One open gap for candidate derivation.
+struct OpenError {
+    id: String,
+    scope_key: String,
+    category: String,
+    detail: String,
+    next_retry_ms: Option<i64>,
+}
+
+/// All open gaps, oldest first. The lib path streams every gap into the
+/// report (no cap), so `coverage.gaps` agrees with the emitted records.
+async fn load_open_errors(store: &TursoStore) -> repo_scan::Result<Vec<OpenError>> {
+    let mut rows = store
+        .connection()
+        .query(
+            "SELECT id, scope_key, category, detail, next_retry_ms FROM errors \
+             WHERE open = 1 ORDER BY id ASC",
+            (),
+        )
+        .await
+        .map_err(store_err)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(store_err)? {
+        out.push(OpenError {
+            id: cell_text(&row, 0)?,
+            scope_key: cell_text(&row, 1)?,
+            category: cell_text(&row, 2)?,
+            detail: cell_text(&row, 3)?,
+            next_retry_ms: cell_opt_int(&row, 4)?,
+        });
     }
+    Ok(out)
 }
 
-/// Reference checker: every non-null relationship ID emitted must resolve.
-struct RefCheck {
-    volumes: HashSet<String>,
-    paths: HashSet<String>,
-    repos: HashSet<String>,
-    checkouts: HashSet<String>,
-    errors: HashSet<String>,
-    need_volume: Vec<String>,
-    need_path: Vec<String>,
-    need_repo: Vec<String>,
-    need_checkout: Vec<String>,
-    need_error: Vec<String>,
+/// One report-subject instance (matches the lib builder's own subject
+/// filter: everything but `nonmatch`).
+struct EmittedInstance {
+    id: String,
+    git_path: Vec<u8>,
+    common_path: Vec<u8>,
+    disposition: String,
 }
 
-impl RefCheck {
-    fn new() -> Self {
-        Self {
-            volumes: HashSet::new(),
-            paths: HashSet::new(),
-            repos: HashSet::new(),
-            checkouts: HashSet::new(),
-            errors: HashSet::new(),
-            need_volume: Vec::new(),
-            need_path: Vec::new(),
-            need_repo: Vec::new(),
-            need_checkout: Vec::new(),
-            need_error: Vec::new(),
-        }
+async fn load_emitted_instances(store: &TursoStore) -> repo_scan::Result<Vec<EmittedInstance>> {
+    let mut rows = store
+        .connection()
+        .query(
+            "SELECT id, git_path, common_path, disposition FROM git_instances \
+             WHERE disposition != 'nonmatch' ORDER BY id ASC",
+            (),
+        )
+        .await
+        .map_err(store_err)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(store_err)? {
+        out.push(EmittedInstance {
+            id: cell_text(&row, 0)?,
+            git_path: cell_blob(&row, 1)?,
+            common_path: cell_blob(&row, 2)?,
+            disposition: cell_text(&row, 3)?,
+        });
     }
+    Ok(out)
+}
 
-    fn verify(&self) -> repo_scan::Result<()> {
-        for id in &self.need_volume {
-            if !self.volumes.contains(id) {
-                return broken_ref("volume", id);
-            }
-        }
-        for id in &self.need_path {
-            if !self.paths.contains(id) {
-                return broken_ref("path", id);
-            }
-        }
-        for id in &self.need_repo {
-            if !self.repos.contains(id) {
-                return broken_ref("repository", id);
-            }
-        }
-        for id in &self.need_checkout {
-            if !self.checkouts.contains(id) {
-                return broken_ref("checkout", id);
-            }
-        }
-        for id in &self.need_error {
-            if !self.errors.contains(id) {
-                return broken_ref("error", id);
-            }
-        }
-        Ok(())
+async fn load_volume_ids(store: &TursoStore) -> repo_scan::Result<HashSet<String>> {
+    let mut rows = store
+        .connection()
+        .query("SELECT id FROM volumes", ())
+        .await
+        .map_err(store_err)?;
+    let mut out = HashSet::new();
+    while let Some(row) = rows.next().await.map_err(store_err)? {
+        out.insert(cell_text(&row, 0)?);
     }
+    Ok(out)
 }
 
-fn broken_ref(kind: &str, id: &str) -> repo_scan::Result<()> {
-    Err(repo_scan::Error::Report(format!(
-        "report references unknown {kind} ID: {id}"
-    )))
-}
-
-/// Strict enum check: stored values are writer-controlled, so anything
-/// outside the schema set is catalog corruption, reported loudly.
-fn one_of<'a>(value: &'a str, allowed: &[&str]) -> repo_scan::Result<&'a str> {
-    if allowed.contains(&value) {
-        Ok(value)
-    } else {
-        Err(repo_scan::Error::Report(format!(
-            "invalid report enum value: {value:?}"
-        )))
-    }
-}
-
-fn opt_time(ms: Option<i64>) -> serde_json::Value {
-    match ms {
-        Some(ms) => serde_json::Value::String(ms_to_rfc3339(ms)),
-        None => serde_json::Value::Null,
-    }
-}
-
-fn opt_count(value: Option<i64>) -> serde_json::Value {
-    match value {
-        Some(v) => serde_json::json!(v.max(0) as u64),
-        None => serde_json::Value::Null,
-    }
-}
-
-fn parse_string_array(json: &str) -> Vec<String> {
-    serde_json::from_str::<Vec<String>>(json).unwrap_or_default()
-}
-
-/// Stream the consistent report into controlled local staging (spec §15):
-/// tmp sibling + atomic rename inside the payload snapshots directory, with
-/// bounded memory (row-by-row emission, matches-bounded tables only).
-async fn stage_report(
+/// Assemble the lib builder inputs from run accounting plus small
+/// caller-owned sections.
+async fn build_lib_inputs(
     store: &TursoStore,
-    state_dir: &Path,
-    inputs: &ReportInputs,
-) -> repo_scan::Result<PathBuf> {
-    let report_id = config::report_id_for_scan(&inputs.scan_id);
-    let dest = config::snapshot_path(state_dir, &report_id)?;
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = dest.with_extension("json.tmp");
-
-    let catalog_rev = store.current_revision().await?;
-    let volumes = load_volumes(store).await?;
-    let instances = load_instances(store).await?;
-    let instance_ids: Vec<String> = instances.iter().map(|i| i.id.clone()).collect();
-    let checkouts = load_checkouts_for(store, &instance_ids).await?;
-    let errors = load_open_errors(store).await?;
-    let errors_capped = errors.len() > REPORT_ERROR_CAP;
-    let errors: Vec<ErrInfo> = errors.into_iter().take(REPORT_ERROR_CAP).collect();
-    let dirs_complete = count_dirs_complete(store, inputs.generation).await?;
-    let mut remotes_by_instance: HashMap<String, Vec<RemInfo>> = HashMap::new();
-    let mut refs_by_instance: HashMap<String, Vec<RefInfo>> = HashMap::new();
-    for id in &instance_ids {
-        remotes_by_instance.insert(id.clone(), load_remotes_for(store, id).await?);
-        refs_by_instance.insert(id.clone(), load_refs_for(store, id).await?);
-    }
-    let mut status_by_checkout: HashMap<String, StatusInfo> = HashMap::new();
-    for checkout in &checkouts {
-        if let Some(status) = load_latest_status(store, &checkout.id).await? {
-            status_by_checkout.insert(checkout.id.clone(), status);
-        }
-    }
-
-    // Phase 1: intern every path byte string the report will reference.
-    let mut paths = PathTable::new();
-    for instance in &instances {
-        paths.intern(&instance.git_path);
-        paths.intern(&instance.common_path);
-    }
-    for checkout in &checkouts {
-        if let Some(root) = &checkout.root_path {
-            paths.intern(root);
-        }
-        paths.intern(&checkout.git_path);
-    }
-    for root in &inputs.roots {
-        paths.intern(&config::path_as_bytes(&root.path));
-    }
-    let snapshot_bytes = config::path_as_bytes(&dest);
-    paths.intern(&snapshot_bytes);
-    if let Some(report) = &inputs.report_dest {
-        paths.intern(&config::path_as_bytes(report));
-    }
-    for error in &errors {
-        if let Some(path) = scope_error_path(&error.scope_key) {
-            paths.intern(&config::path_as_bytes(&path));
-        }
-    }
-
-    // Phase 2: emit.
-    let file = std::fs::File::create(&tmp)?;
-    let mut out = std::io::BufWriter::new(file);
-    let mut refs = RefCheck::new();
-    emit_report(
-        &mut out,
-        &mut refs,
-        &mut paths,
-        store,
-        inputs,
-        &report_id,
-        catalog_rev,
-        &volumes,
-        &instances,
-        &checkouts,
-        &remotes_by_instance,
-        &refs_by_instance,
-        &status_by_checkout,
-        &errors,
-        errors_capped,
-        dirs_complete,
-        &snapshot_bytes,
-    )?;
-    use std::io::Write;
-    out.flush()?;
-    refs.verify()?;
-    drop(out);
-    std::fs::rename(&tmp, &dest)?;
-    Ok(dest)
-}
-
-fn scope_error_path(scope_key: &str) -> Option<PathBuf> {
-    match config::parse_scope_key(scope_key) {
-        Some(config::ScopeRef::Dir(p) | config::ScopeRef::Git(p)) => Some(p),
-        _ => None,
-    }
-}
-
-fn scope_operation(scope_key: &str) -> &'static str {
-    if scope_key.starts_with("dir:") {
-        "enumerate"
-    } else if scope_key.starts_with("git:") {
-        "probe"
-    } else if scope_key.starts_with("status:") {
-        "status"
-    } else {
-        "unknown"
-    }
-}
-
-fn write_value(
-    out: &mut std::io::BufWriter<std::fs::File>,
-    value: &serde_json::Value,
-) -> repo_scan::Result<()> {
-    serde_json::to_writer(&mut *out, value).map_err(|e| repo_scan::Error::Report(e.to_string()))
-}
-
-fn write_raw(out: &mut std::io::BufWriter<std::fs::File>, text: &str) -> repo_scan::Result<()> {
-    use std::io::Write;
-    out.write_all(text.as_bytes())
-        .map_err(|e| repo_scan::Error::Io(e.to_string()))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_report(
-    out: &mut std::io::BufWriter<std::fs::File>,
-    refs: &mut RefCheck,
-    paths: &mut PathTable,
-    store: &TursoStore,
-    inputs: &ReportInputs,
+    inputs: &ScanReportInputs,
     report_id: &str,
     catalog_rev: u64,
-    volumes: &[VolInfo],
-    instances: &[InstInfo],
-    checkouts: &[CoInfo],
-    remotes_by_instance: &HashMap<String, Vec<RemInfo>>,
-    refs_by_instance: &HashMap<String, Vec<RefInfo>>,
-    status_by_checkout: &HashMap<String, StatusInfo>,
-    errors: &[ErrInfo],
-    errors_capped: bool,
     dirs_complete: u64,
-    snapshot_bytes: &[u8],
-) -> repo_scan::Result<()> {
-    let _ = store;
-    let filesystem = if inputs.pending > 0 || inputs.open_gaps > 0 {
-        "incomplete"
-    } else {
-        "complete"
-    };
-    let identity = if inputs.unresolvable > 0 {
-        "unproven"
-    } else {
-        "complete_under_policy"
-    };
-    let status_cov = if inputs.status_mode == StatusMode::Metadata {
-        "not_requested"
-    } else if inputs.status_pending > 0 {
-        "incomplete"
-    } else {
-        "complete"
-    };
+    snapshot_path: &Path,
+) -> repo_scan::Result<LibReportInputs> {
+    let errors = load_open_errors(store).await?;
+    let instances = load_emitted_instances(store).await?;
+    let volumes = load_volume_ids(store).await?;
     let mut boundaries = Vec::new();
     if inputs.scope_policy == "roots" {
         boundaries.push(format!(
@@ -2969,770 +3664,436 @@ fn emit_report(
     boundaries.push(String::from(
         "Unexposed VM/container filesystems are out of scope.",
     ));
-    boundaries.push(String::from(
-        "Observation boundaries are traversal generations; live event-history \
-         reconciliation cursors are not yet wired.",
-    ));
-    if errors_capped {
-        boundaries.push(format!(
-            "Error records capped at {REPORT_ERROR_CAP} in this report; \
-             coverage.gaps holds the true total.",
-        ));
+    boundaries.push(inputs.event_note.clone());
+    // Required-status accounting is task-based (R3): the scheduler boundary
+    // counts enqueued-but-unfinished status work; checkouts that never
+    // needed a probe (other targets' leftovers excluded by the subject
+    // filter, unresolvable identities with no required probe) do not keep
+    // the run incomplete. The lib default would derive this from emitted
+    // checkout rows instead, so the override preserves the run boundary.
+    let coverage_status = if inputs.status_mode == StatusMode::Metadata {
+        "not_requested"
+    } else if inputs.status_pending > 0 {
+        "incomplete"
+    } else {
+        "complete"
+    };
+    let mut artifacts = vec![ArtifactInput {
+        path_bytes: config::path_as_bytes(snapshot_path),
+        kind: String::from("tool_state"),
+        created_after_status: true,
+    }];
+    if let Some(report) = &inputs.report_dest {
+        artifacts.push(ArtifactInput {
+            path_bytes: config::path_as_bytes(report),
+            kind: String::from("report"),
+            created_after_status: true,
+        });
     }
-    write_raw(out, "{\"schema_version\":\"1.0.0\",")?;
-    write_raw(out, &format!("\"report_id\":{},", json_string(report_id)))?;
-    write_raw(
-        out,
-        &format!(
-            "\"created_at\":{},",
-            json_string(&ms_to_rfc3339(inputs.finished_ms))
-        ),
-    )?;
-    write_raw(out, "\"tool\":")?;
-    write_value(
-        out,
-        &serde_json::json!({
-            "name": "repo-scan",
-            "version": repo_scan::version(),
-            "source_commit": null,
-        }),
-    )?;
-    write_raw(out, ",\"scan\":")?;
-    write_value(out, &scan_value(inputs, catalog_rev)?)?;
-    write_raw(out, ",\"coverage\":")?;
-    write_value(
-        out,
-        &serde_json::json!({
-            "filesystem": filesystem,
-            "identity": identity,
-            "status": status_cov,
-            "directories_complete": dirs_complete,
-            "tasks_pending": inputs.pending,
-            "gaps": inputs.open_gaps,
-            "unresolvable_candidates": inputs.unresolvable,
-            "scope_boundaries": boundaries,
-        }),
-    )?;
-    write_raw(out, ",\"resources\":")?;
-    write_value(
-        out,
-        &serde_json::json!({
-            "profile": "conservative",
-            "cpu_target_cores": 1.0,
-            "rss_target_bytes": 268435456u64,
-            "peak_rss_bytes": null,
-            "cpu_seconds": null,
-            "enumerated_entries": inputs.counters.entries,
-            "db_transactions": inputs.counters.db_writes,
-            "db_sync_calls": null,
-        }),
-    )?;
+    Ok(LibReportInputs {
+        report_id: report_id.to_string(),
+        created_at_ms: inputs.finished_ms,
+        scan_id: inputs.scan_id.clone(),
+        generation: inputs.generation,
+        epoch: inputs.epoch,
+        catalog_revision: catalog_rev,
+        target_url: inputs.target_raw.clone(),
+        canonical_url: Some(inputs.canonical.clone()),
+        scope: inputs.scope_policy.clone(),
+        scan_state: inputs.scan_state.clone(),
+        started_at_ms: inputs.started_ms,
+        finished_at_ms: Some(inputs.finished_ms),
+        superseded_by: None,
+        cached: false,
+        status_mode: inputs.status_mode,
+        directories_complete: dirs_complete,
+        tasks_pending: inputs.pending,
+        scope_boundaries: boundaries,
+        profile: String::from("conservative"),
+        cpu_target_cores: 1.0,
+        rss_target_bytes: 268435456,
+        peak_rss_bytes: None,
+        cpu_seconds: None,
+        enumerated_entries: inputs.counters.entries,
+        db_transactions: inputs.counters.db_transactions,
+        db_sync_calls: None,
+        source_commit: None,
+        include_nonmatching: false,
+        coverage_filesystem: None,
+        coverage_identity: None,
+        coverage_status: Some(coverage_status.to_string()),
+        roots: root_inputs(inputs, &errors, &volumes),
+        storage_links: storage_link_inputs(&instances),
+        aliases: alias_inputs(&inputs.aliases),
+        candidates: candidate_inputs(&errors, &instances),
+        generated_artifacts: artifacts,
+    })
+}
 
-    // Volumes.
-    write_raw(out, ",\"volumes\":[")?;
-    let mut first = true;
-    for volume in volumes {
-        if !first {
-            write_raw(out, ",")?;
-        }
-        first = false;
-        refs.volumes.insert(volume.id.clone());
-        write_value(
-            out,
-            &serde_json::json!({
-                "id": &volume.id,
-                "native_identity": &volume.native_identity,
-                "namespace": &volume.namespace,
-                "filesystem": &volume.filesystem,
-                "kind": one_of(&volume.kind, &["local", "network", "virtual", "unknown"])?,
-                "state": one_of(&volume.state, &["available", "inaccessible", "unavailable", "unknown"])?,
-                "observed_at": opt_time(volume.observed_at_ms),
-                "error_ids": Vec::<String>::new(),
-            }),
-        )?;
-    }
-    write_raw(out, "]")?;
-
-    // Paths.
-    write_raw(out, ",\"paths\":[")?;
-    first = true;
-    for (id, bytes) in &paths.ordered {
-        if !first {
-            write_raw(out, ",")?;
-        }
-        first = false;
-        refs.paths.insert(id.clone());
-        let (encoding, value) = match std::str::from_utf8(bytes) {
-            Ok(text) => ("utf8", text.to_string()),
-            Err(_) => ("base64", base64_encode(bytes)),
-        };
-        write_value(
-            out,
-            &serde_json::json!({
-                "id": id,
-                "display": escape_display(bytes),
-                "encoding": encoding,
-                "value": value,
-                "volume_id": null,
-                "object_id": null,
-                "incarnation": null,
-            }),
-        )?;
-    }
-    write_raw(out, "]")?;
-
-    // Roots. State is per-root for errors; otherwise the run boundary
-    // decides (complete only when nothing remains anywhere).
-    write_raw(out, ",\"roots\":[")?;
-    first = true;
-    for (n, root) in inputs.roots.iter().enumerate() {
-        if !first {
-            write_raw(out, ",")?;
-        }
-        first = false;
-        let id = format!("root-{}", n + 1);
-        let path_id = paths.intern(&config::path_as_bytes(&root.path));
-        refs.need_path.push(path_id.clone());
-        let root_scope = config::scope_key_for_dir(&root.path);
-        let root_errors: Vec<String> = errors
-            .iter()
-            .filter(|e| e.scope_key == root_scope)
-            .map(|e| e.id.clone())
-            .collect();
-        for error_id in &root_errors {
-            refs.need_error.push(error_id.clone());
-        }
-        let state = if root_errors.is_empty() {
-            if inputs.pending > 0 {
+fn root_inputs(
+    inputs: &ScanReportInputs,
+    errors: &[OpenError],
+    volumes: &HashSet<String>,
+) -> Vec<RootInput> {
+    inputs
+        .roots
+        .iter()
+        .enumerate()
+        .map(|(n, root)| {
+            let volume_id = match &root.volume {
+                Some(volume) if volumes.contains(&volume.0) => Some(volume.0.clone()),
+                _ if inputs.scope_policy == "roots" && volumes.contains("explicit-roots") => {
+                    Some(String::from("explicit-roots"))
+                }
+                _ => None,
+            };
+            let root_scope = config::scope_key_for_dir(&root.path);
+            let error_ids: Vec<String> = errors
+                .iter()
+                .filter(|e| e.scope_key == root_scope)
+                .map(|e| e.id.clone())
+                .collect();
+            let state = if !error_ids.is_empty() {
+                "error"
+            } else if inputs.pending > 0 {
                 "pending"
             } else {
                 "complete"
+            };
+            let cursors = inputs.root_cursors.get(n).cloned().unwrap_or_default();
+            RootInput {
+                id: format!("root-{}", n + 1),
+                dir_id: None,
+                path_bytes: Some(config::path_as_bytes(&root.path)),
+                volume_id,
+                state: state.to_string(),
+                observed_at_ms: Some(inputs.finished_ms),
+                event_history_uuid: cursors.history_uuid,
+                ingested_cursor: cursors.ingested,
+                reconciled_cursor: cursors.reconciled,
+                error_ids,
             }
-        } else {
-            "error"
-        };
-        let volume_id = match &root.volume {
-            Some(volume) if refs.volumes.contains(&volume.0) => {
-                refs.need_volume.push(volume.0.clone());
-                serde_json::Value::String(volume.0.clone())
-            }
-            _ if inputs.scope_policy == "roots" && refs.volumes.contains("explicit-roots") => {
-                refs.need_volume.push(String::from("explicit-roots"));
-                serde_json::Value::String(String::from("explicit-roots"))
-            }
-            _ => serde_json::Value::Null,
-        };
-        write_value(
-            out,
-            &serde_json::json!({
-                "id": id,
-                "path_id": path_id,
-                "volume_id": volume_id,
-                "state": state,
-                "observed_at": ms_to_rfc3339(inputs.finished_ms),
-                "event_history_uuid": null,
-                "ingested_cursor": null,
-                "reconciled_cursor": null,
-                "error_ids": root_errors,
-            }),
-        )?;
-    }
-    write_raw(out, "]")?;
+        })
+        .collect()
+}
 
-    // Repositories.
-    write_raw(out, ",\"repositories\":[")?;
-    first = true;
-    for instance in instances {
-        if !first {
-            write_raw(out, ",")?;
-        }
-        first = false;
-        refs.repos.insert(instance.id.clone());
-        let git_path_id = paths.intern(&instance.git_path);
-        let common_path_id = paths.intern(&instance.common_path);
-        refs.need_path.push(git_path_id.clone());
-        refs.need_path.push(common_path_id.clone());
-        let prefix = format!("ref-err:{}:", instance.id);
-        let error_ids: Vec<String> = errors
-            .iter()
-            .filter(|e| e.id.starts_with(&prefix))
-            .map(|e| e.id.clone())
-            .collect();
-        for error_id in &error_ids {
-            refs.need_error.push(error_id.clone());
-        }
-        write_value(
-            out,
-            &serde_json::json!({
-                "id": &instance.id,
-                "git_path_id": git_path_id,
-                "common_path_id": common_path_id,
-                "bare": instance.bare,
-                "format": "git-files",
-                "object_format": &instance.object_format,
-                "match": one_of(&instance.disposition,
-                    &["confirmed", "related", "probable", "nonmatch", "unresolvable_identity"])?,
-                "evidence": parse_string_array(&instance.evidence_json),
-                "observed_at": ms_to_rfc3339(instance.observed_at_ms),
-                "tool_managed": null,
-                "error_ids": error_ids,
-            }),
-        )?;
-    }
-    write_raw(out, "]")?;
-
-    // Checkouts.
-    let dispositions: HashMap<&str, &str> = instances
-        .iter()
-        .map(|i| (i.id.as_str(), i.disposition.as_str()))
-        .collect();
-    write_raw(out, ",\"checkouts\":[")?;
-    first = true;
-    for checkout in checkouts {
-        if !first {
-            write_raw(out, ",")?;
-        }
-        first = false;
-        refs.checkouts.insert(checkout.id.clone());
-        refs.need_repo.push(checkout.instance_id.clone());
-        let root_path_id = match &checkout.root_path {
-            Some(root) => {
-                let id = paths.intern(root);
-                refs.need_path.push(id.clone());
-                serde_json::Value::String(id)
-            }
-            None => serde_json::Value::Null,
-        };
-        let git_path_id = paths.intern(&checkout.git_path);
-        refs.need_path.push(git_path_id.clone());
-        let disposition = dispositions
-            .get(checkout.instance_id.as_str())
-            .copied()
-            .unwrap_or("nonmatch");
-        let status = checkout_status_value(
-            status_by_checkout.get(&checkout.id),
-            disposition,
-            inputs.status_mode,
-        )?;
-        write_value(
-            out,
-            &serde_json::json!({
-                "id": &checkout.id,
-                "repository_id": &checkout.instance_id,
-                "root_path_id": root_path_id,
-                "git_path_id": git_path_id,
-                "kind": one_of(&checkout.relationship, &["main", "linked", "submodule", "unknown"])?,
-                "availability": one_of(&checkout.availability,
-                    &["present", "missing", "inaccessible", "broken", "unknown"])?,
-                "head": head_value(checkout)?,
-                "status": status,
-                "observed_at": ms_to_rfc3339(checkout.observed_at_ms),
-                "error_ids": Vec::<String>::new(),
-            }),
-        )?;
-    }
-    write_raw(out, "]")?;
-
-    // Branches (all local + remote-tracking + other refs of the subjects).
-    write_raw(out, ",\"branches\":[")?;
-    first = true;
-    for instance in instances {
-        if let Some(list) = refs_by_instance.get(&instance.id) {
-            for reference in list {
-                if !first {
-                    write_raw(out, ",")?;
-                }
-                first = false;
-                refs.need_repo.push(reference.instance_id.clone());
-                if let Some(scope) = &reference.checkout_scope_id {
-                    refs.need_checkout.push(scope.clone());
-                }
-                write_value(out, &branch_value(reference)?)?;
-            }
-        }
-    }
-    write_raw(out, "]")?;
-
-    // Remotes.
-    write_raw(out, ",\"remotes\":[")?;
-    first = true;
-    for instance in instances {
-        if let Some(list) = remotes_by_instance.get(&instance.id) {
-            for remote in list {
-                if !first {
-                    write_raw(out, ",")?;
-                }
-                first = false;
-                refs.need_repo.push(remote.instance_id.clone());
-                if let Some(scope) = &remote.checkout_scope_id {
-                    refs.need_checkout.push(scope.clone());
-                }
-                write_value(
-                    out,
-                    &serde_json::json!({
-                        "id": &remote.id,
-                        "repository_id": &remote.instance_id,
-                        "checkout_scope_id": &remote.checkout_scope_id,
-                        "name": encoded_name(&remote.name),
-                        "role": one_of(&remote.role, &["fetch", "push"])?,
-                        "url": String::from_utf8_lossy(&remote.url),
-                        "canonical_url": remote.canonical_url.as_ref()
-                            .map(|c| String::from_utf8_lossy(c).into_owned()),
-                        "observed_at": ms_to_rfc3339(remote.observed_at_ms),
-                    }),
-                )?;
-            }
-        }
-    }
-    write_raw(out, "]")?;
-
-    // Storage links (common-directory relationships; alternates are not
-    // inspected by this lane).
-    write_raw(out, ",\"storage_links\":[")?;
-    first = true;
-    for instance in instances {
-        if instance.common_path == instance.git_path {
-            continue;
-        }
-        if !first {
-            write_raw(out, ",")?;
-        }
-        first = false;
-        refs.need_repo.push(instance.id.clone());
-        let to_path_id = paths.intern(&instance.common_path);
-        refs.need_path.push(to_path_id.clone());
-        write_value(
-            out,
-            &serde_json::json!({
-                "id": format!("link:{}:common", instance.id),
-                "from_repository_id": &instance.id,
-                "to_path_id": to_path_id,
-                "kind": "common_directory",
-                "evidence": ["common directory differs from git directory"],
-            }),
-        )?;
-    }
-    write_raw(out, "]")?;
-
-    // Aliases: the v1 schema carries no durable alias table, so none are
-    // emitted; firmlink/mount aliases are not silently collapsed elsewhere.
-    write_raw(out, ",\"aliases\":[]")?;
-
-    // Candidates: unresolvable-identity subjects plus failed/unsupported
-    // probes. Pure coverage gaps (permission, symlink, status) are errors,
-    // not candidates.
-    write_raw(out, ",\"candidates\":[")?;
-    first = true;
+/// Caller-owned candidates: unresolvable-identity subjects plus
+/// failed/unsupported probes. Pure coverage gaps (permission, symlink,
+/// status) are errors, not candidates.
+fn candidate_inputs(errors: &[OpenError], instances: &[EmittedInstance]) -> Vec<CandidateInput> {
+    let mut out = Vec::new();
     for instance in instances {
         if instance.disposition != "unresolvable_identity" {
             continue;
         }
-        if !first {
-            write_raw(out, ",")?;
-        }
-        first = false;
-        let path_id = paths.intern(&instance.git_path);
-        refs.need_path.push(path_id.clone());
-        refs.need_repo.push(instance.id.clone());
-        write_value(
-            out,
-            &serde_json::json!({
-                "id": format!("cand:{}", instance.id),
-                "path_id": path_id,
-                "repository_id": &instance.id,
-                "disposition": "unresolvable_identity",
-                "reason": "identifying remotes removed or uninterpretable under \
-                           the matching policy; see repository evidence",
-                "retry_after": null,
-                "error_ids": Vec::<String>::new(),
-            }),
-        )?;
+        out.push(CandidateInput {
+            id: format!("cand:{}", instance.id),
+            path_bytes: instance.git_path.clone(),
+            repository_id: Some(instance.id.clone()),
+            disposition: String::from("unresolvable_identity"),
+            reason: String::from(
+                "identifying remotes removed or uninterpretable under the matching policy; \
+                 see repository evidence",
+            ),
+            retry_after_ms: None,
+            error_ids: Vec::new(),
+        });
     }
     for error in errors {
-        let candidate_disposition = match error.category.as_str() {
-            "probe-failed" => Some("probe_failed"),
-            "unsupported-git-format" => Some("unsupported"),
-            _ => None,
+        let disposition = match error.category.as_str() {
+            "probe-failed" => "probe_failed",
+            "unsupported-git-format" => "unsupported",
+            _ => continue,
         };
-        let Some(candidate_disposition) = candidate_disposition else {
+        let Some(path) = scope_path(&error.scope_key) else {
             continue;
         };
-        let Some(path) = scope_error_path(&error.scope_key) else {
-            continue;
-        };
-        if !first {
-            write_raw(out, ",")?;
-        }
-        first = false;
-        let path_id = paths.intern(&config::path_as_bytes(&path));
-        refs.need_path.push(path_id.clone());
-        refs.need_error.push(error.id.clone());
-        write_value(
-            out,
-            &serde_json::json!({
-                "id": format!("cand-err:{}", error.id),
-                "path_id": path_id,
-                "repository_id": null,
-                "disposition": candidate_disposition,
-                "reason": truncate_str(&error.detail, 512),
-                "retry_after": opt_time(error.next_retry_ms),
-                "error_ids": [&error.id],
-            }),
-        )?;
+        out.push(CandidateInput {
+            id: format!("cand-err:{}", error.id),
+            path_bytes: config::path_as_bytes(&path),
+            repository_id: None,
+            disposition: disposition.to_string(),
+            reason: truncate_str(&error.detail, 512),
+            retry_after_ms: error.next_retry_ms,
+            error_ids: vec![error.id.clone()],
+        });
     }
-    write_raw(out, "]")?;
-
-    // Errors.
-    write_raw(out, ",\"errors\":[")?;
-    first = true;
-    for error in errors {
-        if !first {
-            write_raw(out, ",")?;
-        }
-        first = false;
-        refs.errors.insert(error.id.clone());
-        let path_id = match scope_error_path(&error.scope_key) {
-            Some(path) => {
-                let id = paths.intern(&config::path_as_bytes(&path));
-                refs.need_path.push(id.clone());
-                serde_json::Value::String(id)
-            }
-            None => serde_json::Value::Null,
-        };
-        write_value(
-            out,
-            &serde_json::json!({
-                "id": &error.id,
-                "path_id": path_id,
-                "operation": scope_operation(&error.scope_key),
-                "category": &error.category,
-                "message": truncate_str(&error.detail, 2048),
-                "retryable": !error.category.starts_with("unsupported"),
-                "attempts": error.attempts,
-                "first_seen": ms_to_rfc3339(error.first_seen_ms),
-                "last_seen": ms_to_rfc3339(error.last_seen_ms),
-                "next_retry": opt_time(error.next_retry_ms),
-            }),
-        )?;
-    }
-    write_raw(out, "]")?;
-
-    // Generated artifacts: the retained snapshot (tool state) plus the
-    // published report when a destination was requested. Working state was
-    // observed before staging, hence `created_after_status: true`.
-    write_raw(out, ",\"generated_artifacts\":[")?;
-    let snapshot_path_id = paths.intern(snapshot_bytes);
-    refs.need_path.push(snapshot_path_id.clone());
-    write_value(
-        out,
-        &serde_json::json!({
-            "path_id": snapshot_path_id,
-            "kind": "tool_state",
-            "created_after_status": true,
-        }),
-    )?;
-    if let Some(report) = &inputs.report_dest {
-        let report_path_id = paths.intern(&config::path_as_bytes(report));
-        refs.need_path.push(report_path_id.clone());
-        write_raw(out, ",")?;
-        write_value(
-            out,
-            &serde_json::json!({
-                "path_id": report_path_id,
-                "kind": "report",
-                "created_after_status": true,
-            }),
-        )?;
-    }
-    write_raw(out, "]}")?;
-    Ok(())
-}
-
-fn scan_value(inputs: &ReportInputs, catalog_rev: u64) -> repo_scan::Result<serde_json::Value> {
-    Ok(serde_json::json!({
-        "id": &inputs.scan_id,
-        "generation": inputs.generation,
-        "epoch": inputs.epoch,
-        "catalog_revision": catalog_rev,
-        "target_url": &inputs.target_raw,
-        "canonical_url": &inputs.canonical,
-        "matching_policy": identity::MATCHING_POLICY,
-        "scope": one_of(&inputs.scope_policy, &["machine", "roots"])?,
-        "state": one_of(&inputs.scan_state,
-            &["running", "complete", "incomplete", "interrupted", "failed", "superseded"])?,
-        "started_at": ms_to_rfc3339(inputs.started_ms),
-        "finished_at": ms_to_rfc3339(inputs.finished_ms),
-        "superseded_by": null,
-        "cached": false,
-        "status_mode": status_mode_str(inputs.status_mode),
-    }))
-}
-
-fn head_value(checkout: &CoInfo) -> repo_scan::Result<serde_json::Value> {
-    let state = one_of(
-        &checkout.head_state,
-        &["branch", "detached", "unborn", "invalid", "unknown"],
-    )?;
-    let ref_name = match &checkout.head_ref {
-        Some(name) => encoded_name(name),
-        None => serde_json::Value::Null,
-    };
-    let oid = match (&checkout.head_oid, &checkout.head_algo) {
-        (Some(hex), Some(algo)) => oid_value(algo, hex),
-        _ => serde_json::Value::Null,
-    };
-    Ok(serde_json::json!({
-        "state": state,
-        "ref_name": ref_name,
-        "oid": oid,
-    }))
-}
-
-fn branch_value(reference: &RefInfo) -> repo_scan::Result<serde_json::Value> {
-    let oid = match (&reference.oid, &reference.algo) {
-        (Some(hex), Some(algo)) => oid_value(algo, hex),
-        _ => serde_json::Value::Null,
-    };
-    let symbolic = match &reference.symbolic_target {
-        Some(target) => encoded_name(target),
-        None => serde_json::Value::Null,
-    };
-    let upstream = match &reference.upstream {
-        Some(upstream) => encoded_name(upstream),
-        None => serde_json::Value::Null,
-    };
-    Ok(serde_json::json!({
-        "id": &reference.id,
-        "repository_id": &reference.instance_id,
-        "checkout_scope_id": &reference.checkout_scope_id,
-        "kind": one_of(&reference.kind, &["local", "remote_tracking", "other"])?,
-        "name": encoded_name(&reference.name),
-        "oid": oid,
-        "symbolic_target": symbolic,
-        "upstream": upstream,
-        "state": one_of(&reference.state, &["valid", "unborn", "invalid", "unsupported"])?,
-        "observed_at": ms_to_rfc3339(reference.observed_at_ms),
-        "error_ids": Vec::<String>::new(),
-    }))
-}
-
-/// Map the latest status observation (or its principled absence) to the
-/// report `Status` record, enforcing the §16 cross-field rules.
-fn checkout_status_value(
-    status: Option<&StatusInfo>,
-    disposition: &str,
-    requested: StatusMode,
-) -> repo_scan::Result<serde_json::Value> {
-    let Some(status) = status else {
-        let matching = matches!(disposition, "confirmed" | "related" | "probable");
-        let state = if matching { "pending" } else { "not_requested" };
-        return Ok(serde_json::json!({
-            "state": state,
-            "mode": status_mode_str(requested),
-            "started_at": null,
-            "finished_at": null,
-            "staged": null,
-            "unstaged": null,
-            "untracked": null,
-            "untracked_units": status_units(requested),
-            "submodules": "not_requested",
-            "unknown_fields": Vec::<String>::new(),
-            "error_ids": Vec::<String>::new(),
-        }));
-    };
-    let mode = one_of(&status.mode, &["metadata", "summary", "full"])?;
-    if mode == "metadata"
-        && (status.staged.is_some() || status.unstaged.is_some() || status.untracked.is_some())
-    {
-        return Err(repo_scan::Error::Report(
-            "metadata status observation carries counts".to_string(),
-        ));
-    }
-    Ok(serde_json::json!({
-        "state": one_of(&status.state,
-            &["complete", "partial", "pending", "not_requested", "unsupported", "unstable", "error"])?,
-        "mode": mode,
-        "started_at": opt_time(status.started_ms),
-        "finished_at": opt_time(status.finished_ms),
-        "staged": opt_count(status.staged),
-        "unstaged": opt_count(status.unstaged),
-        "untracked": opt_count(status.untracked),
-        "untracked_units": one_of(&status.untracked_units,
-            &["collapsed_entries", "files", "not_requested"])?,
-        "submodules": one_of(&status.submodules, &["checked", "not_requested", "unknown"])?,
-        "unknown_fields": parse_string_array(&status.unknown_fields),
-        "error_ids": Vec::<String>::new(),
-    }))
-}
-
-fn truncate_str(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(max_chars).collect();
-    out.push('…');
     out
 }
 
-/// Publish staged report bytes to the external destination (spec §15):
-/// refuse Git administrative paths, the active persistence payload, and
-/// existing unrelated files (only a verified previous `repo-scan` report
-/// for that output may be replaced); reject symlink surprises; write via a
-/// temporary sibling plus atomic replacement.
-fn publish_to_dest(staged: &Path, dest: &Path, state_dir: &Path) -> repo_scan::Result<()> {
+fn scope_path(scope_key: &str) -> Option<PathBuf> {
+    match config::parse_scope_key(scope_key) {
+        Some(config::ScopeRef::Dir(p) | config::ScopeRef::Git(p)) => Some(p),
+        _ => None,
+    }
+}
+
+/// Caller-owned storage edges: common-directory relationships, borrowed
+/// object stores (alternates), shared common storage, and observed
+/// hard-link sharing (R16).
+fn storage_link_inputs(instances: &[EmittedInstance]) -> Vec<StorageLinkInput> {
+    let mut out = Vec::new();
+    for instance in instances {
+        if instance.common_path != instance.git_path {
+            out.push(StorageLinkInput {
+                id: format!("link:{}:common", instance.id),
+                from_repository_id: instance.id.clone(),
+                to_path_bytes: instance.common_path.clone(),
+                kind: String::from("common_directory"),
+                evidence: vec![String::from("common directory differs from git directory")],
+            });
+        }
+    }
+    for instance in instances {
+        for (n, target) in alternates_targets(&instance.git_path).iter().enumerate() {
+            out.push(StorageLinkInput {
+                id: format!("link:{}:alt:{n}", instance.id),
+                from_repository_id: instance.id.clone(),
+                to_path_bytes: target.clone(),
+                kind: String::from("alternate_objects"),
+                evidence: vec![format!(
+                    "borrows object store: {}",
+                    String::from_utf8_lossy(target)
+                )],
+            });
+        }
+    }
+    let mut by_common: HashMap<&Vec<u8>, Vec<&EmittedInstance>> = HashMap::new();
+    for instance in instances {
+        by_common
+            .entry(&instance.common_path)
+            .or_default()
+            .push(instance);
+    }
+    for (_, mut group) in by_common {
+        if group.len() < 2 {
+            continue;
+        }
+        group.sort_by(|a, b| a.id.cmp(&b.id));
+        let first = group[0].id.clone();
+        for instance in group.into_iter().skip(1) {
+            out.push(StorageLinkInput {
+                id: format!("link:{}:shared", instance.id),
+                from_repository_id: instance.id.clone(),
+                to_path_bytes: instance.common_path.clone(),
+                kind: String::from("shared_object_store"),
+                evidence: vec![format!("shares common storage with {first}")],
+            });
+        }
+    }
+    for instance in instances {
+        if let Some(object) = first_hardlinked_object(&instance.git_path) {
+            out.push(StorageLinkInput {
+                id: format!("link:{}:hardlink", instance.id),
+                from_repository_id: instance.id.clone(),
+                to_path_bytes: object,
+                kind: String::from("observed_hardlink"),
+                evidence: vec![String::from(
+                    "object file has multiple hard links; store shared, not copied",
+                )],
+            });
+        }
+    }
+    out
+}
+
+/// Borrowed object-store targets from `objects/info/alternates` (R16),
+/// bounded to 64 entries per instance.
+fn alternates_targets(git_path: &[u8]) -> Vec<Vec<u8>> {
+    let path = config::path_from_bytes(git_path.to_vec()).join("objects/info/alternates");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => return Vec::new(),
+    };
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .take(64)
+        .map(|line| line.as_bytes().to_vec())
+        .collect()
+}
+
+/// First sampled loose object with more than one hard link (R16), or
+/// `None`. Bounded: at most 8 fanout dirs, first file each.
+#[cfg(unix)]
+fn first_hardlinked_object(git_path: &[u8]) -> Option<Vec<u8>> {
+    use std::os::unix::fs::MetadataExt;
+    let objects = config::path_from_bytes(git_path.to_vec()).join("objects");
+    let fanout = std::fs::read_dir(&objects).ok()?;
+    for dir_entry in fanout.flatten().take(8) {
+        let fan_dir = dir_entry.path();
+        if !fan_dir.is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&fan_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if let Ok(md) = std::fs::symlink_metadata(&path) {
+                if md.nlink() > 1 {
+                    return Some(config::path_as_bytes(&path));
+                }
+            }
+            break;
+        }
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn first_hardlinked_object(_git_path: &[u8]) -> Option<Vec<u8>> {
+    None
+}
+
+/// Caller-owned aliases (R7), deduplicated by `(path, target, kind)`.
+fn alias_inputs(aliases: &[ObservedAlias]) -> Vec<AliasInput> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for alias in aliases {
+        let key = (alias.path.clone(), alias.target.clone(), alias.kind);
+        if !seen.insert(key) {
+            continue;
+        }
+        out.push(AliasInput {
+            path_bytes: alias.path.clone(),
+            target_path_bytes: alias.target.clone(),
+            kind: alias.kind.to_string(),
+            verified_at_ms: alias.verified_at_ms,
+        });
+    }
+    out
+}
+
+/// Immutable snapshot ID for this staging attempt (R16): the deterministic
+/// scan ID while unused, else suffixed revisions. Every attempt gets its own
+/// ID so retained snapshots are never rewritten; same-scan restages (resume)
+/// keep history instead of mutating it.
+async fn fresh_report_id(
+    store: &TursoStore,
+    state_dir: &Path,
+    scan_id: &str,
+) -> repo_scan::Result<String> {
+    let base = config::report_id_for_scan(scan_id);
+    let dir = snapshots_dir(state_dir);
+    for attempt in 0..MAX_REPORT_ATTEMPTS {
+        let id = if attempt == 0 {
+            base.clone()
+        } else {
+            format!("{base}-r{}", attempt + 1)
+        };
+        let row_taken = store.get_report_snapshot(&id).await?.is_some();
+        let file_taken = dir.join(format!("{id}.json")).exists();
+        if !row_taken && !file_taken {
+            return Ok(id);
+        }
+    }
+    Err(repo_scan::Error::Report(format!(
+        "could not mint a fresh report ID for scan {scan_id}"
+    )))
+}
+
+/// Binary-side destination guard kept ahead of the lib publisher (R3):
+/// refuse anything inside the tool state dir (the lib refuses the active
+/// payload and lock; the state root itself stays refused here).
+fn reject_state_dir_dest(dest: &Path, state_dir: &Path) -> repo_scan::Result<()> {
     if dest == state_dir || dest.starts_with(state_dir) {
         return Err(repo_scan::Error::Report(format!(
             "refusing to publish inside tool state dir: {}",
             dest.display()
         )));
     }
-    if dest
-        .components()
-        .any(|c| c.as_os_str() == std::ffi::OsStr::new(".git"))
-    {
-        return Err(repo_scan::Error::Report(format!(
-            "refusing to publish inside a .git directory: {}",
-            dest.display()
-        )));
-    }
-    if let Some(parent) = dest.parent() {
-        // A bare-store top level (objects/ + HEAD) is Git administration.
-        if parent.join("objects").is_dir() && parent.join("HEAD").is_file() {
-            return Err(repo_scan::Error::Report(format!(
-                "refusing to publish inside a Git directory: {}",
-                dest.display()
-            )));
-        }
-    }
-    match std::fs::symlink_metadata(dest) {
-        Ok(md) => {
-            if md.file_type().is_symlink() {
-                return Err(repo_scan::Error::Report(format!(
-                    "refusing to publish through a symlink: {}",
-                    dest.display()
-                )));
-            }
-            if md.file_type().is_dir() {
-                return Err(repo_scan::Error::Report(format!(
-                    "refusing to publish over a directory: {}",
-                    dest.display()
-                )));
-            }
-            if md.len() > DEST_INSPECT_CAP {
-                return Err(repo_scan::Error::Report(format!(
-                    "refusing to replace an unexpected large file: {}",
-                    dest.display()
-                )));
-            }
-            if !is_prior_repo_scan_report(dest)? {
-                return Err(repo_scan::Error::Report(format!(
-                    "refusing to overwrite an unrelated existing file (no-clobber): {}",
-                    dest.display()
-                )));
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(repo_scan::Error::Report(format!(
-                "cannot inspect destination {}: {e}",
-                dest.display()
-            )));
-        }
-    }
-    let parent = dest.parent().ok_or_else(|| {
-        repo_scan::Error::Report(format!("destination has no parent: {}", dest.display()))
-    })?;
-    std::fs::create_dir_all(parent)?;
-    let file_name = dest.file_name().ok_or_else(|| {
-        repo_scan::Error::Report(format!("destination has no file name: {}", dest.display()))
-    })?;
-    let tmp = parent.join(format!(
-        ".{}.repo-scan-{}.tmp",
-        file_name.to_string_lossy(),
-        std::process::id()
-    ));
-    if std::fs::copy(staged, &tmp).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(repo_scan::Error::Report(format!(
-            "cannot stage destination file: {}",
-            tmp.display()
-        )));
-    }
-    if let Ok(sync_file) = std::fs::File::open(&tmp) {
-        let _ = sync_file.sync_all();
-    }
-    if let Err(e) = std::fs::rename(&tmp, dest) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(repo_scan::Error::Report(format!(
-            "cannot publish {}: {e}",
-            dest.display()
-        )));
-    }
-    if let Ok(dir) = std::fs::File::open(parent) {
+    Ok(())
+}
+
+/// File emission through the tested lib pieces (R3), stage-first: the
+/// staged report streams from the pinned catalog revision, is verified and
+/// immutably retained as the snapshot, and only then does the destination
+/// check + copy run. A refused destination therefore still leaves the
+/// retained snapshot behind for retry — the same guarantee the old binary
+/// path gave, now with lib validation, checksums, and no-clobber rules.
+/// Returns the snapshot path.
+async fn emit_file_report(
+    store: &TursoStore,
+    inputs: &LibReportInputs,
+    dest: &Path,
+    state_dir: &Path,
+    now_ms: i64,
+) -> repo_scan::Result<PathBuf> {
+    use repo_scan::report::builder::stream_report_from_store;
+    use repo_scan::report::publish;
+    use std::io::Write;
+
+    let staging = staging_dir(state_dir);
+    let snapshots = snapshots_dir(state_dir);
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&snapshots)?;
+    let staged_name = format!(
+        ".staging-{}-{}-{}.json",
+        std::process::id(),
+        store::now_ms(),
+        inputs.report_id,
+    );
+    let staged = staging.join(staged_name);
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)?;
+    let (mut file, _) = stream_report_from_store(store, inputs, file).await?;
+    file.flush()?;
+    file.sync_all()?;
+    drop(file);
+    if let Ok(dir) = std::fs::File::open(&staging) {
         let _ = dir.sync_all();
     }
-    Ok(())
-}
-
-/// True when `dest` is a verified previous `repo-scan` report: parseable
-/// JSON naming this tool and the v1 schema. A filename extension alone is
-/// never proof.
-fn is_prior_repo_scan_report(dest: &Path) -> repo_scan::Result<bool> {
-    let bytes = match std::fs::read(dest) {
-        Ok(bytes) => bytes,
-        Err(_) => return Ok(false),
-    };
-    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
-        Ok(value) => value,
-        Err(_) => return Ok(false),
-    };
-    Ok(value
-        .get("tool")
-        .and_then(|tool| tool.get("name"))
-        .and_then(|name| name.as_str())
-        == Some("repo-scan")
-        && value.get("schema_version").and_then(|v| v.as_str()) == Some("1.0.0"))
-}
-
-/// Readable terminal report for scans without `--report` (stdout; progress
-/// stays on stderr). The versioned snapshot is already retained in state.
-async fn print_terminal_report(
-    store: &TursoStore,
-    inputs: &ReportInputs,
-    staged: &Path,
-) -> repo_scan::Result<()> {
-    let instances = load_instances(store).await?;
-    let mut confirmed = 0u64;
-    let mut related = 0u64;
-    let mut probable = 0u64;
-    let mut unresolvable = 0u64;
-    for instance in instances.iter() {
-        match instance.disposition.as_str() {
-            "confirmed" => confirmed += 1,
-            "related" => related += 1,
-            "probable" => probable += 1,
-            "unresolvable_identity" => unresolvable += 1,
-            _ => {}
+    let receipt = publish::retain_snapshot(
+        store,
+        &staged,
+        &snapshots,
+        &inputs.report_id,
+        inputs.catalog_revision,
+        inputs.generation,
+        now_ms,
+    )
+    .await?;
+    let snapshot = receipt.path.clone();
+    // Binary-side guard first (state root stays refused), then the lib's
+    // destination policy; either refusal fails the publication without
+    // touching the retained snapshot or the destination.
+    let checked =
+        reject_state_dir_dest(dest, state_dir).and(publish::check_destination(dest, state_dir));
+    if let Err(e) = checked {
+        store
+            .set_snapshot_publication(&inputs.report_id, "failed")
+            .await?;
+        return Err(e);
+    }
+    match publish::publish_staged(&snapshot, dest, state_dir) {
+        Ok(_) => {
+            store
+                .set_snapshot_publication(&inputs.report_id, "published")
+                .await?;
+            Ok(snapshot)
+        }
+        Err(e) => {
+            store
+                .set_snapshot_publication(&inputs.report_id, "failed")
+                .await?;
+            Err(e)
         }
     }
-    println!("target: {}", inputs.target_raw);
-    println!("canonical: {}", inputs.canonical);
-    println!("scope: {}", inputs.scope_policy);
-    println!("state: {}", inputs.scan_state);
-    println!("generation: {}", inputs.generation);
-    println!(
-        "matches: {confirmed} confirmed, {related} related, {probable} probable, \
-         {unresolvable} unresolvable"
-    );
-    for instance in instances.iter().filter(|i| i.disposition == "confirmed") {
-        println!("  confirmed: {}", escape_display(&instance.git_path));
-    }
-    println!(
-        "coverage: {} pending tasks, {} open gaps",
-        inputs.pending, inputs.open_gaps
-    );
-    println!("snapshot: {}", staged.display());
-    Ok(())
+}
+
+fn staging_dir(state_dir: &Path) -> PathBuf {
+    store::owner::payload_dir(state_dir).join(config::STAGING_DIR_NAME)
+}
+
+fn snapshots_dir(state_dir: &Path) -> PathBuf {
+    store::owner::payload_dir(state_dir).join(config::SNAPSHOTS_DIR_NAME)
 }
 
 // ---------------------------------------------------------------------------
@@ -3987,17 +4348,35 @@ async fn retry_publication(
             )));
         }
     }
+    // Retry through the tested lib publisher (R3): the snapshot is
+    // revalidated and checksum-verified before it is copied out.
+    if let Some(dest) = &dest {
+        if let Err(e) = reject_state_dir_dest(dest, &cfg.state_dir) {
+            eprintln!("repo-scan: publication retry failed: {e}");
+            return Ok(ExitCode::OperationalFailure);
+        }
+    }
     let published = match &dest {
-        Some(dest) => match publish_to_dest(snapshot, dest, &cfg.state_dir) {
-            Ok(()) => true,
-            Err(e) => {
-                eprintln!("repo-scan: publication retry failed: {e}");
-                store
-                    .set_snapshot_publication(&recorded.report_id, "failed")
-                    .await?;
-                return Ok(ExitCode::OperationalFailure);
+        Some(dest) => {
+            match ReportPipeline::retry_publication(
+                store,
+                snapshot,
+                &recorded.report_id,
+                dest,
+                &cfg.state_dir,
+            )
+            .await
+            {
+                Ok(_) => true,
+                Err(e) => {
+                    eprintln!("repo-scan: publication retry failed: {e}");
+                    store
+                        .set_snapshot_publication(&recorded.report_id, "failed")
+                        .await?;
+                    return Ok(ExitCode::OperationalFailure);
+                }
             }
-        },
+        }
         None => true,
     };
     store
@@ -4092,12 +4471,20 @@ async fn continue_saved_scan(
         status,
         root,
     };
+    // The row's bound generation (R14), if any; `run_scan_inner`
+    // honors it instead of re-picking.
+    let generation = row
+        .outcome
+        .as_deref()
+        .and_then(config::parse_outcome)
+        .and_then(|d| d.generation);
     run_scan_inner(
         cfg,
         &args,
         Some(ResumedRequest {
             scan_id,
             started_ms,
+            generation,
         }),
     )
     .await
@@ -4133,12 +4520,34 @@ async fn run_invalidate_inner(
     };
     let scope_key = config::scope_key_for_dir(&root);
     let rev = store.invalidate_scope(&scope_key, generation, now).await?;
+    // Event ingest runs on invalidate too (R5): available history batches
+    // become durable invalidations alongside the requested one.
+    let ingested = {
+        let roots = [PlannedRoot {
+            path: root.clone(),
+            priority: RootPriority::Early,
+            namespace: String::from("explicit"),
+            volume: None,
+        }];
+        let mut events = open_event_session(&store, &cfg.state_dir, "roots", &roots).await?;
+        let mut counters = RunCounters::default();
+        let applied =
+            ingest_available_events(&mut events, &store, generation, &roots, &mut counters).await?;
+        let _ = reconcile_event_cursors(&mut events, &store).await;
+        applied
+    };
     let _ = store.close().await;
     println!(
         "invalidated {} rev={rev} generation={generation}; reconciliation scheduled \
          (rescan not complete)",
         root.display()
     );
+    if ingested.batches > 0 {
+        println!(
+            "events: ingested {} batch(es), {} scope(s) invalidated",
+            ingested.batches, ingested.scopes,
+        );
+    }
     Ok(ExitCode::Success)
 }
 
@@ -4181,12 +4590,14 @@ async fn run_clear(cfg: &config::Config, args: &repo_scan::cli::ClearArgs) -> Ex
 /// directory; the coordination lock is always retained.
 fn run_clear_inner(state_dir: &Path) -> repo_scan::Result<()> {
     let payload = store::owner::payload_dir(state_dir);
+    // Coordinate first: clearing requires exclusive ownership. The
+    // existence check lives inside the lock (R15) so the decision sees
+    // the state the guard actually serializes.
+    let _guard = acquire_guard(state_dir)?;
     if !payload.exists() {
         println!("cache clear: no persisted state; already absent (success)");
         return Ok(());
     }
-    // Coordinate first: clearing requires exclusive ownership.
-    let _guard = acquire_guard(state_dir)?;
     if is_symlink_path(state_dir)? {
         return Err(unsafe_reset("state dir is a symlink"));
     }
@@ -4204,10 +4615,12 @@ fn run_clear_inner(state_dir: &Path) -> repo_scan::Result<()> {
     let mut removed = 0u64;
     let mut preserved: Vec<String> = Vec::new();
 
-    // Database identity: SQLite magic or a fresh empty file is ours;
-    // anything else at the engine path is foreign and stays.
+    // Database identity (R15): a fresh empty file is ours; a
+    // populated engine file must carry tool ownership evidence — the
+    // ownership marker bound by an owned open, or tool-shaped catalog
+    // bytes. A foreign SQLite database without either stays.
     let db_path = payload.join("catalog.db");
-    let db_ours = verify_db_identity(&db_path, &mut preserved)?;
+    let db_ours = verify_db_identity(state_dir, &db_path, &mut preserved)?;
     if db_ours {
         for name in config::KNOWN_ENGINE_FILES
             .iter()
@@ -4223,6 +4636,9 @@ fn run_clear_inner(state_dir: &Path) -> repo_scan::Result<()> {
     }
     clear_tool_dir(&snapshots, &mut removed, &mut preserved)?;
     clear_tool_dir(&staging, &mut removed, &mut preserved)?;
+    // The ownership marker is tool-owned by definition; drop it with the
+    // state (a substituted symlink refuses, like any reset-path symlink).
+    remove_known_file(&owner_marker_path(state_dir), &mut removed, &mut preserved)?;
     // Unknown payload-root entries are listed, never touched.
     if let Ok(entries) = std::fs::read_dir(&payload) {
         for entry in entries.flatten() {
@@ -4231,6 +4647,7 @@ fn run_clear_inner(state_dir: &Path) -> repo_scan::Result<()> {
                 || config::KNOWN_SIDECAR_FILES.contains(&name.as_str())
                 || name == config::SNAPSHOTS_DIR_NAME
                 || name == config::STAGING_DIR_NAME
+                || name == OWNER_MARKER_NAME
             {
                 continue;
             }
@@ -4278,7 +4695,12 @@ fn is_symlink_path(path: &Path) -> repo_scan::Result<bool> {
 
 /// Verify the engine path holds our database (or nothing). Symlinks refuse
 /// the reset; non-file or foreign-content paths are preserved, not removed.
-fn verify_db_identity(db_path: &Path, preserved: &mut Vec<String>) -> repo_scan::Result<bool> {
+/// Populated files additionally require tool ownership evidence (R15).
+fn verify_db_identity(
+    state_dir: &Path,
+    db_path: &Path,
+    preserved: &mut Vec<String>,
+) -> repo_scan::Result<bool> {
     let md = match std::fs::symlink_metadata(db_path) {
         Ok(md) => md,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
@@ -4310,15 +4732,85 @@ fn verify_db_identity(db_path: &Path, preserved: &mut Vec<String>) -> repo_scan:
             return Ok(false);
         }
     }
-    if magic == *b"SQLite format 3\0" {
-        Ok(true)
-    } else {
+    if magic != *b"SQLite format 3\0" {
         preserved.push(format!(
             "{} (not a database file; preserved)",
             db_path.display()
         ));
-        Ok(false)
+        return Ok(false);
     }
+    // SQLite magic alone never proves ownership (R15): require the marker
+    // bound by an owned open, else tool-shaped catalog bytes.
+    if marker_binds_payload(state_dir) {
+        return Ok(true);
+    }
+    if catalog_bytes_look_tool_owned(db_path) {
+        return Ok(true);
+    }
+    preserved.push(format!(
+        "{} (SQLite database without tool ownership evidence; preserved)",
+        db_path.display()
+    ));
+    Ok(false)
+}
+
+/// True when the payload's ownership marker is a small regular file with
+/// our tag line plus a `db_id` binding. Verified, not trusted: wrong tag,
+/// symlink, or oversize file all fail closed.
+fn marker_binds_payload(state_dir: &Path) -> bool {
+    let path = owner_marker_path(state_dir);
+    let md = match std::fs::symlink_metadata(&path) {
+        Ok(md) => md,
+        Err(_) => return false,
+    };
+    if !md.file_type().is_file() || md.len() > 4096 {
+        return false;
+    }
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines = text.lines();
+    if lines.next() != Some(OWNER_MARKER_TAG) {
+        return false;
+    }
+    lines.any(|line| line.starts_with("db_id=") && line.len() > 6)
+}
+
+/// Catalog schema markers: tables every tool-created catalog carries from
+/// schema v1. Catalogs built through the store without a binary open (no
+/// marker) still verify through their bytes.
+const DB_SCHEMA_MARKERS: [&[u8]; 4] = [
+    b"frontier_tasks",
+    b"report_snapshots",
+    b"event_journal",
+    b"scope_revisions",
+];
+
+/// True when the engine file's head carries enough catalog schema markers
+/// to be tool-shaped. At least two must match so a stray string in a
+/// foreign database cannot qualify it.
+fn catalog_bytes_look_tool_owned(db_path: &Path) -> bool {
+    use std::io::Read;
+    let mut file = match std::fs::File::open(db_path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut head = vec![0u8; DB_IDENTITY_SCAN_BYTES as usize];
+    let len = match file.read(&mut head) {
+        Ok(len) => len,
+        Err(_) => return false,
+    };
+    head.truncate(len);
+    let mut hits = 0;
+    for marker in DB_SCHEMA_MARKERS {
+        let marker: &[u8] = marker;
+        if head.windows(marker.len()).any(|w| w == marker) {
+            hits += 1;
+        }
+    }
+    hits >= 2
 }
 
 /// Remove one exact known file after verifying it is a regular file.
@@ -4384,7 +4876,110 @@ fn clear_tool_dir(
     Ok(())
 }
 
-/// JSON string literal for trusted ASCII (IDs, enums, timestamps).
-fn json_string(text: &str) -> String {
-    serde_json::to_string(text).unwrap_or_else(|_| String::from("null"))
+// ---------------------------------------------------------------------------
+// Integration-test hooks (compiled only under `cfg(test)`; the
+// `tests/review_fix_main.rs` suite includes this file as a module). Each
+// hook drives the same code the command paths use — never a parallel copy.
+// ---------------------------------------------------------------------------
+
+/// Watchdog verdict over an already-measured operation age (R9).
+#[cfg(test)]
+pub fn test_watchdog_exceeded(grace_secs: u64, elapsed: Duration) -> bool {
+    let watchdog = Watchdog::new(Duration::from_secs(grace_secs));
+    let now = Instant::now();
+    watchdog.exceeded(now - elapsed, now)
+}
+
+/// Explicit lease release (R4): returns transactions counted.
+#[cfg(test)]
+pub async fn test_release_claim(
+    store: &TursoStore,
+    claimed: &ClaimedTask,
+    epoch: u64,
+) -> repo_scan::Result<u64> {
+    let mut counters = RunCounters::default();
+    release_claim(store, &mut counters, claimed, epoch).await?;
+    Ok(counters.db_transactions)
+}
+
+/// What one hook-driven ingest applied (R5).
+#[cfg(test)]
+pub struct TestIngestOutcome {
+    pub history_invalid: bool,
+    pub batches: usize,
+    pub scopes: usize,
+    pub tx: u64,
+}
+
+/// Drive one event batch through the scan's ingest path (R5): durable
+/// cursor persistence plus scope invalidation, over a fresh session.
+#[cfg(test)]
+pub async fn test_apply_event_batch(
+    store: &TursoStore,
+    generation: u64,
+    history_uuid: &str,
+    batch: &events::EventBatch,
+) -> repo_scan::Result<TestIngestOutcome> {
+    let mut session = EventSession {
+        reconciler: events::Reconciler::new(events::MemoryCursorJournal::new()),
+        monitored: Vec::new(),
+        mounts: HashMap::new(),
+        applied_scopes: HashMap::new(),
+        history_invalid: false,
+        degraded: Vec::new(),
+        live: false,
+    };
+    // Open rule for the batch's volume so ingest pins a history identity.
+    let stored = load_stored_cursors(store).await?;
+    let live = events::HistoryUuid(history_uuid.to_string());
+    session.reconciler.note_stream_opened(
+        &batch.volume_key,
+        stored.get(&batch.volume_key),
+        Some(&live),
+        batch.high_water.0,
+        batch.high_water,
+    );
+    let mut counters = RunCounters::default();
+    let mut applied = IngestApplied::default();
+    // Hook fence: the batch's own paths (raw + canonical) plus parents.
+    let mut fence: Vec<PathBuf> = Vec::new();
+    for path in &batch.invalidations {
+        fence.push(path.clone());
+        fence.push(path.canonicalize().unwrap_or_else(|_| path.clone()));
+        if let Some(parent) = path.parent() {
+            fence.push(parent.to_path_buf());
+            fence.push(
+                parent
+                    .canonicalize()
+                    .unwrap_or_else(|_| parent.to_path_buf()),
+            );
+        }
+    }
+    apply_event_batch(
+        &mut session,
+        store,
+        generation,
+        &[],
+        &fence,
+        &mut counters,
+        batch,
+        &mut applied,
+    )
+    .await?;
+    Ok(TestIngestOutcome {
+        history_invalid: session.history_invalid,
+        batches: applied.batches,
+        scopes: applied.scopes,
+        tx: counters.db_transactions,
+    })
+}
+
+/// Durable reconcile marking (R5): rows at or below `through` reconcile.
+#[cfg(test)]
+pub async fn test_mark_reconciled(
+    store: &TursoStore,
+    volume: &str,
+    through: u64,
+) -> repo_scan::Result<()> {
+    mark_events_reconciled_through(store, volume, events::EventCursorId(through)).await
 }

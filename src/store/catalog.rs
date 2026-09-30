@@ -17,8 +17,9 @@ use crate::error::Error;
 use crate::model::TaskState;
 use crate::store::owner::OwnerGuard;
 use crate::store::writer::WriterBatch;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Owner-held catalog handle. Only the owner constructs this.
@@ -28,6 +29,42 @@ pub struct TursoStore {
     db_path: PathBuf,
     epoch: u64,
     schema_version: u32,
+    /// True for [`TursoStore::open_read_only`]: every writer entry point
+    /// refuses, so cached queries cannot mutate the catalog.
+    read_only: bool,
+    counters: StoreCounters,
+}
+
+/// Lock-free runtime counters behind [`TursoStore::stats`]. Open/migration
+/// transactions (which run before any handle exists) are excluded; every
+/// runtime transaction, batch, probe, and checkpoint is counted.
+#[derive(Debug, Default)]
+struct StoreCounters {
+    transactions: AtomicU64,
+    rollbacks: AtomicU64,
+    batch_commits: AtomicU64,
+    batch_ops: AtomicU64,
+    checkpoints: AtomicU64,
+    wal_probes: AtomicU64,
+}
+
+/// Transaction/sync-rate snapshot for PERF-02 evidence. Under
+/// `synchronous = FULL` every counted transaction performs at least one WAL
+/// sync on commit; explicit checkpoints are counted separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StoreStats {
+    /// Runtime transactions committed via `with_tx`.
+    pub transactions: u64,
+    /// Runtime transactions rolled back via `with_tx`.
+    pub rollbacks: u64,
+    /// Writer batches committed (`commit_batch` + `flush`).
+    pub batch_commits: u64,
+    /// Batched ops applied across all batch commits.
+    pub batch_ops: u64,
+    /// Explicit `checkpoint_truncate` calls.
+    pub checkpoints: u64,
+    /// `wal_status` probes.
+    pub wal_probes: u64,
 }
 
 /// Monotonic in-process lease-token source, mixed with the pid so tokens
@@ -300,7 +337,8 @@ impl TursoStore {
         Ok((guard, store))
     }
 
-    /// Fencing epoch claimed by this incarnation.
+    /// Fencing epoch claimed by this incarnation (the stored epoch,
+    /// unbumped, for [`TursoStore::open_read_only`]).
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
@@ -308,6 +346,34 @@ impl TursoStore {
     /// Database file this handle opened.
     pub fn db_path(&self) -> &Path {
         &self.db_path
+    }
+
+    /// True when this handle was opened read-only: writer entry points
+    /// refuse, so cached queries cannot mutate the catalog (spec §3).
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Current transaction/sync-rate counters (PERF-02 evidence).
+    pub fn stats(&self) -> StoreStats {
+        StoreStats {
+            transactions: self.counters.transactions.load(Ordering::Relaxed),
+            rollbacks: self.counters.rollbacks.load(Ordering::Relaxed),
+            batch_commits: self.counters.batch_commits.load(Ordering::Relaxed),
+            batch_ops: self.counters.batch_ops.load(Ordering::Relaxed),
+            checkpoints: self.counters.checkpoints.load(Ordering::Relaxed),
+            wal_probes: self.counters.wal_probes.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Refuse a writer entry point on a read-only handle.
+    fn forbid_write(&self, op: &str) -> crate::Result<()> {
+        if self.read_only {
+            return Err(Error::Store(format!(
+                "{op} refused: catalog opened read-only (cached query path)"
+            )));
+        }
+        Ok(())
     }
 
     /// Owner-only writer connection. Report streaming uses `prepare` plus
@@ -356,6 +422,77 @@ impl TursoStore {
             db_path: db_path.to_path_buf(),
             epoch,
             schema_version,
+            read_only: false,
+            counters: StoreCounters::default(),
+        })
+    }
+
+    /// Open an existing catalog read-only for cached queries (spec §3):
+    /// no epoch claim, no crash-recovery writes, no migrations, no PRAGMA
+    /// assignments — only reads. The handle reports the stored epoch
+    /// unbumped, and every writer entry point refuses. Recovery runs only
+    /// when leases actually block, via
+    /// [`TursoStore::recover_if_blocked`] on a read-write handle.
+    /// Returns a store error (not a catalog) when the database file is
+    /// absent or holds no suitable migrated catalog.
+    pub async fn open_read_only(db_path: &Path) -> crate::Result<Self> {
+        if !db_path.exists() {
+            return Err(Error::Store(format!(
+                "no catalog at {}: nothing cached to read",
+                db_path.display()
+            )));
+        }
+        let path_str = db_path.to_str().ok_or_else(|| {
+            Error::Store(format!("database path is not UTF-8: {}", db_path.display()))
+        })?;
+        let db = turso::Builder::new_local(path_str)
+            .build()
+            .await
+            .map_err(store_err)?;
+        let conn = db.connect().map_err(store_err)?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(store_err)?;
+        let journal_mode = Self::pragma_text(&conn, "journal_mode").await?;
+        if journal_mode.to_lowercase() != "wal" {
+            return Err(Error::Store(format!(
+                "catalog at {} is not a WAL catalog (journal_mode {journal_mode:?}); \
+                    refusing read-only open",
+                db_path.display()
+            )));
+        }
+        if !Self::has_table(&conn, "meta").await? {
+            return Err(Error::Store(format!(
+                "catalog at {} holds no repo-scan metadata; refusing read-only open",
+                db_path.display()
+            )));
+        }
+        let raw = Self::read_meta_text(&conn, "schema_version")
+            .await?
+            .ok_or_else(|| {
+                Error::Store("catalog has no schema_version; refusing read-only open".to_string())
+            })?;
+        let schema_version: u32 = raw.parse::<u32>().map_err(|_| {
+            Error::Store(format!("catalog schema_version is not a number: {raw:?}"))
+        })?;
+        // A read-only open never migrates: older and newer catalogs alike
+        // are left for an owner open (or an honest no-suitable-catalog).
+        if schema_version != crate::store::CURRENT_SCHEMA_VERSION {
+            return Err(Error::Store(format!(
+                "catalog schema version {schema_version} is not this binary's v{}; \
+                    refusing read-only open",
+                crate::store::CURRENT_SCHEMA_VERSION
+            )));
+        }
+        let epoch = Self::read_meta_i64(&conn, "epoch").await?.unwrap_or(0) as u64;
+        Self::assert_autocommit(&conn)?;
+        Ok(Self {
+            db,
+            conn,
+            db_path: db_path.to_path_buf(),
+            epoch,
+            schema_version,
+            read_only: true,
+            counters: StoreCounters::default(),
         })
     }
 
@@ -369,7 +506,17 @@ impl TursoStore {
         F: FnOnce(&'a turso::Connection) -> Fut,
         Fut: std::future::Future<Output = crate::Result<T>>,
     {
-        Self::with_tx_on(&self.conn, f).await
+        self.forbid_write("transaction")?;
+        let result = Self::with_tx_on(&self.conn, f).await;
+        match &result {
+            Ok(_) => {
+                self.counters.transactions.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                self.counters.rollbacks.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        result
     }
 
     async fn with_tx_on<'a, T, F, Fut>(conn: &'a turso::Connection, f: F) -> crate::Result<T>
@@ -648,12 +795,52 @@ impl TursoStore {
         self.with_tx(|conn| async move { Self::recover_on(conn, epoch, now_ms).await })
             .await
     }
+
+    /// Leases that would block scheduler progress at `now_ms`: tasks still
+    /// `leased` under a foreign (or missing) epoch, or past expiry. Pure
+    /// read; cached queries use it to decide without writing.
+    pub async fn blocking_lease_count(&self, now_ms: i64) -> crate::Result<u64> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM frontier_tasks WHERE state = 'leased' \
+                    AND (lease_epoch IS NULL OR lease_epoch != ?1 \
+                    OR (lease_expires_ms IS NOT NULL AND lease_expires_ms <= ?2))",
+                vec![v_int(self.epoch as i64), v_int(now_ms)],
+            )
+            .await
+            .map_err(store_err)?;
+        match rows.next().await.map_err(store_err)? {
+            None => Ok(0),
+            Some(row) => Ok(req_i64(&row, 0)? as u64),
+        }
+    }
+
+    /// Run crash recovery only when leases actually block: zero blocking
+    /// leases means zero writes (safe on a read-only handle). A read-only
+    /// handle with blocking leases errors and names the read-write open
+    /// recovery needs; cached queries never take that path.
+    pub async fn recover_if_blocked(&self, now_ms: i64) -> crate::Result<RecoveryReport> {
+        if self.blocking_lease_count(now_ms).await? == 0 {
+            return Ok(RecoveryReport {
+                requeued: 0,
+                uncertain_dropped: 0,
+            });
+        }
+        if self.read_only {
+            return Err(Error::Store(
+                "leases block this catalog; recovery needs a read-write open".to_string(),
+            ));
+        }
+        self.recover_now(now_ms).await
+    }
 }
 
 impl TursoStore {
     /// Enqueue a task idempotently (`INSERT OR IGNORE` on the dedup key).
     /// Returns true when the task was newly inserted.
     pub async fn enqueue_task(&self, task: &NewTask<'_>, now_ms: i64) -> crate::Result<bool> {
+        self.forbid_write("enqueue_task")?;
         let rows = self
             .conn
             .execute(
@@ -699,6 +886,11 @@ impl TursoStore {
     /// Durably claim up to `limit` eligible tasks for `epoch` (expired
     /// leases return to `pending` first, inside the same transaction).
     /// Leases last `ttl_ms` from `now_ms`. Bounded: at most 1,024 claims.
+    ///
+    /// Cross-generation legacy shape: the scan loop must prefer
+    /// [`TursoStore::claim_tasks_in_generation`], which scopes the claim to
+    /// the run's generation so boundary accounting (`pending_count`) and the
+    /// claimed work cannot diverge across `--force-rescan` generations.
     pub async fn claim_tasks(
         &self,
         epoch: u64,
@@ -763,6 +955,80 @@ impl TursoStore {
         .await
     }
 
+    /// Durably claim up to `limit` eligible tasks of one traversal
+    /// `generation` for `epoch`: the claim carries `AND generation = ?`, so
+    /// a force-rescan run never drains older generations' work and claimed
+    /// tasks stay visible to that generation's `pending_count` boundary.
+    /// Requests sharing the *same* generation still share work: repeated
+    /// claims return disjoint pending tasks until the generation is
+    /// exhausted. Lease expiry runs first, inside the same transaction;
+    /// leases last `ttl_ms` from `now_ms`. Bounded: at most 1,024 claims.
+    pub async fn claim_tasks_in_generation(
+        &self,
+        generation: u64,
+        epoch: u64,
+        limit: usize,
+        ttl_ms: i64,
+        now_ms: i64,
+    ) -> crate::Result<Vec<ClaimedTask>> {
+        let limit = limit.clamp(1, 1024);
+        self.with_tx(|conn| async move {
+            Self::expire_leases_on(conn, now_ms).await?;
+            // Bound literal is interpolated (numeric, owner-controlled) so
+            // the query needs no bound LIMIT support.
+            let sql = format!(
+                "SELECT {TASK_COLUMNS} FROM frontier_tasks WHERE generation = ?1 \
+                    AND (state = 'pending' OR (state = 'retry_wait' \
+                    AND retry_after_ms IS NOT NULL AND retry_after_ms <= ?2)) \
+                    ORDER BY id ASC LIMIT {limit}"
+            );
+            let mut rows = conn
+                .query(sql.as_str(), vec![v_int(generation as i64), v_int(now_ms)])
+                .await
+                .map_err(store_err)?;
+            let mut tasks = Vec::new();
+            while let Some(row) = rows.next().await.map_err(store_err)? {
+                tasks.push(FrontierTask::from_row(&row)?);
+            }
+            let mut claimed = Vec::with_capacity(tasks.len());
+            for task in &tasks {
+                let token = fresh_token();
+                let expires = now_ms + ttl_ms;
+                let rows = conn
+                    .execute(
+                        "UPDATE frontier_tasks SET state = 'leased', lease_token = ?1, \
+                            lease_epoch = ?2, lease_expires_ms = ?3, \
+                            attempts = attempts + 1, updated_at_ms = ?4 WHERE id = ?5 \
+                            AND (state = 'pending' OR state = 'retry_wait')",
+                        vec![
+                            v_int(token),
+                            v_int(epoch as i64),
+                            v_int(expires),
+                            v_int(now_ms),
+                            v_text(task.id.clone()),
+                        ],
+                    )
+                    .await
+                    .map_err(store_err)?;
+                if rows == 1 {
+                    let mut leased = task.clone();
+                    leased.state = TaskState::Leased;
+                    leased.lease_token = Some(token);
+                    leased.lease_epoch = Some(epoch);
+                    leased.lease_expires_ms = Some(expires);
+                    leased.attempts += 1;
+                    claimed.push(ClaimedTask {
+                        task: leased,
+                        token,
+                        expires_ms: expires,
+                    });
+                }
+            }
+            Ok::<Vec<ClaimedTask>, Error>(claimed)
+        })
+        .await
+    }
+
     /// Extend a live lease. Returns false when the lease is gone, expired
     /// into another incarnation, or held under a different token/epoch.
     pub async fn renew_lease(
@@ -773,6 +1039,7 @@ impl TursoStore {
         ttl_ms: i64,
         now_ms: i64,
     ) -> crate::Result<bool> {
+        self.forbid_write("renew_lease")?;
         let rows = self
             .conn
             .execute(
@@ -840,18 +1107,14 @@ impl TursoStore {
         }
     }
 
-    /// Returns the stale-completion message when the task was requeued
-    /// (committed by the caller), `None` on a clean completion. Lease and
-    /// parked-state errors return before any write, so their rollback is a
-    /// no-op; only the stale path writes-then-reports.
-    async fn complete_task_on(
+    /// Lease gate shared by plain and verified completions: unknown
+    /// tasks and token/epoch mismatches error before any write.
+    async fn check_lease_on(
         conn: &turso::Connection,
         task_id: &str,
         token: i64,
         epoch: u64,
-        outcome: &TaskOutcome,
-        now_ms: i64,
-    ) -> crate::Result<Option<String>> {
+    ) -> crate::Result<FrontierTask> {
         let task = Self::get_task_on(conn, task_id)
             .await?
             .ok_or_else(|| Error::Scheduler(format!("unknown-task: {task_id}")))?;
@@ -863,20 +1126,84 @@ impl TursoStore {
                 "lease-mismatch: task {task_id} is not leased to epoch {epoch} token {token}"
             )));
         }
+        Ok(task)
+    }
+
+    /// Positive durability check for a parent's preserved child records
+    /// (spec §10): every claimed child task id must already be durable in
+    /// `frontier_tasks` before the parent may complete. A missing child is
+    /// a scheduler defect — the parent stays leased (the caller's
+    /// transaction rolls back with no write) so work is never silently
+    /// dropped. Checked in 500-id chunks to stay under bound-variable
+    /// limits; an empty list (leaf parent) passes vacuously. Callers using
+    /// writer batches must flush before verified completion.
+    async fn verify_child_records_on(
+        conn: &turso::Connection,
+        task_id: &str,
+        child_task_ids: &[String],
+    ) -> crate::Result<()> {
+        for chunk in child_task_ids.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders: Vec<String> =
+                (1..=chunk.len()).map(|index| format!("?{index}")).collect();
+            let sql = format!(
+                "SELECT id FROM frontier_tasks WHERE id IN ({})",
+                placeholders.join(", ")
+            );
+            let params: Vec<turso::Value> = chunk.iter().map(|id| v_text(id.as_str())).collect();
+            let mut rows = conn.query(sql.as_str(), params).await.map_err(store_err)?;
+            let mut found = HashSet::new();
+            while let Some(row) = rows.next().await.map_err(store_err)? {
+                found.insert(req_text(&row, 0)?);
+            }
+            let missing: Vec<&str> = chunk
+                .iter()
+                .map(String::as_str)
+                .filter(|id| !found.contains(*id))
+                .collect();
+            if !missing.is_empty() {
+                let shown: Vec<&str> = missing.iter().take(8).copied().collect();
+                return Err(Error::Scheduler(format!(
+                    "missing-child-record: parent {task_id} claims {} preserved child \
+                        record(s) but {} are not durable (e.g. {})",
+                    child_task_ids.len(),
+                    missing.len(),
+                    shown.join(", ")
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Revision gate plus outcome application shared by plain and verified
+    /// completions. Returns the stale-completion message when the task was
+    /// requeued (committed by the caller), `None` on a clean completion.
+    async fn apply_completion_on(
+        conn: &turso::Connection,
+        task: &FrontierTask,
+        outcome: &TaskOutcome,
+        now_ms: i64,
+    ) -> crate::Result<Option<String>> {
         let current_rev = Self::scope_rev_on(conn, &task.scope_key).await?;
         if current_rev != task.expected_rev {
             conn.execute(
                 "UPDATE frontier_tasks SET state = 'pending', lease_token = NULL, \
                     lease_epoch = NULL, lease_expires_ms = NULL, expected_rev = ?1, \
                     updated_at_ms = ?2 WHERE id = ?3",
-                vec![v_int(current_rev as i64), v_int(now_ms), v_text(task_id)],
+                vec![
+                    v_int(current_rev as i64),
+                    v_int(now_ms),
+                    v_text(task.id.as_str()),
+                ],
             )
             .await
             .map_err(store_err)?;
             return Ok(Some(format!(
-                "stale-completion: task {task_id} expected rev {} but scope {:?} \
+                "stale-completion: task {} expected rev {} but scope {:?} \
                     is at rev {current_rev}; task requeued",
-                task.expected_rev, task.scope_key
+                task.id, task.expected_rev, task.scope_key
             )));
         }
         match outcome {
@@ -885,7 +1212,7 @@ impl TursoStore {
                     "UPDATE frontier_tasks SET state = 'complete', lease_token = NULL, \
                         lease_epoch = NULL, lease_expires_ms = NULL, updated_at_ms = ?1 \
                         WHERE id = ?2",
-                    vec![v_int(now_ms), v_text(task_id)],
+                    vec![v_int(now_ms), v_text(task.id.as_str())],
                 )
                 .await
                 .map_err(store_err)?;
@@ -899,11 +1226,15 @@ impl TursoStore {
                     "UPDATE frontier_tasks SET state = 'retry_wait', lease_token = NULL, \
                         lease_epoch = NULL, lease_expires_ms = NULL, \
                         retry_after_ms = ?1, updated_at_ms = ?2 WHERE id = ?3",
-                    vec![v_int(*retry_after_ms), v_int(now_ms), v_text(task_id)],
+                    vec![
+                        v_int(*retry_after_ms),
+                        v_int(now_ms),
+                        v_text(task.id.as_str()),
+                    ],
                 )
                 .await
                 .map_err(store_err)?;
-                let gap_id = format!("gap:{task_id}");
+                let gap_id = format!("gap:{}", task.id);
                 Self::record_error_on(
                     conn,
                     &gap_id,
@@ -928,12 +1259,12 @@ impl TursoStore {
                     vec![
                         v_text(task_state_as_str(*state)),
                         v_int(now_ms),
-                        v_text(task_id),
+                        v_text(task.id.as_str()),
                     ],
                 )
                 .await
                 .map_err(store_err)?;
-                let gap_id = format!("gap:{task_id}");
+                let gap_id = format!("gap:{}", task.id);
                 Self::record_error_on(
                     conn,
                     &gap_id,
@@ -947,6 +1278,56 @@ impl TursoStore {
             }
         }
         Ok(None)
+    }
+
+    /// Returns the stale-completion message when the task was requeued
+    /// (committed by the caller), `None` on a clean completion. Lease and
+    /// parked-state errors return before any write, so their rollback is a
+    /// no-op; only the stale path writes-then-reports.
+    async fn complete_task_on(
+        conn: &turso::Connection,
+        task_id: &str,
+        token: i64,
+        epoch: u64,
+        outcome: &TaskOutcome,
+        now_ms: i64,
+    ) -> crate::Result<Option<String>> {
+        let task = Self::check_lease_on(conn, task_id, token, epoch).await?;
+        Self::apply_completion_on(conn, &task, outcome, now_ms).await
+    }
+
+    /// Verified parent completion (spec §10): the lease and revision gates
+    /// of [`TursoStore::complete_task`], plus a positive check that every id
+    /// in `child_task_ids` names a durable `frontier_tasks` record before a
+    /// `Complete` outcome is applied. A missing child fails with a
+    /// `missing-child-record` scheduler error and leaves the parent leased;
+    /// non-`Complete` outcomes skip the child check (no children are claimed
+    /// durable). Stale completions still requeue and report as before.
+    /// Callers using writer batches must flush before calling this.
+    pub async fn complete_task_with_children(
+        &self,
+        task_id: &str,
+        token: i64,
+        epoch: u64,
+        outcome: &TaskOutcome,
+        child_task_ids: &[String],
+        now_ms: i64,
+    ) -> crate::Result<()> {
+        let stale = self
+            .with_tx(|conn| async move {
+                let task = Self::check_lease_on(conn, task_id, token, epoch).await?;
+                if matches!(outcome, TaskOutcome::Complete) {
+                    Self::verify_child_records_on(conn, &task.id, child_task_ids).await?;
+                }
+                Self::apply_completion_on(conn, &task, outcome, now_ms).await
+            })
+            .await?;
+        // The stale requeue above committed; report it now. Returning the
+        // error from inside the transaction would roll the requeue back.
+        match stale {
+            None => Ok(()),
+            Some(message) => Err(Error::Scheduler(message)),
+        }
     }
 
     /// Durably invalidate a scope: bump its revision, mirror directory
@@ -968,16 +1349,10 @@ impl TursoStore {
             )
             .await
             .map_err(store_err)?;
-            if let Some(raw) = scope_key.strip_prefix("dir:") {
-                if let Ok(dir_id) = raw.parse::<i64>() {
-                    conn.execute(
-                        "UPDATE directories SET invalidation_rev = ?1 WHERE id = ?2",
-                        vec![v_int(next as i64), v_int(dir_id)],
-                    )
-                    .await
-                    .map_err(store_err)?;
-                }
-            }
+            // Mirror directory scopes into `directories.invalidation_rev`
+            // (§11): `dir:` keys carry hex-encoded path bytes, never row ids,
+            // so the directory rows are looked up by path, not parsed.
+            Self::mirror_dir_invalidation(conn, scope_key, next).await?;
             let task_id = format!("reconcile:{scope_key}:{next}");
             let idempotency = format!("idem:{task_id}");
             conn.execute(
@@ -999,6 +1374,61 @@ impl TursoStore {
             Ok::<u64, Error>(next)
         })
         .await
+    }
+
+    /// Mirror a `dir:` scope invalidation into every matching
+    /// `directories` row (all incarnations of that path). The hex suffix is
+    /// decoded to path bytes and matched against the stored `display` (the
+    /// same lossy-escaped full path the enumeration path stores) plus exact
+    /// final-component bytes, so a lossy-escape collision can never mirror
+    /// into an unrelated directory. Non-`dir:` scopes and malformed keys
+    /// mirror nothing; the `scope_revisions` bump (the correctness guard)
+    /// always applies. Runs inside the caller's transaction.
+    async fn mirror_dir_invalidation(
+        conn: &turso::Connection,
+        scope_key: &str,
+        rev: u64,
+    ) -> crate::Result<()> {
+        let Some(hex) = scope_key.strip_prefix("dir:") else {
+            return Ok(());
+        };
+        let Some(path_bytes) = crate::config::decode_hex(hex) else {
+            return Ok(());
+        };
+        if path_bytes.is_empty() {
+            return Ok(());
+        }
+        let display: String = String::from_utf8_lossy(&path_bytes)
+            .chars()
+            .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+            .collect();
+        let component: Vec<u8> =
+            match crate::config::path_from_bytes(path_bytes.clone()).file_name() {
+                Some(name) => crate::config::path_as_bytes(Path::new(name)),
+                None => path_bytes,
+            };
+        let mut rows = conn
+            .query(
+                "SELECT id, component FROM directories WHERE display = ?1",
+                vec![v_text(display)],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            if req_blob(&row, 1)? == component {
+                ids.push(req_i64(&row, 0)?);
+            }
+        }
+        for id in ids {
+            conn.execute(
+                "UPDATE directories SET invalidation_rev = ?1 WHERE id = ?2",
+                vec![v_int(rev as i64), v_int(id)],
+            )
+            .await
+            .map_err(store_err)?;
+        }
+        Ok(())
     }
 
     /// Current revision of a scope (0 when never invalidated).
@@ -1772,6 +2202,30 @@ impl TursoStore {
         .await
     }
 
+    /// Resolve a directory row id by physical identity, for callers that
+    /// buffered [`TursoStore::buffer_dir_upsert`] and flushed: the id is
+    /// only knowable after the flush commits. Pure read.
+    pub async fn lookup_dir_id(
+        &self,
+        volume_id: &str,
+        object_id: &str,
+        incarnation: &str,
+    ) -> crate::Result<Option<i64>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id FROM directories WHERE volume_id = ?1 AND object_id = ?2 \
+                    AND incarnation = ?3",
+                vec![v_text(volume_id), v_text(object_id), v_text(incarnation)],
+            )
+            .await
+            .map_err(store_err)?;
+        match rows.next().await.map_err(store_err)? {
+            None => Ok(None),
+            Some(row) => Ok(Some(req_i64(&row, 0)?)),
+        }
+    }
+
     /// Fetch one directory by row id.
     pub async fn get_dir(&self, id: i64) -> crate::Result<Option<DirRecord>> {
         let mut rows = self
@@ -1803,6 +2257,7 @@ impl TursoStore {
         error: Option<&str>,
         observed_ms: i64,
     ) -> crate::Result<()> {
+        self.forbid_write("record_dir_observation")?;
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO dir_observations (dir_id, generation, completed, \
@@ -1851,6 +2306,7 @@ impl TursoStore {
         instance: &NewGitInstance<'_>,
         observed_ms: i64,
     ) -> crate::Result<()> {
+        self.forbid_write("upsert_git_instance")?;
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO git_instances (id, git_path, common_path, \
@@ -1903,6 +2359,7 @@ impl TursoStore {
         checkout: &NewCheckout<'_>,
         observed_ms: i64,
     ) -> crate::Result<()> {
+        self.forbid_write("insert_checkout_if_absent")?;
         self.conn
             .execute(
                 "INSERT OR IGNORE INTO checkouts (id, instance_id, root_path, git_path, \
@@ -1933,6 +2390,7 @@ impl TursoStore {
         checkout: &NewCheckout<'_>,
         observed_ms: i64,
     ) -> crate::Result<()> {
+        self.forbid_write("upsert_checkout")?;
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO checkouts (id, instance_id, root_path, git_path, \
@@ -1982,6 +2440,7 @@ impl TursoStore {
         remote: &NewRemote<'_>,
         observed_ms: i64,
     ) -> crate::Result<()> {
+        self.forbid_write("upsert_remote")?;
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO remotes (id, instance_id, checkout_scope_id, name, \
@@ -2024,6 +2483,7 @@ impl TursoStore {
 
     /// Idempotent ref upsert keyed by stable id.
     pub async fn upsert_ref(&self, reference: &NewRef<'_>, observed_ms: i64) -> crate::Result<()> {
+        self.forbid_write("upsert_ref")?;
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO refs (id, instance_id, checkout_scope_id, kind, \
@@ -2074,6 +2534,7 @@ impl TursoStore {
         status: &NewStatus<'_>,
         observed_ms: i64,
     ) -> crate::Result<bool> {
+        self.forbid_write("record_status")?;
         let rows = self
             .conn
             .execute(
@@ -2131,6 +2592,7 @@ impl TursoStore {
         scan: &NewScan<'_>,
         now_ms: i64,
     ) -> crate::Result<bool> {
+        self.forbid_write("create_scan_request")?;
         let rows = self
             .conn
             .execute(
@@ -2161,6 +2623,7 @@ impl TursoStore {
         successor_id: Option<&str>,
         now_ms: i64,
     ) -> crate::Result<()> {
+        self.forbid_write("update_scan_state")?;
         self.conn
             .execute(
                 "UPDATE scan_requests SET state = ?1, outcome = ?2, successor_id = ?3, \
@@ -2210,6 +2673,7 @@ impl TursoStore {
         checksum: Option<&[u8]>,
         now_ms: i64,
     ) -> crate::Result<bool> {
+        self.forbid_write("save_report_snapshot")?;
         let rows = self
             .conn
             .execute(
@@ -2238,6 +2702,7 @@ impl TursoStore {
         id: &str,
         publication_state: &str,
     ) -> crate::Result<()> {
+        self.forbid_write("set_snapshot_publication")?;
         self.conn
             .execute(
                 "UPDATE report_snapshots SET publication_state = ?1 WHERE id = ?2",
@@ -2328,6 +2793,7 @@ impl TursoStore {
 
     /// Close a gap without deleting its evidence.
     pub async fn resolve_error(&self, id: &str, now_ms: i64) -> crate::Result<()> {
+        self.forbid_write("resolve_error")?;
         self.conn
             .execute(
                 "UPDATE errors SET open = 0, last_seen_ms = ?1 WHERE id = ?2",
@@ -2365,6 +2831,7 @@ impl TursoStore {
         invalidated: bool,
         now_ms: i64,
     ) -> crate::Result<bool> {
+        self.forbid_write("append_event")?;
         let rows = self
             .conn
             .execute(
@@ -2386,6 +2853,7 @@ impl TursoStore {
 
     /// Mark one journal record reconciled (reconciliation work satisfied).
     pub async fn mark_event_reconciled(&self, id: i64) -> crate::Result<()> {
+        self.forbid_write("mark_event_reconciled")?;
         self.conn
             .execute(
                 "UPDATE event_journal SET reconciled = 1 WHERE id = ?1",
@@ -2425,6 +2893,7 @@ impl TursoStore {
         volume: &NewVolume<'_>,
         observed_ms: Option<i64>,
     ) -> crate::Result<()> {
+        self.forbid_write("upsert_volume")?;
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO volumes (id, native_identity, namespace, \
@@ -2470,6 +2939,7 @@ impl TursoStore {
         prior_generation: Option<u64>,
         now_ms: i64,
     ) -> crate::Result<u64> {
+        self.forbid_write("create_generation")?;
         self.conn
             .execute(
                 "INSERT INTO generations (scope_policy, state, prior_generation, \
@@ -2488,6 +2958,7 @@ impl TursoStore {
 
     /// Update a generation's completion state.
     pub async fn set_generation_state(&self, id: u64, state: &str) -> crate::Result<()> {
+        self.forbid_write("set_generation_state")?;
         self.conn
             .execute(
                 "UPDATE generations SET state = ?1 WHERE id = ?2",
@@ -2557,6 +3028,7 @@ impl TursoStore {
     /// (lost acknowledgment). Crash recovery drops these markers after
     /// requeueing the underlying work.
     pub async fn note_uncertain_batch(&self, key: &str, now_ms: i64) -> crate::Result<()> {
+        self.forbid_write("note_uncertain_batch")?;
         self.conn
             .execute(
                 "INSERT OR IGNORE INTO batches (idempotency_key, state, created_at_ms) \
@@ -2603,6 +3075,10 @@ impl TursoStore {
             Ok::<(), Error>(())
         })
         .await?;
+        self.counters.batch_commits.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .batch_ops
+            .fetch_add(count as u64, Ordering::Relaxed);
         Ok(count)
     }
 
@@ -2623,7 +3099,279 @@ impl TursoStore {
             Ok::<(), Error>(())
         })
         .await?;
+        self.counters.batch_commits.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .batch_ops
+            .fetch_add(count as u64, Ordering::Relaxed);
         Ok(count)
+    }
+
+    /// Buffer an idempotent task enqueue for batched commit. The scan
+    /// loop calls the `buffer_*` family during task execution instead of
+    /// the one-statement-per-row single-shot writes, and flushes via
+    /// [`TursoStore::flush`]/[`TursoStore::commit_batch`] whenever the
+    /// return value reports a spec §5 limit (512 rows, 512 KiB, 250 ms),
+    /// before any read that must observe the buffered rows, and before
+    /// verified parent completion. Buffered rows are invisible until the
+    /// flush commits. Returns `WriterBatch::should_flush`.
+    pub fn buffer_enqueue_task(batch: &mut WriterBatch, task: &NewTask<'_>, now_ms: i64) -> bool {
+        batch.push(
+            "INSERT OR IGNORE INTO frontier_tasks (id, kind, generation, dir_id, \
+                scope_key, expected_rev, state, idempotency_key, attempts, \
+                updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, 0, ?8)",
+            vec![
+                v_text(task.id),
+                v_text(task.kind),
+                v_int(task.generation as i64),
+                v_opt_int(task.dir_id),
+                v_text(task.scope_key),
+                v_int(task.expected_rev as i64),
+                v_text(task.idempotency_key),
+                v_int(now_ms),
+            ],
+        )
+    }
+
+    /// Buffer the write half of [`TursoStore::upsert_dir`] (insert-or-ignore
+    /// plus attribute refresh). The row id is not known until flush; resolve
+    /// it afterwards with [`TursoStore::lookup_dir_id`]. Returns
+    /// `WriterBatch::should_flush`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn buffer_dir_upsert(
+        batch: &mut WriterBatch,
+        parent_id: Option<i64>,
+        component: &[u8],
+        display: &str,
+        volume_id: &str,
+        object_id: &str,
+        incarnation: &str,
+        observed_ms: i64,
+    ) -> bool {
+        batch.push(
+            "INSERT OR IGNORE INTO directories (parent_id, component, display, \
+                volume_id, object_id, incarnation, last_observed_ms, \
+                invalidation_rev) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+            vec![
+                v_opt_int(parent_id),
+                v_blob(component.to_vec()),
+                v_text(display),
+                v_text(volume_id),
+                v_text(object_id),
+                v_text(incarnation),
+                v_int(observed_ms),
+            ],
+        );
+        batch.push(
+            "UPDATE directories SET parent_id = ?1, display = ?2, \
+                last_observed_ms = ?3 WHERE volume_id = ?4 AND object_id = ?5 \
+                AND incarnation = ?6",
+            vec![
+                v_opt_int(parent_id),
+                v_text(display),
+                v_int(observed_ms),
+                v_text(volume_id),
+                v_text(object_id),
+                v_text(incarnation),
+            ],
+        );
+        batch.should_flush()
+    }
+
+    /// Buffer an enumeration observation; see [`TursoStore::buffer_enqueue_task`]
+    /// for the flush contract. Returns `WriterBatch::should_flush`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn buffer_record_dir_observation(
+        batch: &mut WriterBatch,
+        dir_id: i64,
+        generation: u64,
+        completed: bool,
+        entry_generation: u64,
+        entries_seen: u64,
+        error: Option<&str>,
+        observed_ms: i64,
+    ) -> bool {
+        batch.push(
+            "INSERT OR REPLACE INTO dir_observations (dir_id, generation, completed, \
+                entry_generation, entries_seen, error, observed_at_ms) \
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            vec![
+                v_int(dir_id),
+                v_int(generation as i64),
+                v_int(i64::from(completed)),
+                v_int(entry_generation as i64),
+                v_int(entries_seen as i64),
+                v_opt_text(error.map(str::to_string)),
+                v_int(observed_ms),
+            ],
+        )
+    }
+
+    /// Buffer a Git-instance upsert; see [`TursoStore::buffer_enqueue_task`]
+    /// for the flush contract. Returns `WriterBatch::should_flush`.
+    pub fn buffer_upsert_git_instance(
+        batch: &mut WriterBatch,
+        instance: &NewGitInstance<'_>,
+        observed_ms: i64,
+    ) -> bool {
+        batch.push(
+            "INSERT OR REPLACE INTO git_instances (id, git_path, common_path, \
+                incarnation, format, bare, object_format, disposition, evidence, \
+                observed_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            vec![
+                v_text(instance.id),
+                v_blob(instance.git_path.to_vec()),
+                v_blob(instance.common_path.to_vec()),
+                v_text(instance.incarnation),
+                v_text(instance.format),
+                v_opt_int(instance.bare.map(i64::from)),
+                v_text(instance.object_format),
+                v_text(instance.disposition),
+                v_text(instance.evidence_json),
+                v_int(observed_ms),
+            ],
+        )
+    }
+
+    /// Buffer an insert-if-absent checkout write; see
+    /// [`TursoStore::buffer_enqueue_task`] for the flush contract. Returns
+    /// `WriterBatch::should_flush`.
+    pub fn buffer_insert_checkout_if_absent(
+        batch: &mut WriterBatch,
+        checkout: &NewCheckout<'_>,
+        observed_ms: i64,
+    ) -> bool {
+        batch.push(
+            "INSERT OR IGNORE INTO checkouts (id, instance_id, root_path, git_path, \
+                relationship, availability, head_state, head_ref, head_oid, \
+                head_algo, observed_at_ms) \
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            vec![
+                v_text(checkout.id),
+                v_text(checkout.instance_id),
+                v_opt_blob(checkout.root_path.map(<[u8]>::to_vec)),
+                v_blob(checkout.git_path.to_vec()),
+                v_text(checkout.relationship),
+                v_text(checkout.availability),
+                v_text(checkout.head_state),
+                v_opt_blob(checkout.head_ref.map(<[u8]>::to_vec)),
+                v_opt_blob(checkout.head_oid.map(<[u8]>::to_vec)),
+                v_opt_text(checkout.head_algo.map(str::to_string)),
+                v_int(observed_ms),
+            ],
+        )
+    }
+
+    /// Buffer a checkout upsert; see [`TursoStore::buffer_enqueue_task`] for
+    /// the flush contract. Returns `WriterBatch::should_flush`.
+    pub fn buffer_upsert_checkout(
+        batch: &mut WriterBatch,
+        checkout: &NewCheckout<'_>,
+        observed_ms: i64,
+    ) -> bool {
+        batch.push(
+            "INSERT OR REPLACE INTO checkouts (id, instance_id, root_path, git_path, \
+                relationship, availability, head_state, head_ref, head_oid, \
+                head_algo, observed_at_ms) \
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            vec![
+                v_text(checkout.id),
+                v_text(checkout.instance_id),
+                v_opt_blob(checkout.root_path.map(<[u8]>::to_vec)),
+                v_blob(checkout.git_path.to_vec()),
+                v_text(checkout.relationship),
+                v_text(checkout.availability),
+                v_text(checkout.head_state),
+                v_opt_blob(checkout.head_ref.map(<[u8]>::to_vec)),
+                v_opt_blob(checkout.head_oid.map(<[u8]>::to_vec)),
+                v_opt_text(checkout.head_algo.map(str::to_string)),
+                v_int(observed_ms),
+            ],
+        )
+    }
+
+    /// Buffer a remote upsert; see [`TursoStore::buffer_enqueue_task`] for
+    /// the flush contract. Returns `WriterBatch::should_flush`.
+    pub fn buffer_upsert_remote(
+        batch: &mut WriterBatch,
+        remote: &NewRemote<'_>,
+        observed_ms: i64,
+    ) -> bool {
+        batch.push(
+            "INSERT OR REPLACE INTO remotes (id, instance_id, checkout_scope_id, name, \
+                role, url, canonical_url, observed_at_ms) \
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            vec![
+                v_text(remote.id),
+                v_text(remote.instance_id),
+                v_opt_text(remote.checkout_scope_id.map(str::to_string)),
+                v_blob(remote.name.to_vec()),
+                v_text(remote.role),
+                v_blob(remote.url.to_vec()),
+                v_opt_blob(remote.canonical_url.map(<[u8]>::to_vec)),
+                v_int(observed_ms),
+            ],
+        )
+    }
+
+    /// Buffer a ref upsert; see [`TursoStore::buffer_enqueue_task`] for the
+    /// flush contract. Returns `WriterBatch::should_flush`.
+    pub fn buffer_upsert_ref(
+        batch: &mut WriterBatch,
+        reference: &NewRef<'_>,
+        observed_ms: i64,
+    ) -> bool {
+        batch.push(
+            "INSERT OR REPLACE INTO refs (id, instance_id, checkout_scope_id, kind, \
+                name, oid, algo, symbolic_target, upstream, state, observed_at_ms) \
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            vec![
+                v_text(reference.id),
+                v_text(reference.instance_id),
+                v_opt_text(reference.checkout_scope_id.map(str::to_string)),
+                v_text(reference.kind),
+                v_blob(reference.name.to_vec()),
+                v_opt_blob(reference.oid.map(<[u8]>::to_vec)),
+                v_opt_text(reference.algo.map(str::to_string)),
+                v_opt_blob(reference.symbolic_target.map(<[u8]>::to_vec)),
+                v_opt_blob(reference.upstream.map(<[u8]>::to_vec)),
+                v_text(reference.state),
+                v_int(observed_ms),
+            ],
+        )
+    }
+
+    /// Buffer a status observation; see [`TursoStore::buffer_enqueue_task`]
+    /// for the flush contract. Unlike [`TursoStore::record_status`] the
+    /// inserted-or-ignored outcome is only knowable after flush (by
+    /// re-reading); the return value is `WriterBatch::should_flush`.
+    pub fn buffer_record_status(
+        batch: &mut WriterBatch,
+        status: &NewStatus<'_>,
+        observed_ms: i64,
+    ) -> bool {
+        batch.push(
+            "INSERT OR IGNORE INTO status_observations (checkout_id, mode, state, \
+                started_ms, finished_ms, staged, unstaged, untracked, \
+                untracked_units, submodules, unknown_fields, input_fingerprint, \
+                observed_rev, observed_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, \
+                ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            vec![
+                v_text(status.checkout_id),
+                v_text(status.mode),
+                v_text(status.state),
+                v_opt_int(status.started_ms),
+                v_opt_int(status.finished_ms),
+                v_opt_int(status.staged),
+                v_opt_int(status.unstaged),
+                v_opt_int(status.untracked),
+                v_text(status.untracked_units),
+                v_text(status.submodules),
+                v_text(status.unknown_fields),
+                v_opt_blob(status.input_fingerprint.map(<[u8]>::to_vec)),
+                v_int(status.observed_rev as i64),
+                v_int(observed_ms),
+            ],
+        )
     }
 
     /// Explicit `PRAGMA wal_checkpoint(TRUNCATE)`; returns
@@ -2631,7 +3379,10 @@ impl TursoStore {
     /// a nonzero `busy` means a reader held the WAL — keep serving reads
     /// and retry the checkpoint later instead of blocking them.
     pub async fn checkpoint_truncate(&self) -> crate::Result<(u64, u64, u64)> {
-        Self::wal_checkpoint(&self.conn, "TRUNCATE").await
+        self.forbid_write("checkpoint_truncate")?;
+        let out = Self::wal_checkpoint(&self.conn, "TRUNCATE").await?;
+        self.counters.checkpoints.fetch_add(1, Ordering::Relaxed);
+        Ok(out)
     }
 
     /// Checkpoint progress probe that never blocks readers: runs
@@ -2640,6 +3391,7 @@ impl TursoStore {
     pub async fn wal_status(&self) -> crate::Result<WalStatus> {
         let (busy, log_frames, checkpointed_frames) =
             Self::wal_checkpoint(&self.conn, "PASSIVE").await?;
+        self.counters.wal_probes.fetch_add(1, Ordering::Relaxed);
         Ok(WalStatus {
             busy,
             log_frames,
@@ -2695,7 +3447,9 @@ impl TursoStore {
     /// expected coordination state, not a close failure: durability never
     /// depends on the final checkpoint, so its outcome is ignored.
     pub async fn close(self) -> crate::Result<()> {
-        let _ = Self::wal_checkpoint(&self.conn, "TRUNCATE").await;
+        if !self.read_only {
+            let _ = Self::wal_checkpoint(&self.conn, "TRUNCATE").await;
+        }
         drop(self);
         Ok(())
     }

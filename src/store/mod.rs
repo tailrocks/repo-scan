@@ -19,6 +19,7 @@
 //! [`OwnerGuard`] holds the coordination lock outside the payload namespace.
 
 pub mod catalog;
+pub mod checkpoint;
 pub mod owner;
 pub mod schema;
 pub mod writer;
@@ -27,8 +28,10 @@ pub use catalog::{
     task_state_as_str, task_state_from_str, CheckoutRow, ClaimedTask, DirObservation, DirRecord,
     ErrorRow, EventRow, FrontierTask, GenerationRow, GitInstanceRow, NewCheckout, NewGitInstance,
     NewRef, NewRemote, NewScan, NewStatus, NewTask, NewVolume, RecoveryReport, RefRow, RemoteRow,
-    ReportSnapshotRow, ScanRow, StatusRow, TaskOutcome, TursoStore, VolumeRow, WalStatus,
+    ReportSnapshotRow, ScanRow, StatusRow, StoreStats, TaskOutcome, TursoStore, VolumeRow,
+    WalStatus,
 };
+pub use checkpoint::{CheckpointCoordinator, CheckpointPolicy, CheckpointStats};
 pub use owner::{catalog_db_path, lock_path, payload_dir, OwnerGuard};
 pub use writer::{
     PendingOp, WriterBatch, WRITER_BATCH_BYTES, WRITER_BATCH_MAX_AGE, WRITER_BATCH_ROWS,
