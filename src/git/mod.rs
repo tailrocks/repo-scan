@@ -304,6 +304,88 @@ fn has_include_section(config_text: &str) -> bool {
     false
 }
 
+/// Marker prefix for the explicit filter-driver gap (EXACT-2 defect 1).
+/// gix status converts stat-dirty worktree files through configured
+/// clean/process drivers during index-worktree comparison (and recurses
+/// into submodule worktrees the same way), with no API toggle to disable
+/// drivers — so [`filter_driver_gap`] refuses the probe before the first
+/// status call, and the scheduler records the returned line.
+pub const FILTER_DRIVER_GAP: &str = "filter-drivers-configured";
+
+/// Bounded pre-scan for executable filter drivers (EXACT-2 defect 1).
+///
+/// Inspects the repo-local configs gix loads (`config` and
+/// `config.worktree` under both admin dirs), the live-enumerated
+/// depth-1 submodule configs, and the recursive `modules/` tree beneath
+/// the parent and each enumerated submodule. Returns `Some` evidence
+/// line (prefixed with [`FILTER_DRIVER_GAP`]) when any names a
+/// `filter.<driver>.clean|smudge|process` command — or when a
+/// present-but-unreadable control file makes absence unprovable — else
+/// `None`. Included files are not followed (gix loads with includes
+/// disabled, so their drivers never execute); user/system/env-configured
+/// drivers are the operator's own trust domain (same boundary as
+/// [`fallback`](crate::git::fallback) `--local` scoping and gix's
+/// `is_trusted` default), not repo-selected code.
+///
+/// [`GixInspector::status_interruptible`] enforces this before any
+/// content-converting status call; metadata/bare probes never convert
+/// content and skip the guard.
+pub fn filter_driver_gap(instance: &GitInstance) -> Option<String> {
+    let repo = open_repo(&instance.git_dir).ok()?;
+    filter_driver_gap_for_repo(&repo, instance)
+}
+
+/// Full filter-driver assessment against an opened repository.
+///
+/// `None` means no repo-selected executable drivers were observed;
+/// `Some` carries the refusal line. Submodule enumeration failures are
+/// not a refusal: gix status itself fails the same enumeration before
+/// any content conversion, so the real error surfaces from the probe.
+fn filter_driver_gap_for_repo(repo: &gix::Repository, instance: &GitInstance) -> Option<String> {
+    if scan_repo_filter_configs(&instance.git_dir, &instance.common_dir).refuses() {
+        return Some(format!(
+            "{FILTER_DRIVER_GAP}: {} names executable filter drivers (filter.<name>.clean|smudge|process); gix status would execute them during worktree-content comparison, refusing to execute",
+            instance.git_dir.display()
+        ));
+    }
+    if scan_modules_tree(&instance.common_dir.join("modules"), 0).refuses() {
+        return Some(format!(
+            "{FILTER_DRIVER_GAP}: nested submodule configs under {} name executable filter drivers (or cannot be proven absent); gix status recurses into submodule worktrees, refusing to execute",
+            instance.common_dir.display()
+        ));
+    }
+    // Live depth-1 enumeration covers non-absorbed layouts the `modules/`
+    // walk cannot see; each enumerated gitdir's own nested tree is walked
+    // too. Past the cap the set is unknown, so refuse (fail closed).
+    let mut seen = 0usize;
+    let submodules = match repo.submodules() {
+        Ok(submodules) => submodules,
+        Err(_) => return None,
+    };
+    let iter = submodules?;
+    for sub in iter {
+        seen += 1;
+        if seen > MAX_FILTER_SUBMODULE_SCAN {
+            return Some(format!(
+                "{FILTER_DRIVER_GAP}: more than {MAX_FILTER_SUBMODULE_SCAN} submodules; driver set unprovable, refusing to execute"
+            ));
+        }
+        let git_dir = match sub.git_dir() {
+            Ok(git_dir) => git_dir,
+            Err(_) => continue,
+        };
+        if scan_repo_filter_configs(&git_dir, &git_dir).refuses()
+            || scan_modules_tree(&git_dir.join("modules"), 0).refuses()
+        {
+            return Some(format!(
+                "{FILTER_DRIVER_GAP}: submodule config under {} names executable filter drivers (or cannot be proven absent); gix status recurses into submodule worktrees, refusing to execute",
+                git_dir.display()
+            ));
+        }
+    }
+    None
+}
+
 /// One inspected configuration dependency (spec §8).
 ///
 /// gix include following is disabled (SR-STATE-05), so these paths are
@@ -614,7 +696,10 @@ impl GixInspector {
     /// Status probe with an optional watchdog interrupt flag.
     ///
     /// [`GitInspect::status`] delegates with `None`; the admitted helper
-    /// passes its no-progress watchdog flag here (GIT_QUAL §9).
+    /// passes its no-progress watchdog flag here (GIT_QUAL §9). Refuses
+    /// with an `unsupported` filter-driver gap before any
+    /// content-converting call when repo-selected clean/smudge/process
+    /// drivers are configured (EXACT-2 defect 1).
     pub fn status_interruptible(
         &self,
         instance: &GitInstance,
@@ -646,10 +731,22 @@ impl GixInspector {
                 fingerprints,
             });
         }
+        // EXACT-2 defect 1: refuse before the first content-converting
+        // status call when repo-selected filter drivers are configured.
+        // Metadata/bare probes above never convert content, so they
+        // legitimately skip this guard.
+        if let Some(gap) = filter_driver_gap_for_repo(&repo, instance) {
+            return Err(unsupported(gap));
+        }
         let mut counts = self.run_status_counts(&repo, mode, interrupt.clone())?;
         let after = vec![head_fingerprint(&repo), index_fingerprint(&repo)];
         if after != fingerprints {
             // Retry once within budget; flag instability when it persists.
+            // Re-check drivers first: a config swapped in during the first
+            // pass must not execute on the retry.
+            if let Some(gap) = filter_driver_gap_for_repo(&repo, instance) {
+                return Err(unsupported(gap));
+            }
             let retry = self.run_status_counts(&repo, mode, interrupt)?;
             let again = vec![head_fingerprint(&repo), index_fingerprint(&repo)];
             counts.fingerprints = again;
@@ -1109,6 +1206,160 @@ fn scan_include_paths(config_text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Maximum live-enumerated submodules assessed for filter drivers.
+/// Past the cap the driver set is unknown, so the probe refuses
+/// (fail closed) instead of scanning unboundedly.
+const MAX_FILTER_SUBMODULE_SCAN: usize = 4096;
+
+/// Maximum `modules/` nesting depth assessed for filter drivers
+/// (mirrors the depth cap in [`GixInspector::config_dependencies`]).
+const MAX_FILTER_MODULES_DEPTH: u8 = 4;
+
+/// Maximum entries read from one `modules/` directory during the
+/// filter-driver scan; past the cap the set is unknown, so refuse.
+const MAX_FILTER_MODULES_ENTRIES: usize = 256;
+
+/// Outcome of one bounded filter-driver scan step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterScan {
+    /// No executable drivers observed.
+    Clean,
+    /// Drivers observed, or absence unprovable (present-but-unreadable
+    /// control file, unreadable directory, breached cap): refuse.
+    Refuse,
+}
+
+impl FilterScan {
+    fn refuses(self) -> bool {
+        matches!(self, FilterScan::Refuse)
+    }
+}
+
+/// Scan the repo-local configs gix loads for one admin dir pair:
+/// `config` plus `config.worktree` under each dir (gix reads only the
+/// git dir's worktree config, and only when `extensions.worktreeConfig`
+/// holds — scanning all four is a conservative superset that never
+/// misses a driver gix would execute).
+fn scan_repo_filter_configs(git_dir: &std::path::Path, common_dir: &std::path::Path) -> FilterScan {
+    let mut candidates = vec![
+        git_dir.join("config"),
+        common_dir.join("config"),
+        git_dir.join("config.worktree"),
+        common_dir.join("config.worktree"),
+    ];
+    candidates.sort();
+    candidates.dedup();
+    for candidate in candidates {
+        if scan_config_file_for_filters(&candidate).refuses() {
+            return FilterScan::Refuse;
+        }
+    }
+    FilterScan::Clean
+}
+
+/// Scan one config file for executable filter-driver keys. A missing
+/// file is clean (no drivers to execute); a present-but-unreadable one
+/// (over-cap, link, FIFO, directory, race) refuses — gix follows links
+/// and reads unboundedly, so absence is unprovable there.
+fn scan_config_file_for_filters(path: &std::path::Path) -> FilterScan {
+    match read_bounded_string(path, MAX_GIT_CONTROL_BYTES) {
+        Some(text) if config_text_names_exec_filter(&text) => FilterScan::Refuse,
+        Some(_) => FilterScan::Clean,
+        None if std::fs::symlink_metadata(path).is_err() => FilterScan::Clean,
+        None => FilterScan::Refuse,
+    }
+}
+
+/// True when config text names an executable driver: a
+/// `clean`/`smudge`/`process` key inside any `[filter ...]` section
+/// (case-insensitive; value ignored — presence alone makes gix spawn
+/// the driver on attribute match). `required` and other flags are
+/// inert without a command key. Mirrors the fallback's
+/// `is_exec_filter_key` boundary (key-only, value ignored).
+fn config_text_names_exec_filter(config_text: &str) -> bool {
+    let mut in_filter = false;
+    for raw_line in config_text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with(['#', ';']) {
+            continue;
+        }
+        if line.starts_with('[') {
+            // Section name runs to the first whitespace or `]`:
+            // `[filter "my.driver"]`, `[filter]`, `[Filter]`.
+            let name = line
+                .strip_prefix('[')
+                .unwrap_or_default()
+                .split([' ', '\t', ']'])
+                .next()
+                .unwrap_or_default();
+            in_filter = name.eq_ignore_ascii_case("filter");
+            continue;
+        }
+        if !in_filter {
+            continue;
+        }
+        let key = line.split_once('=').map_or(line, |(key, _)| key).trim();
+        if key.eq_ignore_ascii_case("clean")
+            || key.eq_ignore_ascii_case("smudge")
+            || key.eq_ignore_ascii_case("process")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Recursive `modules/`-tree scan for nested-submodule driver configs.
+/// Depth- and entry-capped; unreadable directories, breached caps, and
+/// unreadable configs refuse (fail closed). Nothing is followed through
+/// links (PATH-GIT-07): a linked `config` refuses via
+/// [`scan_config_file_for_filters`], and a linked entry that could be a
+/// submodule gitdir refuses as unprovable.
+fn scan_modules_tree(modules_dir: &std::path::Path, depth: u8) -> FilterScan {
+    if depth > MAX_FILTER_MODULES_DEPTH {
+        return FilterScan::Refuse;
+    }
+    let entries = match std::fs::read_dir(modules_dir) {
+        Ok(entries) => entries,
+        // Absent `modules/` (no submodules) is clean; any other failure
+        // (permissions, races, non-directories) is unknown, so refuse —
+        // except a provably absent path, which simply has no submodules.
+        Err(_) if std::fs::symlink_metadata(modules_dir).is_err() => return FilterScan::Clean,
+        Err(_) => return FilterScan::Refuse,
+    };
+    let mut count = 0usize;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => return FilterScan::Refuse,
+        };
+        count += 1;
+        if count > MAX_FILTER_MODULES_ENTRIES {
+            return FilterScan::Refuse;
+        }
+        let path = entry.path();
+        // lstat, no follow: links never resolve outside the tree.
+        let file_type = match std::fs::symlink_metadata(&path).map(|m| m.file_type()) {
+            Ok(file_type) => file_type,
+            Err(_) => return FilterScan::Refuse,
+        };
+        if file_type.is_symlink() {
+            // A linked name could be a submodule gitdir gix status would
+            // open and recurse into — unprovable, so refuse.
+            return FilterScan::Refuse;
+        }
+        if !file_type.is_dir() {
+            continue;
+        }
+        if scan_repo_filter_configs(&path, &path).refuses()
+            || scan_modules_tree(&path.join("modules"), depth + 1).refuses()
+        {
+            return FilterScan::Refuse;
+        }
+    }
+    FilterScan::Clean
 }
 
 /// Resolve an include path the way git does: `~/` against HOME, relative

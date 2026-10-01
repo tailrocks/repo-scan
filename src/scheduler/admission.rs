@@ -10,12 +10,24 @@
 //!
 //! CPU (one logical core over a rolling 10 s window) and RSS (256 MiB) are
 //! measured feedback targets, not kernel ceilings; the 512 MiB threshold
-//! triggers stopped admission via [`Admission::set_pressure`].
+//! triggers stopped admission via [`Admission::set_pressure`]. Sustained
+//! rolling-core excess throttles admission via [`Admission::observe_cpu`]
+//! (reduced caps plus pacing, hysteresis, no flapping).
 
 use crate::config::ResourceLimits;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+/// CPU governor: consecutive over-target samples to engage throttling.
+const CPU_ENTER_SAMPLES: u32 = 3;
+/// CPU governor: consecutive under-target samples to release throttling.
+const CPU_EXIT_SAMPLES: u32 = 3;
+/// CPU governor: engage above target times this factor (1.1 matches the
+/// PERF-02 gate margin at the default 1.0 target).
+const CPU_ENTER_FACTOR: f64 = 1.1;
+/// CPU governor: pacing pause between admissions while throttled.
+const CPU_PACE_DELAY: Duration = Duration::from_millis(50);
 
 /// Class of an expensive operation requesting admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -65,6 +77,9 @@ pub struct Admission {
     helpers_live: usize,
     app_fds: usize,
     pressure: bool,
+    cpu_throttled: bool,
+    cpu_over: u32,
+    cpu_under: u32,
     last_progress: Option<Instant>,
     last_telemetry: Option<Instant>,
 }
@@ -82,6 +97,9 @@ impl Admission {
             helpers_live: 0,
             app_fds: 0,
             pressure: false,
+            cpu_throttled: false,
+            cpu_over: 0,
+            cpu_under: 0,
             last_progress: None,
             last_telemetry: None,
         }
@@ -90,15 +108,17 @@ impl Admission {
     /// Try to admit one operation. Returns `None` (without blocking) when
     /// the class cap, the shared cap, or memory pressure forbids it.
     /// Enumeration also consumes one of the 2 shared permits; a Git probe
-    /// consumes its 1 Git slot plus one shared permit.
+    /// consumes its 1 Git slot plus one shared permit. While CPU-throttled
+    /// the effective caps shrink (see `observe_cpu`).
     pub fn try_acquire(&mut self, class: OpClass) -> Option<Permit> {
         if self.pressure {
             return None;
         }
+        let shared_cap = self.eff_shared_cap();
         match class {
             OpClass::Enumerate => {
-                if self.enum_in_use >= self.limits.max_enum_ops
-                    || self.shared_in_use >= self.limits.shared_permits
+                if self.enum_in_use >= self.eff_class_cap(self.limits.max_enum_ops)
+                    || self.shared_in_use >= shared_cap
                 {
                     return None;
                 }
@@ -106,8 +126,8 @@ impl Admission {
                 self.shared_in_use += 1;
             }
             OpClass::GitProbe => {
-                if self.git_in_use >= self.limits.max_git_probes
-                    || self.shared_in_use >= self.limits.shared_permits
+                if self.git_in_use >= self.eff_class_cap(self.limits.max_git_probes)
+                    || self.shared_in_use >= shared_cap
                 {
                     return None;
                 }
@@ -115,7 +135,7 @@ impl Admission {
                 self.shared_in_use += 1;
             }
             OpClass::Other => {
-                if self.shared_in_use >= self.limits.shared_permits {
+                if self.shared_in_use >= shared_cap {
                     return None;
                 }
                 self.shared_in_use += 1;
@@ -152,9 +172,10 @@ impl Admission {
     }
 
     /// True when another helper process may spawn (live count below the
-    /// hard maximum of 4, including idle and still-stuck helpers).
+    /// hard maximum of 4, including idle and still-stuck helpers). Denied
+    /// under memory pressure or CPU throttle.
     pub fn helper_spawn_allowed(&self) -> bool {
-        !self.pressure && self.helpers_live < self.limits.max_helpers
+        !self.pressure && !self.cpu_throttled && self.helpers_live < self.limits.max_helpers
     }
 
     /// Record a newly spawned helper. Returns false (and records nothing)
@@ -191,9 +212,14 @@ impl Admission {
 
     /// True when the scheduler may prefetch more tasks: stops at 1,024
     /// tasks or 4 MiB estimated bytes, first limit wins. Remaining work
-    /// stays in the database.
+    /// stays in the database. CPU throttle halves the task cap.
     pub fn prefetch_allowed(&self, tasks: usize, bytes: usize) -> bool {
-        !self.pressure && tasks < self.limits.prefetch_tasks && bytes < self.limits.prefetch_bytes
+        let task_cap = if self.cpu_throttled {
+            (self.limits.prefetch_tasks / 2).max(1)
+        } else {
+            self.limits.prefetch_tasks
+        };
+        !self.pressure && tasks < task_cap && bytes < self.limits.prefetch_bytes
     }
 
     /// Scheduler prefetch task cap (1,024).
@@ -233,6 +259,78 @@ impl Admission {
     /// True while memory pressure stops admission.
     pub fn under_pressure(&self) -> bool {
         self.pressure
+    }
+
+    /// Feed one rolling-cores sample (trailing 10 s mean, spec §5) into the
+    /// CPU governor. Sustained excess above target times `CPU_ENTER_FACTOR`
+    /// for `CPU_ENTER_SAMPLES` consecutive samples engages throttling
+    /// (reduced admission caps plus [`Admission::pace_delay`]); sustained
+    /// relief below the target for `CPU_EXIT_SAMPLES` consecutive samples
+    /// releases it. In-band samples hold the state and break both streaks,
+    /// so the governor cannot flap. Non-finite or negative inputs count as
+    /// zero; a non-positive target falls back to 1.0.
+    pub fn observe_cpu(&mut self, rolling_cores: f64) {
+        let target =
+            if self.limits.cpu_target_cores.is_finite() && self.limits.cpu_target_cores > 0.0 {
+                self.limits.cpu_target_cores
+            } else {
+                1.0
+            };
+        let cores = if rolling_cores.is_finite() {
+            rolling_cores.max(0.0)
+        } else {
+            0.0
+        };
+        if cores > target * CPU_ENTER_FACTOR {
+            self.cpu_over = self.cpu_over.saturating_add(1);
+            self.cpu_under = 0;
+            if self.cpu_over >= CPU_ENTER_SAMPLES {
+                self.cpu_throttled = true;
+            }
+        } else if cores < target {
+            self.cpu_under = self.cpu_under.saturating_add(1);
+            self.cpu_over = 0;
+            if self.cpu_under >= CPU_EXIT_SAMPLES {
+                self.cpu_throttled = false;
+            }
+        } else {
+            // Hysteresis band: hold state, break both streaks.
+            self.cpu_over = 0;
+            self.cpu_under = 0;
+        }
+    }
+
+    /// True while sustained CPU excess throttles admission.
+    pub fn cpu_throttled(&self) -> bool {
+        self.cpu_throttled
+    }
+
+    /// Pacing pause to insert between admissions while CPU-throttled
+    /// (zero otherwise). Bounded; the run loop sleeps it, never more.
+    pub fn pace_delay(&self) -> Duration {
+        if self.cpu_throttled {
+            CPU_PACE_DELAY
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    /// Effective shared-permit cap (halved, minimum 1, while throttled).
+    fn eff_shared_cap(&self) -> usize {
+        if self.cpu_throttled {
+            (self.limits.shared_permits / 2).max(1)
+        } else {
+            self.limits.shared_permits
+        }
+    }
+
+    /// Effective per-class cap (pinned to the shared cap while throttled).
+    fn eff_class_cap(&self, class_max: usize) -> usize {
+        if self.cpu_throttled {
+            class_max.min(self.eff_shared_cap())
+        } else {
+            class_max
+        }
     }
 
     /// Current admission counters for telemetry.

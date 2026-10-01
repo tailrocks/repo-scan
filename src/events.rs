@@ -393,6 +393,46 @@ pub fn plan_batch_error(volume: &str, error: impl std::fmt::Display) -> BatchErr
     }
 }
 
+/// Stable gap category for failed event-history completeness claims
+/// (EXACT-2/3): the volume's historical phase never closed
+/// (`history_done` unconsumed) or its reconciled cursor never reached the
+/// pinned boundary, so event completeness is unclaimed. Traversal still
+/// covers the scope; only the event-history acceleration is incomplete.
+pub const CLAIM_ERROR_CATEGORY: &str = "event-history-incomplete";
+
+/// Durable action for one failed completeness claim (EXACT-2/3): never
+/// log-and-drop. The owner records (`gap_id`, `scope_key`,
+/// [`CLAIM_ERROR_CATEGORY`], `detail`) via `store.record_error` so the
+/// incomplete history surfaces as an explicit gap in report
+/// coverage/gaps, catalog status, and exit status — not just stderr.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimErrorAction {
+    /// Volume whose claim failed.
+    pub volume_key: String,
+    /// Volume-wide scope (matches [`volume_scope_key`]).
+    pub scope_key: String,
+    /// Stable gap id for `store.record_error`.
+    pub gap_id: String,
+    /// Human-readable detail (report evidence).
+    pub detail: String,
+}
+
+/// Plan the durable gap action for one failed completeness claim. Pure:
+/// the owner applies it through the store. Retrying the claim alone is
+/// wrong — the unconsumed history prefix is still open — so the action
+/// records an explicit gap instead of a silent stderr-only note.
+pub fn plan_claim_error(volume: &str, reason: impl std::fmt::Display) -> ClaimErrorAction {
+    ClaimErrorAction {
+        volume_key: volume.to_string(),
+        scope_key: volume_scope_key(volume),
+        gap_id: format!("gap:event-claim:{volume}"),
+        detail: format!(
+            "event-history completeness not claimed on volume {volume}: {reason}; \
+             traversal covers scope, event history incomplete"
+        ),
+    }
+}
+
 /// Collapse invalidations: sorted, deduplicated, and any path below an
 /// already-listed ancestor removed (a busy directory must not create an
 /// unbounded queue of identical work). Pure and unit-testable.
@@ -1444,6 +1484,25 @@ impl<J: CursorJournal> Reconciler<J> {
         if batch.history_done {
             self.note_history_done(&volume);
         }
+        // A batch carrying the end-of-history sentinel proves delivery
+        // through the pinned boundary — even when coalescing swallowed
+        // the topmost event IDs (FSEvents never promised dense IDs).
+        // Its high-water mark reflects that proof, not just observed
+        // IDs, so reconciled cursors can reach the boundary once the
+        // delivered work is satisfied. Batches without the sentinel
+        // keep their observed mark, and volumes with no recorded
+        // boundary are untouched: only the stream's own close moves a
+        // cursor past unobserved IDs.
+        let high_water = if batch.history_done {
+            batch.high_water.max(
+                self.boundaries
+                    .get(&volume)
+                    .copied()
+                    .unwrap_or(batch.high_water),
+            )
+        } else {
+            batch.high_water
+        };
         let mut kept = Vec::with_capacity(batch.invalidations.len());
         let mut suppressed_own = 0usize;
         for path in &batch.invalidations {
@@ -1463,7 +1522,7 @@ impl<J: CursorJournal> Reconciler<J> {
         let record = self.journal.record_ingested(
             &volume,
             loaded.as_ref().and_then(|c| c.uuid.as_ref()),
-            batch.high_water,
+            high_water,
             &scopes,
             &batch.signals,
         )?;
@@ -1590,6 +1649,18 @@ pub struct MonitoredVolume {
     pub boundary: EventCursorId,
     /// Bounded batch stream for this volume.
     pub batches: Box<dyn crate::platform::EventBatchIter>,
+    /// True when the open rule resumed stored cursors, so a historical
+    /// phase exists and must close (`HistoryDone`) before the checked
+    /// completeness claim can hold. False for fresh `SinceNow` opens:
+    /// no historical phase exists — FSEvents delivers no sentinel for
+    /// a stream that requested no history — so the checked claim does
+    /// not apply and attempting it would manufacture a permanent false
+    /// gap. Such volumes are traversal-covered with live-event
+    /// acceleration; only volumes with live history are claimed.
+    /// The owner sets this from the [`OpenDecision`] after open;
+    /// [`monitor_volumes`] cannot know it (the live-UUID/cursor
+    /// comparison happens in `Reconciler::note_stream_opened`).
+    pub history_expected: bool,
 }
 
 /// Open one history stream per volume BEFORE the initial traversal and pin
@@ -1608,6 +1679,10 @@ pub fn monitor_volumes<S: crate::platform::EventSource + ?Sized>(
             volume_key: volume.0.clone(),
             boundary,
             batches,
+            // Conservative default: the owner enables this from the
+            // open decision where stored cursors resumed (live history
+            // exists and the checked claim applies).
+            history_expected: false,
         });
     }
     Ok(out)

@@ -64,6 +64,36 @@ fn parse_progress(line: &str) -> Option<(u64, u64)> {
     Some((done, pending))
 }
 
+/// Minimum durable acknowledgments before the RESUME-01 kill (clarified
+/// floor: >=1 terminal task while pending work remains; 5 keeps margin
+/// against a single-task fluke without slowing the gate).
+const MIN_ACKS: u64 = 5;
+
+/// Kill-gate predicate: durable evidence of acknowledged work while work
+/// remains. Both counters are store-read per tick (never a fixed-sleep
+/// proxy); `pending > 0` proves the kill lands mid-scan.
+fn kill_gate_met(done: u64, pending: u64) -> bool {
+    done >= MIN_ACKS && pending > 0
+}
+
+#[test]
+fn resume01_kill_gate_requires_acks_with_pending_work() {
+    // Production progress format (`format_progress_line_full_inner`):
+    // store-read cumulative `tasks_done` plus `pending` on one line.
+    let line = "repo-scan: scan abc gen 1 session(this run): claimed=7 dirs=7 entries=70 \
+         stale-requeued=0 | cumulative(scan total): tasks_done=7/50 dirs=7 entries=70 \
+         pending=43 | elapsed=3s rate=1.0 tasks/s eta=~1s scope=- volume=- scope_total=unknown";
+    assert_eq!(parse_progress(line), Some((7, 43)));
+    assert!(kill_gate_met(7, 43));
+    // Drained scan: dones without pending work are never a mid-scan kill.
+    assert!(!kill_gate_met(7, 0));
+    // Below the acknowledgment floor: no durable evidence yet.
+    assert!(!kill_gate_met(MIN_ACKS - 1, 43));
+    // Non-progress lines never satisfy the gate.
+    assert_eq!(parse_progress("repo-scan: starting scan"), None);
+    assert_eq!(parse_progress(""), None);
+}
+
 fn report_json(path: &Path) -> serde_json::Value {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     serde_json::from_slice(&bytes).expect("report is JSON")
@@ -159,7 +189,6 @@ fn resume01_kill_mid_scan_resume_completes_without_redo() {
     // and kills before the first acknowledgment on a loaded host).
     // Progress `tasks_done`/`pending` are store-read per tick, so an
     // observed `tasks_done` count is already durable at kill time.
-    const MIN_ACKS: u64 = 5;
     let mut child = cmd(&state, tmp.path())
         .args([
             "scan",
@@ -188,26 +217,35 @@ fn resume01_kill_mid_scan_resume_completes_without_redo() {
     });
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut acked = 0u64;
+    let mut lines_seen = 0u64;
+    let mut last_progress = String::from("<none>");
     loop {
         if let Some(status) = child.try_wait().expect("poll child") {
             panic!("scan exited ({status}) before the kill window");
         }
+        // Bounded on every path: the deadline is checked above the
+        // receive, so a closed pipe (Disconnected) can never spin past
+        // it while the child lingers.
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "no durable acknowledgment within 120s \
+                 (acked={acked} lines_seen={lines_seen} last_progress={last_progress:?})"
+            );
+        }
         match line_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(line) => {
+                lines_seen += 1;
                 if let Some((done, pending)) = parse_progress(&line) {
                     acked = acked.max(done);
-                    if done >= MIN_ACKS && pending > 0 {
+                    last_progress = line;
+                    if kill_gate_met(done, pending) {
                         break;
                     }
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if Instant::now() > deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!("no durable acknowledgment within 120s (acked={acked})");
-                }
-            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 // stderr closed: the child is exiting; re-polled above.
             }

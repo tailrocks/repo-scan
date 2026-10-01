@@ -138,8 +138,17 @@ pub const STAGING_DIR_NAME: &str = "staging";
 /// Exact known engine files inside `payload/` a clear may remove.
 pub const KNOWN_ENGINE_FILES: &[&str] = &["catalog.db"];
 /// Exact known engine sidecars inside `payload/` a clear may remove.
-pub const KNOWN_SIDECAR_FILES: &[&str] =
-    &["catalog.db-wal", "catalog.db-shm", "catalog.db-journal"];
+/// `catalog.db-tshm` is the multiprocess-WAL coordinator probe target: the
+/// vendored engine compiles with `host_shared_wal` on 64-bit unix/windows
+/// and path-probes it on every legacy open (RS-PRIV-11), so a planted or
+/// stale file must clear with the rest. Keep in sync with
+/// `store::catalog::DB_SIDECAR_SUFFIXES`.
+pub const KNOWN_SIDECAR_FILES: &[&str] = &[
+    "catalog.db-wal",
+    "catalog.db-shm",
+    "catalog.db-journal",
+    "catalog.db-tshm",
+];
 
 /// Resolve the effective state directory to an absolute path exactly once:
 /// leading `~` expansion, then one join against the current directory when

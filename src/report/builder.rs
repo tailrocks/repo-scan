@@ -29,18 +29,23 @@ use crate::report::model::{
     Volume,
 };
 use crate::report::publish::{
-    check_report_id, publish_bound, retain_bound, BoundStaged, PublishReceipt,
+    check_report_id, check_staged_memory_budget, publish_bound, retain_bound, BoundStaged,
+    PublishReceipt,
 };
 use crate::report::stream::StreamingWriter;
 use crate::report::validate::validate_report;
+use serde::de::IgnoredAny;
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-/// Cap for the directory full-path cache (entries; cleared and rebuilt
-/// when full, so correctness never depends on it).
+/// Entry-count cap for the directory full-path cache ([`FullPathCache`];
+/// cleared and rebuilt when full, so correctness never depends on it).
+/// Paired with [`MAX_FULL_PATH_CACHE_BYTES`], which bounds aggregate
+/// retained bytes: total retention never exceeds either bound.
 const PATH_CACHE_CAP: usize = 4096;
 
 /// Maximum parent-chain depth when reconstructing a full path. Deeper
@@ -373,11 +378,14 @@ const MAX_FULL_PATH_BYTES: usize = 1024 * 1024;
 
 /// Intern synthetic (non-`directories`) full paths to stable report IDs.
 /// Memory is bounded by explicit count/byte caps, never by the directory
-/// walk or unbounded caller/store input.
+/// walk or unbounded caller/store input. One canonical store: the map is
+/// the only owner of the raw bytes, so the 64MiB cap bounds the total
+/// retained footprint with no duplicated second copy.
 struct PathInterner {
     by_bytes: HashMap<Vec<u8>, String>,
-    synthetics: Vec<(String, Vec<u8>)>,
     counter: u64,
+    /// Monotonic raw-byte total, hence the peak interned footprint;
+    /// checked against the caller's `rss_target_bytes` resource gate.
     total_bytes: u64,
 }
 
@@ -385,7 +393,6 @@ impl PathInterner {
     fn new() -> Self {
         Self {
             by_bytes: HashMap::new(),
-            synthetics: Vec::new(),
             counter: 0,
             total_bytes: 0,
         }
@@ -395,7 +402,7 @@ impl PathInterner {
         if let Some(id) = self.by_bytes.get(bytes) {
             return Ok(id.clone());
         }
-        if self.synthetics.len() >= MAX_INTERNED_PATHS {
+        if self.by_bytes.len() >= MAX_INTERNED_PATHS {
             return Err(Error::Report(format!(
                 "interned path count exceeds the {MAX_INTERNED_PATHS} bound; refusing"
             )));
@@ -409,16 +416,84 @@ impl PathInterner {
         self.counter += 1;
         self.total_bytes += bytes.len() as u64;
         self.by_bytes.insert(bytes.to_vec(), id.clone());
-        self.synthetics.push((id.clone(), bytes.to_vec()));
         Ok(id)
     }
 }
 
-fn insert_capped(cache: &mut HashMap<i64, Vec<u8>>, key: i64, value: Vec<u8>) {
-    if cache.len() >= PATH_CACHE_CAP {
-        cache.clear();
+/// Maximum aggregate retained bytes across the directory full-path
+/// cache (RESOURCE-RECHECK item 7): together with [`PATH_CACHE_CAP`]
+/// (entry count) this bounds total retention — the cache never holds
+/// more than `PATH_CACHE_CAP` entries nor more than
+/// `MAX_FULL_PATH_CACHE_BYTES` bytes, whichever binds first. Single
+/// values over [`MAX_FULL_PATH_BYTES`] are refused before retention.
+const MAX_FULL_PATH_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Bounded cache of reconstructed directory full paths.
+///
+/// Retention bound: at most [`PATH_CACHE_CAP`] entries and at most
+/// [`MAX_FULL_PATH_CACHE_BYTES`] aggregate bytes; the cache is cleared
+/// and rebuilt when either bound would be exceeded, so correctness never
+/// depends on it. Values longer than [`MAX_FULL_PATH_BYTES`] are refused
+/// *before* retention (never stored): the per-path error is still raised
+/// by [`resolve_full_path`] after reconstruction, but the oversize bytes
+/// are never cached.
+pub struct FullPathCache {
+    map: HashMap<i64, Vec<u8>>,
+    total_bytes: usize,
+}
+
+impl FullPathCache {
+    pub fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            total_bytes: 0,
+        }
     }
-    cache.insert(key, value);
+
+    pub fn get(&self, key: &i64) -> Option<&Vec<u8>> {
+        self.map.get(key)
+    }
+
+    /// Number of retained entries (bounded by [`PATH_CACHE_CAP`]).
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Aggregate retained bytes (bounded by [`MAX_FULL_PATH_CACHE_BYTES`]).
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Insert a reconstructed path, enforcing the retention bounds before
+    /// storing: overlong values (`> MAX_FULL_PATH_BYTES`) are dropped
+    /// without retention, and the cache is cleared first when the
+    /// entry-count or aggregate-byte bound would otherwise be exceeded.
+    pub fn insert(&mut self, key: i64, value: Vec<u8>) {
+        if value.len() > MAX_FULL_PATH_BYTES {
+            return;
+        }
+        if let Some(old) = self.map.remove(&key) {
+            self.total_bytes -= old.len();
+        }
+        if self.map.len() >= PATH_CACHE_CAP
+            || self.total_bytes + value.len() > MAX_FULL_PATH_CACHE_BYTES
+        {
+            self.map.clear();
+            self.total_bytes = 0;
+        }
+        self.total_bytes += value.len();
+        self.map.insert(key, value);
+    }
+}
+
+impl Default for FullPathCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn push_component(full: &mut Vec<u8>, component: &[u8]) {
@@ -430,13 +505,15 @@ fn push_component(full: &mut Vec<u8>, component: &[u8]) {
 
 /// Reconstruct a directory's full path bytes by walking `parent_id` links.
 /// Bounded by [`MAX_PATH_DEPTH`] with cycle detection plus a
-/// [`MAX_FULL_PATH_BYTES`] per-path byte cap (XSEC-08); a bounded cache
-/// amortizes clustered lookups. A vanished parent ends the walk (treated
-/// as a root boundary); under the publication barrier this cannot happen.
+/// [`MAX_FULL_PATH_BYTES`] per-path byte cap (XSEC-08); a bounded
+/// [`FullPathCache`] amortizes clustered lookups, and oversize paths are
+/// refused before cache retention. A vanished parent ends the walk
+/// (treated as a root boundary); under the publication barrier this
+/// cannot happen.
 async fn resolve_full_path(
     conn: &turso::Connection,
     dir_id: i64,
-    cache: &mut HashMap<i64, Vec<u8>>,
+    cache: &mut FullPathCache,
 ) -> crate::Result<Vec<u8>> {
     let full = resolve_full_path_inner(conn, dir_id, cache).await?;
     if full.len() > MAX_FULL_PATH_BYTES {
@@ -450,7 +527,7 @@ async fn resolve_full_path(
 async fn resolve_full_path_inner(
     conn: &turso::Connection,
     dir_id: i64,
-    cache: &mut HashMap<i64, Vec<u8>>,
+    cache: &mut FullPathCache,
 ) -> crate::Result<Vec<u8>> {
     if let Some(hit) = cache.get(&dir_id) {
         return Ok(hit.clone());
@@ -464,7 +541,7 @@ async fn resolve_full_path_inner(
             for component in suffix.iter().rev() {
                 push_component(&mut full, component);
             }
-            insert_capped(cache, dir_id, full.clone());
+            cache.insert(dir_id, full.clone());
             return Ok(full);
         }
         if !visited.insert(current) {
@@ -493,7 +570,7 @@ async fn resolve_full_path_inner(
                 for component in suffix.iter().rev() {
                     push_component(&mut full, component);
                 }
-                insert_capped(cache, dir_id, full.clone());
+                cache.insert(dir_id, full.clone());
                 return Ok(full);
             }
             Some(row) => {
@@ -509,7 +586,7 @@ async fn resolve_full_path_inner(
                         for component in suffix.iter().rev() {
                             push_component(&mut full, component);
                         }
-                        insert_capped(cache, dir_id, full.clone());
+                        cache.insert(dir_id, full.clone());
                         return Ok(full);
                     }
                 }
@@ -768,6 +845,16 @@ async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Res
             None => 0,
         }
     };
+
+    // Resource gate: the interned-path peak is real report memory;
+    // refuse loudly when it already exceeds the caller's RSS target
+    // instead of streaming a report built over budget.
+    if interner.total_bytes > inputs.rss_target_bytes {
+        return Err(Error::Report(format!(
+            "interned path peak {} bytes exceeds the rss_target_bytes {} resource gate; refusing",
+            interner.total_bytes, inputs.rss_target_bytes
+        )));
+    }
 
     Ok(PrePass {
         included_repos,
@@ -1084,7 +1171,7 @@ async fn stream_with_pre_pass<W: Write>(
     // parent/component links), then the interned synthetic paths.
     stream.begin_array_field("paths")?;
     {
-        let mut cache: HashMap<i64, Vec<u8>> = HashMap::new();
+        let mut cache = FullPathCache::new();
         let mut rows = reader
             .query(
                 "SELECT id, volume_id, object_id, incarnation FROM directories ORDER BY id ASC",
@@ -1109,9 +1196,11 @@ async fn stream_with_pre_pass<W: Write>(
             stats.paths += 1;
         }
     }
-    let mut synthetics = pre.interner.synthetics.clone();
-    synthetics.sort_by(|a, b| a.0.cmp(&b.0));
-    for (id, bytes) in &synthetics {
+    // Sort references by report ID: the canonical map is never cloned,
+    // so emission holds no second copy of the bounded path bytes.
+    let mut synthetics: Vec<(&Vec<u8>, &String)> = pre.interner.by_bytes.iter().collect();
+    synthetics.sort_by(|a, b| a.1.cmp(b.1));
+    for (bytes, id) in synthetics {
         let (encoding, value, display) = encode_bytes(bytes);
         stream.array_item(&PathRecord {
             id: id.clone(),
@@ -1482,14 +1571,93 @@ async fn error_path_id(
     }
 }
 
+/// Default RSS target for staged-report verification when the caller
+/// supplies none (R3): 256 MiB, matching the conservative profile default
+/// and the `ReportInputs.rss_target_bytes` test value. Emit paths pass the
+/// caller's configured target instead; the staged envelope's self-declared
+/// target is never trusted for the budget.
+pub const DEFAULT_STAGED_VERIFY_RSS_TARGET_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Low-memory budget probe over staged bytes (R3): counts the records in
+/// every report section without retaining any record content (`IgnoredAny`
+/// elements occupy no heap), so the aggregate budget check runs while the
+/// only live allocation is the staged byte vector itself. Section names
+/// must match [`Report`]'s exactly; a missing section defaults to empty
+/// (the full parse still rejects a malformed envelope afterwards).
+#[derive(Debug, Deserialize)]
+struct StagedBudgetProbe {
+    #[serde(default)]
+    volumes: Vec<IgnoredAny>,
+    #[serde(default)]
+    paths: Vec<IgnoredAny>,
+    #[serde(default)]
+    roots: Vec<IgnoredAny>,
+    #[serde(default)]
+    repositories: Vec<IgnoredAny>,
+    #[serde(default)]
+    checkouts: Vec<IgnoredAny>,
+    #[serde(default)]
+    branches: Vec<IgnoredAny>,
+    #[serde(default)]
+    remotes: Vec<IgnoredAny>,
+    #[serde(default)]
+    storage_links: Vec<IgnoredAny>,
+    #[serde(default)]
+    aliases: Vec<IgnoredAny>,
+    #[serde(default)]
+    candidates: Vec<IgnoredAny>,
+    #[serde(default)]
+    errors: Vec<IgnoredAny>,
+    #[serde(default)]
+    generated_artifacts: Vec<IgnoredAny>,
+}
+
+impl StagedBudgetProbe {
+    fn total_records(&self) -> u64 {
+        (self.volumes.len()
+            + self.paths.len()
+            + self.roots.len()
+            + self.repositories.len()
+            + self.checkouts.len()
+            + self.branches.len()
+            + self.remotes.len()
+            + self.storage_links.len()
+            + self.aliases.len()
+            + self.candidates.len()
+            + self.errors.len()
+            + self.generated_artifacts.len()) as u64
+    }
+}
+
+/// Count staged-report records with the low-memory probe (R3). Malformed
+/// JSON fails here with the same wording the full parse uses, so error
+/// precedence is unchanged.
+fn probe_staged_records(bytes: &[u8]) -> crate::Result<u64> {
+    let probe: StagedBudgetProbe = serde_json::from_slice(bytes)
+        .map_err(|e| Error::Report(format!("staged report bytes are not valid JSON: {e}")))?;
+    Ok(probe.total_records())
+}
+
 /// Parse staged bytes back into a validated [`Report`]. Used by the
 /// REPORT-01 gate, the terminal renderer, and publication retries. The
 /// staging file is opened once (`O_NOFOLLOW`, capped) and the bound bytes
 /// are verified; production file publication reuses the same bound bytes
 /// without re-opening the path.
 pub fn verify_staged_report(staged: &Path) -> crate::Result<Report> {
+    verify_staged_report_capped(staged, DEFAULT_STAGED_VERIFY_RSS_TARGET_BYTES)
+}
+
+/// Parse staged bytes back into a validated [`Report`] under an explicit
+/// aggregate budget (R3). The bound handle is consumed and its byte vector
+/// moved out as the single copy; a low-memory probe counts records, the
+/// aggregate budget is enforced against `rss_target_bytes`, and only then
+/// is the typed report built. The byte buffer is dropped before the
+/// typed-only validation phase, so bytes and the typed report never
+/// coexist past the parse call. Budget exhaustion refuses with an
+/// incomplete-worded resource error instead of exceeding memory.
+pub fn verify_staged_report_capped(staged: &Path, rss_target_bytes: u64) -> crate::Result<Report> {
     let bound = BoundStaged::open(staged)?;
-    verify_bound_report(&bound).map_err(|e| {
+    verify_owned_bound_report(bound, rss_target_bytes).map_err(|e| {
         Error::Report(format!(
             "staged report {} is not valid: {e}",
             staged.display()
@@ -1497,8 +1665,40 @@ pub fn verify_staged_report(staged: &Path) -> crate::Result<Report> {
     })
 }
 
+/// Owned-bound verification (R3): see [`verify_staged_report_capped`].
+/// Consumes the bound handle, enforces the aggregate budget from the
+/// probe count, builds the typed report, then drops the staging bytes
+/// before validation.
+fn verify_owned_bound_report(bound: BoundStaged, rss_target_bytes: u64) -> crate::Result<Report> {
+    let bytes = bound.into_bytes();
+    let records = probe_staged_records(&bytes)?;
+    check_staged_memory_budget(bytes.len() as u64, records, rss_target_bytes)?;
+    let report: Report = serde_json::from_slice(&bytes)
+        .map_err(|e| Error::Report(format!("staged report bytes are not valid JSON: {e}")))?;
+    drop(bytes);
+    validate_report(&report)?;
+    Ok(report)
+}
+
 /// Parse already-bound staged bytes into a validated [`Report`].
 pub fn verify_bound_report(bound: &BoundStaged) -> crate::Result<Report> {
+    verify_bound_report_capped(bound, DEFAULT_STAGED_VERIFY_RSS_TARGET_BYTES)
+}
+
+/// Parse already-bound staged bytes into a validated [`Report`] under an
+/// explicit aggregate budget (R3). A low-memory probe counts records and
+/// the `rss_target_bytes` gate is enforced before the typed build, so the
+/// transient bytes-plus-typed peak stays within budget; the bound bytes
+/// stay borrowed for the caller's later retain/publish stages (same
+/// binding, no re-read). Callers that neither retain nor publish
+/// afterwards should prefer the owned path, which drops the byte buffer
+/// before validation.
+pub fn verify_bound_report_capped(
+    bound: &BoundStaged,
+    rss_target_bytes: u64,
+) -> crate::Result<Report> {
+    let records = probe_staged_records(bound.bytes())?;
+    check_staged_memory_budget(bound.len(), records, rss_target_bytes)?;
     let report: Report = serde_json::from_slice(bound.bytes())
         .map_err(|e| Error::Report(format!("staged report bytes are not valid JSON: {e}")))?;
     validate_report(&report)?;
@@ -1546,7 +1746,7 @@ impl ReportPipeline {
                 staged.display()
             ))
         })?;
-        verify_bound_report(&bound).map_err(|e| {
+        verify_bound_report_capped(&bound, inputs.rss_target_bytes).map_err(|e| {
             quarantine_staging(&staged);
             crate::error::Error::Report(format!(
                 "refusing invalid staged report {}: {e}",
@@ -1612,7 +1812,7 @@ impl ReportPipeline {
                 staged.display()
             ))
         })?;
-        let report = verify_bound_report(&bound).map_err(|e| {
+        let report = verify_bound_report_capped(&bound, inputs.rss_target_bytes).map_err(|e| {
             quarantine_staging(&staged);
             crate::error::Error::Report(format!(
                 "refusing invalid staged report {}: {e}",
@@ -1629,6 +1829,9 @@ impl ReportPipeline {
             now_ms,
         )
         .await?;
+        // R3: the bound bytes are no longer needed once retained; drop them
+        // before rendering so the typed report is the only live allocation.
+        drop(bound);
         crate::report::render::render_terminal(&report, terminal)?;
         store
             .set_snapshot_publication(&inputs.report_id, "retained")
@@ -1651,14 +1854,17 @@ impl ReportPipeline {
         state_dir: &Path,
     ) -> crate::Result<crate::report::Publication> {
         let bound = BoundStaged::open(snapshot_path)?;
-        let report = verify_bound_report(&bound)?;
-        if report.report_id != report_id {
-            return Err(Error::Report(format!(
-                "snapshot {} holds report {}, not {report_id}",
-                snapshot_path.display(),
-                report.report_id
-            )));
-        }
+        {
+            let report =
+                verify_bound_report_capped(&bound, DEFAULT_STAGED_VERIFY_RSS_TARGET_BYTES)?;
+            if report.report_id != report_id {
+                return Err(Error::Report(format!(
+                    "snapshot {} holds report {}, not {report_id}",
+                    snapshot_path.display(),
+                    report.report_id
+                )));
+            }
+        } // R3: typed report dropped before publication; publish ships bytes only.
         match publish_bound(&bound, dest, state_dir) {
             Ok(file) => {
                 store

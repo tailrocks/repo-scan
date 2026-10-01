@@ -17,7 +17,7 @@
 
 use crate::error::Error;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 #[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
@@ -36,6 +36,12 @@ pub const STATE_DIR_MODE: u32 = 0o700;
 /// Owner-only file mode for the lock, marker, and staged/snapshot files (unix).
 #[cfg(unix)]
 pub const STATE_FILE_MODE: u32 = 0o600;
+/// Tool-ownership marker filename inside the payload namespace (R15).
+pub const OWNER_MARKER_NAME: &str = "owner.marker";
+/// Marker format tag (first line of the marker file).
+pub const OWNER_MARKER_TAG: &str = "repo-scan-owner-v1";
+/// Maximum ownership-marker bytes read (RS-PRIV-02: oversize fails closed).
+pub const OWNER_MARKER_MAX_BYTES: u64 = 4096;
 
 /// `<state_dir>/payload`.
 pub fn payload_dir(state_dir: &Path) -> PathBuf {
@@ -50,6 +56,178 @@ pub fn catalog_db_path(state_dir: &Path) -> PathBuf {
 /// `<state_dir>/instance.lock`.
 pub fn lock_path(state_dir: &Path) -> PathBuf {
     state_dir.join(LOCK_FILE_NAME)
+}
+
+/// `<state_dir>/payload/owner.marker`.
+pub fn owner_marker_path(state_dir: &Path) -> PathBuf {
+    payload_dir(state_dir).join(OWNER_MARKER_NAME)
+}
+
+/// Read the ownership marker through a pinned payload-dir FD (RS-PRIV-02):
+/// the payload dir is bound `O_NOFOLLOW|O_DIRECTORY`, the marker is opened
+/// with `openat(O_NOFOLLOW)`, and the open FD must be a regular file of at
+/// most [`OWNER_MARKER_MAX_BYTES`] bytes. Missing payload/marker yields
+/// `Ok(None)`; a symlink, non-regular file, oversize file, or unreadable
+/// file fails closed. The caller validates the tag line and the `db_id=`
+/// binding against the live catalog. Unix only pins FDs; elsewhere the
+/// same kind/size checks run on the path.
+pub fn read_owner_marker_text(state_dir: &Path) -> crate::Result<Option<String>> {
+    #[cfg(unix)]
+    {
+        let payload = payload_dir(state_dir);
+        let dir = match open_dir_nofollow(&payload) {
+            Ok(dir) => dir,
+            Err(_) => {
+                // Missing payload means no marker. An un-openable dir FD
+                // on an otherwise usable payload (macOS denies O_RDONLY
+                // dir opens without read permission even when w+x child
+                // access still works) falls back to a path-validated
+                // marker read with the same kind/size checks the
+                // off-unix build always runs (documented residual: path
+                // re-resolution instead of FD pinning).
+                if !payload.exists() {
+                    return Ok(None);
+                }
+                return read_owner_marker_by_path(state_dir);
+            }
+        };
+        let mut file = match open_child_file(&dir, std::ffi::OsStr::new(OWNER_MARKER_NAME)) {
+            Ok(file) => file,
+            Err(e) => {
+                if !owner_marker_path(state_dir).exists() {
+                    return Ok(None);
+                }
+                return Err(e);
+            }
+        };
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(Error::Store(format!(
+                "ownership marker {} is not a regular file; refusing",
+                owner_marker_path(state_dir).display()
+            )));
+        }
+        if meta.len() > OWNER_MARKER_MAX_BYTES {
+            return Err(Error::Store(format!(
+                "ownership marker {} exceeds {OWNER_MARKER_MAX_BYTES} bytes; refusing",
+                owner_marker_path(state_dir).display()
+            )));
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > OWNER_MARKER_MAX_BYTES {
+            return Err(Error::Store(
+                "ownership marker grew past the size cap during read; refusing".to_string(),
+            ));
+        }
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    }
+    #[cfg(not(unix))]
+    {
+        read_owner_marker_by_path(state_dir)
+    }
+}
+
+/// Path-validated ownership-marker read: the payload dir must be a
+/// non-symlink directory and the marker a non-symlink regular file of at
+/// most [`OWNER_MARKER_MAX_BYTES`] bytes; a missing payload/marker yields
+/// `Ok(None)`. Shared by the off-unix build and the unix fallback for
+/// payload dirs whose FD cannot be opened (documented residual: path
+/// re-resolution, no FD pinning).
+fn read_owner_marker_by_path(state_dir: &Path) -> crate::Result<Option<String>> {
+    let payload = payload_dir(state_dir);
+    match std::fs::symlink_metadata(&payload) {
+        Ok(md) if md.file_type().is_symlink() => {
+            return Err(Error::Store(format!(
+                "refusing symlinked directory {}",
+                payload.display()
+            )));
+        }
+        Ok(md) if !md.is_dir() => {
+            return Err(Error::Store(format!(
+                "not a directory: {}",
+                payload.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(Error::Io(format!(
+                "cannot inspect {}: {e}",
+                payload.display()
+            )));
+        }
+    }
+    let path = owner_marker_path(state_dir);
+    match std::fs::symlink_metadata(&path) {
+        Ok(md) => {
+            if md.file_type().is_symlink() || !md.is_file() {
+                return Err(symlink_refusal("ownership marker is not a regular file"));
+            }
+            if md.len() > OWNER_MARKER_MAX_BYTES {
+                return Err(Error::Store(
+                    "ownership marker exceeds the size cap".to_string(),
+                ));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(Error::Io(format!("cannot inspect {}: {e}", path.display())));
+        }
+    }
+    Ok(Some(
+        String::from_utf8_lossy(&std::fs::read(&path)?).into_owned(),
+    ))
+}
+
+/// `(dev, ino)` of `name` inside the pinned `dir` FD, opened with
+/// `openat(O_NOFOLLOW)` and required to be a regular file (RS-PRIV-08
+/// catalog bind). Missing files yield `Ok(None)`; symlinks and
+/// non-regular files fail closed. Unix only.
+#[cfg(unix)]
+pub fn child_file_identity(
+    dir: &std::fs::File,
+    name: &std::ffi::OsStr,
+) -> crate::Result<Option<(u64, u64)>> {
+    let file = match open_child_file(dir, name) {
+        Ok(file) => file,
+        Err(e) => {
+            // Missing reads as `None`; every other failure (including a
+            // symlinked component, already a store error) fails closed.
+            // Absence is confirmed with `faccessat` against the same
+            // pinned FD so a transient error cannot masquerade as missing.
+            if child_missing(dir, name) {
+                return Ok(None);
+            }
+            return Err(e);
+        }
+    };
+    if !file.metadata()?.is_file() {
+        return Err(Error::Store(format!(
+            "catalog component {name:?} is not a regular file; refusing"
+        )));
+    }
+    Ok(Some(fd_identity(&file)?))
+}
+
+/// True when `name` is absent under the pinned `dir` FD (`faccessat`
+/// `F_OK` returning `ENOENT`). Any other outcome reports false (the
+/// caller fails closed on its original error). Unix only.
+#[cfg(unix)]
+pub fn child_missing(dir: &std::fs::File, name: &std::ffi::OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::AsRawFd;
+    let bytes = name.as_bytes();
+    let Ok(cname) = std::ffi::CString::new(bytes) else {
+        return false;
+    };
+    // SAFETY: `faccessat` with a valid dir FD and NUL-terminated name
+    // inspects only that directory entry.
+    let rc = unsafe { libc::faccessat(dir.as_raw_fd(), cname.as_ptr(), libc::F_OK, 0) };
+    if rc == 0 {
+        return false;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT)
 }
 
 /// Held owner lock. Dropping closes the file (releasing the lock); the
@@ -76,6 +254,26 @@ impl OwnerGuard {
         ensure_private_dir_all(state_dir)?;
         let payload = payload_dir(state_dir);
         ensure_private_dir_all(&payload)?;
+        Self::lock_state(state_dir)
+    }
+
+    /// Acquire the coordination lock for `cache clear`: the state dir is
+    /// ensured (the lock lives there) but `payload/` is deliberately left
+    /// untouched — clear inspects a possibly unlistable, foreign, or
+    /// absent payload itself under the held lock instead of failing (or
+    /// tightening permissions) up front. The caller performs its own
+    /// payload symlink/existence checks after acquiring.
+    pub fn acquire_for_clear(state_dir: &Path) -> crate::Result<Self> {
+        if is_symlink_path(state_dir)? {
+            return Err(symlink_refusal("state dir is a symlink"));
+        }
+        ensure_private_dir_all(state_dir)?;
+        Self::lock_state(state_dir)
+    }
+
+    /// Open (creating), owner-tighten, lock, and note the coordination
+    /// lock. The state dir must already be ensured by the caller.
+    fn lock_state(state_dir: &Path) -> crate::Result<Self> {
         let lock = lock_path(state_dir);
         if is_symlink_path(&lock)? {
             return Err(symlink_refusal("coordination lock is a symlink"));
@@ -91,8 +289,10 @@ impl OwnerGuard {
         let mut file = opts.open(&lock)?;
         #[cfg(unix)]
         {
+            // RS-PRIV-05: fchmod the open FD, never the path (a path chmod
+            // can land on a swapped victim after open).
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(STATE_FILE_MODE))?;
+            file.set_permissions(std::fs::Permissions::from_mode(STATE_FILE_MODE))?;
         }
         lock_exclusive(&file)?;
         let note = format!(
@@ -197,73 +397,209 @@ fn symlink_refusal(detail: &str) -> Error {
 /// Create `path` (parents as needed) as an owner-only directory (`0o700` on
 /// unix, applied to every component this call creates plus the target
 /// itself whether newly created or pre-existing; pre-existing parents are
-/// never touched). A symlinked target is refused before and after creation
-/// (fail closed). After creation each tightened directory is bound through
-/// an `O_NOFOLLOW|O_DIRECTORY` FD: mode is tightened with `fchmod` on the
-/// FD (never the path), and the FD identity is re-verified against the
-/// canonical string so a transient ancestor swap between creation and
-/// binding is detected loudly instead of silently trusted
-/// (RSP-004/XSEC-06/SR-STATE-06).
+/// never touched). RS-PRIV-05/07 ancestor-pinned creation: the nearest
+/// existing ancestor is bound through an `O_NOFOLLOW|O_DIRECTORY` FD (a
+/// symlinked ancestor is refused, not followed), then each missing
+/// component is created with `mkdirat` and opened with `openat`
+/// (`O_NOFOLLOW|O_DIRECTORY`) relative to the pinned parent FD, so an
+/// ancestor swap or symlink plant during creation cannot redirect the
+/// result. Modes are tightened with `fchmod` on the FD (never the path).
+/// The nearest existing ancestor is the trust root: symlinks strictly
+/// above it resolve normally (system prefixes like `/tmp`/`/var` are
+/// legitimately symlinked on some platforms), exactly as with
+/// [`StateRootAnchor`].
 #[cfg(unix)]
 pub fn ensure_private_dir_all(path: &Path) -> crate::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if path.as_os_str().is_empty() {
+        return Err(Error::Store(
+            "refusing empty private directory path".to_string(),
+        ));
+    }
     if is_symlink_path(path)? {
         return Err(symlink_refusal(&format!(
             "directory is a symlink: {}",
             path.display()
         )));
     }
-    // Snapshot the missing chain BEFORE creation so only components this
-    // call creates are tightened; pre-existing parents keep their modes.
-    // Target-first order; tightened top-down after creation.
-    let mut missing: Vec<std::path::PathBuf> = Vec::new();
-    {
-        let mut cur = path;
-        loop {
-            match std::fs::symlink_metadata(cur) {
-                Ok(_) => break,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    missing.push(cur.to_path_buf());
-                    match cur.parent() {
-                        Some(parent) if !parent.as_os_str().is_empty() => cur = parent,
-                        _ => break,
+    // Snapshot the missing chain BEFORE creation (target-first component
+    // names) above the nearest existing ancestor.
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let mut base = path.to_path_buf();
+    loop {
+        match std::fs::symlink_metadata(&base) {
+            Ok(md) => {
+                if md.file_type().is_symlink() {
+                    return Err(symlink_refusal(&format!(
+                        "private ancestor is a symlink: {}",
+                        base.display()
+                    )));
+                }
+                if !md.is_dir() {
+                    return Err(Error::Store(format!(
+                        "private ancestor {} is not a directory",
+                        base.display()
+                    )));
+                }
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match base.file_name() {
+                    Some(name) => missing.push(name.to_os_string()),
+                    None => {
+                        // No file name (root or prefix): pin the parent dir.
+                        break;
                     }
                 }
-                Err(e) => {
-                    return Err(Error::Io(format!("cannot inspect {}: {e}", cur.display())));
+                match base.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => {
+                        base = parent.to_path_buf();
+                    }
+                    _ => {
+                        base = std::path::PathBuf::from(".");
+                        break;
+                    }
                 }
+            }
+            Err(e) => {
+                return Err(Error::Io(format!("cannot inspect {}: {e}", base.display())));
             }
         }
     }
-    std::fs::create_dir_all(path)?;
-    if is_symlink_path(path)? {
-        return Err(symlink_refusal(&format!(
-            "directory is a symlink: {}",
-            path.display()
-        )));
-    }
-    for dir in missing.iter().rev() {
-        bind_and_tighten_dir(dir)?;
-    }
+    // Pin the trust root; a symlink here is refused, never followed.
+    let mut dir = open_dir_nofollow(&base)?;
     if missing.is_empty() {
-        bind_and_tighten_dir(path)?;
+        // Pre-existing target: tighten it exactly as before (RS-PRIV-07:
+        // no canonicalize-then-trust; the FD opened above IS the target).
+        dir.set_permissions(std::fs::Permissions::from_mode(STATE_DIR_MODE))?;
+        verify_dir_mode(&dir, path)?;
+        verify_fd_matches_path(&dir, path)?;
+        return Ok(());
     }
+    for name in missing.iter().rev() {
+        mkdir_at(&dir, name)?;
+        let child = open_child_dir(&dir, name)?;
+        child.set_permissions(std::fs::Permissions::from_mode(STATE_DIR_MODE))?;
+        verify_dir_mode(&child, path)?;
+        dir = child;
+    }
+    // The FD chain ends at the target; one loud re-check that the path
+    // still names the bound directory (swap/restore across the window).
+    verify_fd_matches_path(&dir, path)?;
     Ok(())
 }
 
-/// Bind an existing directory through an `O_NOFOLLOW|O_DIRECTORY` FD,
-/// tighten it to [`STATE_DIR_MODE`] with `fchmod`, and verify the mode and
-/// FD identity loudly. Unix only.
+/// `mkdirat(dirfd, name, 0o700)`; `EEXIST` is absorbed (a racing creator
+/// won) and the caller re-verifies through `openat(O_NOFOLLOW)`.
 #[cfg(unix)]
-fn bind_and_tighten_dir(path: &Path) -> crate::Result<()> {
+fn mkdir_at(dir: &std::fs::File, name: &std::ffi::OsStr) -> crate::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::AsRawFd;
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.contains(&0) || bytes == b"." || bytes == b".." {
+        return Err(Error::Store(format!(
+            "refusing unsafe private path component {name:?}"
+        )));
+    }
+    let cname = std::ffi::CString::new(bytes)
+        .map_err(|_| Error::Store(format!("private path component {name:?} holds a NUL byte")))?;
+    // SAFETY: `mkdirat` on an owned open dir FD with a valid NUL-terminated
+    // name touches only that directory; the FD stays valid for the call.
+    let rc = unsafe {
+        libc::mkdirat(
+            dir.as_raw_fd(),
+            cname.as_ptr(),
+            STATE_DIR_MODE as libc::mode_t,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let errno = std::io::Error::last_os_error();
+    if errno.raw_os_error() == Some(libc::EEXIST) {
+        return Ok(());
+    }
+    Err(Error::Io(format!(
+        "cannot create private directory component {name:?}: {errno}"
+    )))
+}
+
+/// Open `name` relative to the pinned `dir` FD with
+/// `O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC` and verify by `fstat` that
+/// the result is a directory. Symlinks and non-directories are refused
+/// (fail closed). Unix only.
+#[cfg(unix)]
+pub fn open_child_dir(dir: &std::fs::File, name: &std::ffi::OsStr) -> crate::Result<std::fs::File> {
+    let file = open_at(dir, name, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    if !file.metadata()?.is_dir() {
+        return Err(Error::Store(format!(
+            "private component {name:?} is not a directory"
+        )));
+    }
+    Ok(file)
+}
+
+/// Open `name` relative to the pinned `dir` FD with
+/// `O_RDONLY|O_NOFOLLOW|O_CLOEXEC` (files; the caller `fstat`s the kind).
+/// Symlinks are refused with `ELOOP` mapped to a store error. Unix only.
+#[cfg(unix)]
+pub fn open_child_file(
+    dir: &std::fs::File,
+    name: &std::ffi::OsStr,
+) -> crate::Result<std::fs::File> {
+    open_at(dir, name, libc::O_RDONLY)
+}
+
+/// `openat(dirfd, name, flags | O_NOFOLLOW | O_CLOEXEC)`.
+#[cfg(unix)]
+fn open_at(
+    dir: &std::fs::File,
+    name: &std::ffi::OsStr,
+    flags: libc::c_int,
+) -> crate::Result<std::fs::File> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.contains(&0) || bytes == b"." || bytes == b".." {
+        return Err(Error::Store(format!(
+            "refusing unsafe private path component {name:?}"
+        )));
+    }
+    if bytes.contains(&b'/') {
+        return Err(Error::Store(format!(
+            "refusing multi-component private path {name:?}"
+        )));
+    }
+    let cname = std::ffi::CString::new(bytes)
+        .map_err(|_| Error::Store(format!("private path component {name:?} holds a NUL byte")))?;
+    // SAFETY: `openat` on an owned open dir FD with a valid NUL-terminated
+    // single-component name; ownership of the new FD moves into `File`.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            cname.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let errno = std::io::Error::last_os_error();
+        if errno.raw_os_error() == Some(libc::ELOOP) {
+            return Err(Error::Store(format!(
+                "refusing symlinked private component {name:?}"
+            )));
+        }
+        return Err(Error::Io(format!(
+            "cannot open private component {name:?}: {errno}"
+        )));
+    }
+    // SAFETY: `fd` is a fresh owned FD from the successful `openat` above.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// Fail closed unless the open dir FD carries exactly [`STATE_DIR_MODE`].
+#[cfg(unix)]
+fn verify_dir_mode(dir: &std::fs::File, path: &Path) -> crate::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let canonical = path.canonicalize().map_err(|e| {
-        Error::Store(format!(
-            "cannot resolve private directory {}: {e}",
-            path.display()
-        ))
-    })?;
-    let dir = open_dir_nofollow(&canonical)?;
-    dir.set_permissions(std::fs::Permissions::from_mode(STATE_DIR_MODE))?;
     let mode = dir.metadata()?.permissions().mode() & 0o777;
     if mode != STATE_DIR_MODE {
         return Err(Error::Store(format!(
@@ -271,26 +607,33 @@ fn bind_and_tighten_dir(path: &Path) -> crate::Result<()> {
             path.display()
         )));
     }
-    // Transient-swap detector: the bound FD must still be what the
-    // canonical string names. A persistent redirection means the caller's
-    // path genuinely names that directory; a swap/restore across the bind
-    // window is caught here.
-    let (fd_dev, fd_ino) = fd_identity(&dir)?;
-    let restated = std::fs::metadata(&canonical)?;
-    {
-        use std::os::unix::fs::MetadataExt;
-        if restated.dev() != fd_dev || restated.ino() != fd_ino {
-            return Err(Error::Store(format!(
-                "private directory {} changed during creation; refusing",
-                path.display()
-            )));
-        }
-        if !restated.is_dir() {
-            return Err(Error::Store(format!(
-                "private directory {} is not a directory",
-                path.display()
-            )));
-        }
+    Ok(())
+}
+
+/// Fail closed unless the live path still names the bound FD's directory
+/// (same `(dev, ino)`, still a directory, not a symlink). Unix only.
+#[cfg(unix)]
+fn verify_fd_matches_path(dir: &std::fs::File, path: &Path) -> crate::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let (fd_dev, fd_ino) = fd_identity(dir)?;
+    if is_symlink_path(path)? {
+        return Err(Error::Store(format!(
+            "private directory {} is now a symlink; refusing",
+            path.display()
+        )));
+    }
+    let restated = std::fs::metadata(path)?;
+    if (restated.dev(), restated.ino()) != (fd_dev, fd_ino) {
+        return Err(Error::Store(format!(
+            "private directory {} changed (dev,ino) during creation; refusing",
+            path.display()
+        )));
+    }
+    if !restated.is_dir() {
+        return Err(Error::Store(format!(
+            "private directory {} is not a directory",
+            path.display()
+        )));
     }
     Ok(())
 }

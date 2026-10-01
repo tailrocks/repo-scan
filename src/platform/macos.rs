@@ -283,6 +283,16 @@ struct StreamContext {
     budget: &'static StreamBudget,
     /// Last callback delivery in unix millis (SR-EVENT-01 heartbeat).
     last_callback_ms: AtomicU64,
+    /// A dropped event carried the `HistoryDone` sentinel. Flood drops
+    /// must not lose the historical-phase close: the rescan signal
+    /// covers the dropped paths, and this latch carries the sentinel
+    /// into the next emitted batch. Drained (swap) by `next_batch`.
+    dropped_history_done: AtomicBool,
+    /// Highest event ID seen on dropped events. Merged into the next
+    /// emitted batch's high-water mark so ingested cursors stay ahead
+    /// of coalesced-away events (their paths are covered by the
+    /// overflow rescan). Drained (swap) by `next_batch`.
+    dropped_max_id: AtomicU64,
 }
 
 /// FSEvents history callback. Runs on the stream's dispatch queue; only
@@ -317,21 +327,35 @@ unsafe extern "C-unwind" fn fsevents_callback(
         // path_ptr is a NUL-terminated C string per the FSEvents contract.
         let path_bytes = unsafe { CStr::from_ptr(path_ptr) }.to_bytes();
         ctx.last_callback_ms.store(unix_millis(), Ordering::Relaxed);
+        let observed_flags: FSEventStreamEventFlags = unsafe { *flags.add(i) };
+        let observed_id: FSEventStreamEventId = unsafe { *ids.add(i) };
+        // A drop preserves what the rescan signal cannot carry: the
+        // historical-phase sentinel and the highest observed event ID.
+        // Drained into the next emitted batch by `next_batch`, so a
+        // flood can delay but never lose the history close.
+        let preserve_dropped = || {
+            if observed_flags & kFSEventStreamEventFlagHistoryDone != 0 {
+                ctx.dropped_history_done.store(true, Ordering::Relaxed);
+            }
+            ctx.dropped_max_id.fetch_max(observed_id, Ordering::Relaxed);
+        };
         if !ctx.budget.try_charge_bytes(path_bytes.len()) {
             // Aggregate queue-byte budget exhausted (SR-STATE-02): drop
             // the path but keep the volume-wide rescan signal — never
             // grow memory, never go silent.
             ctx.overflow.store(true, Ordering::Relaxed);
+            preserve_dropped();
             continue;
         }
         let event = RawEvent {
             path: path_bytes.to_vec(),
-            flags: unsafe { *flags.add(i) },
-            id: unsafe { *ids.add(i) },
+            flags: observed_flags,
+            id: observed_id,
         };
         if ctx.tx.try_send(event).is_err() {
             ctx.overflow.store(true, Ordering::Relaxed);
             ctx.budget.release_bytes(path_bytes.len());
+            preserve_dropped();
         }
     }
 }
@@ -481,6 +505,8 @@ fn create_stream(
         overflow: AtomicBool::new(false),
         budget: &NATIVE_STREAM_BUDGET,
         last_callback_ms: AtomicU64::new(unix_millis()),
+        dropped_history_done: AtomicBool::new(false),
+        dropped_max_id: AtomicU64::new(0),
     });
     let info = Box::into_raw(ctx) as *mut std::ffi::c_void;
     let mut context = FSEventStreamContext {
@@ -519,6 +545,12 @@ fn create_stream(
     // SAFETY: stream is valid and scheduled.
     let started = unsafe { FSEventStreamStart(stream) };
     if !started {
+        // Start-failure no-enqueue: `FSEventStreamStart` returned false,
+        // so no callback was ever enqueued on the queue and no barrier
+        // is needed before freeing the context. (Contrast
+        // `teardown_stream`, where a started stream may have callbacks
+        // in flight and the barrier must precede both `Release` and the
+        // free.)
         unsafe {
             FSEventStreamInvalidate(stream);
             FSEventStreamRelease(stream);
@@ -565,12 +597,14 @@ unsafe impl Send for FsEventStreamIter {}
 ///
 /// `FSEventStreamStop` is asynchronous with respect to the dispatch
 /// queue: a callback already enqueued or running can still execute
-/// after Stop/Invalidate/Release return. The context box must therefore
-/// stay alive until a synchronous barrier on the stream's private
-/// serial queue proves no callback is in flight; freeing it earlier is
-/// a use-after-free (SIGSEGV observed under parallel-test load, with
-/// the faulting frame inside `fsevents_callback` after Drop had freed
-/// the context).
+/// after Stop/Invalidate return. The context box must therefore stay
+/// alive until a synchronous barrier on the stream's private serial
+/// queue proves no callback is in flight; freeing it earlier is a
+/// use-after-free (SIGSEGV observed under parallel-test load, with the
+/// faulting frame inside `fsevents_callback` after Drop had freed the
+/// context). `FSEventStreamRelease` runs after the barrier for the same
+/// reason: the stream object must stay alive while a callback may still
+/// reference it.
 ///
 /// Must run on the scan thread, never on the stream's own queue (a
 /// synchronous dispatch onto the current serial queue deadlocks). The
@@ -581,14 +615,15 @@ fn teardown_stream(stream: FSEventStreamRef, info: *mut std::ffi::c_void, queue:
     unsafe {
         FSEventStreamStop(stream);
         FSEventStreamInvalidate(stream);
-        FSEventStreamRelease(stream);
     }
     // The queue is serial and private to this stream, and the stream is
     // stopped and invalidated, so when this empty block runs, every
     // previously enqueued callback has finished and none can follow:
-    // the context is unreachable from the queue from here on.
+    // the context is unreachable from the queue from here on. Only then
+    // is the stream released and the context freed.
     queue.exec_sync(|| {});
     unsafe {
+        FSEventStreamRelease(stream);
         let _ = Box::from_raw(info as *mut StreamContext);
     }
 }
@@ -657,7 +692,7 @@ impl FsEventStreamIter {
         };
         let (stream, info, rx, queue) = create_stream(self.dev, since, &self.volume_key)?;
         // The new stream is live: tear down the old one exactly like Drop
-        // (stop / invalidate / release / queue barrier / free), then
+        // (stop / invalidate / queue barrier / release / free), then
         // drain its channel — freeing the context dropped the only
         // sender, so the drain releases every still-queued byte exactly
         // once. `self._queue` is still the OLD queue here (replaced
@@ -789,12 +824,21 @@ impl EventBatchIter for FsEventStreamIter {
         // SAFETY: the context box is alive until Drop/restart (which
         // stop the stream and barrier-drain the queue before freeing),
         // and next_batch cannot run during Drop.
-        let overflowed = unsafe { &*(self.info as *const StreamContext) }
-            .overflow
-            .swap(false, Ordering::Relaxed);
+        let dropped = unsafe { &*(self.info as *const StreamContext) };
+        let overflowed = dropped.overflow.swap(false, Ordering::Relaxed);
         if overflowed {
             signals.push(ContinuitySignal::MustScanSubDirs);
         }
+        // Flood drops preserve the historical-phase sentinel and the
+        // highest dropped event ID (the callback records both): merge
+        // them here so a flood delays but never loses the history
+        // close, and ingested cursors stay ahead of coalesced-away
+        // events (covered by the rescan above). A concurrent delivery
+        // lands in the next batch via the same latches.
+        if dropped.dropped_history_done.swap(false, Ordering::Relaxed) {
+            history_done = true;
+        }
+        high_water = high_water.max(dropped.dropped_max_id.swap(0, Ordering::Relaxed));
 
         if count == 0 && signals.is_empty() && !history_done {
             // SR-EVENT-01: prove liveness before reporting idle — an empty

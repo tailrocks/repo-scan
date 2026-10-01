@@ -9,9 +9,10 @@
 //! CPU beyond what the kernel sees arrives through [`SamplerInputs`]. Live
 //! helper RSS is `Some(n)` when measured (including `Some(0)` when no helpers
 //! exist) and `None` when live helpers exist but are not instrumented — an
-//! honest unknown, never a fake zero. On macOS the owner RSS reading is a
-//! `ru_maxrss` peak stand-in and stays labeled peak (see
-//! [`ResourceSample::rss_is_peak`] and [`Telemetry::accounting_method`]).
+//! honest unknown, never a fake zero. Owner RSS is CURRENT on every target
+//! (macOS via `task_info` `resident_size`); the macOS `ru_maxrss` peak is
+//! retained for reporting only (see `ResourceSample::owner_peak_rss_bytes`
+//! and [`Telemetry::accounting_method`]) and never feeds admission.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime};
@@ -32,9 +33,13 @@ pub struct ResourceSample {
     /// helpers exist); `None` means honest unknown (live helpers exist but
     /// per-helper RSS is not instrumented) — never a fake zero.
     pub helpers_rss_bytes: Option<u64>,
-    /// True when RSS readings on this target are `ru_maxrss` peak stand-ins
-    /// (macOS), not current RSS. Peak stays labeled peak.
+    /// Legacy flag: always false now that every target reports CURRENT RSS
+    /// (macOS via `task_info` `resident_size`). Kept for API stability; the
+    /// macOS `ru_maxrss` peak lives in `owner_peak_rss_bytes`.
     pub rss_is_peak: bool,
+    /// Owner `ru_maxrss` peak bytes on macOS (reporting only — never an
+    /// admission input); `None` on targets without a separate peak source.
+    pub owner_peak_rss_bytes: Option<u64>,
     /// Rolling mean logical cores over the 10 s window.
     pub rolling_cores: f64,
     /// Cumulative CPU seconds: owner plus measured reaped-children CPU plus
@@ -184,10 +189,11 @@ pub fn live_helper_rss_bytes(helpers_live: usize) -> Option<u64> {
     }
 }
 
-/// True when RSS readings on this target are `ru_maxrss` peak stand-ins
-/// (macOS), not current RSS. Peak stays labeled peak.
+/// False on every target: RSS readings are CURRENT (macOS `task_info`
+/// `resident_size`, Linux `/proc/self/statm`). Kept for API stability; the
+/// macOS `ru_maxrss` peak is retained per-sample for reporting only.
 pub fn rss_is_peak() -> bool {
-    cfg!(target_os = "macos")
+    false
 }
 
 /// Rolling CPU window: keeps (instant, cumulative CPU seconds) samples and
@@ -238,19 +244,81 @@ fn owner_rss_bytes() -> u64 {
     resident.saturating_mul(page)
 }
 
-/// Owner RSS on macOS: `ru_maxrss` peak as a conservative stand-in. A true
-/// current-RSS read needs `task_info` (out of `libc`'s surface); the
-/// accounting string discloses this. See unresolved note in the walk-impl
-/// evidence: wiring `task_info` current RSS is follow-up work.
+/// Mach `task_info` flavor for [`MachTaskBasicInfo`].
+#[cfg(target_os = "macos")]
+const MACH_TASK_BASIC_INFO: i32 = 20;
+/// Mach success code.
+#[cfg(target_os = "macos")]
+const KERN_SUCCESS: i32 = 0;
+
+/// `struct mach_task_basic_info` (64-bit macOS, 64 bytes, `#[repr(C)]`).
+/// Fields other than `resident_size` are written by the kernel and unread.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[allow(dead_code)]
+struct MachTaskBasicInfo {
+    suspend_count: i32,
+    _pad1: i32,
+    virtual_size: u64,
+    resident_size: u64,
+    user_time_seconds: i64,
+    user_time_microseconds: i32,
+    _pad2: i32,
+    system_time_seconds: i64,
+    system_time_microseconds: i32,
+    _pad3: i32,
+    policy: i32,
+    _pad4: i32,
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn mach_task_self() -> u32;
+    fn task_info(
+        target_task: u32,
+        flavor: i32,
+        task_info_out: *mut i32,
+        task_info_count: *mut u32,
+    ) -> i32;
+}
+
+/// Owner RSS on macOS: CURRENT `resident_size` via `task_info` (`libc`
+/// has no Mach surface, so the two calls above are declared directly;
+/// libSystem is always linked). Returns 0 when the call fails.
 #[cfg(target_os = "macos")]
 fn owner_rss_bytes() -> u64 {
+    // SAFETY: the self task port is valid; info/count are writable for the
+    // call. Count is in 4-byte units (16 = 64 bytes); an oversized count is
+    // safe — the kernel writes exactly the struct.
+    unsafe {
+        let task = mach_task_self();
+        let mut info: MachTaskBasicInfo = std::mem::zeroed();
+        let mut count: u32 =
+            (std::mem::size_of::<MachTaskBasicInfo>() / std::mem::size_of::<u32>()) as u32;
+        let out = &mut info as *mut MachTaskBasicInfo as *mut i32;
+        if task_info(task, MACH_TASK_BASIC_INFO, out, &mut count) != KERN_SUCCESS {
+            return 0;
+        }
+        info.resident_size
+    }
+}
+
+/// Owner `ru_maxrss` peak bytes on macOS (bytes, not kilobytes as on
+/// Linux). Reporting only: never an admission input.
+#[cfg(target_os = "macos")]
+fn owner_peak_rss_bytes() -> Option<u64> {
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     // SAFETY: usage is writable for the call.
     if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
-        return 0;
+        return None;
     }
-    // macOS ru_maxrss is in bytes (not kilobytes as on Linux).
-    usage.ru_maxrss.max(0) as u64
+    Some(usage.ru_maxrss.max(0) as u64)
+}
+
+/// No separate peak source off macOS.
+#[cfg(not(target_os = "macos"))]
+fn owner_peak_rss_bytes() -> Option<u64> {
+    None
 }
 
 /// Owner RSS fallback for other targets.
@@ -313,7 +381,7 @@ const ACCOUNTING_METHOD: &str =
     "linux: owner RSS (current) from /proc/self/statm resident pages; CPU = getrusage(RUSAGE_SELF) + measured getrusage(RUSAGE_CHILDREN) + owner-retained SamplerInputs.helpers_cpu_seconds; live-helper RSS is Some(n) when measured (Some(0)=measured zero, no helpers) and None=honest unknown when live helpers exist but are not instrumented (aggregate is owner-only then)";
 #[cfg(target_os = "macos")]
 const ACCOUNTING_METHOD: &str =
-    "macos: owner RSS is getrusage ru_maxrss PEAK bytes, not current RSS (task_info current-RSS wiring pending; peak stays labeled peak); CPU = getrusage(RUSAGE_SELF) + measured getrusage(RUSAGE_CHILDREN) + owner-retained SamplerInputs.helpers_cpu_seconds; live-helper RSS is Some(n) when measured (Some(0)=measured zero, no helpers) and None=honest unknown when live helpers exist but are not instrumented (aggregate is owner-peak-only then)";
+    "macos: owner RSS is CURRENT resident_size bytes via task_info(MACH_TASK_BASIC_INFO); getrusage ru_maxrss PEAK retained for reporting only (never an admission input); CPU = getrusage(RUSAGE_SELF) + measured getrusage(RUSAGE_CHILDREN) + owner-retained SamplerInputs.helpers_cpu_seconds; live-helper RSS is Some(n) when measured (Some(0)=measured zero, no helpers) and None=honest unknown when live helpers exist but are not instrumented (aggregate is owner-only then)";
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 const ACCOUNTING_METHOD: &str =
     "fallback: owner RSS/CPU unsupported on this target (reported 0); reaped-children CPU unsupported (0); live-helper RSS via SamplerInputs only (Some(n)=measured, None=honest unknown)";
@@ -337,7 +405,8 @@ impl FootprintSampler {
     /// Reaped-subprocess CPU (`RUSAGE_CHILDREN`) is measured automatically on
     /// top of the owner-retained input so short-lived subprocess CPU (e.g.
     /// installed-git fallback probes) cannot be reset by respawning. When
-    /// helper RSS is unknown (`None`), the aggregate is owner-only.
+    /// helper RSS is unknown (`None`), the aggregate is owner-only. The
+    /// macOS `ru_maxrss` peak rides along for reporting only.
     pub fn sample_with(&self, inputs: &SamplerInputs) -> ResourceSample {
         let now = Instant::now();
         let owner_cpu = owner_cpu_seconds();
@@ -361,6 +430,7 @@ impl FootprintSampler {
             owner_rss_bytes: owner_rss,
             helpers_rss_bytes: inputs.helpers_rss_bytes,
             rss_is_peak: rss_is_peak(),
+            owner_peak_rss_bytes: owner_peak_rss_bytes(),
             rolling_cores,
             cpu_seconds: cpu,
             owner_cpu_seconds: owner_cpu,

@@ -18,6 +18,10 @@ concurrency:
   cancel-in-progress: true
 jobs:
   audit:
+    # RS-CI-01: GitHub-hosted labels take no digest, so full image
+    # immutability needs a self-hosted or container runner pinned by digest
+    # (owner action, see docs/AUDIT_GATE.md §1). Until then the exact image
+    # version is recorded in the provenance step below.
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -76,9 +80,13 @@ jobs:
           export PATH="$RUNNER_TEMP/cargo-home/bin:$PATH"
           export CARGO_HOME="$RUNNER_TEMP/cargo-home"
           rustc --version
+          rustc --version --verbose
           cargo-audit --version
           cargo-deny --version
+          sha256sum "$RUNNER_TEMP/cargo-home/bin/cargo-audit" "$RUNNER_TEMP/cargo-home/bin/cargo-deny"
           sha256sum "$GITHUB_WORKSPACE/Cargo.lock"
+          echo "runner_image_os=$ImageOS runner_image_version=$ImageVersion"
+          cat /etc/os-release
           echo "source_oid=$GITHUB_SHA"
           git -C "$GITHUB_WORKSPACE" rev-parse HEAD
           db_found=0

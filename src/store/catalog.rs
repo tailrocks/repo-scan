@@ -44,6 +44,9 @@ pub struct TursoStore {
     read_only: bool,
     counters: StoreCounters,
     state_anchor: Option<StateRootAnchor>,
+    /// Catalog-file `(dev, ino)` bound at open (RS-PRIV-08, unix only;
+    /// always `None` elsewhere). Re-checked by [`TursoStore::verify_state_root`].
+    catalog_id: Option<(u64, u64)>,
 }
 
 /// Lock-free runtime counters behind [`TursoStore::stats`]. Open/migration
@@ -151,45 +154,123 @@ fn state_root_for_db(db_path: &Path) -> Option<PathBuf> {
     Some(parent.to_path_buf())
 }
 
-/// Best-effort `0600` on the catalog file plus WAL sidecars, then verify.
-/// Missing sidecars are skipped; an existing file that still allows
-/// group/other access fails closed (unix only; no-op elsewhere).
+/// Engine sidecar suffixes hardened and bound with the catalog file.
+/// `-tshm` is the multiprocess-WAL coordinator probe target: repo-scan
+/// never enables `experimental_multiprocess_wal`, but the vendored engine
+/// compiles WITH the `host_shared_wal` cfg on every 64-bit unix/windows
+/// target (turso_core `build.rs` cfg_aliases; `cargo:rustc-cfg=host_shared_wal`
+/// observed in this repo's own debug AND release build output), so every
+/// legacy engine open path-probes `<db>-tshm`, follows a symlink there,
+/// and mmaps a present file (RS-PRIV-11). Keep in sync with
+/// `config::KNOWN_SIDECAR_FILES` (clear path).
+const DB_SIDECAR_SUFFIXES: &[&str] = &["-wal", "-shm", "-journal", "-tshm"];
+
+/// Harden the catalog file plus engine sidecars to `0600`, then verify
+/// (RS-PRIV-03/11). The parent dir is pinned `O_NOFOLLOW|O_DIRECTORY` and
+/// every candidate is opened with `openat(O_NOFOLLOW)` and `fstat`'d from
+/// the FD: symlinks and non-regular files are refused (fail closed),
+/// modes are applied with `fchmod` on the FD, and permission errors FAIL
+/// (never ignored). Missing sidecars are skipped. Called BEFORE the engine
+/// open (so a hostile sidecar never meets the path-following engine) and
+/// again after (post-open re-verify). Unix only; no-op elsewhere.
 #[cfg(unix)]
 fn ensure_private_db_files(db_path: &Path) -> crate::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let mut candidates = vec![db_path.to_path_buf()];
-    if let Some(name) = db_path.file_name() {
-        if let Some(parent) = db_path.parent() {
-            for suffix in ["-wal", "-shm", "-journal"] {
-                let mut file = std::ffi::OsString::from(name);
-                file.push(suffix);
-                candidates.push(parent.join(file));
-            }
-        }
+    let Some(file_name) = db_path.file_name() else {
+        return Err(Error::Store(format!(
+            "database path {} has no file name",
+            db_path.display()
+        )));
+    };
+    let parent = match db_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let dir = crate::store::owner::open_dir_nofollow(parent)?;
+    let mut names: Vec<std::ffi::OsString> = vec![file_name.to_os_string()];
+    for suffix in DB_SIDECAR_SUFFIXES {
+        let mut name = file_name.to_os_string();
+        name.push(suffix);
+        names.push(name);
     }
-    for path in candidates {
-        let meta = match std::fs::symlink_metadata(&path) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => continue,
+    for name in &names {
+        let file = match crate::store::owner::open_child_file(&dir, name) {
+            Ok(file) => file,
+            Err(e) => {
+                if crate::store::owner::child_missing(&dir, name) {
+                    continue;
+                }
+                return Err(e);
+            }
         };
-        if meta.file_type().is_symlink() || !meta.is_file() {
-            continue;
+        if !file.metadata()?.is_file() {
+            return Err(Error::Store(format!(
+                "catalog component {name:?} under {} is not a regular file; refusing",
+                parent.display()
+            )));
         }
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        let mode = match std::fs::metadata(&path) {
-            Ok(m) => m.permissions().mode() & 0o777,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(Error::Io(format!("cannot inspect {}: {e}", path.display()))),
-        };
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        let mode = file.metadata()?.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
             return Err(Error::Store(format!(
-                "catalog file {} mode is {mode:o}, want no group/other access",
-                path.display()
+                "catalog component {name:?} under {} mode is {mode:o}, want no group/other access",
+                parent.display()
             )));
         }
     }
     Ok(())
+}
+
+/// Pre-engine catalog bind (RS-PRIV-08, unix): the payload dir stays
+/// pinned across the engine open and the catalog file identity observed
+/// before the open is re-compared after it. The engine opens by path
+/// string, so a swap exactly inside the open window is invisible; the
+/// re-compare catches every net change, and the lifetime re-check in
+/// [`TursoStore::verify_state_root`] keeps catching later ones.
+#[cfg(unix)]
+struct CatalogBind {
+    dir: std::fs::File,
+    name: std::ffi::OsString,
+    before: Option<(u64, u64)>,
+}
+
+#[cfg(unix)]
+impl CatalogBind {
+    fn preopen(db_path: &Path) -> crate::Result<Self> {
+        let Some(file_name) = db_path.file_name() else {
+            return Err(Error::Store(format!(
+                "database path {} has no file name",
+                db_path.display()
+            )));
+        };
+        let parent = match db_path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let dir = crate::store::owner::open_dir_nofollow(parent)?;
+        let before = crate::store::owner::child_file_identity(&dir, file_name)?;
+        Ok(Self {
+            dir,
+            name: file_name.to_os_string(),
+            before,
+        })
+    }
+
+    fn verify_postopen(&self, db_path: &Path) -> crate::Result<Option<(u64, u64)>> {
+        let after = crate::store::owner::child_file_identity(&self.dir, &self.name)?;
+        match (self.before, after) {
+            (Some(was), Some(now)) if was == now => Ok(after),
+            (None, _) => Ok(after),
+            (Some(_), None) => Err(Error::Store(format!(
+                "catalog {} was removed under the engine open; refusing",
+                db_path.display()
+            ))),
+            (Some(_), Some(_)) => Err(Error::Store(format!(
+                "catalog {} was swapped under the engine open; refusing",
+                db_path.display()
+            ))),
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -556,6 +637,11 @@ impl TursoStore {
         if let Some(anchor) = &state_anchor {
             anchor.verify()?;
         }
+        // RS-PRIV-03/08: harden sidecars BEFORE the path-following engine
+        // open, and bind the catalog file identity across the open.
+        ensure_private_db_files(db_path)?;
+        #[cfg(unix)]
+        let pre_bind = CatalogBind::preopen(db_path)?;
         let path_str = db_path.to_str().ok_or_else(|| {
             Error::Store(format!("database path is not UTF-8: {}", db_path.display()))
         })?;
@@ -570,6 +656,10 @@ impl TursoStore {
             anchor.verify()?;
         }
         ensure_private_db_files(db_path)?;
+        #[cfg(unix)]
+        let catalog_id = pre_bind.verify_postopen(db_path)?;
+        #[cfg(not(unix))]
+        let catalog_id: Option<(u64, u64)> = None;
         Self::apply_pragmas(&conn).await?;
         let schema_version = Self::migrate(&conn).await?;
         let epoch = i64_to_u64(
@@ -600,6 +690,7 @@ impl TursoStore {
             read_only: false,
             counters: StoreCounters::default(),
             state_anchor,
+            catalog_id,
         })
     }
 
@@ -637,6 +728,11 @@ impl TursoStore {
         // engine even through the raw `connection()` handle. The
         // `read_only` flag plus `forbid_write` remain as the first
         // refusal layer for writer entry points.
+        // RS-PRIV-03/08: same pre-engine hardening and file-identity bind
+        // as the owner open, including the `-tshm` probe target.
+        ensure_private_db_files(db_path)?;
+        #[cfg(unix)]
+        let pre_bind = CatalogBind::preopen(db_path)?;
         let db = turso::Builder::new_local(path_str)
             .read_only(true)
             .build()
@@ -648,6 +744,11 @@ impl TursoStore {
         if let Some(anchor) = &state_anchor {
             anchor.verify()?;
         }
+        ensure_private_db_files(db_path)?;
+        #[cfg(unix)]
+        let catalog_id = pre_bind.verify_postopen(db_path)?;
+        #[cfg(not(unix))]
+        let catalog_id: Option<(u64, u64)> = None;
         conn.busy_timeout(Duration::from_secs(5))
             .map_err(store_err)?;
         let journal_mode = Self::pragma_text(&conn, "journal_mode").await?;
@@ -695,6 +796,7 @@ impl TursoStore {
             read_only: true,
             counters: StoreCounters::default(),
             state_anchor,
+            catalog_id,
         })
     }
 
@@ -705,7 +807,52 @@ impl TursoStore {
         if let Some(anchor) = &self.state_anchor {
             anchor.verify()?;
         }
+        self.verify_catalog_identity()
+    }
+
+    /// Re-verify the catalog-file identity bound at open (RS-PRIV-08,
+    /// unix): fail closed when the live path no longer names the same
+    /// `(dev, ino)` regular file. A swap restored between verifies is not
+    /// observable at this layer (same residual as the state anchor).
+    fn verify_catalog_identity(&self) -> crate::Result<()> {
+        #[cfg(not(unix))]
+        let _ = self.catalog_id;
+        #[cfg(unix)]
+        {
+            let Some((dev, ino)) = self.catalog_id else {
+                return Ok(());
+            };
+            let meta = std::fs::metadata(&self.db_path).map_err(|e| {
+                Error::Store(format!(
+                    "catalog {} is unreachable; refusing: {e}",
+                    self.db_path.display()
+                ))
+            })?;
+            if !meta.is_file() {
+                return Err(Error::Store(format!(
+                    "catalog {} is no longer a regular file; refusing",
+                    self.db_path.display()
+                )));
+            }
+            {
+                use std::os::unix::fs::MetadataExt;
+                if (meta.dev(), meta.ino()) != (dev, ino) {
+                    return Err(Error::Store(format!(
+                        "catalog {} changed (dev,ino) under the open handle; refusing",
+                        self.db_path.display()
+                    )));
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Live `meta.db_id` of the open catalog (RS-PRIV-02/06): ownership
+    /// binding compares this exact value against the marker's `db_id=`
+    /// line. `None` when the row is absent (never on tool-created v1
+    /// catalogs, which seed it in `seed_meta`).
+    pub async fn catalog_db_id(&self) -> crate::Result<Option<String>> {
+        Self::read_meta_text(&self.conn, "db_id").await
     }
 
     /// Explicit transaction helper: `BEGIN IMMEDIATE`, run `f`, then an
@@ -3158,6 +3305,48 @@ impl TursoStore {
             .await
             .map_err(store_err)?;
         Ok(())
+    }
+
+    /// Resolve a volume's event gaps after successful bounded recovery
+    /// (RSF-GAP-RECOVERY): a later rescan or consumed `HistoryDone` closes
+    /// BOTH `gap:event-batch:<volume>` and `gap:event-claim:<volume>` in
+    /// ONE transaction, so one failed batch/claim can never pin every
+    /// later generation incomplete. Evidence rows stay; only `open` flips.
+    /// Returns true only when a transaction committed (an open gap
+    /// existed); the no-gap path is read-only, keeping hot drains free of
+    /// write transactions. Any later failure re-opens via `record_error`,
+    /// so resolving on a proven recovery signal never hides fresh
+    /// breakage.
+    pub async fn resolve_event_gaps_for_volume(
+        &self,
+        volume: &str,
+        now_ms: i64,
+    ) -> crate::Result<bool> {
+        let batch_gap = format!("gap:event-batch:{volume}");
+        let claim_gap = format!("gap:event-claim:{volume}");
+        let mut open = false;
+        for gap_id in [&batch_gap, &claim_gap] {
+            if self.get_error(gap_id).await?.is_some_and(|row| row.open) {
+                open = true;
+                break;
+            }
+        }
+        if !open {
+            return Ok(false);
+        }
+        self.with_tx(move |conn| async move {
+            for gap_id in [&batch_gap, &claim_gap] {
+                conn.execute(
+                    "UPDATE errors SET open = 0, last_seen_ms = ?1 WHERE id = ?2",
+                    vec![v_int(now_ms), v_text(gap_id.as_str())],
+                )
+                .await
+                .map_err(store_err)?;
+            }
+            Ok::<(), Error>(())
+        })
+        .await?;
+        Ok(true)
     }
 
     /// Fetch one error record by id.

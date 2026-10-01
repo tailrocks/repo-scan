@@ -114,6 +114,23 @@ succeeded from lack of error.
   process only. Same-process concurrent connections on one `Database` ARE the
   supported topology (8-writer contention test with `Busy` retry:
   turso lib.rs:874-949).
+- RS-PRIV-11 build fact (recorded, must survive dependency bumps):
+  `host_shared_wal` is NOT a cargo feature (absent from both `[features]`
+  tables) but a `cfg_aliases` cfg set by `turso_core-0.8.1/build.rs` for
+  every 64-bit unix/windows target — ACTIVE in repo-scan's own builds
+  (`cargo:rustc-cfg=host_shared_wal` present in both the debug and the
+  release `turso_core` build output). With the cfg compiled in, EVERY
+  legacy open runs `reject_live_multiprocess_wal_for_legacy_open`
+  (database.rs:933-971) → `MappedSharedWalCoordination::open_existing(io,
+  "<db>-tshm")` → path-based `io.open_file` (io/unix.rs:50-60, no
+  `O_NOFOLLOW`): a present `-tshm` file is fcntl-probed, size-checked, and
+  `mmap`'d, so garbage fails every open (fail-closed DoS) and a symlink is
+  followed. Repo-scan never creates `-tshm` itself (multiprocess off) but
+  hardens it like every other sidecar pre-engine
+  (`store::catalog::DB_SIDECAR_SUFFIXES`), binds it by FD, and clears it
+  (`config::KNOWN_SIDECAR_FILES`). Re-verify this cfg on every Turso bump:
+  if a future version enables multiprocess by default, the invariant must
+  be requalified before the bump lands.
 - MVCC / `BEGIN CONCURRENT`: experimental path (`journal_mode` `mvcc`
   supported flag exists, journal_mode.rs:31, but MVCC has no cross-process
   coordination and needs its own checkpoint/GC tuning pragmas). Do not use.

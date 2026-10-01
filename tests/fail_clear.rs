@@ -269,6 +269,117 @@ fn known_tool_files_removed() {
     }
 }
 
+/// Finding 4: known dirs leave through the validated parent FD only
+/// when provably empty — emptied dirs are gone, while a dir kept
+/// non-empty by preserved content stays and the run reports INCOMPLETE.
+fn empty_dirs_removed_nonempty_report_incomplete() {
+    // All-owned payload: every file removable, so every known dir drops.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (state, payload) = owned_payload(dir.path());
+    let snapshots = payload.join("report-snapshots");
+    let staging = payload.join("staging");
+    write_private(
+        &snapshots.join("report-gone.json"),
+        marker_report("report-gone").as_bytes(),
+    );
+    write_private(
+        &staging.join(".staging-7-8-report-gone.json"),
+        marker_report("report-gone").as_bytes(),
+    );
+    let out = run(&["cache", "clear", "--all"], dir.path(), &state);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let stdout = stdout_text(&out);
+    assert!(!snapshots.exists(), "emptied snapshots dir removed");
+    assert!(!staging.exists(), "emptied staging dir removed");
+    assert!(!payload.exists(), "emptied payload dir removed");
+    assert!(
+        !stdout.contains("INCOMPLETE"),
+        "complete clear stays complete: {stdout}"
+    );
+
+    // Preserved content keeps its dir; the run says INCOMPLETE, exit 0.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (state, payload) = owned_payload(dir.path());
+    let snapshots = payload.join("report-snapshots");
+    repo_scan::privacy::private_dir_0700(&snapshots.join("nested")).expect("mkdir");
+    write_private(&snapshots.join("nested").join("keep.txt"), b"nested");
+    let out = run(&["cache", "clear", "--all"], dir.path(), &state);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let stdout = stdout_text(&out);
+    assert!(
+        stdout.contains("INCOMPLETE"),
+        "non-empty dir reports incomplete: {stdout}"
+    );
+    assert!(snapshots.is_dir(), "non-empty dir kept");
+    assert!(
+        snapshots.join("nested").join("keep.txt").is_file(),
+        "nested content kept"
+    );
+}
+
+/// Finding 5: the deadline/per-read-bounded snapshot loading loop still
+/// resolves every checksum row on the normal path — row-bound files
+/// with opaque (non-marker) bytes are all removed with no INCOMPLETE.
+fn snapshot_row_loading_resolves_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (state, payload) = owned_payload(dir.path());
+    let snapshots = payload.join("report-snapshots");
+    let db = payload.join("catalog.db");
+    let mut victims = Vec::new();
+    for n in 0..150u32 {
+        let id = format!("report-row-{n:03}");
+        let path = snapshots.join(format!("{id}.json"));
+        let bytes = format!("opaque catalog-bound bytes {n}");
+        write_private(&path, bytes.as_bytes());
+        save_row(&db, &id, bytes.as_bytes());
+        victims.push(path);
+    }
+    let out = run(&["cache", "clear", "--all"], dir.path(), &state);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let stdout = stdout_text(&out);
+    assert!(
+        !stdout.contains("INCOMPLETE"),
+        "row loading stays within bounds: {stdout}"
+    );
+    for path in &victims {
+        assert!(!path.exists(), "row-bound file removed: {}", path.display());
+    }
+}
+
+/// Finding 6: a payload-root listing failure is INCOMPLETE with the
+/// unknown content preserved — never success-with-uninspected. The
+/// payload keeps write+execute (FD-relative removal still works) but
+/// drops read, so only the listing fails.
+#[cfg(unix)]
+fn unlistable_payload_reports_incomplete() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (state, payload) = owned_payload(dir.path());
+    let unknown = payload.join("mine.txt");
+    write_private(&unknown, b"not tool state");
+    std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o333)).expect("chmod");
+    if std::fs::read_dir(&payload).is_ok() {
+        // Privileged environments (root) bypass permission bits, so the
+        // listing cannot fail here; nothing to regress.
+        std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod back");
+        return;
+    }
+    let out = run(&["cache", "clear", "--all"], dir.path(), &state);
+    std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o700)).expect("chmod back");
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let stdout = stdout_text(&out);
+    assert!(
+        stdout.contains("INCOMPLETE"),
+        "listing failure reports incomplete: {stdout}"
+    );
+    assert!(unknown.is_file(), "unknown payload file preserved");
+    assert!(
+        !payload.join("catalog.db").exists(),
+        "owned clear proceeded where it could"
+    );
+}
+
 #[test]
 fn clear_unknown_files_matrix() {
     unknown_preserved_while_owned_clear_proceeds();
@@ -278,4 +389,8 @@ fn clear_unknown_files_matrix() {
     #[cfg(unix)]
     symlinks_kept();
     known_tool_files_removed();
+    empty_dirs_removed_nonempty_report_incomplete();
+    snapshot_row_loading_resolves_rows();
+    #[cfg(unix)]
+    unlistable_payload_reports_incomplete();
 }

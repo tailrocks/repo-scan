@@ -649,8 +649,8 @@ fn credential_redaction_table() {
     );
     assert_eq!(
         redact_credentials("git@github.com:o/r.git"),
-        "git@github.com:o/r.git",
-        "scp-like user is not a password field"
+        "<redacted>@github.com:o/r.git",
+        "RS-PRIV-10: scp-like user redacts (token-as-username is indistinguishable)"
     );
 }
 

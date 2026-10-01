@@ -220,6 +220,8 @@ fn is_sensitive_key(lower_key: &str) -> bool {
         "signature",
         "session",
         "bearer",
+        "jwt",
+        "opaque",
         "apikey",
         "api_key",
         "access_key",
@@ -335,13 +337,16 @@ fn scrub_query_fragment(tail: &str) -> String {
 /// `token@` (no colon, the common token-as-username shape) becomes
 /// `<redacted>@`. Sensitive query/fragment parameter values become
 /// `<redacted>` while structure is preserved. Scp-like `user@host:path`
-/// carries no password field and is returned unchanged. Inputs that
-/// cannot be represented safely (control characters, or an `@` past the
-/// authority that signals malformed smuggled userinfo such as
+/// has its user component redacted (`<redacted>@host:path`): a
+/// token-as-username (`secret@github.com:o/r`) is indistinguishable from
+/// the conventional `git` login without an allowlist, so every scp-like
+/// user redacts (RS-PRIV-10). Inputs that cannot be represented safely
+/// (control characters, or an `@` past the authority that signals
+/// malformed smuggled userinfo such as
 /// `https://user:secret/ret@host/...`) collapse to [`REDACTED_URL`].
 pub fn redact_credentials(url: &str) -> String {
     let Some((scheme, rest)) = split_scheme(url) else {
-        return url.to_string();
+        return redact_scp_like(url).unwrap_or_else(|| url.to_string());
     };
     if url.chars().any(|c| c.is_control()) {
         return REDACTED_URL.to_string();
@@ -371,11 +376,62 @@ pub fn redact_credentials(url: &str) -> String {
     format!("{scheme}{redacted_user}@{host}{scrubbed_tail}")
 }
 
+/// Redact the user component of a scp-like `user@host:path` shape, if
+/// `url` is one. Returns `None` for anything else (emails, bare
+/// `user@host`, paths, prose): the shape requires a non-empty single-token
+/// user, a non-empty host with no `/`, and a `host:path` remainder.
+/// Control characters fail closed to [`REDACTED_URL`], mirroring scheme
+/// URLs. Used by [`redact_credentials`] and the free-text scp pass of
+/// [`scrub_text`] (RS-PRIV-10).
+fn redact_scp_like(url: &str) -> Option<String> {
+    let rest = scp_host_path(url)?;
+    if rest.chars().any(|c| c.is_control()) {
+        return Some(REDACTED_URL.to_string());
+    }
+    Some(format!("{REDACTED}@{rest}"))
+}
+
+/// Split an scp-like `user@host:path` shape into its `host:path` remainder,
+/// if `url` is one. Shape rules are exactly those of [`redact_scp_like`]:
+/// no `://`, a non-empty single-token user, a non-empty whitespace-free
+/// host with no `/`, and a `host:path` remainder. Shared by redaction and
+/// by [`sanitize_target_url`] (EXACT-2), which normalizes the user instead
+/// of redacting it so the persisted shape still resolves.
+fn scp_host_path(url: &str) -> Option<&str> {
+    if url.contains("://") {
+        return None;
+    }
+    let at = url.find('@')?;
+    let (user, rest) = url.split_at(at);
+    let rest = &rest[1..];
+    if user.is_empty()
+        || user
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '/')
+    {
+        return None;
+    }
+    let colon = rest.find(':')?;
+    let (host, path) = rest.split_at(colon);
+    if host.is_empty()
+        || host
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '/')
+        || path.len() < 2
+    {
+        return None;
+    }
+    Some(rest)
+}
+
 /// True when a scheme URL carries a non-empty `userinfo@` authority prefix
 /// or a malformed smuggled-userinfo shape (an `@` past the authority
 /// boundary, which [`redact_credentials`] collapses). Scp-like
-/// `user@host:path` has no `://` and carries no password field, so it
-/// reports false, matching redaction behavior.
+/// `user@host:path` carries no password field, so it reports false even
+/// though [`redact_credentials`] redacts its user component: the reject
+/// boundary (CLI target validation) must keep accepting the conventional
+/// `git@` login, while display paths redact because a token-as-username
+/// is indistinguishable from it (RS-PRIV-10).
 pub fn has_userinfo(url: &str) -> bool {
     let Some((_, rest)) = split_scheme(url) else {
         return false;
@@ -416,14 +472,138 @@ pub fn strip_userinfo(url: &str) -> String {
     }
 }
 
+/// True when a CLI scan target carries a rejectable credential form and
+/// must be refused before any persistence (EXACT-2): scheme userinfo
+/// (including malformed smuggled `@`, see [`has_userinfo`]) or any
+/// query/fragment tail. A canonical target names `owner/repo` only, so a
+/// tail can only carry non-target material — JWT/opaque/spaced/JSON values
+/// that are not key-identifiable — and fails closed. Scp-like
+/// `user@host:path` is NOT rejectable (the CLI must keep accepting the
+/// `git@` login, RS-PRIV-10); its user is normalized before persist by
+/// [`sanitize_target_url`].
+pub fn must_reject_target(url: &str) -> bool {
+    if has_userinfo(url) {
+        return true;
+    }
+    let trimmed = url.trim();
+    if let Some((_, rest)) = split_scheme(trimmed) {
+        let tail = &rest[authority_len(rest)..];
+        return tail.find(['?', '#']).is_some();
+    }
+    // Scp-like or bare input: a `?`/`#` tail is meaningless for a target
+    // (repository names cannot contain them), so fail closed here rather
+    // than persisting an opaque value normalization would ignore.
+    trimmed.find(['?', '#']).is_some()
+}
+
+/// Persist-safe form of an accepted CLI scan target (EXACT-2): the only
+/// value mint/report/catalog/snapshot/terminal may observe. Scp-like
+/// `user@host:path` has its user normalized to the conventional `git`
+/// login (normalization ignores the user and display redacts it, RS-PRIV-10,
+/// so a token-as-username never persists while the shape still resolves);
+/// scheme URLs are stripped of userinfo plus any query/fragment tail
+/// (defense-in-depth behind [`must_reject_target`]); inputs that cannot be
+/// represented safely collapse to [`REDACTED_URL`]. Plain targets
+/// round-trip unchanged (modulo surrounding whitespace).
+pub fn sanitize_target_url(url: &str) -> String {
+    let trimmed = url.trim();
+    if let Some(rest) = scp_host_path(trimmed) {
+        if rest.chars().any(|c| c.is_control()) {
+            return REDACTED_URL.to_string();
+        }
+        return format!("git@{rest}");
+    }
+    let Some((scheme, rest)) = split_scheme(trimmed) else {
+        return trimmed.to_string();
+    };
+    if trimmed.chars().any(|c| c.is_control()) {
+        return REDACTED_URL.to_string();
+    }
+    let end = authority_len(rest);
+    let (authority, tail) = rest.split_at(end);
+    let path = tail.split(['?', '#']).next().unwrap_or(tail);
+    if path.contains('@') {
+        return REDACTED_URL.to_string();
+    }
+    match authority.rfind('@') {
+        Some(at) => format!("{scheme}{}{path}", &authority[at + 1..]),
+        None => format!("{scheme}{authority}{path}"),
+    }
+}
+
+/// Display form of a (possibly rejected) scan target for errors and
+/// diagnostics (EXACT-2): userinfo redacted, query/fragment stripped
+/// entirely (opaque values are not key-identifiable, so key-based redaction
+/// cannot make them safe to echo), spaced/JSON/CLI pairs scrubbed. Never
+/// carries secret bytes; host/path structure is preserved for the user.
+pub fn redact_target_for_display(url: &str) -> String {
+    let head = url.split(['?', '#']).next().unwrap_or(url);
+    scrub_text(&redact_credentials(head))
+}
+
 /// Scrub free text (evidence lines, error strings, reasons) for report
-/// emission: every embedded `scheme://...` token is passed through
-/// [`redact_credentials`], and bare sensitive `key=value`/`key:value` pairs
-/// have their values replaced with [`REDACTED`]. Ordinary prose passes
-/// through unchanged.
+/// emission: every embedded `scheme://...` token and every scp-like
+/// `user@host:path` token is passed through [`redact_credentials`], and
+/// sensitive pairs — same-token `key=value`/`key:value` plus spaced, JSON,
+/// CLI-flag, and multiline shapes — have their values replaced with
+/// [`REDACTED`]. Ordinary prose passes through unchanged.
 pub fn scrub_text(text: &str) -> String {
     let scrubbed_urls = scrub_embedded_urls(text);
-    scrub_secret_pairs(&scrubbed_urls)
+    let scrubbed_scp = scrub_embedded_scp(&scrubbed_urls);
+    let scrubbed_pairs = scrub_secret_pairs(&scrubbed_scp);
+    scrub_spaced_pairs(&scrubbed_pairs)
+}
+
+/// Redact embedded scp-like `user@host:path` tokens inside free text
+/// (RS-PRIV-10). Tokens are whitespace-delimited; surrounding quotes and
+/// trailing sentence punctuation are preserved, the user component is
+/// redacted. Scheme URLs were handled by the earlier pass and are
+/// skipped here.
+fn scrub_embedded_scp(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut token_start: Option<usize> = None;
+    let flush = |out: &mut String, token: &str| {
+        if token.contains("://") {
+            out.push_str(token);
+            return;
+        }
+        // Preserve surrounding punctuation; redact the core shape only.
+        let core = token.trim_start_matches(['\'', '"', '`', '(', '[', '<']);
+        let stripped =
+            core.trim_end_matches(['\'', '"', '`', '.', ',', ';', ':', '!', '?', ')', ']', '>']);
+        if stripped.is_empty() {
+            out.push_str(token);
+            return;
+        }
+        match redact_scp_like(stripped) {
+            Some(redacted) => {
+                let lead = token.len()
+                    - token
+                        .trim_start_matches(['\'', '"', '`', '(', '[', '<'])
+                        .len();
+                out.push_str(&token[..lead]);
+                out.push_str(&redacted);
+                // `stripped` borrows from `core`, which starts `lead`
+                // bytes into `token`, so the tail reattaches here.
+                out.push_str(&token[lead + stripped.len()..]);
+            }
+            None => out.push_str(token),
+        }
+    };
+    for (index, ch) in text.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(start) = token_start.take() {
+                flush(&mut out, &text[start..index]);
+            }
+            out.push(ch);
+        } else if token_start.is_none() {
+            token_start = Some(index);
+        }
+    }
+    if let Some(start) = token_start.take() {
+        flush(&mut out, &text[start..]);
+    }
+    out
 }
 
 /// Redact embedded URL tokens inside free text.
@@ -532,6 +712,174 @@ fn split_pair(token: &str) -> Option<(&str, &str, &str)> {
         }
     }
     None
+}
+
+/// Value-redact sensitive pairs whose key and value are NOT in one token
+/// (RS-PRIV-04): spaced `password: secret` / `password : secret`, JSON
+/// `{"password": "secret"}`, CLI `--password secret`, and multiline values
+/// (`key:` then the value on a later line). Structure (key, separator,
+/// gaps, quotes) is preserved; only the value span becomes [`REDACTED`].
+/// Runs after [`scrub_secret_pairs`]; same-token pairs are already
+/// redacted and re-match idempotently.
+fn scrub_spaced_pairs(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let Some((key_end, clean_len, cli_flag)) = match_key_at(text, i) else {
+            // No sensitive key here: emit one char, keep scanning.
+            let width = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            out.push_str(&text[i..i + width]);
+            i += width;
+            continue;
+        };
+        // Gap between key and separator: spaces/tabs only (a newline
+        // before the separator is not a pair shape we claim).
+        let mut j = key_end;
+        while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') {
+            j += 1;
+        }
+        let has_sep = j < bytes.len() && matches!(bytes[j], b'=' | b':');
+        if has_sep {
+            // Drive-letter guard mirrors `split_pair` (`C:\...`); a `::`
+            // Rust path / IPv6 run is not a pair either.
+            if bytes[j] == b':' && (clean_len <= 1 || bytes.get(j + 1) == Some(&b':')) {
+                let width = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                out.push_str(&text[i..i + width]);
+                i += width;
+                continue;
+            }
+            j += 1;
+        } else if !cli_flag {
+            // Bare `key value` with no separator redacts only for `--flag`
+            // shapes; anything else would mangle ordinary prose.
+            let width = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            out.push_str(&text[i..i + width]);
+            i += width;
+            continue;
+        }
+        // Gap between separator (or flag) and value: whitespace including
+        // newlines, so multiline values redact.
+        let mut k = j;
+        while k < bytes.len() && matches!(bytes[k], b' ' | b'\t' | b'\r' | b'\n') {
+            k += 1;
+        }
+        // A CLI flag followed by another flag/option or nothing has no value.
+        if cli_flag && !has_sep && (k >= bytes.len() || bytes[k] == b'-') {
+            let width = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            out.push_str(&text[i..i + width]);
+            i += width;
+            continue;
+        }
+        let Some((val_start, val_end, quote)) = value_span(text, k) else {
+            let width = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            out.push_str(&text[i..i + width]);
+            i += width;
+            continue;
+        };
+        // `text[i..val_start]` already ends with the opening quote for
+        // quoted values; only the inner span is replaced.
+        out.push_str(&text[i..val_start]);
+        out.push_str(REDACTED);
+        match quote {
+            Some(q) => {
+                out.push(q);
+                i = val_end + 1;
+            }
+            None => {
+                i = val_end;
+            }
+        }
+    }
+    out
+}
+
+/// Match a sensitive key starting at byte `i`: bare (`password`), quoted
+/// (`"password"`), or CLI-flag (`--password`) form. Returns the byte end
+/// of the key, the cleaned-key length (for the drive-letter guard), and
+/// whether the key is a `--flag`. The match must start at a key boundary
+/// (start of text or a non-key character before `i`) and the raw key is
+/// capped at 128 bytes.
+fn match_key_at(text: &str, i: usize) -> Option<(usize, usize, bool)> {
+    let bytes = text.as_bytes();
+    if i > 0 {
+        let prev = bytes[i - 1];
+        if prev.is_ascii_alphanumeric() || matches!(prev, b'_' | b'-' | b'.') {
+            return None;
+        }
+    }
+    let first = *bytes.get(i)?;
+    let (raw, key_end) = if first == b'"' || first == b'\'' {
+        let mut j = i + 1;
+        while j < bytes.len() && bytes[j] != first && j - i <= 128 {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != first {
+            return None;
+        }
+        (&text[i + 1..j], j + 1)
+    } else if first.is_ascii_alphabetic() || first == b'_' || first == b'-' {
+        let mut j = i;
+        while j < bytes.len()
+            && (bytes[j].is_ascii_alphanumeric() || matches!(bytes[j], b'_' | b'-' | b'.'))
+            && j - i <= 128
+        {
+            j += 1;
+        }
+        (&text[i..j], j)
+    } else {
+        return None;
+    };
+    if raw.is_empty() || raw.len() > 128 {
+        return None;
+    }
+    let clean_key: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .collect();
+    let match_key = percent_decode_for_match(&clean_key).to_lowercase();
+    if match_key.is_empty() || !is_sensitive_key(&match_key) {
+        return None;
+    }
+    Some((key_end, match_key.len(), raw.starts_with("--")))
+}
+
+/// Value span starting at byte `k`: a quoted span (quote-aware, `\`
+/// escapes honored, closing quote required within 1024 bytes) or a bare
+/// run to the next delimiter (whitespace, `,;`, quotes, or `}]`).
+/// Returns `(span_start, span_end, quote_char)`; empty values are `None`.
+fn value_span(text: &str, k: usize) -> Option<(usize, usize, Option<char>)> {
+    let bytes = text.as_bytes();
+    if k >= bytes.len() {
+        return None;
+    }
+    if bytes[k] == b'"' || bytes[k] == b'\'' {
+        let quote = bytes[k] as char;
+        let mut j = k + 1;
+        while j < bytes.len() && j - k <= 1024 {
+            if bytes[j] == b'\\' {
+                j += 2;
+                continue;
+            }
+            if bytes[j] == bytes[k] {
+                return Some((k + 1, j, Some(quote)));
+            }
+            j += 1;
+        }
+        return None;
+    }
+    let mut j = k;
+    while j < bytes.len()
+        && !bytes[j].is_ascii_whitespace()
+        && !matches!(bytes[j], b',' | b';' | b'"' | b'\'' | b'}' | b']')
+        && j - k <= 1024
+    {
+        j += 1;
+    }
+    if j == k {
+        return None;
+    }
+    Some((k, j, None))
 }
 
 /// True when `host` is github.com directly or via an SSH alias.

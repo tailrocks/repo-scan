@@ -34,9 +34,12 @@ fn symlink_refusal(detail: String) -> crate::Error {
 }
 
 /// Create `path` (parents as needed) as an owner-only directory (`0o700` on
-/// unix) and return it. A symlinked target is refused before and after
-/// creation (fail closed). The mode is passed at creation time AND re-applied
-/// with an explicit chmod afterwards, so the result never depends on umask.
+/// unix) and return it. RS-PRIV-05/07: this routes through the single
+/// ancestor-pinned creation primitive
+/// ([`crate::store::owner::ensure_private_dir_all`]), so symlinked
+/// ancestors are refused (fail closed) and modes are tightened with
+/// `fchmod` on bound FDs, never the path — the result never depends on
+/// umask and creation cannot be redirected mid-call.
 pub fn private_dir_0700(path: &Path) -> crate::Result<PathBuf> {
     if is_symlink_path(path)? {
         return Err(symlink_refusal(format!(
@@ -46,18 +49,7 @@ pub fn private_dir_0700(path: &Path) -> crate::Result<PathBuf> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(PRIVATE_DIR_MODE)
-            .create(path)?;
-        if is_symlink_path(path)? {
-            return Err(symlink_refusal(format!(
-                "directory is a symlink: {}",
-                path.display()
-            )));
-        }
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(PRIVATE_DIR_MODE))?;
+        crate::store::owner::ensure_private_dir_all(path)?;
     }
     #[cfg(not(unix))]
     {
@@ -96,8 +88,9 @@ pub fn private_file_0600(path: &Path) -> crate::Result<File> {
     let file = opts.open(path)?;
     #[cfg(unix)]
     {
+        // RS-PRIV-05: fchmod the open FD, never the path.
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
+        file.set_permissions(std::fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
     }
     Ok(file)
 }
@@ -125,8 +118,9 @@ pub fn private_write_0600(path: &Path, contents: &[u8]) -> crate::Result<()> {
     let mut file = opts.open(path)?;
     #[cfg(unix)]
     {
+        // RS-PRIV-05: fchmod the open FD, never the path.
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
+        file.set_permissions(std::fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
     }
     {
         use std::io::Write as _;

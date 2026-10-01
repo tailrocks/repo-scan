@@ -8,12 +8,14 @@
 //! removal or `realpath` alone (firmlinks would collapse incorrectly).
 
 use super::{ChildKind, EntryMetadata};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 #[cfg(unix)]
 use std::ffi::{c_char, CString, OsString};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 /// Maximum symlink hops before reporting [`ResolveError::TooDeep`].
 /// Mirrors the OS `ELOOP` convention (Linux `MAXSYMLINKS` = 40).
@@ -141,15 +143,33 @@ impl ScheduleProvenance {
     }
 }
 
+/// Maximum entries retained by the in-memory [`Topology`] guard (R2
+/// bound, spec §5: no in-memory set of every path/identity). Past the cap
+/// the oldest entry is evicted (FIFO), so memory stays flat on a full
+/// machine scan regardless of distinct-directory count.
+pub const TOPOLOGY_SEEN_CAP: usize = 4096;
+
 /// Process-local cycle/dedupe guard for in-flight traversal.
 ///
 /// This is the cheap in-memory guard against symlink cycles and firmlink
 /// double-scheduling within one owner process. Durable deduplication state
 /// lives in the store (directories table keyed by physical identity); this
 /// guard never replaces it and is rebuilt from durable state on restart.
+///
+/// The guard retains at most [`TOPOLOGY_SEEN_CAP`] identities (FIFO
+/// eviction). Re-walk cost of eviction: an identity evicted and observed
+/// again reports [`ObserveOutcome::New`] instead of `Duplicate`, so a
+/// caller that schedules on `New` may re-enumerate that directory — a
+/// bounded duplicate, never a missed directory and never unbounded
+/// memory. A catalog-backed visited set was rejected for this layer:
+/// [`Topology::observe`] is synchronous while the store is async, and the
+/// sole production call site (`exec_enumerate`) already upserts through
+/// the durable `directories` identity index, which remains the dedupe
+/// authority.
 #[derive(Debug, Default)]
 pub struct Topology {
     seen: HashSet<PhysicalDirId>,
+    order: VecDeque<PhysicalDirId>,
 }
 
 impl Topology {
@@ -159,25 +179,39 @@ impl Topology {
     }
 
     /// Observe one physical directory, reporting whether it is new.
+    ///
+    /// Past [`TOPOLOGY_SEEN_CAP`] retained identities the oldest entry is
+    /// evicted first; an evicted identity observed again reports `New`
+    /// (bounded re-walk, documented on [`Topology`]).
     pub fn observe(&mut self, id: PhysicalDirId) -> ObserveOutcome {
-        if self.seen.insert(id) {
-            ObserveOutcome::New
-        } else {
-            ObserveOutcome::Duplicate
+        if self.seen.contains(&id) {
+            return ObserveOutcome::Duplicate;
         }
+        while self.seen.len() >= TOPOLOGY_SEEN_CAP {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.seen.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+        self.order.push_back(id.clone());
+        self.seen.insert(id);
+        ObserveOutcome::New
     }
 
-    /// True when this physical directory was already observed.
+    /// True when this physical directory is currently retained.
     pub fn contains(&self, id: &PhysicalDirId) -> bool {
         self.seen.contains(id)
     }
 
-    /// Number of distinct physical directories observed.
+    /// Number of physical directories currently retained (at most
+    /// [`TOPOLOGY_SEEN_CAP`]).
     pub fn len(&self) -> usize {
         self.seen.len()
     }
 
-    /// True when nothing has been observed yet.
+    /// True when nothing is currently retained.
     pub fn is_empty(&self) -> bool {
         self.seen.is_empty()
     }
@@ -317,12 +351,113 @@ fn normalize_absolute(path: &Path) -> Option<PathBuf> {
 /// One declared scan root: its canonical spelling (symlinks resolved),
 /// the raw spelling when it differs (roots may carry an unclean spelling
 /// such as `/var` vs `/private/var`), and the canonical directory's
-/// `(dev, ino)` identity for root-swap detection.
+/// `(dev, ino)` identity for root-swap detection. `unknown` marks roots
+/// whose identity never verified (canonicalize/stat failed or the bounded
+/// resolve timed out): scheduling still matches them lexically, but the
+/// caller must persist a durable gap for each (see
+/// [`ScopeFence::unknown_roots`]).
 #[derive(Debug, Clone)]
 struct FenceRoot {
     canonical: PathBuf,
     raw: Option<PathBuf>,
     identity: Option<(u64, u64)>,
+    unknown: bool,
+}
+
+/// Coordinator identity-I/O budget (RSF-TOPOLOGY-ADMISSION): at most 2
+/// concurrent identity resolves (mirroring the enum admission class), a
+/// 1 s wait for a slot, and a 1 s timeout per resolve. Past either bound
+/// the resolve fails unknown and the caller persists a gap — the
+/// current-thread coordinator never blocks indefinitely on a hung path.
+pub const IDENTITY_IO_CAP: usize = 2;
+/// How long a resolve waits for an identity-I/O slot before failing unknown.
+pub const IDENTITY_IO_SLOT_WAIT: Duration = Duration::from_secs(1);
+/// Timeout for one bounded identity resolve on its worker thread.
+pub const IDENTITY_IO_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Live identity-I/O workers (process-wide, lock-free: resolve sites have
+/// no owner [`Admission`](crate::scheduler::admission::Admission) handle).
+static IDENTITY_IO_LIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// Run blocking identity I/O (`canonicalize`/`metadata`) on a worker
+/// thread with bounded admission plus a timeout. `None` means the slot
+/// wait expired, the worker timed out, or the spawn failed: the caller
+/// must treat the identity as unknown and persist a gap, never silently
+/// substitute a path-derived identity.
+fn bounded_identity_io<T>(op: impl FnOnce() -> T + Send + 'static) -> Option<T>
+where
+    T: Send + 'static,
+{
+    let start = Instant::now();
+    let admitted = loop {
+        let live = IDENTITY_IO_LIVE.load(Ordering::Relaxed);
+        if live < IDENTITY_IO_CAP
+            && IDENTITY_IO_LIVE
+                .compare_exchange_weak(live, live + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            break true;
+        }
+        if start.elapsed() >= IDENTITY_IO_SLOT_WAIT {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    if !admitted {
+        return None;
+    }
+    struct SlotGuard;
+    impl Drop for SlotGuard {
+        fn drop(&mut self) {
+            IDENTITY_IO_LIVE.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    // R1: the permit is owned by the detached worker, not the caller.
+    // The guard moves into the thread, so the live count covers the
+    // worker's full blocked lifetime. `recv_timeout` abandons the wait
+    // only — the cap stays charged until the worker exits (or the spawn
+    // fails, which drops the un-run closure and its guard with it).
+    // Repeated stalls therefore refuse admission via the slot wait above
+    // instead of exceeding the stated cap.
+    let (tx, rx) = std::sync::mpsc::channel();
+    if std::thread::Builder::new()
+        .name(String::from("identity-io"))
+        .spawn({
+            let guard = SlotGuard;
+            move || {
+                let _held = guard;
+                let _ = tx.send(op());
+            }
+        })
+        .is_err()
+    {
+        return None;
+    }
+    rx.recv_timeout(IDENTITY_IO_TIMEOUT).ok()
+}
+
+/// Bounded physical identity for one coordinator path (R7 alias sharing:
+/// follows symlinks). `None` on timeout, admission refusal, or stat
+/// failure: the caller persists unknown/gap instead of silently
+/// substituting a path-derived identity.
+#[cfg(unix)]
+pub fn bounded_dir_identity(path: &Path) -> Option<(u64, u64)> {
+    let owned = path.to_path_buf();
+    bounded_identity_io(move || {
+        std::fs::metadata(&owned).ok().map(|md| {
+            let meta = super::fs_entry_metadata(&md);
+            (meta.dev, meta.ino)
+        })
+    })
+    .flatten()
+}
+
+/// Non-unix targets have no stable `(dev, ino)` identity, so coordinator
+/// scheduling always treats identity as unknown (never a silent
+/// path-derived fallback that splits or shares tasks unpredictably).
+#[cfg(not(unix))]
+pub fn bounded_dir_identity(_path: &Path) -> Option<(u64, u64)> {
+    None
 }
 
 /// Scan-scope fence built once from the planned roots.
@@ -342,25 +477,76 @@ pub struct ScopeFence {
 impl ScopeFence {
     /// Build the fence from declared roots. Each root is canonicalized
     /// (resolving root-level symlinks such as `/var` → `/private/var`);
-    /// when canonicalization fails the raw spelling is kept, mirroring
-    /// the legacy fence fallback. Root identities come from the
-    /// canonical spelling for root-swap detection.
+    /// when canonicalization fails the raw spelling is kept for lexical
+    /// scheduling but the root is flagged unknown (see
+    /// [`ScopeFence::unknown_roots`]) so the caller persists a durable gap
+    /// instead of silently fencing a fallback spelling. Root identities
+    /// come from the canonical spelling for root-swap detection. All
+    /// filesystem I/O runs on ONE worker thread under the
+    /// [`IDENTITY_IO_TIMEOUT`] bound, so a hung path cannot stall the
+    /// coordinator past the budget.
     pub fn build(roots: &[PathBuf]) -> Self {
+        let owned: Vec<PathBuf> = roots.to_vec();
+        let resolved = bounded_identity_io(move || {
+            owned
+                .iter()
+                .map(|root| {
+                    let (canonical, canonical_ok) = match root.canonicalize() {
+                        Ok(canonical) => (canonical, true),
+                        Err(_) => (root.clone(), false),
+                    };
+                    let raw = (canonical != *root).then(|| root.clone());
+                    let identity = std::fs::symlink_metadata(&canonical).ok().map(|md| {
+                        let meta = super::fs_entry_metadata(&md);
+                        (meta.dev, meta.ino)
+                    });
+                    (
+                        canonical,
+                        raw,
+                        identity,
+                        !canonical_ok || identity.is_none(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
         let mut fenced = Vec::with_capacity(roots.len());
-        for root in roots {
-            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            let raw = (canonical != *root).then(|| root.clone());
-            let identity = std::fs::symlink_metadata(&canonical).ok().map(|md| {
-                let meta = super::fs_entry_metadata(&md);
-                (meta.dev, meta.ino)
-            });
-            fenced.push(FenceRoot {
-                canonical,
-                raw,
-                identity,
-            });
+        match resolved {
+            Some(items) => {
+                for (canonical, raw, identity, unknown) in items {
+                    fenced.push(FenceRoot {
+                        canonical,
+                        raw,
+                        identity,
+                        unknown,
+                    });
+                }
+            }
+            None => {
+                // Bounded resolve refused or timed out: every root stays
+                // lexically schedulable but unverified, with gaps due.
+                for root in roots {
+                    fenced.push(FenceRoot {
+                        canonical: root.clone(),
+                        raw: None,
+                        identity: None,
+                        unknown: true,
+                    });
+                }
+            }
         }
         Self { roots: fenced }
+    }
+
+    /// Declared spellings whose identity never verified (canonicalize or
+    /// stat failed, or the bounded resolve timed out). The caller persists
+    /// one durable gap per entry; scheduling still matches these spellings
+    /// lexically and execution re-verifies through pinned descriptors.
+    pub fn unknown_roots(&self) -> Vec<PathBuf> {
+        self.roots
+            .iter()
+            .filter(|root| root.unknown)
+            .map(|root| root.raw.clone().unwrap_or_else(|| root.canonical.clone()))
+            .collect()
     }
 
     /// True when no roots were declared (deny-all: every path is refused).
@@ -1086,4 +1272,53 @@ fn last_errno() -> i32 {
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 fn last_errno() -> i32 {
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// R1 stall injection: a timed-out wait abandons the wait only, never
+    /// the cap. Workers stalled past [`IDENTITY_IO_TIMEOUT`] still hold
+    /// their permits (repeated stalls refuse admission instead of
+    /// exceeding the cap), and the count drains once the workers exit.
+    #[test]
+    fn identity_io_timeout_abandons_wait_not_cap() {
+        let baseline = IDENTITY_IO_LIVE.load(Ordering::Relaxed);
+        let mut releases = Vec::new();
+        let mut callers = Vec::new();
+        for _ in 0..IDENTITY_IO_CAP {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            releases.push(release_tx);
+            callers.push(std::thread::spawn(move || {
+                bounded_identity_io(move || {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                    7u32
+                })
+            }));
+            started_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("identity worker starts");
+        }
+        // Both workers are blocked inside `op()` while their callers sit
+        // in `recv_timeout`: the cap is fully charged.
+        assert!(IDENTITY_IO_LIVE.load(Ordering::Relaxed) >= baseline + IDENTITY_IO_CAP);
+        // Every caller abandons its wait at the timeout ...
+        for caller in callers {
+            assert_eq!(caller.join().expect("caller joins"), None);
+        }
+        // ... but the stalled workers still hold the cap (pre-fix code
+        // dropped the caller-owned guard here and fell back to baseline).
+        assert!(IDENTITY_IO_LIVE.load(Ordering::Relaxed) >= baseline + IDENTITY_IO_CAP);
+        // Releasing the workers drains the cap back to baseline: no leak.
+        drop(releases);
+        let drain_by = Instant::now() + Duration::from_secs(10);
+        while IDENTITY_IO_LIVE.load(Ordering::Relaxed) != baseline && Instant::now() < drain_by {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(IDENTITY_IO_LIVE.load(Ordering::Relaxed), baseline);
+    }
 }

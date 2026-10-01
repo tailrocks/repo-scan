@@ -20,6 +20,12 @@ Workflow: [.github/workflows/audit.yml](../.github/workflows/audit.yml)
 - Runner image and toolchain are pinned exactly (`ubuntu-24.04`,
   Rust `1.85.0`); audit tools install at exact versions with
   `--locked` (`cargo-audit 0.21.0`, `cargo-deny 0.18.3`).
+  RS-CI-01 residual: a GitHub-hosted `runs-on` label takes no digest,
+  so byte-immutability of the runner image is an owner action (move
+  the job to a self-hosted or container runner pinned by digest).
+  Until then the provenance step records the exact image version
+  (`$ImageOS`/`$ImageVersion` plus `/etc/os-release`) with every run,
+  so an image change is visible in the log, not silent.
   Expected crates.io sha256 digests are recorded in workflow
   comments and enforced by a `Verify pinned tool archives` step
   that downloads each `.crate` from `static.crates.io` and
@@ -36,9 +42,12 @@ Workflow: [.github/workflows/audit.yml](../.github/workflows/audit.yml)
   steps invoke the installed binaries directly with explicit
   lockfile/manifest paths and never compile repository code.
 - A provenance step runs after the audits (`if: always()`, so a
-  failing audit is still attributed) and records `rustc`,
-  `cargo-audit`, and `cargo-deny` versions, the `Cargo.lock`
-  sha256, the source OID (`source_oid=$GITHUB_SHA` plus
+  failing audit is still attributed) and records `rustc`
+  (`--version --verbose`, including the toolchain commit hash),
+  `cargo-audit`, and `cargo-deny` versions, the sha256 of the two
+  installed audit binaries, the `Cargo.lock` sha256, the runner
+  image version (`$ImageOS`/`$ImageVersion`, `/etc/os-release`),
+  the source OID (`source_oid=$GITHUB_SHA` plus
   `git rev-parse HEAD`), and the advisory-database revision
   (`git rev-parse HEAD` in the fetched checkout under
   `$CARGO_HOME/advisory-dbs`, failing closed when absent). The
@@ -100,6 +109,15 @@ boundary is the base-branch branch protection above. A
 base-controlled reusable workflow would remove the PR-tree trust
 dependency entirely; until then, treat an `audit` green on an
 unprotected branch as unaudited.
+
+RS-CI-02 quarantine (owner action, outside this repository): any merge
+that lands while the `audit` check is failing, pending-and-bypassed, or
+absent (admin merge, unprotected base, renamed job) carries no
+audit-gate evidence for its tree. Quarantine such trees before release:
+re-run the gate on the exact merged commit on the protected base and
+re-confirm the policy/workflow files byte-identical to a reviewed
+revision; policy or workflow edits merged under bypass get owner
+re-review regardless of content.
 
 `dtolnay/rust-toolchain` downloads `https://sh.rustup.rs` only as a
 fallback when rustup is absent; the pinned `ubuntu-24.04` runner

@@ -46,6 +46,19 @@ pub trait SchedulerStore: Send {
     /// Return one leased task to `pending` (prefetch trimming).
     fn release_to_pending(&mut self, task_id: &str) -> crate::Result<()>;
 
+    /// Extend a live lease (R4 heartbeat primitive): move the expiry to
+    /// `now + lease_ttl` iff the task is still `leased` under the exact
+    /// token/epoch. Returns false when the lease is gone, expired into
+    /// another incarnation, or held under a different token/epoch — the
+    /// caller must stop touching the scope and preserve a gap instead of
+    /// racing a completion. Never touches another owner's lease.
+    fn renew_lease(
+        &mut self,
+        lease: &Lease,
+        lease_ttl: Duration,
+        now: SystemTime,
+    ) -> crate::Result<bool>;
+
     /// Load the task for a lease, rejecting unknown tasks, wrong epochs,
     /// and wrong lease tokens.
     fn verify_lease(&self, lease: &Lease) -> crate::Result<Task>;
@@ -292,6 +305,14 @@ impl<S: SchedulerStore> DurableScheduler<S> {
             }
         }
     }
+
+    /// Extend a live lease (R4 heartbeat for long probe/status operations):
+    /// delegates to [`SchedulerStore::renew_lease`] at the current time.
+    /// False means the lease is gone — stop and preserve a gap, never
+    /// race a completion against whoever holds the scope now.
+    pub fn renew_lease(&mut self, lease: &Lease, lease_ttl: Duration) -> crate::Result<bool> {
+        self.store.renew_lease(lease, lease_ttl, SystemTime::now())
+    }
 }
 
 impl<S: SchedulerStore> Scheduler for DurableScheduler<S> {
@@ -518,6 +539,25 @@ impl SchedulerStore for MemorySchedulerStore {
                 "release of non-leased task {task_id}"
             ))),
         }
+    }
+
+    fn renew_lease(
+        &mut self,
+        lease: &Lease,
+        lease_ttl: Duration,
+        now: SystemTime,
+    ) -> crate::Result<bool> {
+        let Some(record) = self.tasks.get_mut(&lease.task_id) else {
+            return Ok(false);
+        };
+        if record.task.state != TaskState::Leased
+            || record.task.epoch != lease.epoch
+            || record.lease_token != Some(lease.token)
+        {
+            return Ok(false);
+        }
+        record.lease_expires = Some(now.checked_add(lease_ttl).unwrap_or(now));
+        Ok(true)
     }
 
     fn verify_lease(&self, lease: &Lease) -> crate::Result<Task> {

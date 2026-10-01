@@ -219,7 +219,9 @@ fn rsf_speed003_store_pending_and_cumulative_totals() {
 
 /// RSF-23D074E0: helper CPU is measured (reaped children + retained input),
 /// helper RSS is measured or an honest unknown — never a hardcoded fake zero.
-/// The macOS `ru_maxrss` peak stays labeled peak.
+/// Owner RSS is CURRENT on every target (macOS via `task_info`
+/// `resident_size`); the macOS `ru_maxrss` peak is retained for reporting
+/// only, stays labeled peak, and never feeds admission (RESOURCE-RECHECK 5).
 #[test]
 fn rsf_23d_helper_telemetry_honesty() {
     // Honesty helper: measured zero vs honest unknown.
@@ -267,13 +269,27 @@ fn rsf_23d_helper_telemetry_honesty() {
         method.contains("peak") || method.contains("PEAK"),
         "peak stays labeled: {method}"
     );
+    // RESOURCE-RECHECK 5: RSS is CURRENT on every target; the macOS
+    // `ru_maxrss` peak rides along for reporting only, never as the
+    // admission input (a monotonic peak cannot measure relief).
+    assert!(!rss_is_peak(), "RSS readings are current, not peak");
     #[cfg(target_os = "macos")]
-    assert!(
-        method.contains("PEAK") && rss_is_peak(),
-        "macOS ru_maxrss peak labeled: {method}"
-    );
+    {
+        assert!(
+            method.contains("task_info") && method.contains("resident_size"),
+            "macOS current-RSS source disclosed: {method}"
+        );
+        assert!(
+            method.contains("reporting only"),
+            "macOS peak is reporting-only: {method}"
+        );
+        assert!(
+            retained.owner_peak_rss_bytes.is_some(),
+            "macOS retains ru_maxrss peak for reporting"
+        );
+    }
     #[cfg(not(target_os = "macos"))]
-    assert!(!rss_is_peak(), "only macOS uses the peak stand-in");
+    assert_eq!(retained.owner_peak_rss_bytes, None);
 }
 
 /// The 2 Hz progress ceiling still holds after the content changes.

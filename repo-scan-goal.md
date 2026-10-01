@@ -28,14 +28,6 @@ Keep one catalog-owning process and one writer actor. Concurrent CLI commands co
 
 Build a CLI and reusable Rust library. Keep the initial project small. Do not add a GUI, web service, recovery agent, merge engine, remote synchronization service or unrelated framework.
 
-## Mandatory coding model gate
-
-Before any project implementation, verify from reliable runtime configuration or execution metadata that the coordinator and every implementation, testing, code-review and verification subagents.
-
-A requested model string without evidence of the effective configuration is insufficient. Do not use a stronger equivalent, automatic fallback, another model family, or another effort level. Configure the exact combination using supported controls if available. If it is unavailable or cannot be verified, preserve the prepared plan and report the executor incompatibility; do not perform project implementation with a substitute. This specific gate takes precedence over the general instruction to continue autonomously.
-
-Autonomous investigation always remains within this fixed model requirement, the product scope, access controls and existing authorization. Do not invent permissions, weaken a gate, fabricate a successful check or claim that external access was obtained.
-
 ## Resolve the implementation destination autonomously
 
 Use an explicitly supplied project directory and remote if present. Otherwise reuse an existing working repository only when its context clearly identifies it as the intended `repo-scan` implementation. If no such target exists, create a new `repo-scan` directory inside the current writable workspace. Do not overwrite or initialize over an unrelated repository.
@@ -186,7 +178,7 @@ Continue working until the goal is fully completed, verified, and no meaningful 
 
 All mandatory specification requirements have implementation and verification evidence. The six commands work unchanged. Reports validate against the shipped schema. Correctness fixtures cover the required Git layouts and filesystem locations. Interrupted work resumes without forgetting tasks or restarting all completed scope. Cache operations are coordinated and confined to tool-owned state. The scanner does not mutate examined Git metadata or source code; only application-owned state and the identified, explicitly requested report artifact may be written. Status observations retain accurate timestamps when that artifact is placed within a checkout. Resource and performance gates have measured evidence. Independent correctness and performance findings are resolved. Documentation matches actual behavior, and final deterministic checks pass.
 
-External access limitations remain explicit unresolved obligations. They do not become exclusions or success claims. If an exact-model, required-platform or other genuine external gate cannot be satisfied, complete the independent work that is still authorized and possible, preserve reproducible state, and report the specific unmet gate honestly. Never declare full completion while a mandatory gate lacks evidence.
+External access limitations remain explicit unresolved obligations. They do not become exclusions or success claims. If a required-platform or other genuine external gate cannot be satisfied, complete the independent work that is still authorized and possible, preserve reproducible state, and report the specific unmet gate honestly. Never declare full completion while a mandatory gate lacks evidence.
 
 ## Final delivery format
 

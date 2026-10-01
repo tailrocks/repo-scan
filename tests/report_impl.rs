@@ -478,6 +478,29 @@ fn stream_from_catalog_resolves_and_agrees() {
 }
 
 #[test]
+fn interned_peak_over_rss_target_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = open_store(&dir);
+    let now = 1_759_154_400_000;
+    seed_catalog(&store, now);
+    // Seeded git/checkout paths intern a nonzero peak; a 1-byte RSS
+    // target trips the resource gate before any JSON is written.
+    let mut over = test_inputs("report-resource-gate-1");
+    over.rss_target_bytes = 1;
+    let err = runtime()
+        .block_on(async { stream_report_from_store(&store, &over, Vec::new()).await })
+        .expect_err("over-budget peak refused");
+    assert!(err.to_string().contains("resource gate"), "{err}");
+    // Same catalog streams fine under the normal target, with the
+    // single-store interner emitting both synthetic paths.
+    let inputs = test_inputs("report-resource-gate-2");
+    let (_bytes, stats) = runtime()
+        .block_on(async { stream_report_from_store(&store, &inputs, Vec::new()).await })
+        .expect("stream");
+    assert_eq!(stats.paths, 2 + 2);
+}
+
+#[test]
 fn terminal_render_goes_to_caller_writer() {
     let report = example_report();
     let mut out: Vec<u8> = Vec::new();

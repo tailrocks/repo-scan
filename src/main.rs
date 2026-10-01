@@ -53,6 +53,19 @@ const KIND_RECONCILE: &str = "reconcile";
 
 /// Tasks claimed per scheduler round (far below the 1,024 prefetch cap).
 const CLAIM_BATCH: usize = 16;
+/// Bound for the post-traversal history-close wait (RSF-F940): the
+/// checked completeness claim needs the `HistoryDone` sentinel on
+/// every history-expected volume, and delivery is asynchronous — the
+/// pre-traversal drain races stream startup. The scan polls
+/// non-blocking drains until every such volume's history closes or
+/// this bound expires; expiry is a fail-closed timeout (the claim
+/// fails honestly into gaps + exit 3), never a skip. Volumes without
+/// live history pay nothing (the closed check is immediately true).
+const HISTORY_CLOSE_WAIT: Duration = Duration::from_secs(15);
+/// Poll interval inside the history-close wait while no batches arrive.
+/// Short enough to catch the sentinel promptly at 0.3 s stream
+/// latency, long enough to never busy-spin.
+const HISTORY_CLOSE_POLL: Duration = Duration::from_millis(100);
 /// Lease TTL granted per claim.
 const LEASE_TTL_MS: i64 = 60_000;
 /// Transient failures before a task parks as unavailable.
@@ -71,9 +84,10 @@ const BREAKER_THRESHOLD: u32 = 3;
 const BREAKER_COOLDOWN: Duration = Duration::from_secs(60);
 /// Tool-ownership marker filename inside the payload namespace (R15). Written
 /// on every owned open; verified before any destructive `cache clear`.
-const OWNER_MARKER_NAME: &str = "owner.marker";
+/// Single definition in `store::owner` (RS-PRIV-02/05).
+use repo_scan::store::owner::OWNER_MARKER_NAME;
 /// Marker format tag (first line of the marker file).
-const OWNER_MARKER_TAG: &str = "repo-scan-owner-v1";
+use repo_scan::store::owner::OWNER_MARKER_TAG;
 /// Pending-outcome exit sentinel (R14): a scan row carrying this exit in its
 /// outcome column has no terminal outcome yet; the outcome only binds the
 /// traversal generation the scan runs in.
@@ -83,6 +97,24 @@ const PENDING_EXIT: i32 = -1;
 const MAX_REPORT_ATTEMPTS: u32 = 1_000;
 /// Bytes of the engine file scanned for catalog schema markers (R15).
 const DB_IDENTITY_SCAN_BYTES: u64 = 64 * 1024;
+/// RS-PRIV-09 budgets: snapshot/clear/query paths never do unbounded work.
+/// Budget exhaustion is reported as INCOMPLETE coverage, never as a
+/// complete cleanup or a full answer.
+/// Max entries scanned per clear directory (snapshots/staging/payload).
+const CLEAR_MAX_FILES_PER_DIR: usize = 50_000;
+/// Max total bytes hashed while verifying clear candidates.
+const CLEAR_MAX_BYTES_HASHED: u64 = 4 * 1024 * 1024 * 1024;
+/// Max preserved entries accumulated (display already caps at 20).
+const CLEAR_MAX_PRESERVED: usize = 10_000;
+/// Wall-clock budget for one `cache clear`.
+const CLEAR_DEADLINE_SECS: u64 = 600;
+/// Max snapshot stems resolved to checksum rows per clear.
+const SNAPSHOT_MAX_STEMS: usize = 10_000;
+/// Max generations / matches served by one cached query.
+const QUERY_MAX_GENERATIONS: usize = 1_024;
+const QUERY_MAX_MATCHES: usize = 10_000;
+/// Wall-clock budget for one cached query.
+const QUERY_DEADLINE_SECS: u64 = 60;
 /// Rows per catalog page for bounded report-derivation scans
 /// (RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1): errors, instances, and
 /// reclassification reads never hold more than one page from the database
@@ -184,9 +216,23 @@ fn is_lock_contention(e: &repo_scan::Error) -> bool {
 /// Contention ends in a clear [`Error::OwnerBusy`][repo_scan::Error::OwnerBusy],
 /// never in an independent database open beside the live owner.
 fn acquire_guard(state_dir: &Path) -> repo_scan::Result<OwnerGuard> {
+    acquire_guard_with(state_dir, OwnerGuard::acquire)
+}
+
+/// Bounded-wait owner lock for `cache clear`: the payload dir is left
+/// untouched (possibly unlistable/foreign/absent) for clear's own
+/// fail-closed inspection under the held lock.
+fn acquire_guard_for_clear(state_dir: &Path) -> repo_scan::Result<OwnerGuard> {
+    acquire_guard_with(state_dir, OwnerGuard::acquire_for_clear)
+}
+
+fn acquire_guard_with(
+    state_dir: &Path,
+    acquire: fn(&Path) -> repo_scan::Result<OwnerGuard>,
+) -> repo_scan::Result<OwnerGuard> {
     let deadline = Instant::now() + Duration::from_millis(config::OWNER_WAIT_MAX_MS);
     loop {
-        match OwnerGuard::acquire(state_dir) {
+        match acquire(state_dir) {
             Ok(guard) => return Ok(guard),
             Err(e) => {
                 if !is_lock_contention(&e) {
@@ -231,15 +277,10 @@ fn owner_marker_path(state_dir: &Path) -> PathBuf {
 /// verified (not trusted blindly) by `cache clear` alongside the database
 /// identity checks.
 async fn write_owner_marker(store: &TursoStore, state_dir: &Path) -> repo_scan::Result<()> {
-    let mut rows = store
-        .connection()
-        .query("SELECT value FROM meta WHERE name = 'db_id'", ())
-        .await
-        .map_err(store_err)?;
-    let db_id = match rows.next().await.map_err(store_err)? {
-        Some(row) => cell_text(&row, 0)?,
-        None => String::from("unknown"),
-    };
+    let db_id = store
+        .catalog_db_id()
+        .await?
+        .unwrap_or_else(|| String::from("unknown"));
     let contents = format!(
         "{OWNER_MARKER_TAG}\ndb_id={db_id}\nwritten_ms={}\npid={}\n",
         store::now_ms(),
@@ -284,11 +325,12 @@ async fn write_owner_marker(store: &TursoStore, state_dir: &Path) -> repo_scan::
         .open(&path)?;
     #[cfg(unix)]
     {
+        // RS-PRIV-05: fchmod the open FD, never the path (the parent comes
+        // from the ancestor-pinned creation primitive above).
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            &path,
-            std::fs::Permissions::from_mode(store::owner::STATE_FILE_MODE),
-        )?;
+        file.set_permissions(std::fs::Permissions::from_mode(
+            store::owner::STATE_FILE_MODE,
+        ))?;
     }
     {
         use std::io::Write as _;
@@ -473,21 +515,26 @@ async fn run_scan_inner(
     args: &repo_scan::cli::ScanArgs,
     resumed: Option<ResumedRequest>,
 ) -> repo_scan::Result<ExitCode> {
-    // CLI boundary (RSF-SEC-TARGET-URL): credential-bearing targets are
-    // rejected before any persistence or reporting; the error echoes only
-    // the redacted shape.
-    if identity::has_userinfo(&args.url) {
+    // CLI boundary (RSF-SEC-TARGET-URL, EXACT-2): credential-bearing
+    // targets (userinfo, any query/fragment tail) are rejected before any
+    // persistence or reporting; the error echoes only the display-safe
+    // shape, never secret bytes.
+    if identity::must_reject_target(&args.url) {
         return Err(repo_scan::Error::InvalidArgs(format!(
-            "target URL must not embed credentials; remove userinfo and retry: {}",
-            identity::redact_credentials(&args.url),
+            "target URL must not embed credentials or a query/fragment tail; remove them and retry: {}",
+            identity::redact_target_for_display(&args.url),
         )));
     }
-    let canonical = match identity::normalize_github_url(&args.url) {
+    // Centralized (EXACT-2): everything downstream — canonicalization,
+    // mint, catalog, report, snapshot, terminal — observes only the
+    // sanitized target, never a credential form.
+    let target = identity::sanitize_target_url(&args.url);
+    let canonical = match identity::normalize_github_url(&target) {
         Some(canonical) => canonical,
         None => {
             return Err(repo_scan::Error::InvalidArgs(format!(
                 "target URL is not a supported GitHub shape: {}",
-                identity::redact_credentials(&args.url),
+                identity::redact_target_for_display(&args.url),
             )));
         }
     };
@@ -504,12 +551,35 @@ async fn run_scan_inner(
     // Finding 12: the traversal fence is built once from the planned
     // roots; every enum task re-verifies its directory against it through
     // a pinned descriptor-relative open before listing.
-    runner.fence = Some(ScopeFence::build(
+    let fence = ScopeFence::build(
         &roots
             .iter()
             .map(|root| root.path.clone())
             .collect::<Vec<_>>(),
-    ));
+    );
+    // RSF-TOPOLOGY-ADMISSION: unverified root identities persist as durable
+    // gaps, never a silent lexical fallback; execution parks them honestly.
+    for unknown in fence.unknown_roots() {
+        let scope_key = config::scope_key_for_dir(&unknown);
+        store
+            .record_error(
+                &format!(
+                    "gap:fence-identity:{}",
+                    config::encode_hex(&config::path_as_bytes(&unknown))
+                ),
+                &scope_key,
+                "fence-identity-unknown",
+                &format!(
+                    "root identity unverified for {}; bounded resolve failed or timed out",
+                    unknown.display()
+                ),
+                None,
+                store::now_ms(),
+            )
+            .await?;
+        runner.counters.db_transactions += 1;
+    }
+    runner.fence = Some(fence);
     // Event monitoring opens before any traversal decision (R5).
     let mut events = open_event_session(&store, &cfg.state_dir, &policy, &roots).await?;
     // One fresh catalog revision per run: status observations keyed by it
@@ -559,7 +629,7 @@ async fn run_scan_inner(
         None => {
             mint_scan_id(
                 &store,
-                &args.url,
+                &target,
                 &canonical,
                 &policy,
                 args.status,
@@ -606,7 +676,7 @@ async fn run_scan_inner(
     runner.counters.db_transactions += 1;
     upsert_volumes(&store, &policy, &roots, now, &mut runner.counters).await?;
     // Ingest available event history before traversal (R5).
-    let drain = ingest_available_events(
+    let mut drain = ingest_available_events(
         &mut events,
         &store,
         generation,
@@ -626,7 +696,7 @@ async fn run_scan_inner(
     reclassify_for_target(&store, &canonical, &mut runner.counters).await?;
     enqueue_status_refresh(&store, &mut runner, generation, run_rev, now).await?;
 
-    let outcome = run_until_boundary(
+    let mut outcome = run_until_boundary(
         &mut runner,
         &store,
         epoch,
@@ -643,6 +713,66 @@ async fn run_scan_inner(
             runner.watchdog.tripped,
         );
     }
+    // Bounded history-close wait (R5, RSF-F940): the pre-traversal
+    // drain races stream startup, so history that arrived during
+    // traversal — including the `HistoryDone` sentinel on resumed
+    // volumes — is ingested here, before the completeness claim.
+    // Polls non-blocking drains until every history-expected volume
+    // closes or the bound expires; expiry fails the claim honestly
+    // (gaps + exit 3), never silently. Work scheduled during the wait
+    // runs back to boundary once, after it; later arrivals stay queued
+    // for the next run (the claim is relative to the pinned boundary,
+    // not the live tip).
+    let wait_scopes_before = drain.scopes;
+    let mut errored_volumes: HashSet<String> = HashSet::new();
+    let close_deadline = Instant::now() + HISTORY_CLOSE_WAIT;
+    loop {
+        let post = ingest_available_events(
+            &mut events,
+            &store,
+            generation,
+            &roots,
+            &mut runner.counters,
+        )
+        .await?;
+        if post.batches > 0 {
+            eprintln!(
+                "repo-scan: events: ingested {} batch(es), {} scope(s) invalidated (post-traversal)",
+                post.batches, post.scopes,
+            );
+        }
+        drain.batches += post.batches;
+        drain.scopes += post.scopes;
+        drain.mount_changed |= post.mount_changed;
+        errored_volumes.extend(post.failed_volumes);
+        if volumes_history_closed(&events, &errored_volumes)
+            || outcome.interrupted
+            || Instant::now() >= close_deadline
+        {
+            break;
+        }
+        if post.batches == 0 {
+            std::thread::sleep(HISTORY_CLOSE_POLL);
+        }
+    }
+    if drain.scopes != wait_scopes_before && !outcome.interrupted {
+        let next = run_until_boundary(
+            &mut runner,
+            &store,
+            epoch,
+            generation,
+            run_rev,
+            &canonical,
+            args.status,
+            &scan_id,
+        )
+        .await?;
+        outcome.interrupted |= next.interrupted;
+        outcome.pending = next.pending;
+        outcome.open_gaps = next.open_gaps;
+        outcome.unresolvable = next.unresolvable;
+        outcome.status_pending = next.status_pending;
+    }
     if drain.mount_changed {
         // A mount change during ingest asked for fresh volume rows (R5).
         upsert_volumes(
@@ -655,20 +785,25 @@ async fn run_scan_inner(
         .await?;
     }
     // Advance reconciled cursors over satisfied work (R5). Claim
-    // verdicts are logged inside; only cursors feed the report.
-    let (cursors, _) = reconcile_event_cursors(&mut events, &store).await?;
+    // verdicts persist as explicit gaps inside (EXACT-2/3); the returned
+    // verdicts feed scan status here so incomplete history surfaces as
+    // non-complete status in the catalog, the report, and the exit code —
+    // never stderr-only.
+    let (cursors, claims) = reconcile_event_cursors(&mut events, &store).await?;
+    let event_gaps = claims.iter().filter(|c| !c.complete).count() as u64;
 
     let finished_ms = store::now_ms();
+    let scan_incomplete = outcome.has_gaps() || event_gaps > 0;
     let gen_state = if outcome.interrupted {
         "interrupted"
-    } else if outcome.has_gaps() {
+    } else if scan_incomplete {
         "incomplete"
     } else {
         "complete"
     };
     store.set_generation_state(generation, gen_state).await?;
     runner.counters.db_transactions += 1;
-    let discovery_code = if outcome.has_gaps() { 3 } else { 0 };
+    let discovery_code = if scan_incomplete { 3 } else { 0 };
     // Stage first, publish second through the tested lib pipeline (R3): a
     // failed publication retains the saved snapshot and can be retried
     // without repeating discovery.
@@ -676,11 +811,18 @@ async fn run_scan_inner(
     let catalog_rev = store.current_revision().await?;
     let dirs_complete = count_dirs_complete(&store, generation).await?;
     let snapshot_path = snapshots_dir(&cfg.state_dir).join(format!("{report_id}.json"));
+    let mut event_note = events.note();
+    if event_gaps > 0 {
+        event_note.push_str(&format!(
+            " {event_gaps} volume(s) event-history incomplete \
+             (traversal covers scope; see event-history-incomplete gaps)."
+        ));
+    }
     let inputs = ScanReportInputs {
         scan_id: scan_id.clone(),
         generation,
         epoch,
-        target_raw: args.url.clone(),
+        target_raw: target.clone(),
         canonical: canonical.clone(),
         scope_policy: policy.clone(),
         scan_state: gen_state.to_string(),
@@ -693,7 +835,7 @@ async fn run_scan_inner(
         pending: outcome.pending,
         aliases: runner.aliases.clone(),
         root_cursors: root_cursors_for(&roots, &events, &cursors),
-        event_note: events.note(),
+        event_note,
     };
     let lib_inputs = build_lib_inputs(
         &store,
@@ -790,7 +932,7 @@ async fn run_scan_inner(
             )
             .await?;
         ExitCode::Interrupted
-    } else if outcome.has_gaps() {
+    } else if scan_incomplete {
         store
             .update_scan_state(
                 &scan_id,
@@ -943,14 +1085,17 @@ async fn mint_scan_id(
     report_dest: &Option<PathBuf>,
     counters: &mut RunCounters,
 ) -> repo_scan::Result<String> {
-    // Defense-in-depth: the CLI boundary already rejected userinfo; never
-    // persist a credential-bearing target even on a direct call path.
-    if identity::has_userinfo(raw_url) {
+    // Defense-in-depth: the CLI boundary already rejected credential
+    // forms; never persist one even on a direct call path (EXACT-2).
+    if identity::must_reject_target(raw_url) {
         return Err(repo_scan::Error::InvalidArgs(format!(
-            "target URL must not embed credentials: {}",
-            identity::redact_credentials(raw_url),
+            "target URL must not embed credentials or a query/fragment tail: {}",
+            identity::redact_target_for_display(raw_url),
         )));
     }
+    // Redact-before-persist (EXACT-2): the catalog row carries the
+    // sanitized target (scp user normalized), never the raw login.
+    let safe_url = identity::sanitize_target_url(raw_url);
     let now = store::now_ms();
     let dest_bytes = report_dest.as_ref().map(|p| config::path_as_bytes(p));
     for _ in 0..3 {
@@ -959,7 +1104,7 @@ async fn mint_scan_id(
             .create_scan_request(
                 &NewScan {
                     id: &id,
-                    url_raw: raw_url.as_bytes(),
+                    url_raw: safe_url.as_bytes(),
                     url_canonical: Some(canonical.as_bytes()),
                     scope: policy,
                     status_mode: status_mode_str(status),
@@ -1110,19 +1255,20 @@ async fn seed_root_tasks(
     Ok(())
 }
 
-/// Stable enumeration task ID from physical identity when the path stats,
-/// else from the path bytes (execution then records the gap durably).
-/// Identity follows symlinks (R7) so alias spellings share one task and
-/// its results; the `(0, 0)` fallback (non-unix) never shares an ID.
-fn enum_task_id_for_path(generation: u64, path: &Path) -> String {
-    let identity = std::fs::metadata(path)
-        .ok()
-        .map(|md| dir_identity(&md))
-        .filter(|key| *key != (0, 0));
+/// Stable enumeration task ID from bounded physical identity, else an
+/// explicit unknown marker (RSF-TOPOLOGY-ADMISSION). Identity follows
+/// symlinks (R7) so alias spellings share one task and its results; the
+/// bounded resolve refuses or times out on hung paths instead of stalling
+/// the coordinator. Unknown IDs never collide with identity IDs and never
+/// silently change meaning: execution stats through the fence and records
+/// the gap durably when the path is truly unusable.
+pub fn enum_task_id_for_path(generation: u64, path: &Path) -> String {
+    let identity =
+        repo_scan::walk::topology::bounded_dir_identity(path).filter(|key| *key != (0, 0));
     match identity {
         Some((dev, ino)) => format!("enum:{generation}:d{dev}:i{ino}"),
         None => format!(
-            "enum:{generation}:path:{}",
+            "enum:{generation}:unknown:{}",
             config::encode_hex(&config::path_as_bytes(path))
         ),
     }
@@ -1430,7 +1576,7 @@ async fn open_event_session(
                 Ok(mut opened) => {
                     let live_uuid = live_history_uuid_for(&volume.mount);
                     let live_id = events::native::current_event_id().0;
-                    for m in opened.drain(..) {
+                    for mut m in opened.drain(..) {
                         let decision = session.reconciler.note_stream_opened(
                             &volume.key,
                             stored.get(&volume.key),
@@ -1438,6 +1584,12 @@ async fn open_event_session(
                             live_id,
                             m.boundary,
                         );
+                        // The checked completeness claim applies only
+                        // where a historical phase exists (open-rule
+                        // Resume). Fresh `SinceNow` opens requested no
+                        // history, so no sentinel can arrive and no
+                        // claim is attempted for them.
+                        m.history_expected = decision.resumed();
                         if decision.history_invalid() {
                             session.history_invalid = true;
                             eprintln!(
@@ -1504,6 +1656,24 @@ struct IngestApplied {
     batches: usize,
     scopes: usize,
     mount_changed: bool,
+    /// Volumes whose batch read failed this drain (durable rescan with
+    /// retry already scheduled by `apply_batch_error`). The history-close
+    /// wait stops waiting on these: a dead stream's sentinel will never
+    /// arrive, and its claim fails honestly instead of stalling the rest.
+    failed_volumes: Vec<String>,
+}
+
+/// True when every history-expected volume's historical phase closed
+/// (the reconcile path consumed `HistoryDone`) or errored (a dead
+/// stream's sentinel will never arrive; its claim fails honestly).
+/// Volumes without live history are vacuously closed: no historical
+/// phase exists for them, so the history-close wait pays nothing.
+fn volumes_history_closed(session: &EventSession, errored: &HashSet<String>) -> bool {
+    session
+        .monitored
+        .iter()
+        .filter(|m| m.history_expected)
+        .all(|m| errored.contains(&m.volume_key) || session.reconciler.history_done(&m.volume_key))
 }
 
 /// Drain available batches from every monitored stream (bounded per call)
@@ -1556,6 +1726,28 @@ async fn ingest_available_events(
     // roots may carry an unclean spelling (`/var` vs `/private/var`).
     // Membership is `..`-normalized, never a raw `starts_with` (finding 12).
     let fence = ScopeFence::build(&roots.iter().map(|r| r.path.clone()).collect::<Vec<_>>());
+    // RSF-TOPOLOGY-ADMISSION: the drain rebuilds its fence every call, so
+    // unverified root identities persist here exactly as on the scan path.
+    for unknown in fence.unknown_roots() {
+        let scope_key = config::scope_key_for_dir(&unknown);
+        store
+            .record_error(
+                &format!(
+                    "gap:fence-identity:{}",
+                    config::encode_hex(&config::path_as_bytes(&unknown))
+                ),
+                &scope_key,
+                "fence-identity-unknown",
+                &format!(
+                    "root identity unverified for {}; bounded resolve failed or timed out",
+                    unknown.display()
+                ),
+                None,
+                store::now_ms(),
+            )
+            .await?;
+        counters.db_transactions += 1;
+    }
     for batch in &batches {
         apply_event_batch(
             session,
@@ -1568,6 +1760,21 @@ async fn ingest_available_events(
             &mut applied,
         )
         .await?;
+        // RSF-GAP-RECOVERY: a successfully ingested batch proves bounded
+        // recovery once the volume's history closed (`HistoryDone`) or its
+        // scheduled rescan drained — resolve the matching event gaps in one
+        // transaction so old failures never pin later generations. The
+        // resolver is read-only without an open gap, so the hot path and
+        // its transaction accounting are unchanged.
+        let recovered = session.reconciler.history_done(&batch.volume_key)
+            || scope_pending_work(store, &events::volume_scope_key(&batch.volume_key)).await? == 0;
+        if recovered
+            && store
+                .resolve_event_gaps_for_volume(&batch.volume_key, store::now_ms())
+                .await?
+        {
+            counters.db_transactions += 1;
+        }
     }
     Ok(applied)
 }
@@ -1606,6 +1813,7 @@ async fn apply_batch_error(
         .await?;
     counters.db_transactions += 1;
     applied.scopes += 1;
+    applied.failed_volumes.push(volume_key.to_string());
     note_applied_scopes(session, volume_key, std::slice::from_ref(&action.scope_key));
     eprintln!(
         "repo-scan: events: batch error on {volume_key}: {error}; \
@@ -1837,10 +2045,33 @@ async fn reconcile_event_cursors(
     // Checked completeness claims (RSF-F940): a live volume's claim
     // requires the consumed `history_done` sentinel, so a volume whose
     // historical phase may still be replaying is never treated as
-    // event-complete. Failures degrade to stderr: the traversal is the
-    // source of truth and events only accelerate it.
+    // event-complete. Failures persist as explicit gaps (EXACT-2/3) plus
+    // stderr: the traversal is the source of truth and events only
+    // accelerate it, but the incomplete history must surface in report
+    // coverage/gaps, catalog status, and exit status — never stderr-only.
+    // Durability lives here (not in the caller) so no caller can discard
+    // a claim verdict by dropping the returned vec. Volumes that opened
+    // fresh (`SinceNow`, no stored cursors) requested no history, so no
+    // historical phase exists to close and no claim is attempted for
+    // them: attempting one would manufacture a permanent false gap
+    // (no sentinel is ever delivered for history that was never
+    // requested).
+    let history_expected: HashSet<String> = session
+        .monitored
+        .iter()
+        .filter(|m| m.history_expected)
+        .map(|m| m.volume_key.clone())
+        .collect();
     let mut claims = Vec::with_capacity(keys.len());
     for key in &keys {
+        if !history_expected.contains(key) {
+            claims.push(VolumeClaim {
+                volume: key.clone(),
+                complete: true,
+                detail: String::new(),
+            });
+            continue;
+        }
         let claim = match session
             .reconciler
             .claim_volume_complete_requiring_history(key)
@@ -1861,6 +2092,25 @@ async fn reconcile_event_cursors(
                 "repo-scan: events: volume {} event completeness not claimed: {}",
                 claim.volume, claim.detail,
             );
+            let action = events::plan_claim_error(&claim.volume, &claim.detail);
+            store
+                .record_error(
+                    &action.gap_id,
+                    &action.scope_key,
+                    events::CLAIM_ERROR_CATEGORY,
+                    &action.detail,
+                    None,
+                    store::now_ms(),
+                )
+                .await?;
+        } else {
+            // RSF-GAP-RECOVERY: a held claim proves the rescan drained and
+            // history closed — resolve this volume's event gaps in one
+            // transaction so the old failure never pins later generations.
+            // Read-only without an open gap; a later failure re-opens.
+            store
+                .resolve_event_gaps_for_volume(&claim.volume, store::now_ms())
+                .await?;
         }
         claims.push(claim);
     }
@@ -2472,6 +2722,12 @@ async fn run_until_boundary(
             if runner.admission.telemetry_due() {
                 sample_footprint(runner);
             }
+            // CPU-governor pacing (spec §5): bounded pause between
+            // admissions while throttled; zero otherwise.
+            let pace = runner.admission.pace_delay();
+            if !pace.is_zero() {
+                std::thread::sleep(pace);
+            }
             let elapsed = started.elapsed();
             if elapsed > Duration::from_secs(SLOW_TASK_SECS) {
                 eprintln!(
@@ -2667,6 +2923,16 @@ fn sample_footprint(runner: &mut Runner) {
     let pressured = sample.aggregate_rss_bytes > runner.pressure_threshold_bytes;
     let rising = pressured && !runner.admission.under_pressure();
     runner.admission.set_pressure(pressured);
+    // CPU governor (spec §5): sustained rolling-core excess reduces
+    // admission and paces work; hysteresis lives in `observe_cpu`.
+    let was_throttled = runner.admission.cpu_throttled();
+    runner.admission.observe_cpu(sample.rolling_cores);
+    if runner.admission.cpu_throttled() && !was_throttled {
+        eprintln!(
+            "repo-scan: CPU throttle: rolling {:.2} cores over target; admission reduced",
+            sample.rolling_cores,
+        );
+    }
     if rising {
         let helper_note = match sample.helpers_rss_bytes {
             Some(_) => "measured",
@@ -4435,6 +4701,93 @@ fn park_on_identity_change(what: &str, path: &Path) -> TaskOutcome {
     }
 }
 
+/// Margin between a renewed lease's expiry and the longest blocking
+/// call allowed under it (R4): the status call runs under `LEASE_TTL_MS`
+/// minus this, so the guard trips and the observation is discarded
+/// strictly before the lease can lapse — valid work is never reclaimed
+/// mid-call.
+const LEASE_WINDOW_MARGIN_MS: i64 = 15_000;
+
+/// Renew one claimed task's lease (R4 heartbeat for probe/status paths):
+/// extends `lease_expires_ms` by [`LEASE_TTL_MS`] iff the exact
+/// token/epoch lease is still held. Mirrors the enumeration heartbeat's
+/// `WHERE` clause: a zero-row renewal means the lease is gone (expired,
+/// reclaimed, or superseded) — the caller must stop touching the scope
+/// and preserve a gap via [`fail_task`], never race a completion. Never
+/// touches another owner's lease. One transaction when the lease is held.
+async fn renew_claim_lease(
+    store: &TursoStore,
+    counters: &mut RunCounters,
+    claimed: &ClaimedTask,
+) -> repo_scan::Result<bool> {
+    let lease_epoch = claimed.task.lease_epoch.unwrap_or(u64::MAX);
+    let new_expiry = store::now_ms().saturating_add(LEASE_TTL_MS);
+    let matched = store
+        .connection()
+        .execute(
+            "UPDATE frontier_tasks SET lease_expires_ms = ?1, updated_at_ms = ?1 \
+             WHERE id = ?2 AND state = 'leased' AND lease_token = ?3 \
+             AND lease_epoch = ?4",
+            vec![
+                turso::Value::Integer(new_expiry),
+                turso::Value::Text(claimed.task.id.clone()),
+                turso::Value::Integer(claimed.token),
+                turso::Value::Integer(lease_epoch as i64),
+            ],
+        )
+        .await
+        .map_err(store_err)?;
+    if matched > 0 {
+        counters.db_transactions += 1;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Retry outcome for a probe/status op that outlived its lease (R4):
+/// observations are discarded (another owner may hold the scope) and the
+/// scope retries with backoff — or parks when attempts are exhausted —
+/// with the loss preserved as a gap. Mirrors the enumeration path, which
+/// funnels its own lease loss through [`fail_task`].
+async fn retry_on_lease_lost(
+    runner: &mut Runner,
+    store: &TursoStore,
+    claimed: &ClaimedTask,
+    detail: &str,
+) -> repo_scan::Result<TaskOutcome> {
+    eprintln!("repo-scan: {detail}");
+    fail_task(
+        runner,
+        store,
+        claimed,
+        ExecFail {
+            category: String::from("lease-lost"),
+            detail: detail.to_string(),
+        },
+    )
+    .await
+}
+
+/// Budget split for one blocking status call (R4): `(call_ms, lease_bound)`.
+/// The call runs under the tighter of the remaining wall budget and the
+/// freshly-renewed lease window (margin held back); `lease_bound` tells the
+/// post-call check whether a window abandonment must retry with a fresh
+/// lease rather than park valid-but-slow work. Pure and unit-testable.
+fn lease_call_budget(wall_remaining_ms: u64) -> (u64, bool) {
+    let lease_ms = (LEASE_TTL_MS - LEASE_WINDOW_MARGIN_MS).max(1) as u64;
+    (
+        wall_remaining_ms.min(lease_ms),
+        lease_ms < wall_remaining_ms,
+    )
+}
+
+/// R4 regression hook: budget split of one blocking status call.
+#[cfg(test)]
+pub fn test_lease_call_budget(wall_remaining_ms: u64) -> (u64, bool) {
+    lease_call_budget(wall_remaining_ms)
+}
+
 /// Validate one Git candidate at its exact path and persist the instance,
 /// checkouts, remotes, refs, and HEAD observations. Marker evidence that
 /// fails validation becomes a preserved `probe-failed` gap (terminal for
@@ -4489,6 +4842,23 @@ async fn exec_probe(
             path.display()
         )));
     }
+    // R4 heartbeat: the claim may have aged in the batch before this op
+    // started — renew before the first Git read so the 60 s lease covers
+    // the read stages below. A lost lease stops the op: nothing is
+    // observed yet, so retry with a fresh lease instead of racing a
+    // completion.
+    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+        return retry_on_lease_lost(
+            runner,
+            store,
+            claimed,
+            &format!(
+                "lease lost before probe of {}; retrying with a fresh lease",
+                path.display()
+            ),
+        )
+        .await;
+    }
     // The pin binds the execution (XSEC-01): Git runs between the
     // pre-run pin above and the DURING/post-run re-verification below, so a
     // path swapped mid-run discards every observation. Inspection keeps
@@ -4524,7 +4894,17 @@ async fn exec_probe(
     if !poll.ok_now() {
         return Ok(park_on_identity_change("probe", &path));
     }
-    let reads = match collect_probe_reads(runner, &validated.instance, &path, &mut poll, deadline) {
+    let reads = match collect_probe_reads(
+        runner,
+        store,
+        claimed,
+        &validated.instance,
+        &path,
+        &mut poll,
+        deadline,
+    )
+    .await
+    {
         Ok(CollectOutcome::Reads(reads)) => reads,
         Ok(CollectOutcome::IdentityChanged) => {
             return Ok(park_on_identity_change("probe", &path));
@@ -4535,6 +4915,18 @@ async fn exec_probe(
                  budget during Git reads; observations discarded",
                 path.display()
             )));
+        }
+        Ok(CollectOutcome::LeaseLost) => {
+            return retry_on_lease_lost(
+                runner,
+                store,
+                claimed,
+                &format!(
+                    "lease lost during probe of {}; observations discarded",
+                    path.display()
+                ),
+            )
+            .await;
         }
         // Operational Git read failures retry with backoff, then park with
         // the gap preserved; store failures abort the run (exit 1).
@@ -4555,6 +4947,22 @@ async fn exec_probe(
     // Pre-store gate: the last poll before the first buffered write.
     if !poll.ok_now() {
         return Ok(park_on_identity_change("probe", &path));
+    }
+    // R4 heartbeat: re-verify the lease before the first buffered write —
+    // a Git stage may have consumed the window without tripping the
+    // identity polls. Observations under a lost lease are discarded and
+    // the scope retries with a fresh lease.
+    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+        return retry_on_lease_lost(
+            runner,
+            store,
+            claimed,
+            &format!(
+                "lease lost before persisting probe of {}; observations discarded",
+                path.display()
+            ),
+        )
+        .await;
     }
     match persist_probe(
         runner, store, generation, run_rev, canonical, &path, &validated, *reads, now,
@@ -4728,11 +5136,13 @@ struct ProbeReads {
 }
 
 /// Outcome of [`collect_probe_reads`]: full reads, or an abandon signal.
-/// `IdentityChanged`/`TimedOut` mean "park, persist nothing".
+/// `IdentityChanged`/`TimedOut` mean "park, persist nothing";
+/// `LeaseLost` means "retry with a fresh lease, persist nothing".
 enum CollectOutcome {
     Reads(Box<ProbeReads>),
     IdentityChanged,
     TimedOut,
+    LeaseLost,
 }
 
 // One-shot mid-inspection swap hook for the XSEC-01 regression test:
@@ -4754,8 +5164,10 @@ pub fn test_set_mid_inspection_hook(hook: impl FnOnce() + Send + 'static) {
     });
 }
 
-fn collect_probe_reads(
+async fn collect_probe_reads(
     runner: &mut Runner,
+    store: &TursoStore,
+    claimed: &ClaimedTask,
     instance: &git::GitInstance,
     path: &Path,
     poll: &mut IdentityPoll,
@@ -4798,6 +5210,13 @@ fn collect_probe_reads(
     if !poll.ok_now() {
         return Ok(CollectOutcome::IdentityChanged);
     }
+    // R4 heartbeat: the stage above consumed lease time — renew at this
+    // yield point so a slow-but-advancing probe never lets its 60 s lease
+    // lapse mid-operation. A lost lease abandons the collection: the
+    // caller discards every observation and retries with a fresh lease.
+    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+        return Ok(CollectOutcome::LeaseLost);
+    }
     if deadline.expired() {
         return Ok(CollectOutcome::TimedOut);
     }
@@ -4813,6 +5232,10 @@ fn collect_probe_reads(
     if !poll.ok_throttled() {
         return Ok(CollectOutcome::IdentityChanged);
     }
+    // R4 heartbeat at this yield point (see above).
+    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+        return Ok(CollectOutcome::LeaseLost);
+    }
     let relationship = match runner.inspector.checkout_kind(instance) {
         Ok(git::CheckoutKind::Main) => "main",
         Ok(git::CheckoutKind::Linked) => "linked",
@@ -4822,10 +5245,18 @@ fn collect_probe_reads(
     if !poll.ok_throttled() {
         return Ok(CollectOutcome::IdentityChanged);
     }
+    // R4 heartbeat at this yield point (see above).
+    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+        return Ok(CollectOutcome::LeaseLost);
+    }
     let work_present = instance.work_dir.as_ref().map(|root| root.exists());
     let worktrees = runner.inspector.worktrees(instance).unwrap_or_default();
     if !poll.ok_throttled() {
         return Ok(CollectOutcome::IdentityChanged);
+    }
+    // R4 heartbeat at this yield point (see above).
+    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+        return Ok(CollectOutcome::LeaseLost);
     }
     if deadline.expired() {
         return Ok(CollectOutcome::TimedOut);
@@ -4836,6 +5267,10 @@ fn collect_probe_reads(
     })?;
     if !poll.ok_now() {
         return Ok(CollectOutcome::IdentityChanged);
+    }
+    // R4 heartbeat at this yield point (see above).
+    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+        return Ok(CollectOutcome::LeaseLost);
     }
     let ref_errors = runner.inspector.reference_errors(instance);
     let branch_upstreams = load_branch_upstreams(&instance.common_dir);
@@ -5521,7 +5956,29 @@ async fn exec_status(
     if !poll.ok_now() {
         return Ok(park_on_identity_change("status", &git_path));
     }
+    // R4 heartbeat: renew before the blocking call below, which has no
+    // in-call yield point. A lost lease stops the op before any Git read.
+    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+        return retry_on_lease_lost(
+            runner,
+            store,
+            claimed,
+            &format!(
+                "lease lost before status of {}; retrying with a fresh lease",
+                git_path.display()
+            ),
+        )
+        .await;
+    }
     let started = store::now_ms();
+    // R4: the blocking status call has no in-call yield point, so it runs
+    // under the tighter of the wall budget and the lease window just
+    // renewed above — the guard trips the interrupt strictly before the
+    // lease can lapse, and a window abandonment retries (fresh lease)
+    // instead of parking valid-but-slow work.
+    let (call_ms, lease_bound) =
+        lease_call_budget(deadline.remaining().as_millis().min(u128::from(u64::MAX)) as u64);
+    let call_deadline = OpDeadline::new(Duration::from_millis(call_ms));
     // SR-STATE-01 + XSEC-01: the guard thread polls identity DURING the
     // blocking status call and trips the interrupt flag on change or
     // deadline. The flag is best-effort preemption; the checks after the
@@ -5531,7 +5988,7 @@ async fn exec_status(
         runner.fence.clone(),
         git_path.clone(),
         pinned.as_ref().map(snapshot_of),
-        *deadline,
+        call_deadline,
     );
     let status_result =
         runner
@@ -5548,8 +6005,39 @@ async fn exec_status(
             git_path.display()
         )));
     }
+    if lease_bound && call_deadline.expired() {
+        // R4: the lease window (not the wall budget) ended the call — the
+        // observation is discarded and the scope retries with a fresh
+        // lease. The lease itself never lapsed, so no reclaim or duplicate
+        // is possible; parking here would strand valid-but-slow work.
+        return retry_on_lease_lost(
+            runner,
+            store,
+            claimed,
+            &format!(
+                "status of {} exceeded its lease window; observation discarded",
+                git_path.display()
+            ),
+        )
+        .await;
+    }
     if !poll.ok_now() {
         return Ok(park_on_identity_change("status", &git_path));
+    }
+    // R4 heartbeat: the blocking call consumed most of the window renewed
+    // above — renew again so the fallback and submodule reads below run
+    // under a fresh lease instead of racing its expiry.
+    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+        return retry_on_lease_lost(
+            runner,
+            store,
+            claimed,
+            &format!(
+                "lease lost during status of {}; observation discarded",
+                git_path.display()
+            ),
+        )
+        .await;
     }
     let observation = match status_result {
         Ok(obs) => Some(obs),
@@ -5590,6 +6078,23 @@ async fn exec_status(
     // XSEC-01: one more read stage done — poll before recording.
     if !poll.ok_now() {
         return Ok(park_on_identity_change("status", &git_path));
+    }
+    // R4 heartbeat: the blocking call and fallback reads above may have
+    // outrun the lease window (the interrupt flag is best-effort) —
+    // verify the lease before any status row is recorded. A lost lease
+    // discards the observation and the scope retries with a fresh lease
+    // instead of racing a completion.
+    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+        return retry_on_lease_lost(
+            runner,
+            store,
+            claimed,
+            &format!(
+                "lease lost during status of {}; observation discarded",
+                git_path.display()
+            ),
+        )
+        .await;
     }
     // Status fence (post-run): every Git read above is done; re-verify
     // identity before any status row is recorded. On mismatch the
@@ -6898,22 +7403,51 @@ async fn run_query_inner(
     // writes, no migrations — so it is servable while a scan owner holds
     // the write lock and can never mutate catalog state.
     let store = TursoStore::open_read_only(&db_path).await?;
+    // RS-PRIV-06/08/12: an unbound catalog (no marker, or marker `db_id`
+    // != live `meta.db_id`) is not served — it reports "no suitable
+    // catalog", exactly like an absent one.
+    if !catalog_bound_to_marker(&store, &cfg.state_dir).await? {
+        println!("cached: true");
+        println!("suitable_catalog: false");
+        println!(
+            "note: catalog at {} is not bound to this tool's ownership marker; \
+             no live verification performed",
+            db_path.display()
+        );
+        let _ = store.close().await;
+        return Ok(ExitCode::Incomplete);
+    }
+    // RS-PRIV-09: row-count and time budgets; exhaustion truncates with
+    // an explicit incomplete note, never a silent partial answer.
+    let deadline = Instant::now() + Duration::from_secs(QUERY_DEADLINE_SECS);
+    let expired = || Instant::now() > deadline;
+    let generations_sql = format!(
+        "SELECT id, scope_policy, state, created_at_ms FROM generations ORDER BY id DESC LIMIT {}",
+        QUERY_MAX_GENERATIONS + 1
+    );
     let mut rows = store
         .connection()
-        .query(
-            "SELECT id, scope_policy, state, created_at_ms FROM generations ORDER BY id DESC",
-            (),
-        )
+        .query(&generations_sql, ())
         .await
         .map_err(store_err)?;
     let mut generations = Vec::new();
+    let mut generations_truncated = false;
     while let Some(row) = rows.next().await.map_err(store_err)? {
+        if expired() {
+            generations_truncated = true;
+            break;
+        }
         generations.push((
             cell_int(&row, 0)? as u64,
             cell_text(&row, 1)?,
             cell_text(&row, 2)?,
             cell_int(&row, 3)?,
         ));
+        if generations.len() > QUERY_MAX_GENERATIONS {
+            generations.pop();
+            generations_truncated = true;
+            break;
+        }
     }
     if generations.is_empty() {
         println!("cached: true");
@@ -6924,30 +7458,44 @@ async fn run_query_inner(
     }
     let Some(canonical) = normalize_query_cached(&args.url) else {
         println!("cached: true");
-        println!("target: {}", identity::redact_credentials(&args.url));
+        println!("target: {}", identity::redact_target_for_display(&args.url));
         println!("canonical: unresolved (unsupported shape or unresolvable host alias)");
         println!("note: aliases resolve only from cached observations; no live probe performed");
         let _ = store.close().await;
         return Ok(ExitCode::Incomplete);
     };
+    let matches_sql = format!(
+        "SELECT g.id, g.git_path, g.disposition, g.observed_at_ms FROM git_instances g \
+         JOIN remotes r ON r.instance_id = g.id WHERE r.canonical_url = ?1 \
+         GROUP BY g.id ORDER BY g.id ASC LIMIT {}",
+        QUERY_MAX_MATCHES + 1
+    );
     let mut rows = store
         .connection()
         .query(
-            "SELECT g.id, g.git_path, g.disposition, g.observed_at_ms FROM git_instances g \
-             JOIN remotes r ON r.instance_id = g.id WHERE r.canonical_url = ?1 \
-             GROUP BY g.id ORDER BY g.id ASC",
+            &matches_sql,
             vec![turso::Value::Blob(canonical.as_bytes().to_vec())],
         )
         .await
         .map_err(store_err)?;
     let mut matches = Vec::new();
+    let mut matches_truncated = false;
     while let Some(row) = rows.next().await.map_err(store_err)? {
+        if expired() {
+            matches_truncated = true;
+            break;
+        }
         matches.push((
             cell_text(&row, 0)?,
             cell_blob(&row, 1)?,
             cell_text(&row, 2)?,
             cell_int(&row, 3)?,
         ));
+        if matches.len() > QUERY_MAX_MATCHES {
+            matches.pop();
+            matches_truncated = true;
+            break;
+        }
     }
     let open_gaps = count_open_errors(&store).await?;
     let pending_all = count_query(
@@ -6958,7 +7506,7 @@ async fn run_query_inner(
     )
     .await?;
     println!("cached: true (no live verification performed)");
-    println!("target: {}", identity::redact_credentials(&args.url));
+    println!("target: {}", identity::redact_target_for_display(&args.url));
     println!("canonical: {canonical}");
     for (id, policy, state, created) in &generations {
         println!(
@@ -6968,10 +7516,24 @@ async fn run_query_inner(
     }
     println!("matches: {}", matches.len());
     for (_, git_path, disposition, observed) in &matches {
+        // RS-PRIV-12: stored bytes are scrubbed for secrets before
+        // display; escaping alone is not redaction.
+        let shown =
+            escape_display(identity::scrub_text(&String::from_utf8_lossy(git_path)).as_bytes());
         println!(
-            "  {disposition}: {} (observed {})",
-            escape_display(git_path),
+            "  {disposition}: {shown} (observed {})",
             ms_to_rfc3339(*observed),
+        );
+    }
+    if generations_truncated {
+        println!(
+            "note: generations truncated at the {QUERY_MAX_GENERATIONS}-row budget; \
+             coverage incomplete"
+        );
+    }
+    if matches_truncated {
+        println!(
+            "note: matches truncated at the {QUERY_MAX_MATCHES}-row budget; coverage incomplete"
         );
     }
     println!("open_gaps: {open_gaps}");
@@ -7055,7 +7617,7 @@ async fn run_resume_inner(
             );
             println!(
                 "target: {}",
-                identity::redact_credentials(&String::from_utf8_lossy(&row.url_raw))
+                identity::redact_target_for_display(&String::from_utf8_lossy(&row.url_raw))
             );
             let _ = store.close().await;
             drop(guard);
@@ -7187,16 +7749,16 @@ async fn continue_saved_scan(
     row: &store::ScanRow,
     saved_roots: Option<Vec<PathBuf>>,
 ) -> repo_scan::Result<ExitCode> {
-    // Redact-on-read (RSF-SEC-TARGET-URL): rows persisted before the CLI
-    // boundary reject may hold credential-bearing targets. Reuse the stored
-    // canonical target (never credential-bearing) or a stripped raw URL so
-    // the resumed scan resolves the same repository without carrying the
-    // secret forward into state or reports.
+    // Redact-on-read (RSF-SEC-TARGET-URL, EXACT-2): rows persisted
+    // before the CLI boundary reject may hold credential-bearing targets.
+    // Reuse the stored canonical target (never credential-bearing) or a
+    // sanitized raw URL so the resumed scan resolves the same repository
+    // without carrying the secret forward into state or reports.
     let stored_url = String::from_utf8_lossy(&row.url_raw).into_owned();
-    let url = if identity::has_userinfo(&stored_url) {
+    let url = if identity::must_reject_target(&stored_url) {
         match &row.url_canonical {
             Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-            None => identity::strip_userinfo(&stored_url),
+            None => identity::sanitize_target_url(&stored_url),
         }
     } else {
         stored_url
@@ -7301,7 +7863,13 @@ async fn run_invalidate_inner(
     let scope_key = config::scope_key_for_dir(&root);
     let rev = store.invalidate_scope(&scope_key, generation, now).await?;
     // Event ingest runs on invalidate too (R5): available history batches
-    // become durable invalidations alongside the requested one.
+    // become durable invalidations alongside the requested one. No
+    // reconcile here: the checked completeness claim requires a
+    // completed traversal (reconcile-before-claim), and invalidate
+    // performs none — attempting it would manufacture a claim gap that
+    // poisons the next scan's exit status. Cursor advancement is
+    // redundant too: the next scan re-derives it after satisfying the
+    // work this command just scheduled.
     let ingested = {
         let roots = [PlannedRoot {
             path: root.clone(),
@@ -7311,10 +7879,7 @@ async fn run_invalidate_inner(
         }];
         let mut events = open_event_session(&store, &cfg.state_dir, "roots", &roots).await?;
         let mut counters = RunCounters::default();
-        let applied =
-            ingest_available_events(&mut events, &store, generation, &roots, &mut counters).await?;
-        let _ = reconcile_event_cursors(&mut events, &store).await;
-        applied
+        ingest_available_events(&mut events, &store, generation, &roots, &mut counters).await?
     };
     let _ = store.close().await;
     println!(
@@ -7371,12 +7936,22 @@ async fn run_clear(cfg: &config::Config, args: &repo_scan::cli::ClearArgs) -> Ex
 /// anywhere on the reset path refuses the whole reset. Never a recursive
 /// delete of the configured directory; the coordination lock is always
 /// retained.
+///
+/// RS-PRIV-01: the payload/snapshots/staging dirs are FD-pinned for the
+/// whole clear and every victim is opened with `openat(O_NOFOLLOW)`,
+/// `fstat`'d, hashed, `(dev,ino)` re-compared, and removed with
+/// `unlinkat` — the path string never names the victim. RS-PRIV-02: the
+/// ownership marker drops only on an exact live-`db_id` binding.
+/// RS-PRIV-09: entry/byte/time budgets bound the work; exhaustion prints
+/// INCOMPLETE lines and never reports a complete cleanup.
 async fn run_clear_inner(state_dir: &Path) -> repo_scan::Result<()> {
     let payload = store::owner::payload_dir(state_dir);
     // Coordinate first: clearing requires exclusive ownership. The
     // existence check lives inside the lock (R15) so the decision sees
-    // the state the guard actually serializes.
-    let _guard = acquire_guard(state_dir)?;
+    // the state the guard actually serializes. The clear lock leaves
+    // payload/ untouched (possibly unlistable/foreign/absent) for the
+    // fail-closed inspection below.
+    let _guard = acquire_guard_for_clear(state_dir)?;
     if !payload.exists() {
         println!("cache clear: no persisted state; already absent (success)");
         return Ok(());
@@ -7395,29 +7970,53 @@ async fn run_clear_inner(state_dir: &Path) -> repo_scan::Result<()> {
     if staging.exists() && is_symlink_path(&staging)? {
         return Err(unsafe_reset("staging dir is a symlink"));
     }
-    let mut removed = 0u64;
-    let mut preserved: Vec<String> = Vec::new();
+    let mut st = ClearState::new();
+    let payload_pin = match ClearPinnedDir::pin(&payload) {
+        Ok(pin) => pin,
+        Err(e) => {
+            // Un-openable payload dir FD (macOS denies O_RDONLY dir
+            // opens without read permission even when w+x child access
+            // still works): degrade to path-validated removal and
+            // report INCOMPLETE, never success-with-uninspected. The
+            // degraded pin re-validates symlink/dir-ness, so a swapped
+            // victim still refuses instead of degrading.
+            st.incomplete.push(format!(
+                "cannot pin {} for FD-relative clear; path-validated removal only ({e})",
+                payload.display()
+            ));
+            ClearPinnedDir::pin_degraded(&payload)?
+        }
+    };
 
     // Database identity (R15): a fresh empty file is ours; a
     // populated engine file must carry tool ownership evidence — the
-    // ownership marker bound by an owned open, or tool-shaped catalog
-    // bytes. A foreign SQLite database without either stays.
+    // ownership marker exactly bound to the live catalog `db_id`
+    // (RS-PRIV-02), or tool-shaped catalog bytes. A foreign SQLite
+    // database without either stays.
     let db_path = payload.join("catalog.db");
-    let db_ours = verify_db_identity(state_dir, &db_path, &mut preserved)?;
+    let (db_ours, marker_bound) =
+        verify_db_identity(state_dir, &db_path, &payload_pin, &mut st).await?;
     // Snapshot row checksums while the catalog still exists: per-file
     // ownership proof needs the rows before the engine files go. A
     // missing/foreign/unreadable catalog yields no rows, so those files
     // then need tool-marker bytes or stay preserved.
-    let snapshot_rows = load_snapshot_rows(&db_path, db_ours, &snapshots).await;
+    let (snapshot_rows, snapshot_truncated) =
+        load_snapshot_rows(&db_path, db_ours, &snapshots, &mut st).await;
+    if snapshot_truncated {
+        st.incomplete.push(format!(
+            "snapshot checksum rows truncated at the {SNAPSHOT_MAX_STEMS}-stem budget; \
+             unscanned files stay preserved"
+        ));
+    }
     if db_ours {
         for name in config::KNOWN_ENGINE_FILES
             .iter()
             .chain(config::KNOWN_SIDECAR_FILES.iter())
         {
-            remove_known_file(&payload.join(name), &mut removed, &mut preserved)?;
+            remove_pinned_file(&payload_pin, name, &mut st)?;
         }
     } else if db_path.exists() {
-        preserved.push(format!(
+        st.note_preserved(format!(
             "{} (unknown content; database left in place)",
             db_path.display()
         ));
@@ -7427,23 +8026,67 @@ async fn run_clear_inner(state_dir: &Path) -> repo_scan::Result<()> {
         ClearDirKind::Snapshots,
         db_ours,
         &snapshot_rows,
-        &mut removed,
-        &mut preserved,
+        &mut st,
     )?;
     clear_tool_dir(
         &staging,
         ClearDirKind::Staging,
         db_ours,
         &snapshot_rows,
-        &mut removed,
-        &mut preserved,
+        &mut st,
     )?;
-    // The ownership marker is tool-owned by definition; drop it with the
-    // state (a substituted symlink refuses, like any reset-path symlink).
-    remove_known_file(&owner_marker_path(state_dir), &mut removed, &mut preserved)?;
-    // Unknown payload-root entries are listed, never touched.
-    if let Ok(entries) = std::fs::read_dir(&payload) {
-        for entry in entries.flatten() {
+    // RS-PRIV-02: the ownership marker drops only when it exactly binds
+    // the live catalog; otherwise it stays (a substituted symlink
+    // refuses, like any reset-path symlink).
+    if marker_bound {
+        remove_pinned_file(&payload_pin, OWNER_MARKER_NAME, &mut st)?;
+    } else if payload_pin.child_present(OWNER_MARKER_NAME)? {
+        st.note_preserved(format!(
+            "{} (not bound to the live catalog; preserved)",
+            owner_marker_path(state_dir).display()
+        ));
+    }
+    // Unknown payload-root entries are listed, never touched. A
+    // listing/read failure is INCOMPLETE (never success with
+    // uninspected entries): the unknown content stays preserved.
+    let payload_entries = match std::fs::read_dir(&payload) {
+        Ok(entries) => Some(entries),
+        Err(e) => {
+            st.incomplete.push(format!(
+                "cannot list {}; payload-root coverage incomplete ({e})",
+                payload.display()
+            ));
+            st.note_preserved(format!(
+                "{} (unlistable; content preserved)",
+                payload.display()
+            ));
+            None
+        }
+    };
+    if let Some(entries) = payload_entries {
+        let mut scanned = 0usize;
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    st.incomplete.push(format!(
+                        "cannot read a payload-root entry; coverage incomplete ({e})"
+                    ));
+                    st.note_preserved(format!(
+                        "{} (unreadable entry; preserved)",
+                        payload.display()
+                    ));
+                    continue;
+                }
+            };
+            scanned += 1;
+            if scanned > CLEAR_MAX_FILES_PER_DIR {
+                st.incomplete.push(format!(
+                    "payload listing truncated at the {CLEAR_MAX_FILES_PER_DIR}-entry budget; \
+                     coverage incomplete"
+                ));
+                break;
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
             if config::KNOWN_ENGINE_FILES.contains(&name.as_str())
                 || config::KNOWN_SIDECAR_FILES.contains(&name.as_str())
@@ -7453,31 +8096,675 @@ async fn run_clear_inner(state_dir: &Path) -> repo_scan::Result<()> {
             {
                 continue;
             }
-            preserved.push(format!("{} (unknown; preserved)", entry.path().display()));
+            st.note_preserved(format!("{} (unknown; preserved)", entry.path().display()));
         }
     }
-    // Remove only provably empty known dirs; never the state dir or lock.
-    for dir in [&snapshots, &staging, &payload] {
-        if dir.exists() {
-            let _ = std::fs::remove_dir(dir);
+    // Remove only provably empty known dirs through validated parent
+    // FDs with a (dev, ino) identity guard (RS-PRIV-01) — never a
+    // path-based `remove_dir`, so a swap between check and removal
+    // cannot redirect the victim. Never the state dir or lock.
+    // Divergence preserves + reports incomplete, never a retry.
+    remove_known_empty_dir(&payload_pin, config::SNAPSHOTS_DIR_NAME, &mut st);
+    remove_known_empty_dir(&payload_pin, config::STAGING_DIR_NAME, &mut st);
+    match ClearPinnedDir::pin(state_dir) {
+        Ok(state_pin) => {
+            state_pin.remove_empty_child_dir("payload", payload_pin.identity(), &mut st);
+        }
+        Err(e) => {
+            st.incomplete.push(format!(
+                "cannot re-validate the state dir for payload removal; preserved ({e})"
+            ));
+            st.note_preserved(format!("{} (preserved)", payload.display()));
         }
     }
-    println!("cache clear: removed {removed} tool-owned file(s)");
-    if preserved.is_empty() {
-        println!("cache clear: no foreign files encountered");
+    if st.incomplete.is_empty() {
+        println!("cache clear: removed {} tool-owned file(s)", st.removed);
     } else {
+        println!("cache clear: INCOMPLETE: budgets exhausted; coverage incomplete");
+        for line in &st.incomplete {
+            println!("  incomplete: {line}");
+        }
         println!(
-            "cache clear: preserved {} foreign file(s):",
-            preserved.len()
+            "cache clear: removed {} tool-owned file(s) before stopping; rerun or inspect manually",
+            st.removed
         );
-        for item in preserved.iter().take(20) {
+    }
+    st.report_preserved();
+    Ok(())
+}
+
+/// Mutable clear progress plus RS-PRIV-09 budget state.
+struct ClearState {
+    removed: u64,
+    preserved: Vec<String>,
+    preserved_overflow: usize,
+    bytes_hashed: u64,
+    deadline: Instant,
+    incomplete: Vec<String>,
+}
+
+impl ClearState {
+    fn new() -> Self {
+        Self {
+            removed: 0,
+            preserved: Vec::new(),
+            preserved_overflow: 0,
+            bytes_hashed: 0,
+            deadline: Instant::now() + Duration::from_secs(CLEAR_DEADLINE_SECS),
+            incomplete: Vec::new(),
+        }
+    }
+
+    /// Record a preserved entry; past [`CLEAR_MAX_PRESERVED`] only the
+    /// overflow count grows (the list itself stays bounded).
+    fn note_preserved(&mut self, item: String) {
+        if self.preserved.len() < CLEAR_MAX_PRESERVED {
+            self.preserved.push(item);
+        } else {
+            self.preserved_overflow += 1;
+        }
+    }
+
+    fn expired(&self) -> bool {
+        Instant::now() > self.deadline
+    }
+
+    fn report_preserved(&self) {
+        let total = self.preserved.len() + self.preserved_overflow;
+        if total == 0 {
+            println!("cache clear: no foreign files encountered");
+            return;
+        }
+        println!("cache clear: preserved {total} foreign file(s):");
+        for item in self.preserved.iter().take(20) {
             println!("  preserved: {item}");
         }
-        if preserved.len() > 20 {
-            println!("  ... and {} more", preserved.len() - 20);
+        if total > 20 {
+            println!("  ... and {} more", total - 20);
+        }
+        if self.preserved_overflow > 0 {
+            println!("  (preserved list truncated at {CLEAR_MAX_PRESERVED}; coverage incomplete)");
         }
     }
-    Ok(())
+}
+
+/// FD-pinned clear directory (RS-PRIV-01): on unix an
+/// `O_NOFOLLOW|O_DIRECTORY` FD plus the `(dev, ino)` observed at pin,
+/// held for the whole clear. Victims open with `openat(O_NOFOLLOW)` from
+/// this FD and leave with `unlinkat` after a `(dev, ino)` re-compare; the
+/// path string never names the victim. Elsewhere the same checks run on
+/// paths (documented residual: no FD pinning off-unix). A degraded unix
+/// pin ([`ClearPinnedDir::pin_degraded`], `file: None`) covers
+/// directories whose FD cannot be opened (macOS denies `O_RDONLY` dir
+/// opens without read permission even when w+x child access still
+/// works): the same checks run on paths with a `(dev, ino)` re-compare,
+/// and the caller reports INCOMPLETE, never a complete cleanup.
+struct ClearPinnedDir {
+    path: PathBuf,
+    #[cfg(unix)]
+    file: Option<std::fs::File>,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+impl ClearPinnedDir {
+    fn pin(path: &Path) -> repo_scan::Result<Self> {
+        #[cfg(unix)]
+        {
+            let file = store::owner::open_dir_nofollow(path)?;
+            let (dev, ino) = store::owner::fd_identity(&file)?;
+            Ok(Self {
+                path: path.to_path_buf(),
+                file: Some(file),
+                dev,
+                ino,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            if is_symlink_path(path)? {
+                return Err(unsafe_reset("clear directory is a symlink"));
+            }
+            Ok(Self {
+                path: path.to_path_buf(),
+            })
+        }
+    }
+
+    /// Path-validated pin for a directory whose FD cannot be opened: the
+    /// path must currently be a non-symlink directory, and its `(dev,
+    /// ino)` is recorded for later re-compare. Symlinks and non-dirs
+    /// refuse (fail closed), so only a permission-denied pin on a
+    /// genuine directory degrades — never a swapped victim.
+    #[cfg(unix)]
+    fn pin_degraded(path: &Path) -> repo_scan::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        if is_symlink_path(path)? {
+            return Err(unsafe_reset("clear directory is a symlink"));
+        }
+        let meta = std::fs::metadata(path)
+            .map_err(|e| repo_scan::Error::Io(format!("cannot inspect {}: {e}", path.display())))?;
+        if !meta.is_dir() {
+            return Err(unsafe_reset("clear directory is not a directory"));
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: None,
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
+
+    /// Off-unix pins are already path-validated, so the degraded pin is
+    /// just the pin (a symlink still refuses).
+    #[cfg(not(unix))]
+    fn pin_degraded(path: &Path) -> repo_scan::Result<Self> {
+        Self::pin(path)
+    }
+
+    /// Fail closed unless the pinned directory is unchanged: under the
+    /// held FD for a pinned dir, or by path re-validation (`(dev, ino)`
+    /// re-compare) for a degraded pin.
+    fn verify(&self) -> repo_scan::Result<()> {
+        #[cfg(unix)]
+        {
+            let Some(file) = self.file.as_ref() else {
+                return self.verify_degraded();
+            };
+            let (fd_dev, fd_ino) = store::owner::fd_identity(file)?;
+            if (fd_dev, fd_ino) != (self.dev, self.ino) {
+                return Err(unsafe_reset("clear directory changed under the held FD"));
+            }
+            if is_symlink_path(&self.path)? {
+                return Err(unsafe_reset("clear directory is now a symlink"));
+            }
+            let restated =
+                std::fs::metadata(&self.path).map_err(|e| unsafe_reset(&e.to_string()))?;
+            {
+                use std::os::unix::fs::MetadataExt;
+                if (restated.dev(), restated.ino()) != (self.dev, self.ino) || !restated.is_dir() {
+                    return Err(unsafe_reset(
+                        "clear directory changed (dev,ino) under the held FD",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Degraded-pin re-validation (unix only): the path must still be a
+    /// non-symlink directory with the `(dev, ino)` observed at pin.
+    #[cfg(unix)]
+    fn verify_degraded(&self) -> repo_scan::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        if is_symlink_path(&self.path)? {
+            return Err(unsafe_reset("clear directory is now a symlink"));
+        }
+        let restated = std::fs::metadata(&self.path).map_err(|e| unsafe_reset(&e.to_string()))?;
+        if (restated.dev(), restated.ino()) != (self.dev, self.ino) || !restated.is_dir() {
+            return Err(unsafe_reset(
+                "clear directory changed (dev,ino) under the held path",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Open `name` for reading without following a trailing symlink:
+    /// `openat(O_NOFOLLOW)` on unix, `symlink_metadata` + open elsewhere
+    /// and for a degraded unix pin. Missing files yield `Ok(None)`;
+    /// symlinks refuse the reset.
+    fn open_child(&self, name: &str) -> repo_scan::Result<Option<std::fs::File>> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            use std::os::unix::io::{AsRawFd, FromRawFd};
+            let bytes = std::ffi::OsStr::new(name).as_bytes();
+            if bytes.is_empty() || bytes.contains(&0) || name.contains('/') {
+                return Err(unsafe_reset("refusing unsafe clear name"));
+            }
+            let cname =
+                std::ffi::CString::new(bytes).map_err(|_| unsafe_reset("bad clear name"))?;
+            let Some(dir) = self.file.as_ref() else {
+                return self.open_child_by_path(name);
+            };
+            // SAFETY: `openat` on the held dir FD with a valid
+            // NUL-terminated single-component name; ownership moves into
+            // `File` exactly once.
+            let fd = unsafe {
+                libc::openat(
+                    dir.as_raw_fd(),
+                    cname.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                let errno = std::io::Error::last_os_error();
+                if errno.raw_os_error() == Some(libc::ENOENT) {
+                    return Ok(None);
+                }
+                if errno.raw_os_error() == Some(libc::ELOOP) {
+                    return Err(unsafe_reset(&format!("engine path is a symlink: {name}")));
+                }
+                return Err(repo_scan::Error::Io(format!(
+                    "cannot open {}: {errno}",
+                    self.path.join(name).display()
+                )));
+            }
+            // SAFETY: `fd` is a fresh owned FD from the successful `openat`.
+            Ok(Some(unsafe { std::fs::File::from_raw_fd(fd) }))
+        }
+        #[cfg(not(unix))]
+        {
+            let path = self.path.join(name);
+            match std::fs::symlink_metadata(&path) {
+                Ok(md) if md.file_type().is_symlink() => Err(unsafe_reset(&format!(
+                    "engine path is a symlink: {}",
+                    path.display()
+                ))),
+                Ok(_) => Ok(Some(std::fs::File::open(&path)?)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(repo_scan::Error::Io(format!(
+                    "cannot inspect {}: {e}",
+                    path.display()
+                ))),
+            }
+        }
+    }
+
+    /// Degraded-pin child open (unix only): `symlink_metadata` + open,
+    /// mirroring the off-unix branch (same documented residual: path
+    /// re-resolution, no FD pinning).
+    #[cfg(unix)]
+    fn open_child_by_path(&self, name: &str) -> repo_scan::Result<Option<std::fs::File>> {
+        let path = self.path.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(md) if md.file_type().is_symlink() => Err(unsafe_reset(&format!(
+                "engine path is a symlink: {}",
+                path.display()
+            ))),
+            Ok(_) => match std::fs::File::open(&path) {
+                Ok(file) => Ok(Some(file)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(repo_scan::Error::Io(format!(
+                    "cannot open {}: {e}",
+                    path.display()
+                ))),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(repo_scan::Error::Io(format!(
+                "cannot inspect {}: {e}",
+                path.display()
+            ))),
+        }
+    }
+
+    /// True when `name` is present (any kind). Symlinks refuse the reset.
+    fn child_present(&self, name: &str) -> repo_scan::Result<bool> {
+        Ok(self.open_child(name)?.is_some())
+    }
+
+    /// Remove `name` after re-verifying the parent and re-comparing the
+    /// victim `(dev, ino)` observed at hash time (RS-PRIV-01). A victim
+    /// that vanished reads as converged (`Ok`); a victim whose identity
+    /// changed refuses the reset. Unix uses `unlinkat` from the pinned
+    /// FD; elsewhere (and for a degraded unix pin) the path is
+    /// re-statted and removed.
+    fn remove_child(&self, name: &str, expect: (u64, u64)) -> repo_scan::Result<()> {
+        self.verify()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            use std::os::unix::io::AsRawFd;
+            let file = match self.open_child(name)? {
+                Some(file) => file,
+                None => return Ok(()),
+            };
+            if store::owner::fd_identity(&file)? != expect {
+                return Err(unsafe_reset(&format!(
+                    "victim {name} changed between verify and unlink; refusing"
+                )));
+            }
+            drop(file);
+            let bytes = std::ffi::OsStr::new(name).as_bytes();
+            let cname =
+                std::ffi::CString::new(bytes).map_err(|_| unsafe_reset("bad clear name"))?;
+            let Some(dir) = self.file.as_ref() else {
+                return self.remove_child_by_path(name);
+            };
+            // SAFETY: `unlinkat` on the held dir FD with a valid
+            // NUL-terminated single-component name unlinks only that entry.
+            let rc = unsafe { libc::unlinkat(dir.as_raw_fd(), cname.as_ptr(), 0) };
+            if rc != 0 {
+                let errno = std::io::Error::last_os_error();
+                if errno.raw_os_error() == Some(libc::ENOENT) {
+                    return Ok(());
+                }
+                return Err(repo_scan::Error::Io(format!(
+                    "cannot remove {}: {errno}",
+                    self.path.join(name).display()
+                )));
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let path = self.path.join(name);
+            match std::fs::symlink_metadata(&path) {
+                Ok(md) if md.file_type().is_symlink() => Err(unsafe_reset(&format!(
+                    "engine path is a symlink: {}",
+                    path.display()
+                ))),
+                Ok(_) => {
+                    let _ = expect;
+                    std::fs::remove_file(&path)?;
+                    Ok(())
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(repo_scan::Error::Io(format!(
+                    "cannot inspect {}: {e}",
+                    path.display()
+                ))),
+            }
+        }
+    }
+
+    /// Degraded-pin child removal (unix only): the path is re-statted
+    /// (symlinks refuse) and removed, mirroring the off-unix branch.
+    /// The victim `(dev, ino)` was already re-compared by the caller.
+    #[cfg(unix)]
+    fn remove_child_by_path(&self, name: &str) -> repo_scan::Result<()> {
+        let path = self.path.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(md) if md.file_type().is_symlink() => Err(unsafe_reset(&format!(
+                "engine path is a symlink: {}",
+                path.display()
+            ))),
+            Ok(_) => match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(repo_scan::Error::Io(format!(
+                    "cannot remove {}: {e}",
+                    path.display()
+                ))),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(repo_scan::Error::Io(format!(
+                "cannot inspect {}: {e}",
+                path.display()
+            ))),
+        }
+    }
+
+    /// `(dev, ino)` observed at pin time (unix); `(0, 0)` elsewhere.
+    fn identity(&self) -> (u64, u64) {
+        #[cfg(unix)]
+        {
+            (self.dev, self.ino)
+        }
+        #[cfg(not(unix))]
+        {
+            (0, 0)
+        }
+    }
+
+    /// Remove empty known child dir `name` from this validated parent:
+    /// re-verify the parent, re-open the child with
+    /// `openat(O_NOFOLLOW|O_DIRECTORY)` from the parent FD, re-compare
+    /// its `(dev, ino)` against `expect`, and remove with
+    /// `unlinkat(AT_REMOVEDIR)` — never a path-based `remove_dir`, so a
+    /// swap between check and removal cannot redirect the victim (the
+    /// syscall itself enforces emptiness atomically). A vanished child
+    /// reads as converged; a non-empty child stays preserved with
+    /// incomplete (entries may have raced in after the scan);
+    /// divergence preserves + reports incomplete. Unix uses the pinned
+    /// FD; elsewhere (and for a degraded unix pin) the path is
+    /// re-statted and removed (documented residual: no FD pinning
+    /// off-unix or degraded).
+    fn remove_empty_child_dir(&self, name: &str, expect: (u64, u64), st: &mut ClearState) {
+        let display = self.path.join(name);
+        if let Err(e) = self.verify() {
+            st.incomplete.push(format!(
+                "parent {} changed during clear; {} preserved ({e})",
+                self.path.display(),
+                display.display()
+            ));
+            st.note_preserved(format!("{} (preserved)", display.display()));
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            use std::os::unix::io::{AsRawFd, FromRawFd};
+            let bytes = std::ffi::OsStr::new(name).as_bytes();
+            if bytes.is_empty() || bytes.contains(&0) || name.contains('/') {
+                st.incomplete.push(format!(
+                    "refusing unsafe clear name for {}; preserved",
+                    display.display()
+                ));
+                st.note_preserved(format!("{} (preserved)", display.display()));
+                return;
+            }
+            let cname = match std::ffi::CString::new(bytes) {
+                Ok(cname) => cname,
+                Err(_) => {
+                    st.incomplete.push(format!(
+                        "bad clear name for {}; preserved",
+                        display.display()
+                    ));
+                    st.note_preserved(format!("{} (preserved)", display.display()));
+                    return;
+                }
+            };
+            let Some(dir) = self.file.as_ref() else {
+                self.remove_empty_child_dir_by_path(name, expect, st);
+                return;
+            };
+            // SAFETY: `openat` on the held dir FD with a valid
+            // NUL-terminated single-component name; ownership moves into
+            // `File` exactly once.
+            let fd = unsafe {
+                libc::openat(
+                    dir.as_raw_fd(),
+                    cname.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                let errno = std::io::Error::last_os_error();
+                if errno.raw_os_error() == Some(libc::ENOENT) {
+                    return;
+                }
+                if errno.raw_os_error() == Some(libc::ELOOP) {
+                    st.incomplete
+                        .push(format!("{} is a symlink; preserved", display.display()));
+                } else {
+                    st.incomplete.push(format!(
+                        "cannot open {}; preserved ({errno})",
+                        display.display()
+                    ));
+                }
+                st.note_preserved(format!("{} (preserved)", display.display()));
+                return;
+            }
+            // SAFETY: `fd` is a fresh owned FD from the successful `openat`.
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            if store::owner::fd_identity(&file).unwrap_or((u64::MAX, u64::MAX)) != expect {
+                st.incomplete.push(format!(
+                    "{} changed (dev, ino) before removal; preserved",
+                    display.display()
+                ));
+                st.note_preserved(format!("{} (preserved)", display.display()));
+                return;
+            }
+            drop(file);
+            // SAFETY: `unlinkat(AT_REMOVEDIR)` on the held dir FD with a
+            // valid NUL-terminated single-component name removes only that
+            // (provably empty) entry.
+            let rc = unsafe { libc::unlinkat(dir.as_raw_fd(), cname.as_ptr(), libc::AT_REMOVEDIR) };
+            if rc != 0 {
+                let errno = std::io::Error::last_os_error();
+                if errno.raw_os_error() == Some(libc::ENOENT) {
+                    return;
+                }
+                if matches!(
+                    errno.raw_os_error(),
+                    Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
+                ) {
+                    st.incomplete.push(format!(
+                        "{} is non-empty after clear; content preserved",
+                        display.display()
+                    ));
+                } else {
+                    st.incomplete.push(format!(
+                        "cannot remove {}; preserved ({errno})",
+                        display.display()
+                    ));
+                }
+                st.note_preserved(format!("{} (preserved)", display.display()));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = expect;
+            match std::fs::symlink_metadata(&display) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(md) if md.file_type().is_symlink() => {
+                    st.incomplete
+                        .push(format!("{} is a symlink; preserved", display.display()));
+                    st.note_preserved(format!("{} (preserved)", display.display()));
+                }
+                Ok(_) => match std::fs::remove_dir(&display) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        st.incomplete.push(format!(
+                            "cannot remove {}; preserved ({e})",
+                            display.display()
+                        ));
+                        st.note_preserved(format!("{} (preserved)", display.display()));
+                    }
+                },
+                Err(e) => {
+                    st.incomplete.push(format!(
+                        "cannot inspect {}; preserved ({e})",
+                        display.display()
+                    ));
+                    st.note_preserved(format!("{} (preserved)", display.display()));
+                }
+            }
+        }
+    }
+
+    /// Degraded-pin empty-dir removal (unix only): the child path is
+    /// re-statted (symlinks refuse, `(dev, ino)` must still match
+    /// `expect`) and removed with `remove_dir` (which itself enforces
+    /// emptiness atomically); a non-empty child stays preserved with
+    /// incomplete. Mirrors the off-unix branch plus the identity
+    /// re-compare.
+    #[cfg(unix)]
+    fn remove_empty_child_dir_by_path(&self, name: &str, expect: (u64, u64), st: &mut ClearState) {
+        use std::os::unix::fs::MetadataExt;
+        let display = self.path.join(name);
+        let meta = match std::fs::symlink_metadata(&display) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                st.incomplete.push(format!(
+                    "cannot inspect {}; preserved ({e})",
+                    display.display()
+                ));
+                st.note_preserved(format!("{} (preserved)", display.display()));
+                return;
+            }
+            Ok(md) if md.file_type().is_symlink() => {
+                st.incomplete
+                    .push(format!("{} is a symlink; preserved", display.display()));
+                st.note_preserved(format!("{} (preserved)", display.display()));
+                return;
+            }
+            Ok(md) => md,
+        };
+        if (meta.dev(), meta.ino()) != expect || !meta.is_dir() {
+            st.incomplete.push(format!(
+                "{} changed (dev, ino) before removal; preserved",
+                display.display()
+            ));
+            st.note_preserved(format!("{} (preserved)", display.display()));
+            return;
+        }
+        match std::fs::remove_dir(&display) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                st.incomplete.push(format!(
+                    "{} is non-empty after clear; content preserved",
+                    display.display()
+                ));
+                st.note_preserved(format!("{} (preserved)", display.display()));
+            }
+            Err(e) => {
+                st.incomplete.push(format!(
+                    "cannot remove {}; preserved ({e})",
+                    display.display()
+                ));
+                st.note_preserved(format!("{} (preserved)", display.display()));
+            }
+        }
+    }
+}
+
+/// Remove one known (possibly already absent) empty child directory
+/// through the validated parent FD: the child is pinned for its live
+/// `(dev, ino)` and the removal goes through
+/// [`ClearPinnedDir::remove_empty_child_dir`] — never a path-based
+/// `remove_dir`. Missing reads as converged; anything else unexpected
+/// preserves + reports incomplete.
+fn remove_known_empty_dir(parent: &ClearPinnedDir, name: &str, st: &mut ClearState) {
+    let display = parent.path.join(name);
+    match std::fs::symlink_metadata(&display) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            st.incomplete.push(format!(
+                "cannot inspect {}; preserved ({e})",
+                display.display()
+            ));
+            st.note_preserved(format!("{} (preserved)", display.display()));
+            return;
+        }
+        Ok(md) if md.file_type().is_symlink() => {
+            st.incomplete
+                .push(format!("{} is a symlink; preserved", display.display()));
+            st.note_preserved(format!("{} (symlink; preserved)", display.display()));
+            return;
+        }
+        Ok(md) if !md.is_dir() => {
+            st.note_preserved(format!(
+                "{} (not a directory; preserved)",
+                display.display()
+            ));
+            return;
+        }
+        Ok(_) => {}
+    }
+    let child = match ClearPinnedDir::pin(&display) {
+        Ok(child) => child,
+        Err(e) => {
+            st.incomplete
+                .push(format!("cannot pin {}; preserved ({e})", display.display()));
+            st.note_preserved(format!("{} (preserved)", display.display()));
+            return;
+        }
+    };
+    if let Err(e) = child.verify() {
+        st.incomplete.push(format!(
+            "{} changed during clear; preserved ({e})",
+            display.display()
+        ));
+        st.note_preserved(format!("{} (preserved)", display.display()));
+        return;
+    }
+    parent.remove_empty_child_dir(name, child.identity(), st);
 }
 
 fn unsafe_reset(detail: &str) -> repo_scan::Error {
@@ -7495,89 +8782,93 @@ fn is_symlink_path(path: &Path) -> repo_scan::Result<bool> {
     }
 }
 
-/// Verify the engine path holds our database (or nothing). Symlinks refuse
-/// the reset; non-file or foreign-content paths are preserved, not removed.
-/// Populated files additionally require tool ownership evidence (R15).
-fn verify_db_identity(
+/// Verify the engine path holds our database (or nothing). Returns
+/// `(db_ours, marker_bound)`: symlinks refuse the reset; non-file or
+/// foreign-content paths are preserved, not removed. Populated files
+/// additionally require tool ownership evidence (R15): the marker exactly
+/// bound to the live catalog `db_id` (RS-PRIV-02), else tool-shaped
+/// catalog bytes. The victim opens through the pinned payload FD
+/// (RS-PRIV-01), never by path.
+async fn verify_db_identity(
     state_dir: &Path,
     db_path: &Path,
-    preserved: &mut Vec<String>,
-) -> repo_scan::Result<bool> {
-    let md = match std::fs::symlink_metadata(db_path) {
-        Ok(md) => md,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-        Err(e) => {
-            return Err(repo_scan::Error::Io(format!(
-                "cannot inspect {}: {e}",
-                db_path.display()
-            )));
-        }
+    payload_pin: &ClearPinnedDir,
+    st: &mut ClearState,
+) -> repo_scan::Result<(bool, bool)> {
+    let mut file = match payload_pin.open_child("catalog.db")? {
+        Some(file) => file,
+        None => return Ok((true, false)),
     };
-    if md.file_type().is_symlink() {
-        return Err(unsafe_reset("engine file is a symlink"));
+    if !file.metadata()?.is_file() {
+        st.note_preserved(format!("{} (not a file; preserved)", db_path.display()));
+        return Ok((false, false));
     }
-    if !md.file_type().is_file() {
-        preserved.push(format!("{} (not a file; preserved)", db_path.display()));
-        return Ok(false);
-    }
-    if md.len() == 0 {
-        return Ok(true);
+    if file.metadata()?.len() == 0 {
+        return Ok((true, false));
     }
     let mut magic = [0u8; 16];
-    match std::fs::File::open(db_path).and_then(|mut f| {
+    {
         use std::io::Read;
-        f.read_exact(&mut magic)
-    }) {
-        Ok(()) => {}
-        Err(_) => {
-            preserved.push(format!("{} (unreadable; preserved)", db_path.display()));
-            return Ok(false);
+        if file.read_exact(&mut magic).is_err() {
+            st.note_preserved(format!("{} (unreadable; preserved)", db_path.display()));
+            return Ok((false, false));
         }
     }
     if magic != *b"SQLite format 3\0" {
-        preserved.push(format!(
+        st.note_preserved(format!(
             "{} (not a database file; preserved)",
             db_path.display()
         ));
-        return Ok(false);
+        return Ok((false, false));
     }
     // SQLite magic alone never proves ownership (R15): require the marker
-    // bound by an owned open, else tool-shaped catalog bytes.
-    if marker_binds_payload(state_dir) {
-        return Ok(true);
+    // exactly bound to the live catalog, else tool-shaped catalog bytes.
+    // An un-openable catalog (e.g. its dir lost read permission, so the
+    // store's own dir pin fails) still gets the shape check below: the
+    // head bytes need only the already-open victim FD.
+    let store = TursoStore::open_read_only(db_path).await.ok();
+    if let Some(store) = store {
+        let bound = catalog_bound_to_marker(&store, state_dir).await?;
+        let _ = store.close().await;
+        if bound {
+            return Ok((true, true));
+        }
     }
-    if catalog_bytes_look_tool_owned(db_path) {
-        return Ok(true);
+    if catalog_head_looks_tool_owned(&read_head_bytes(&mut file)?) {
+        // Tool-shaped but marker-unbound (e.g. built without a binary
+        // open): the engine file may go, the marker (if any) stays.
+        return Ok((true, false));
     }
-    preserved.push(format!(
+    st.note_preserved(format!(
         "{} (SQLite database without tool ownership evidence; preserved)",
         db_path.display()
     ));
-    Ok(false)
+    Ok((false, false))
 }
 
-/// True when the payload's ownership marker is a small regular file with
-/// our tag line plus a `db_id` binding. Verified, not trusted: wrong tag,
-/// symlink, or oversize file all fail closed.
-fn marker_binds_payload(state_dir: &Path) -> bool {
-    let path = owner_marker_path(state_dir);
-    let md = match std::fs::symlink_metadata(&path) {
-        Ok(md) => md,
-        Err(_) => return false,
+/// RS-PRIV-02/06: exact ownership binding between an open catalog and the
+/// ownership marker. The live `meta.db_id` and the marker's `db_id=` line
+/// must both exist and compare byte-equal; anything else (missing marker,
+/// wrong tag, missing row, mismatch) is unbound. A substituted symlink or
+/// non-regular marker fails closed via the pinned read.
+async fn catalog_bound_to_marker(store: &TursoStore, state_dir: &Path) -> repo_scan::Result<bool> {
+    let live = match store.catalog_db_id().await? {
+        Some(id) => id,
+        None => return Ok(false),
     };
-    if !md.file_type().is_file() || md.len() > 4096 {
-        return false;
-    }
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(_) => return false,
+    let Some(text) = store::owner::read_owner_marker_text(state_dir)? else {
+        return Ok(false);
     };
-    let text = String::from_utf8_lossy(&bytes);
     let mut lines = text.lines();
     if lines.next() != Some(OWNER_MARKER_TAG) {
-        return false;
+        return Ok(false);
     }
-    lines.any(|line| line.starts_with("db_id=") && line.len() > 6)
+    for line in lines {
+        if let Some(id) = line.strip_prefix("db_id=") {
+            return Ok(!id.is_empty() && id == live);
+        }
+    }
+    Ok(false)
 }
 
 /// Catalog schema markers: tables every tool-created catalog carries from
@@ -7590,59 +8881,60 @@ const DB_SCHEMA_MARKERS: [&[u8]; 4] = [
     b"scope_revisions",
 ];
 
+/// Read the identity-scan head (rewinding first) from an already-open
+/// victim FD. Short reads yield short heads; errors read as empty (the
+/// shape check then fails, preserving the file).
+fn read_head_bytes(file: &mut std::fs::File) -> repo_scan::Result<Vec<u8>> {
+    use std::io::{Read, Seek};
+    let _ = file.seek(std::io::SeekFrom::Start(0));
+    let mut head = vec![0u8; DB_IDENTITY_SCAN_BYTES as usize];
+    let len = file.read(&mut head).unwrap_or(0);
+    head.truncate(len);
+    Ok(head)
+}
+
 /// True when the engine file's head carries enough catalog schema markers
 /// to be tool-shaped. At least two must match so a stray string in a
 /// foreign database cannot qualify it.
-fn catalog_bytes_look_tool_owned(db_path: &Path) -> bool {
-    use std::io::Read;
-    let mut file = match std::fs::File::open(db_path) {
-        Ok(file) => file,
-        Err(_) => return false,
-    };
-    let mut head = vec![0u8; DB_IDENTITY_SCAN_BYTES as usize];
-    let len = match file.read(&mut head) {
-        Ok(len) => len,
-        Err(_) => return false,
-    };
-    head.truncate(len);
+fn catalog_head_looks_tool_owned(head: &[u8]) -> bool {
     let mut hits = 0;
     for marker in DB_SCHEMA_MARKERS {
         let marker: &[u8] = marker;
-        if head.windows(marker.len()).any(|w| w == marker) {
+        if head.len() >= marker.len() && head.windows(marker.len()).any(|w| w == marker) {
             hits += 1;
         }
     }
     hits >= 2
 }
 
-/// Remove one exact known file after verifying it is a regular file.
-fn remove_known_file(
-    path: &Path,
-    removed: &mut u64,
-    preserved: &mut Vec<String>,
+/// Remove one exact known file from a pinned dir after verifying the open
+/// FD is a regular file; the victim `(dev, ino)` re-compares immediately
+/// before `unlinkat` (RS-PRIV-01). Missing files are a no-op.
+fn remove_pinned_file(
+    dir: &ClearPinnedDir,
+    name: &str,
+    st: &mut ClearState,
 ) -> repo_scan::Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(md) => {
-            if md.file_type().is_symlink() {
-                return Err(unsafe_reset(&format!(
-                    "engine path is a symlink: {}",
-                    path.display()
-                )));
-            }
-            if !md.file_type().is_file() {
-                preserved.push(format!("{} (not a file; preserved)", path.display()));
-                return Ok(());
-            }
-            std::fs::remove_file(path)?;
-            *removed += 1;
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(repo_scan::Error::Io(format!(
-            "cannot inspect {}: {e}",
-            path.display()
-        ))),
+    dir.verify()?;
+    let file = match dir.open_child(name)? {
+        Some(file) => file,
+        None => return Ok(()),
+    };
+    if !file.metadata()?.is_file() {
+        st.note_preserved(format!(
+            "{} (not a file; preserved)",
+            dir.path.join(name).display()
+        ));
+        return Ok(());
     }
+    #[cfg(unix)]
+    let identity = store::owner::fd_identity(&file)?;
+    #[cfg(not(unix))]
+    let identity = (0u64, 0u64);
+    drop(file);
+    dir.remove_child(name, identity)?;
+    st.removed += 1;
+    Ok(())
 }
 
 /// Which tool-owned directory is being cleared: snapshot files are
@@ -7718,23 +9010,69 @@ fn tool_report_id(bytes: &[u8]) -> Option<String> {
     Some(id.to_string())
 }
 
+/// Per-catalog-read bound inside snapshot loading (RS-PRIV-09): a
+/// read slower than this stops further reads with INCOMPLETE while the
+/// rows already gathered stay (state is preserved, never discarded).
+/// Cooperative only — a read that never returns cannot be preempted
+/// in-process (same residual as [`OP_DEADLINE_SECS`]).
+const SNAPSHOT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Checksums (`report_id` -> SHA-256 hex) for tool-shaped snapshot files
 /// currently on disk, read through a read-only catalog open that is
 /// closed before any removal (spec §15). A missing/foreign/unreadable
 /// catalog, or no tool-shaped files, yields no rows, so those files then
 /// need tool-marker bytes or stay preserved. Never fails the reset.
+/// RS-PRIV-09: stem collection and row queries are capped at
+/// [`SNAPSHOT_MAX_STEMS`]; the flag reports truncation so the caller
+/// prints incomplete coverage instead of a complete cleanup. The
+/// [`ClearState`] deadline is enforced inside both loops and each row
+/// read carries the [`SNAPSHOT_READ_TIMEOUT`] bound; on expiry the
+/// gathered rows stay and the miss resolves to preserved content.
+/// Listing/read failures are INCOMPLETE, never silent.
 async fn load_snapshot_rows(
     db_path: &Path,
     db_ours: bool,
     snapshots: &Path,
-) -> HashMap<String, String> {
+    st: &mut ClearState,
+) -> (HashMap<String, String>, bool) {
     let mut rows = HashMap::new();
     if !db_ours || !db_path.is_file() {
-        return rows;
+        return (rows, false);
     }
     let mut stems: HashSet<String> = HashSet::new();
-    if let Ok(entries) = std::fs::read_dir(snapshots) {
-        for entry in entries.flatten() {
+    let mut truncated = false;
+    let snapshot_entries = match std::fs::read_dir(snapshots) {
+        Ok(entries) => Some(entries),
+        Err(e) => {
+            st.incomplete.push(format!(
+                "cannot list {}; checksum rows unresolved, files stay preserved ({e})",
+                snapshots.display()
+            ));
+            None
+        }
+    };
+    if let Some(entries) = snapshot_entries {
+        for entry in entries {
+            if st.expired() {
+                st.incomplete.push(format!(
+                    "snapshot stem scan hit the {CLEAR_DEADLINE_SECS}s time budget; \
+                     unresolved files stay preserved"
+                ));
+                break;
+            }
+            if stems.len() >= SNAPSHOT_MAX_STEMS {
+                truncated = true;
+                break;
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    st.incomplete.push(format!(
+                        "cannot read a snapshot entry; its checksum row stays unresolved ({e})"
+                    ));
+                    continue;
+                }
+            };
             let name = entry.file_name().to_string_lossy().into_owned();
             if let Some(stem) = snapshot_stem(&name) {
                 stems.insert(stem);
@@ -7742,14 +9080,31 @@ async fn load_snapshot_rows(
         }
     }
     if stems.is_empty() {
-        return rows;
+        return (rows, truncated);
+    }
+    if st.expired() {
+        st.incomplete.push(format!(
+            "snapshot checksum loading hit the {CLEAR_DEADLINE_SECS}s time budget; \
+             unresolved files stay preserved"
+        ));
+        return (rows, truncated);
     }
     let store = match TursoStore::open_read_only(db_path).await {
         Ok(store) => store,
-        Err(_) => return rows,
+        Err(_) => return (rows, truncated),
     };
-    for stem in &stems {
-        if let Ok(Some(row)) = store.get_report_snapshot(stem).await {
+    for stem in stems.iter().take(SNAPSHOT_MAX_STEMS) {
+        if st.expired() {
+            st.incomplete.push(format!(
+                "snapshot checksum loading hit the {CLEAR_DEADLINE_SECS}s time budget; \
+                 unresolved files stay preserved"
+            ));
+            break;
+        }
+        let read_start = Instant::now();
+        let row = store.get_report_snapshot(stem).await;
+        let slow = read_start.elapsed() > SNAPSHOT_READ_TIMEOUT;
+        if let Ok(Some(row)) = row {
             if let Some(checksum) = row.checksum {
                 rows.insert(
                     stem.clone(),
@@ -7757,9 +9112,17 @@ async fn load_snapshot_rows(
                 );
             }
         }
+        if slow {
+            st.incomplete.push(format!(
+                "a snapshot checksum read exceeded the {}s per-read bound; \
+                 remaining rows unresolved, files stay preserved",
+                SNAPSHOT_READ_TIMEOUT.as_secs()
+            ));
+            break;
+        }
     }
     let _ = store.close().await;
-    rows
+    (rows, truncated)
 }
 
 /// Remove only tool-owned regular files directly inside a known
@@ -7768,38 +9131,84 @@ async fn load_snapshot_rows(
 /// proof (spec §15): a tool-shaped name for its directory plus a
 /// catalog-bound checksum row matching its bytes or tool-marker bytes
 /// bound to its filename. A foreign catalog authorizes nothing; nested
-/// directories and symlinks are always retained.
+/// directories and symlinks are always retained. RS-PRIV-01: the dir is
+/// FD-pinned and victims open with `openat(O_NOFOLLOW)`, hash from the
+/// FD, and leave with `unlinkat` after a `(dev, ino)` re-compare.
+/// RS-PRIV-09: entry/byte/time budgets bound the scan; exhaustion stops
+/// the dir with an incomplete report, never a silent partial clear.
 fn clear_tool_dir(
     dir: &Path,
     kind: ClearDirKind,
     db_ours: bool,
     snapshot_rows: &HashMap<String, String>,
-    removed: &mut u64,
-    preserved: &mut Vec<String>,
+    st: &mut ClearState,
 ) -> repo_scan::Result<()> {
     if !dir.exists() {
         return Ok(());
     }
+    let pin = ClearPinnedDir::pin(dir)?;
     let entries = std::fs::read_dir(dir)
         .map_err(|e| repo_scan::Error::Io(format!("cannot inspect {}: {e}", dir.display())))?;
+    let mut scanned = 0usize;
     for entry in entries {
+        scanned += 1;
+        if scanned > CLEAR_MAX_FILES_PER_DIR {
+            st.incomplete.push(format!(
+                "{} listing truncated at the {CLEAR_MAX_FILES_PER_DIR}-entry budget; \
+                 coverage incomplete",
+                dir.display()
+            ));
+            break;
+        }
+        if st.expired() {
+            st.incomplete.push(format!(
+                "{} scan hit the {CLEAR_DEADLINE_SECS}s time budget; coverage incomplete",
+                dir.display()
+            ));
+            break;
+        }
         let entry = entry
             .map_err(|e| repo_scan::Error::Io(format!("cannot read {}: {e}", dir.display())))?;
-        let file_type = entry.file_type().map_err(|e| {
-            repo_scan::Error::Io(format!("cannot inspect {}: {e}", entry.path().display()))
-        })?;
-        if file_type.is_symlink() {
-            preserved.push(format!("{} (symlink; preserved)", entry.path().display()));
-            continue;
-        }
-        if !file_type.is_file() {
-            preserved.push(format!(
-                "{} (not a file; preserved)",
-                entry.path().display()
+        let raw = entry.file_name();
+        if raw.to_str().is_none() {
+            st.note_preserved(format!(
+                "{} (non-UTF8 name; preserved)",
+                dir.join(&raw).display()
             ));
             continue;
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
+        let name = raw.to_string_lossy().into_owned();
+        // Open through the pinned FD; the `DirEntry` file type is
+        // advisory only and never trusted for the victim. A symlink here
+        // is preserved (never followed, never unlinked): the advisory
+        // pre-check catches the static case and the `ELOOP` fallback
+        // catches a plant between check and open.
+        if is_symlink_path(&dir.join(&name))? {
+            st.note_preserved(format!(
+                "{} (symlink; preserved)",
+                dir.join(&name).display()
+            ));
+            continue;
+        }
+        let mut file = match pin.open_child(&name) {
+            Ok(Some(file)) => file,
+            Ok(None) => continue,
+            Err(e) if e.to_string().contains("is a symlink") => {
+                st.note_preserved(format!(
+                    "{} (symlink; preserved)",
+                    dir.join(&name).display()
+                ));
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        if !file.metadata()?.is_file() {
+            st.note_preserved(format!(
+                "{} (not a file; preserved)",
+                dir.join(&name).display()
+            ));
+            continue;
+        }
         let claimed = match kind {
             ClearDirKind::Snapshots => snapshot_stem(&name),
             ClearDirKind::Staging => staging_report_id(&name),
@@ -7807,47 +9216,98 @@ fn clear_tool_dir(
         let claimed = match claimed {
             Some(claimed) => claimed,
             None => {
-                preserved.push(format!(
+                st.note_preserved(format!(
                     "{} (unknown name; preserved)",
-                    entry.path().display()
+                    dir.join(&name).display()
                 ));
                 continue;
             }
         };
         if !db_ours {
-            preserved.push(format!(
+            st.note_preserved(format!(
                 "{} (catalog not verified; preserved)",
-                entry.path().display()
+                dir.join(&name).display()
             ));
             continue;
         }
-        // Bound open: no symlink follow, regular file, capped read (RSP-005).
-        let bound = match repo_scan::report::publish::BoundStaged::open(&entry.path()) {
-            Ok(bound) => bound,
+        // Bound read from the open FD: regular file, capped (RSP-005),
+        // size re-checked after the read; the hash binds these exact
+        // bytes to the removal decision below.
+        let bytes = match read_pinned_capped(&mut file, &dir.join(&name)) {
+            Ok(bytes) => bytes,
             Err(_) => {
-                preserved.push(format!(
+                st.note_preserved(format!(
                     "{} (unreadable; preserved)",
-                    entry.path().display()
+                    dir.join(&name).display()
                 ));
                 continue;
             }
         };
+        st.bytes_hashed += bytes.len() as u64;
+        if st.bytes_hashed > CLEAR_MAX_BYTES_HASHED {
+            st.incomplete.push(format!(
+                "clear hashing hit the {CLEAR_MAX_BYTES_HASHED}-byte budget; coverage incomplete"
+            ));
+            st.note_preserved(format!(
+                "{} (byte budget exhausted; preserved)",
+                dir.join(&name).display()
+            ));
+            break;
+        }
+        let digest = repo_scan::report::publish::sha256_hex(&bytes);
         let row_ok = kind == ClearDirKind::Snapshots
             && snapshot_rows
                 .get(claimed.as_str())
-                .is_some_and(|sum| sum.as_str() == bound.sha256());
-        let marker_ok = tool_report_id(bound.bytes()).as_deref() == Some(claimed.as_str());
+                .is_some_and(|sum| sum.as_str() == digest.as_str());
+        let marker_ok = tool_report_id(&bytes).as_deref() == Some(claimed.as_str());
         if row_ok || marker_ok {
-            std::fs::remove_file(entry.path())?;
-            *removed += 1;
+            #[cfg(unix)]
+            let identity = store::owner::fd_identity(&file)?;
+            #[cfg(not(unix))]
+            let identity = (0u64, 0u64);
+            drop(file);
+            pin.remove_child(&name, identity)?;
+            st.removed += 1;
         } else {
-            preserved.push(format!(
+            st.note_preserved(format!(
                 "{} (unverified; preserved)",
-                entry.path().display()
+                dir.join(&name).display()
             ));
         }
     }
     Ok(())
+}
+
+/// Bounded read from an already-open victim FD (mirrors
+/// `BoundStaged::open_capped` over the FD instead of the path):
+/// size-capped, with a size re-check after the read so a mutation
+/// mid-read is detected rather than hashed.
+fn read_pinned_capped(file: &mut std::fs::File, display: &Path) -> repo_scan::Result<Vec<u8>> {
+    use std::io::Read;
+    let cap = repo_scan::report::publish::MAX_STAGED_REPORT_BYTES;
+    if file.metadata()?.len() > cap {
+        return Err(repo_scan::Error::Report(format!(
+            "staged report {} exceeds the {cap}-byte cap",
+            display.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(file)
+        .take(cap.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Err(repo_scan::Error::Report(format!(
+            "staged report {} exceeds the {cap}-byte cap",
+            display.display()
+        )));
+    }
+    if file.metadata()?.len() != bytes.len() as u64 {
+        return Err(repo_scan::Error::Report(format!(
+            "staged report {} changed during read; refusing",
+            display.display()
+        )));
+    }
+    Ok(bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -8074,6 +9534,10 @@ async fn test_drain_session(
         batches: Box::new(TestDrainIter {
             script: script.into(),
         }),
+        // Scripted volumes model live-history volumes: the scripted
+        // batches are the historical phase, so the checked claim
+        // applies exactly as on a resumed production volume.
+        history_expected: true,
     });
     let roots: Vec<PlannedRoot> = fence_roots
         .iter()

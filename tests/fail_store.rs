@@ -230,6 +230,114 @@ fn sr06_state_root_swap_fails_closed() {
     });
 }
 
+/// RS-PRIV-03: a symlinked engine sidecar is refused BEFORE the engine
+/// open (the path-following engine never meets it), not skipped.
+#[cfg(unix)]
+#[test]
+fn rspriv03_symlinked_sidecar_refused_preopen() {
+    rt().block_on(async {
+        let t = tempfile::tempdir().unwrap();
+        let db = t.path().join("payload").join("catalog.db");
+        TursoStore::open(&db).await.unwrap().close().await.unwrap();
+        let outside = t.path().join("outside-wal");
+        std::fs::write(&outside, b"planted").unwrap();
+        let wal = db.parent().unwrap().join("catalog.db-wal");
+        if wal.exists() {
+            std::fs::remove_file(&wal).unwrap();
+        }
+        std::os::unix::fs::symlink(&outside, &wal).unwrap();
+        let err = match TursoStore::open(&db).await {
+            Ok(_) => panic!("symlinked sidecar must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("symlink"), "{err}");
+        let err = match TursoStore::open_read_only(&db).await {
+            Ok(_) => panic!("symlinked sidecar must be refused (ro)"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("symlink"), "{err}");
+    });
+}
+
+/// RS-PRIV-07: ancestor-pinned creation refuses a symlinked ancestor
+/// instead of creating through it; nested missing chains still build.
+#[cfg(unix)]
+#[test]
+fn rspriv07_creation_refuses_symlinked_ancestor() {
+    use repo_scan::store::owner::ensure_private_dir_all;
+    let t = tempfile::tempdir().unwrap();
+    let real = t.path().join("real");
+    repo_scan::privacy::private_dir_0700(&real).unwrap();
+    let link = t.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let err =
+        ensure_private_dir_all(&link.join("a").join("b")).expect_err("symlinked ancestor refused");
+    assert!(err.to_string().contains("symlink"), "{err}");
+    assert!(!real.join("a").exists(), "nothing created through the link");
+    let nested = t.path().join("n1").join("n2").join("n3");
+    ensure_private_dir_all(&nested).unwrap();
+    assert!(nested.is_dir());
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+}
+
+/// RS-PRIV-08: the catalog-file identity bound at open is re-checked for
+/// the handle lifetime — a swapped catalog file fails `verify_state_root`.
+#[cfg(unix)]
+#[test]
+fn rspriv08_catalog_swap_fails_lifetime_recheck() {
+    rt().block_on(async {
+        let t = tempfile::tempdir().unwrap();
+        let db = t.path().join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.unwrap();
+        store.verify_state_root().unwrap();
+        let other = t.path().join("other.db");
+        TursoStore::open(&other)
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+        std::fs::rename(&other, &db).unwrap();
+        let err = store
+            .verify_state_root()
+            .expect_err("swapped catalog refused");
+        assert!(
+            err.to_string().contains("changed") || err.to_string().contains("refusing"),
+            "{err}"
+        );
+        let _ = store.close().await;
+    });
+}
+
+/// RS-PRIV-11: `catalog.db-tshm` is enumerated with the other sidecars —
+/// a symlinked one is refused pre-open — and is listed for clearing.
+#[cfg(unix)]
+#[test]
+fn rspriv11_tshm_sidecar_enumerated() {
+    rt().block_on(async {
+        assert!(
+            repo_scan::config::KNOWN_SIDECAR_FILES.contains(&"catalog.db-tshm"),
+            "clear must enumerate catalog.db-tshm"
+        );
+        let t = tempfile::tempdir().unwrap();
+        let db = t.path().join("payload").join("catalog.db");
+        TursoStore::open(&db).await.unwrap().close().await.unwrap();
+        let outside = t.path().join("outside-tshm");
+        std::fs::write(&outside, b"planted").unwrap();
+        let tshm = db.parent().unwrap().join("catalog.db-tshm");
+        std::os::unix::fs::symlink(&outside, &tshm).unwrap();
+        let err = match TursoStore::open_read_only(&db).await {
+            Ok(_) => panic!("symlinked -tshm must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("symlink"), "{err}");
+    });
+}
+
 /// Privacy: state/payload parents are created `0700` and the catalog/WAL
 /// files are tightened to `0600` post-create (best-effort + verify).
 #[cfg(unix)]

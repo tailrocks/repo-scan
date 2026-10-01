@@ -7,11 +7,16 @@ use repo_scan::identity::{
 };
 use repo_scan::model::StatusMode;
 use repo_scan::report::builder::{
-    quarantine_staging, stream_report_from_store, AliasInput, CandidateInput, ReportInputs,
-    ReportPipeline,
+    quarantine_staging, stream_report_from_store, verify_staged_report_capped, AliasInput,
+    CandidateInput, FullPathCache, ReportInputs, ReportPipeline,
 };
 use repo_scan::report::model::Report;
-use repo_scan::report::publish::{check_destination, publish_staged, BoundStaged, DestinationKind};
+use repo_scan::report::publish::{
+    check_destination, check_staged_memory_budget, publish_staged, sha256_hex, BoundStaged,
+    DestinationKind,
+};
+#[cfg(unix)]
+use repo_scan::report::publish::{publish_staged_with_options, PublishOptions};
 use repo_scan::report::validate::validate_report;
 use repo_scan::store::{
     NewCheckout, NewGitInstance, NewRemote, NewStatus, NewTask, NewVolume, Store, TursoStore,
@@ -270,9 +275,11 @@ fn rsp002_query_fragment_and_malformed_redaction() {
     );
     assert_eq!(
         redact_credentials("git@github.com:o/r.git"),
-        "git@github.com:o/r.git"
+        "<redacted>@github.com:o/r.git"
     );
     assert!(!has_userinfo("https://@github.com/o/r.git"));
+    // RS-PRIV-10: scp-like users redact on display but are not rejectable
+    // userinfo (the CLI must keep accepting the `git@` login).
     assert!(!has_userinfo("git@github.com:o/r.git"));
     // Free-text scrubbing: embedded URLs and bare secret pairs.
     let scrubbed = scrub_text("clone failed for https://u:p@h/r?token=abc, retry later");
@@ -286,6 +293,33 @@ fn rsp002_query_fragment_and_malformed_redaction() {
         scrub_text("ordinary prose, nothing secret"),
         "ordinary prose, nothing secret"
     );
+}
+
+/// RS-PRIV-04: spaced, JSON, CLI-flag, and multiline pairs redact with
+/// structure preserved; bare `key value` prose does not.
+#[test]
+fn rspriv04_spaced_json_cli_multiline_pairs_redact() {
+    assert_eq!(scrub_text("password: secret"), "password: <redacted>");
+    assert_eq!(scrub_text("token: abc"), "token: <redacted>");
+    assert_eq!(scrub_text("password : secret"), "password : <redacted>");
+    assert_eq!(
+        scrub_text(r#"{"password": "secret"}"#),
+        r#"{"password": "<redacted>"}"#
+    );
+    assert_eq!(scrub_text("--password secret"), "--password <redacted>");
+    assert_eq!(scrub_text("token:\nabc123"), "token:\n<redacted>");
+    // Same-token behavior is unchanged and idempotent.
+    assert_eq!(
+        scrub_text("access_token=zzz leaked"),
+        "access_token=<redacted> leaked"
+    );
+    // Non-pairs survive: bare prose, drive letters, `::` paths.
+    assert_eq!(
+        scrub_text("ordinary prose, nothing secret"),
+        "ordinary prose, nothing secret"
+    );
+    assert_eq!(scrub_text("C:\\path\\x"), "C:\\path\\x");
+    assert_eq!(scrub_text("--password --user x"), "--password --user x");
 }
 
 fn prior_bytes(report_id: &str) -> Vec<u8> {
@@ -914,6 +948,61 @@ fn xsec08_path_interning_bounded() {
     assert!(err.to_string().contains("bound"), "{err}");
 }
 
+/// RESOURCE-RECHECK item 7: the directory full-path cache refuses overlong
+/// values *before* retention and bounds aggregate bytes as well as entries
+/// (previously count-only with the 1 MiB check running after insertion).
+#[test]
+fn recheck07_full_path_cache_byte_bounded() {
+    const MIB: usize = 1024 * 1024;
+    let mut cache = FullPathCache::new();
+
+    // Overlong values (>1 MiB) are refused pre-insert: never retained,
+    // never counted.
+    for i in 0..8i64 {
+        cache.insert(i, vec![i as u8; 2 * MIB]);
+    }
+    assert!(cache.is_empty(), "overlong values must not be retained");
+    assert_eq!(cache.total_bytes(), 0, "refused values add no bytes");
+    assert!(cache.get(&0).is_none(), "refused key must miss");
+
+    // Ordinary retention still works, with exact byte accounting.
+    cache.insert(1, vec![0xAA; 1024]);
+    cache.insert(2, vec![0xBB; 2048]);
+    assert_eq!(cache.len(), 2);
+    assert_eq!(cache.total_bytes(), 3072);
+    assert_eq!(cache.get(&1).expect("hit").len(), 1024);
+    // Re-inserting a key replaces without double-counting.
+    cache.insert(1, vec![0xCC; 512]);
+    assert_eq!(cache.len(), 2);
+    assert_eq!(cache.total_bytes(), 2560);
+
+    // Aggregate bounded: 1 MiB values fill the 64 MiB budget, then the
+    // cache clears and rebuilds — total never exceeds 64 MiB.
+    let mut cache = FullPathCache::new();
+    for i in 0..100i64 {
+        cache.insert(1000 + i, vec![0xAA; MIB]);
+        assert!(
+            cache.total_bytes() <= 64 * MIB,
+            "aggregate exceeds 64 MiB after insert {i}: {}",
+            cache.total_bytes()
+        );
+        assert!(cache.len() <= 4096, "entry count exceeds 4096");
+    }
+    // 100 x 1 MiB through a 64 MiB cache forces at least one clear.
+    assert!(
+        cache.len() < 100,
+        "expected clear-and-rebuild, kept {}",
+        cache.len()
+    );
+
+    // Entry-count bound still holds with tiny values.
+    let mut cache = FullPathCache::new();
+    for i in 0..5000i64 {
+        cache.insert(i, vec![b'x'; 8]);
+        assert!(cache.len() <= 4096, "entry count exceeds 4096");
+    }
+}
+
 /// RSP-004: staging/snapshot creation is dir-FD-relative (`openat`
 /// `O_CREAT|O_EXCL|O_NOFOLLOW`): a symlinked snapshot dir is refused and
 /// a symlinked snapshot leaf can neither be created through nor
@@ -1222,4 +1311,110 @@ fn rsp004_binary_staging_shape_fd_relative() {
     assert_eq!(mode(&staging), 0o700);
     let strays: Vec<_> = staging.read_dir().expect("ls").flatten().collect();
     assert!(strays.is_empty(), "no staging residue: {strays:?}");
+}
+
+/// PUB-01A: replacement inside an untrusted parent (world-writable
+/// without the sticky bit) is refused unless explicitly overridden —
+/// a hostile sibling writer could swap the destination inside the
+/// residual single-`renameat` window. Fresh publishes stay allowed
+/// (the atomic `install_new` path needs no trust), and trusted parents
+/// need no override.
+#[cfg(unix)]
+#[test]
+fn pub01a_untrusted_parent_replacement_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    repo_scan::privacy::private_dir_0700(&state.join("payload")).expect("payload");
+    let shared = dir.path().join("shared");
+    repo_scan::privacy::private_dir_0700(&shared).expect("shared");
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).expect("chmod 777");
+
+    let staged = dir.path().join("staged-a.json");
+    let bytes_a = prior_bytes("pub01a-a");
+    repo_scan::privacy::private_write_0600(&staged, &bytes_a).expect("staged");
+    let dest = shared.join("report.json");
+
+    // Fresh publish into the untrusted parent: allowed.
+    publish_staged(&staged, &dest, &state).expect("fresh publish allowed on untrusted parent");
+    assert_eq!(std::fs::read(&dest).expect("read"), bytes_a);
+
+    // Replacement: refused by pre-flight and by publish; bytes untouched.
+    let staged_b = dir.path().join("staged-b.json");
+    let bytes_b = prior_bytes("pub01a-b");
+    repo_scan::privacy::private_write_0600(&staged_b, &bytes_b).expect("staged b");
+    let err = check_destination(&dest, &state).expect_err("pre-flight refuses");
+    assert!(err.to_string().contains("untrusted parent"), "{err}");
+    let err = publish_staged(&staged_b, &dest, &state).expect_err("publish refuses");
+    assert!(err.to_string().contains("untrusted parent"), "{err}");
+    assert_eq!(
+        std::fs::read(&dest).expect("read"),
+        bytes_a,
+        "refused replacement touches nothing"
+    );
+
+    // Explicit override: replacement proceeds.
+    publish_staged_with_options(
+        &staged_b,
+        &dest,
+        &state,
+        PublishOptions {
+            allow_untrusted_parent_replacement: true,
+        },
+    )
+    .expect("override publishes");
+    assert_eq!(std::fs::read(&dest).expect("read"), bytes_b);
+
+    // Trusted-parent control (the 0700 tempdir itself): replacement
+    // without override still works.
+    let trusted = dir.path().join("report2.json");
+    publish_staged(&staged, &trusted, &state).expect("fresh");
+    publish_staged(&staged_b, &trusted, &state).expect("trusted replacement needs no override");
+    assert_eq!(std::fs::read(&trusted).expect("read"), bytes_b);
+}
+
+/// R3 (RESOURCE-RECHECK item 3): staged-report verification cannot multiply
+/// memory past the RSS target. A low-memory probe counts records, the
+/// aggregate bytes-plus-typed budget is enforced before the typed build,
+/// exhaustion refuses with incomplete-worded resource wording, and the
+/// owned path releases the staging bytes as a single moved copy.
+#[test]
+fn r3_staged_aggregate_budget_and_byte_release() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = open_store(&dir);
+    let now = 1_759_154_400_000;
+    seed_minimal(&store, now, b"https://github.com/owner/repo.git", "[]");
+    let inputs = test_inputs("r3-budget-1");
+    let (bytes, _) = runtime()
+        .block_on(async { stream_report_from_store(&store, &inputs, Vec::new()).await })
+        .expect("stream");
+    let staged = dir.path().join("staged.json");
+    repo_scan::privacy::private_write_0600(&staged, &bytes).expect("write");
+
+    // Generous budget: verifies and validates.
+    let report = verify_staged_report_capped(&staged, 256 * 1024 * 1024).expect("verifies");
+    assert_eq!(report.report_id, "r3-budget-1");
+
+    // Exhausted budget: refused before the typed build, incomplete-worded.
+    let err = verify_staged_report_capped(&staged, 1024).expect_err("budget refused");
+    assert!(err.to_string().contains("incomplete"), "{err}");
+    assert!(err.to_string().contains("rss_target_bytes"), "{err}");
+
+    // Budget unit shape: byte-driven and count-driven exhaustion each
+    // refuse, while a fitting footprint passes.
+    check_staged_memory_budget(200 * 1024 * 1024, 0, 256 * 1024 * 1024)
+        .expect_err("byte-driven exhaustion refuses");
+    check_staged_memory_budget(1024, 1_048_576, 256 * 1024 * 1024)
+        .expect_err("count-driven exhaustion refuses");
+    check_staged_memory_budget(1024 * 1024, 1000, 256 * 1024 * 1024)
+        .expect("fitting budget passes");
+
+    // Explicit release: the bound bytes move out as the single copy.
+    let expected = BoundStaged::open(&staged)
+        .expect("open")
+        .sha256()
+        .to_string();
+    let owned = BoundStaged::open(&staged).expect("open").into_bytes();
+    assert_eq!(owned.len(), bytes.len());
+    assert_eq!(sha256_hex(&owned), expected);
 }
