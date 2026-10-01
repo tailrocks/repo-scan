@@ -3,19 +3,29 @@
 Source of truth: `repo-scan-spec.md`. Qualification evidence: `docs/*_QUAL.md`.
 Gate record: `docs/GATE_DECISION.md` (do not edit).
 
-## Ownership and process model (spec §4)
+## Ownership and process model (spec §4, as shipped)
 
-- One catalog-owning process per state directory; other CLI invocations talk
-  to it over local IPC. No owner -> a command acquires the instance lock and
-  assumes ownership. The coordination lock + ownership marker live outside
-  the replaceable `payload/` namespace.
-- Only the owner opens the Turso database. It owns a bounded writer actor
-  and any tested read connections. Enumeration/Git helpers exchange bounded
-  messages and never open the database.
-- Every potentially blocking operation against inspected scope runs through
-  an admitted helper (enum, metadata, readlink, canonicalization, identity,
-  mount validation, config includes, alternate-store access, status, report
-  sinks). Tool-owned state I/O follows spec §10.
+- One catalog-owning process per state directory. There is no IPC: a second
+  command waits up to 5 s for the lock, then exits `1` with `owner busy`
+  rather than opening the database beside the live owner
+  (`src/main.rs:170-190`, `src/config.rs:130`). The coordination lock +
+  ownership marker live outside the replaceable `payload/` namespace
+  (`src/store/owner.rs:1-16`).
+- Only the owner opens the catalog read-write, on a single-threaded runtime,
+  driving the durable frontier sequentially: claim bounded work, execute one
+  task through the `Admission` gates, persist findings, complete under
+  epoch/lease/revision guards (`src/main.rs:1-11`). The one exception is
+  `query --cached`, which opens the catalog read-only with no lock, no epoch
+  claim, and no recovery writes (`src/main.rs:5710-5715`).
+- The owner spawns zero helper processes; the spec §5 admission limits (enum
+  2 / git 1 / shared 2 / helpers 4) are enforced as in-process caps, so
+  exactly one operation is ever admitted at a time
+  (`tests/accept_db.rs:9-16`). Scan writes buffer in a `WriterBatch` and
+  commit at the spec §5 limits (`src/main.rs:2158-2162`).
+- Every filesystem/Git access inside inspected scope runs inside the
+  traversal fence (below); potentially blocking work is fenced, leased, and
+  watchdog-guarded per task (`src/main.rs:59-66,613-618`). Tool-owned state
+  I/O follows spec §10.
 
 ## Module boundaries (spec §4: these are sufficient)
 
@@ -62,15 +72,42 @@ Gate record: `docs/GATE_DECISION.md` (do not edit).
 6. **Resources.** Hard admission (enum 2 / git 1 / shared 2 / helpers 4),
    buffer bounds (prefetch 1024|4MiB, batches 256|256KiB, writer
    512|512KiB|250ms, fds 64), measured targets (1 core, 256 MiB RSS,
-   512 MiB pressure) in `src/config.rs` (spec §5).
+   512 MiB pressure) in `src/config.rs:40-76` (spec §5). The owner samples
+   aggregate RSS each loop and calls `set_pressure` past the 512 MiB
+   threshold (`src/main.rs:2536-2540`); the PERF-02/03 gate harness lives in
+   `benches/perf_gates.rs`, asserted by `tests/accept_perf.rs:359`.
 7. **Reports.** Draft 2020-12 schema at `schemas/report-v1.schema.json`;
-   illustrative example at `tests/data/example-report.json`. Stage-then-
-   publish through an admitted helper; failed publication retries the saved
-   snapshot (spec §§15-16).
+   illustrative example at `tests/data/example-report.json`. The binary
+   stages through the lib pipeline: stream from the store, verify, retain
+   an immutable snapshot, then atomic publish (`src/main.rs:5555-5663`,
+   `src/report/publish.rs`, `ReportPipeline` at
+   `src/report/builder.rs:1272`). Failed publication marks the snapshot and
+   retries from it without repeating discovery
+   (`src/main.rs:5910-5960`, spec §§15-16).
+
+## Shipped hardening (not in the Phase-1 sketch)
+
+- **Traversal fence.** `ScopeFence` (`src/walk/topology.rs:240`, built at
+  `:250`) pins every enumeration and Git probe to descriptor-relative opens
+  under the declared roots; swapped/out-of-scope paths park with a gap and
+  persist nothing (`src/main.rs:3840-3898`). Tests: `tests/sec_fence.rs:40,57`,
+  `tests/sec_probe_fence.rs:35`.
+- **Lossless planner keys.** `scope_key_for_dir/git` carry exact path bytes,
+  so distinct byte paths never collide and planner keys agree 1:1 with
+  scheduler scopes (`src/main.rs:1627-1628`). Tests: `tests/sec_keys.rs:29`,
+  `tests/sec_bounds.rs:13`.
+- **Publish path.** Staging + snapshot retention + atomic publication with a
+  sha256/byte-count receipt (`src/report/publish.rs:256,411,706`); staged
+  input is opened `O_NOFOLLOW`, byte-capped, and quarantined on failure.
+  Tests: `tests/sec_publish.rs:33,77,95,109,285`,
+  `tests/accept_report.rs:589,656,704`.
+- **Audit gate.** Dependency audit/deny policy is CI-enforced and
+  regression-tested (`docs/AUDIT_GATE.md`, `tests/sec_audit_gate.rs:13`).
 
 ## Data flow (steady state)
 
-CLI -> owner -> scheduler claims bounded tasks -> admitted helpers run
-walk/git probes -> bounded batches -> writer actor commits -> invalidation
-revisions gate completions -> report streams one catalog revision -> staged
-snapshot -> atomic publish.
+CLI -> owner lock (or read-only query / `OwnerBusy`) -> scheduler claims
+bounded tasks -> inline execution through `Admission` gates -> fenced
+walk/git probes -> bounded batches -> buffered writer commits ->
+invalidation revisions gate completions -> report streams one catalog
+revision -> staged snapshot -> verified, retained, atomically published.

@@ -18,7 +18,7 @@ cargo build --release
 
 No runtime dependencies: no LLM, cloud service, daemon, GUI, or TUI. Installed Git is
 an optional compatibility backend only. Locked deps: `turso =0.8.1`, `dua-core =4.1.0`,
-`gix =0.88.0` ([Cargo.toml](Cargo.toml:19)).
+`gix =0.88.0` ([Cargo.toml](Cargo.toml:34)).
 
 ## Test
 

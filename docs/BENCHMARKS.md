@@ -47,5 +47,8 @@ Verdict record: `adapters`, `equivalent`, `baseline_dirs/entries/errors`.
 | 2026-10-01 | M5 Max / macOS 27.0 / APFS | resume | — | — | — | — | — | — | — | — | — | 500 | 501 | enqueue 2068.81 ms, recover+claim 55.94 ms, recovered_to_pending 0 |
 | 2026-10-01 | M5 Max / macOS 27.0 / APFS | footprint | — | — | — | — | — | — | — | — | — | — | — | 17711104 |
 
-PERF-02/03 gates (declared corpus, ≥30 s sustained measurement, 512 MiB injection)
-have no harness yet — see [docs/CHECKLIST.md](../docs/CHECKLIST.md).
+PERF-02/03 gates run from [benches/perf_gates.rs](../benches/perf_gates.rs)
+(declared corpus, ≥30 s sustained measurement, 512 MiB pressure injection),
+asserted by [tests/accept_perf.rs](../tests/accept_perf.rs:359)
+(`perf_02_03_gates_hold`; results: `benches/results/perf_gates.jsonl`).
+Traceability: [docs/CHECKLIST.md](../docs/CHECKLIST.md) PERF-02/03.
