@@ -15,7 +15,7 @@
 
 use crate::error::Error;
 use crate::model::TaskState;
-use crate::store::owner::OwnerGuard;
+use crate::store::owner::{OwnerGuard, StateRootAnchor};
 use crate::store::writer::WriterBatch;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -23,6 +23,16 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Owner-held catalog handle. Only the owner constructs this.
+///
+/// SR-STATE-06: `state_anchor` pins the state root with a lifetime
+/// `O_NOFOLLOW|O_DIRECTORY` FD plus `(dev, ino)`, verified pre/post-open
+/// and periodically (`with_tx`, `open_reader`). A swap fails closed.
+///
+/// Engine-opens-by-path residual: Turso `Builder::new_local(path)` opens
+/// the database by path string inside the engine, so the FD cannot force
+/// the engine to use the pinned directory. The anchor detects a swap
+/// before/after the engine open and on later verifies, but a swap that is
+/// restored between two verifies is not observable at this layer.
 pub struct TursoStore {
     db: turso::Database,
     conn: turso::Connection,
@@ -33,6 +43,7 @@ pub struct TursoStore {
     /// refuses, so cached queries cannot mutate the catalog.
     read_only: bool,
     counters: StoreCounters,
+    state_anchor: Option<StateRootAnchor>,
 }
 
 /// Lock-free runtime counters behind [`TursoStore::stats`]. Open/migration
@@ -85,6 +96,105 @@ fn fresh_token() -> i64 {
 
 fn store_err(error: turso::Error) -> Error {
     Error::Store(error.to_string())
+}
+
+/// Refuse symlinked owned ancestors (SR-STATE-06): the database file, its
+/// parent (payload), and its grandparent (state dir) must none be symlinks.
+/// Final-component-only `O_NOFOLLOW` is insufficient — a symlinked `payload`
+/// or state dir would redirect the catalog open. Only the owned namespace
+/// is checked (never system ancestors like `/tmp`/`/var`, which are
+/// legitimately symlinked on some platforms). Missing components are
+/// skipped (the database file need not exist yet); other inspection
+/// failures fail closed.
+fn refuse_symlinked_owned_ancestors(db_path: &Path) -> crate::Result<()> {
+    let mut current: Option<&Path> = Some(db_path);
+    for _ in 0..3 {
+        let Some(path) = current else {
+            break;
+        };
+        if path.as_os_str().is_empty() {
+            break;
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(md) if md.file_type().is_symlink() => {
+                return Err(Error::Store(format!(
+                    "refusing symlinked state component: {}",
+                    path.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(Error::Io(format!("cannot inspect {}: {e}", path.display())));
+            }
+        }
+        current = path.parent();
+    }
+    Ok(())
+}
+
+/// State root for `db_path` (SR-STATE-06): `<state>/payload/catalog.db`
+/// anchors `<state>`; any other layout anchors the immediate parent.
+/// Never climbs into system ancestors.
+fn state_root_for_db(db_path: &Path) -> Option<PathBuf> {
+    let parent = db_path.parent()?;
+    if parent.as_os_str().is_empty() {
+        return None;
+    }
+    if parent.file_name().is_some_and(|n| n == "payload") {
+        if let Some(grand) = parent.parent() {
+            if !grand.as_os_str().is_empty() {
+                return Some(grand.to_path_buf());
+            }
+        }
+    }
+    Some(parent.to_path_buf())
+}
+
+/// Best-effort `0600` on the catalog file plus WAL sidecars, then verify.
+/// Missing sidecars are skipped; an existing file that still allows
+/// group/other access fails closed (unix only; no-op elsewhere).
+#[cfg(unix)]
+fn ensure_private_db_files(db_path: &Path) -> crate::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut candidates = vec![db_path.to_path_buf()];
+    if let Some(name) = db_path.file_name() {
+        if let Some(parent) = db_path.parent() {
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let mut file = std::ffi::OsString::from(name);
+                file.push(suffix);
+                candidates.push(parent.join(file));
+            }
+        }
+    }
+    for path in candidates {
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => continue,
+        };
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            continue;
+        }
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        let mode = match std::fs::metadata(&path) {
+            Ok(m) => m.permissions().mode() & 0o777,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(Error::Io(format!("cannot inspect {}: {e}", path.display()))),
+        };
+        if mode & 0o077 != 0 {
+            return Err(Error::Store(format!(
+                "catalog file {} mode is {mode:o}, want no group/other access",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_private_db_files(_db_path: &Path) -> crate::Result<()> {
+    Ok(())
 }
 
 fn v_int(value: i64) -> turso::Value {
@@ -400,6 +510,20 @@ impl TursoStore {
         Ok(())
     }
 
+    /// Enforce the single-owner invariant (SR-STATE-08): lease operations
+    /// must carry this handle's fencing epoch. A foreign epoch is a caller
+    /// defect (a replaced owner's workers are fenced), never silently
+    /// accepted.
+    fn check_owner_epoch(&self, epoch: u64, op: &str) -> crate::Result<()> {
+        if epoch != self.epoch {
+            return Err(Error::Store(format!(
+                "{op} refused: epoch {epoch} is not this owner (epoch {})",
+                self.epoch
+            )));
+        }
+        Ok(())
+    }
+
     /// Owner-only writer connection. Report streaming uses `prepare` plus
     /// `Rows::next()` on this or a dedicated reader; never buffering batch
     /// APIs. The owner serializes writer use.
@@ -412,14 +536,25 @@ impl TursoStore {
         &self.conn
     }
 
-    /// Open (or create) the catalog at `db_path`: parent directories,
-    /// `Builder::new_local` + `connect`, durability PRAGMAs with asserted
-    /// query-backs, migrations, epoch claim, and crash recovery.
+    /// Open (or create) the catalog at `db_path`: private parent
+    /// directories (`0700`), `Builder::new_local` + `connect`, durability
+    /// PRAGMAs with asserted query-backs, migrations, epoch claim, and
+    /// crash recovery. Holds a lifetime state-root anchor (SR-STATE-06)
+    /// and tightens the catalog/WAL files to `0600` post-create.
     async fn open_inner(db_path: &Path) -> crate::Result<Self> {
+        refuse_symlinked_owned_ancestors(db_path)?;
         if let Some(parent) = db_path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
+                crate::store::owner::ensure_private_dir_all(parent)?;
             }
+        }
+        // Re-bind after creation: a swap between check and create fails.
+        refuse_symlinked_owned_ancestors(db_path)?;
+        let state_anchor = state_root_for_db(db_path)
+            .map(|root| StateRootAnchor::open(&root))
+            .transpose()?;
+        if let Some(anchor) = &state_anchor {
+            anchor.verify()?;
         }
         let path_str = db_path.to_str().ok_or_else(|| {
             Error::Store(format!("database path is not UTF-8: {}", db_path.display()))
@@ -429,6 +564,12 @@ impl TursoStore {
             .await
             .map_err(store_err)?;
         let conn = db.connect().map_err(store_err)?;
+        // Re-bind after open: fail closed if swapped under the open.
+        refuse_symlinked_owned_ancestors(db_path)?;
+        if let Some(anchor) = &state_anchor {
+            anchor.verify()?;
+        }
+        ensure_private_db_files(db_path)?;
         Self::apply_pragmas(&conn).await?;
         let schema_version = Self::migrate(&conn).await?;
         let epoch = i64_to_u64(
@@ -458,6 +599,7 @@ impl TursoStore {
             schema_version,
             read_only: false,
             counters: StoreCounters::default(),
+            state_anchor,
         })
     }
 
@@ -473,11 +615,18 @@ impl TursoStore {
     /// Returns a store error (not a catalog) when the database file is
     /// absent or holds no suitable migrated catalog.
     pub async fn open_read_only(db_path: &Path) -> crate::Result<Self> {
+        refuse_symlinked_owned_ancestors(db_path)?;
         if !db_path.exists() {
             return Err(Error::Store(format!(
                 "no catalog at {}: nothing cached to read",
                 db_path.display()
             )));
+        }
+        let state_anchor = state_root_for_db(db_path)
+            .map(|root| StateRootAnchor::open(&root))
+            .transpose()?;
+        if let Some(anchor) = &state_anchor {
+            anchor.verify()?;
         }
         let path_str = db_path.to_str().ok_or_else(|| {
             Error::Store(format!("database path is not UTF-8: {}", db_path.display()))
@@ -494,6 +643,11 @@ impl TursoStore {
             .await
             .map_err(store_err)?;
         let conn = db.connect().map_err(store_err)?;
+        // Re-bind after open: fail closed if swapped under the open.
+        refuse_symlinked_owned_ancestors(db_path)?;
+        if let Some(anchor) = &state_anchor {
+            anchor.verify()?;
+        }
         conn.busy_timeout(Duration::from_secs(5))
             .map_err(store_err)?;
         let journal_mode = Self::pragma_text(&conn, "journal_mode").await?;
@@ -540,7 +694,18 @@ impl TursoStore {
             schema_version,
             read_only: true,
             counters: StoreCounters::default(),
+            state_anchor,
         })
+    }
+
+    /// Re-verify the lifetime state-root anchor (SR-STATE-06). Fails closed
+    /// when the state directory was swapped, replaced, or symlinked under
+    /// the held FD. Called periodically by `with_tx` and `open_reader`.
+    pub fn verify_state_root(&self) -> crate::Result<()> {
+        if let Some(anchor) = &self.state_anchor {
+            anchor.verify()?;
+        }
+        Ok(())
     }
 
     /// Explicit transaction helper: `BEGIN IMMEDIATE`, run `f`, then an
@@ -554,6 +719,7 @@ impl TursoStore {
         Fut: std::future::Future<Output = crate::Result<T>>,
     {
         self.forbid_write("transaction")?;
+        self.verify_state_root()?;
         let result = Self::with_tx_on(&self.conn, f).await;
         match &result {
             Ok(_) => {
@@ -945,6 +1111,13 @@ impl TursoStore {
         ttl_ms: i64,
         now_ms: i64,
     ) -> crate::Result<Vec<ClaimedTask>> {
+        // Fix10 probes before the owner gate: out-of-range epochs and
+        // overflowing expiries fail with their own errors for any epoch.
+        u64_to_i64(epoch, "lease epoch")?;
+        now_ms.checked_add(ttl_ms).ok_or_else(|| {
+            Error::Store(format!("lease expiry {now_ms} + {ttl_ms} overflows i64"))
+        })?;
+        self.check_owner_epoch(epoch, "claim_tasks")?;
         let limit = limit.clamp(1, 1024);
         self.with_tx(|conn| async move {
             Self::expire_leases_on(conn, now_ms).await?;
@@ -1018,8 +1191,9 @@ impl TursoStore {
     /// tasks stay visible to that generation's `pending_count` boundary.
     /// Requests sharing the *same* generation still share work: repeated
     /// claims return disjoint pending tasks until the generation is
-    /// exhausted. Lease expiry runs first, inside the same transaction;
-    /// leases last `ttl_ms` from `now_ms`. Bounded: at most 1,024 claims.
+    /// exhausted. Lease expiry for this generation runs first, inside the
+    /// same transaction; other generations' leases are untouched.
+    /// Leases last `ttl_ms` from `now_ms`. Bounded: at most 1,024 claims.
     pub async fn claim_tasks_in_generation(
         &self,
         generation: u64,
@@ -1028,9 +1202,16 @@ impl TursoStore {
         ttl_ms: i64,
         now_ms: i64,
     ) -> crate::Result<Vec<ClaimedTask>> {
+        // Fix10 probes before the owner gate (see `claim_tasks`).
+        u64_to_i64(generation, "task generation")?;
+        u64_to_i64(epoch, "lease epoch")?;
+        now_ms.checked_add(ttl_ms).ok_or_else(|| {
+            Error::Store(format!("lease expiry {now_ms} + {ttl_ms} overflows i64"))
+        })?;
+        self.check_owner_epoch(epoch, "claim_tasks_in_generation")?;
         let limit = limit.clamp(1, 1024);
         self.with_tx(|conn| async move {
-            Self::expire_leases_on(conn, now_ms).await?;
+            Self::expire_leases_in_generation_on(conn, generation, now_ms).await?;
             // Bound literal is interpolated (numeric, owner-controlled) so
             // the query needs no bound LIMIT support.
             let sql = format!(
@@ -1106,10 +1287,13 @@ impl TursoStore {
     ) -> crate::Result<bool> {
         self.forbid_write("renew_lease")?;
         // fix10: checked — see `claim_tasks`; an overflowing expiry must
-        // fail the renew, never silently shorten the lease.
+        // fail the renew, never silently shorten the lease. Probed before
+        // the owner gate so range/overflow errors keep their own messages.
         let expires = now_ms.checked_add(ttl_ms).ok_or_else(|| {
             Error::Store(format!("lease expiry {now_ms} + {ttl_ms} overflows i64"))
         })?;
+        u64_to_i64(epoch, "lease epoch")?;
+        self.check_owner_epoch(epoch, "renew_lease")?;
         let rows = self
             .conn
             .execute(
@@ -1149,6 +1333,29 @@ impl TursoStore {
         Ok(rows)
     }
 
+    /// Return expired leases of one generation to `pending` (SR-STATE-08):
+    /// a generation-scoped claim must not expire other generations' leases.
+    async fn expire_leases_in_generation_on(
+        conn: &turso::Connection,
+        generation: u64,
+        now_ms: i64,
+    ) -> crate::Result<u64> {
+        let rows = conn
+            .execute(
+                "UPDATE frontier_tasks SET state = 'pending', lease_token = NULL, \
+                    lease_epoch = NULL, lease_expires_ms = NULL, updated_at_ms = ?1 \
+                    WHERE state = 'leased' AND generation = ?2 \
+                    AND lease_expires_ms IS NOT NULL AND lease_expires_ms <= ?1",
+                vec![
+                    v_int(now_ms),
+                    v_int(u64_to_i64(generation, "task generation")?),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(rows)
+    }
+
     /// Accept a completion only when the task is still leased to this exact
     /// token and epoch and the scope revision still matches. A completion
     /// that arrives after an invalidation is stale: the task is requeued
@@ -1164,6 +1371,7 @@ impl TursoStore {
         outcome: &TaskOutcome,
         now_ms: i64,
     ) -> crate::Result<()> {
+        self.check_owner_epoch(epoch, "complete_task")?;
         let stale = self
             .with_tx(|conn| async move {
                 Self::complete_task_on(conn, task_id, token, epoch, outcome, now_ms).await
@@ -1383,6 +1591,7 @@ impl TursoStore {
         child_task_ids: &[String],
         now_ms: i64,
     ) -> crate::Result<()> {
+        self.check_owner_epoch(epoch, "complete_task_with_children")?;
         let stale = self
             .with_tx(|conn| async move {
                 let task = Self::check_lease_on(conn, task_id, token, epoch).await?;
@@ -1475,11 +1684,18 @@ impl TursoStore {
     /// into an unrelated directory. Non-`dir:` scopes and malformed keys
     /// mirror nothing; the `scope_revisions` bump (the correctness guard)
     /// always applies. Runs inside the caller's transaction.
+    ///
+    /// SR-STATE-09: paged with a bounded fanout — one 256-row keyset page
+    /// at a time, at most 1,024 mirrored rows. Past the cap the whole
+    /// invalidation fails loudly (the caller's transaction rolls back)
+    /// instead of gathering unbounded IDs or mirroring partially.
     async fn mirror_dir_invalidation(
         conn: &turso::Connection,
         scope_key: &str,
         rev: u64,
     ) -> crate::Result<()> {
+        const MIRROR_PAGE: usize = 256;
+        const MIRROR_MAX: u64 = 1024;
         let Some(hex) = scope_key.strip_prefix("dir:") else {
             return Ok(());
         };
@@ -1498,28 +1714,51 @@ impl TursoStore {
                 Some(name) => crate::config::path_as_bytes(Path::new(name)),
                 None => path_bytes,
             };
-        let mut rows = conn
-            .query(
-                "SELECT id, component FROM directories WHERE display = ?1",
-                vec![v_text(display)],
-            )
-            .await
-            .map_err(store_err)?;
-        let mut ids = Vec::new();
-        while let Some(row) = rows.next().await.map_err(store_err)? {
-            if req_blob(&row, 1)? == component {
-                ids.push(req_i64(&row, 0)?);
-            }
-        }
         let rev_i64 = i64::try_from(rev)
             .map_err(|_| Error::Store(format!("invalidation revision {rev} exceeds i64 range")))?;
-        for id in ids {
-            conn.execute(
-                "UPDATE directories SET invalidation_rev = ?1 WHERE id = ?2",
-                vec![v_int(rev_i64), v_int(id)],
-            )
-            .await
-            .map_err(store_err)?;
+        let mut last_id: i64 = 0;
+        let mut mirrored: u64 = 0;
+        loop {
+            // Bound literal is interpolated (numeric, owner-controlled) so
+            // the query needs no bound LIMIT support.
+            let sql = format!(
+                "SELECT id FROM directories WHERE display = ?1 AND component = ?2 \
+                    AND id > ?3 ORDER BY id ASC LIMIT {MIRROR_PAGE}"
+            );
+            let mut rows = conn
+                .query(
+                    sql.as_str(),
+                    vec![
+                        v_text(display.as_str()),
+                        v_blob(component.clone()),
+                        v_int(last_id),
+                    ],
+                )
+                .await
+                .map_err(store_err)?;
+            let mut ids = Vec::new();
+            while let Some(row) = rows.next().await.map_err(store_err)? {
+                ids.push(req_i64(&row, 0)?);
+            }
+            if ids.is_empty() {
+                break;
+            }
+            for id in ids {
+                mirrored += 1;
+                if mirrored > MIRROR_MAX {
+                    return Err(Error::Store(format!(
+                        "invalidation fanout for {scope_key:?} exceeds {MIRROR_MAX} \
+                            directory rows; refusing partial mirror"
+                    )));
+                }
+                conn.execute(
+                    "UPDATE directories SET invalidation_rev = ?1 WHERE id = ?2",
+                    vec![v_int(rev_i64), v_int(id)],
+                )
+                .await
+                .map_err(store_err)?;
+                last_id = id;
+            }
         }
         Ok(())
     }
@@ -3238,32 +3477,56 @@ impl TursoStore {
         batch: &mut WriterBatch,
         now_ms: i64,
     ) -> crate::Result<usize> {
-        if self.reconcile_idempotency_key(idempotency_key).await? {
-            batch.drain();
-            return Ok(0);
-        }
+        self.forbid_write("commit_batch")?;
         let ops = batch.drain();
         let count = ops.len();
         if count == 0 {
             return Ok(0);
         }
         let key = idempotency_key.to_string();
-        self.with_tx(move |conn| async move {
-            conn.execute(
-                "INSERT OR IGNORE INTO batches (idempotency_key, state, created_at_ms) \
-                    VALUES (?1, 'committed', ?2)",
-                vec![v_text(key), v_int(now_ms)],
-            )
-            .await
-            .map_err(store_err)?;
-            for op in ops {
-                conn.execute(op.sql.as_str(), op.params)
+        // SR-STATE-07: the duplicate check is authoritative only INSIDE the
+        // `BEGIN IMMEDIATE` transaction. An outside check-then-insert races:
+        // two committers can both observe absence, then both apply ops.
+        // `INSERT OR IGNORE` returning 0 rows means a replay — skip ops.
+        // Ops execute from clones so a failed transaction restores the
+        // batch instead of losing buffered work.
+        // Borrow through a shared ref so `async move` captures the ref,
+        // not `ops`: a failed transaction restores `ops` into the batch.
+        let ops_ref = &ops;
+        let applied = match self
+            .with_tx(|conn| async move {
+                let inserted = conn
+                    .execute(
+                        "INSERT OR IGNORE INTO batches (idempotency_key, state, created_at_ms) \
+                            VALUES (?1, 'committed', ?2)",
+                        vec![v_text(key.as_str()), v_int(now_ms)],
+                    )
                     .await
-                    .map_err(store_err)?;
+                    .map_err(store_err)?
+                    == 1;
+                if !inserted {
+                    return Ok::<bool, Error>(false);
+                }
+                for op in ops_ref {
+                    conn.execute(op.sql.as_str(), op.params.clone())
+                        .await
+                        .map_err(store_err)?;
+                }
+                Ok::<bool, Error>(true)
+            })
+            .await
+        {
+            Ok(applied) => applied,
+            Err(error) => {
+                for op in ops {
+                    batch.push(op.sql, op.params);
+                }
+                return Err(error);
             }
-            Ok::<(), Error>(())
-        })
-        .await?;
+        };
+        if !applied {
+            return Ok(0);
+        }
         self.counters.batch_commits.fetch_add(1, Ordering::Relaxed);
         // fix10: op counts are `usize`; loud on 32-bit overflow, infallible on 64-bit.
         let count_u64 = u64::try_from(count)
@@ -3277,20 +3540,32 @@ impl TursoStore {
     /// Commit a writer batch in one transaction without an idempotency
     /// marker. Returns the number of applied ops.
     pub async fn flush(&self, batch: &mut WriterBatch) -> crate::Result<usize> {
+        self.forbid_write("flush")?;
         let ops = batch.drain();
         let count = ops.len();
         if count == 0 {
             return Ok(0);
         }
-        self.with_tx(move |conn| async move {
+        // SR-STATE-07: execute from clones; a failed transaction restores
+        // the batch instead of losing buffered work. Borrow through a
+        // shared ref so `async move` captures the ref, not `ops`.
+        let ops_ref = &ops;
+        if let Err(error) = self
+            .with_tx(|conn| async move {
+                for op in ops_ref {
+                    conn.execute(op.sql.as_str(), op.params.clone())
+                        .await
+                        .map_err(store_err)?;
+                }
+                Ok::<(), Error>(())
+            })
+            .await
+        {
             for op in ops {
-                conn.execute(op.sql.as_str(), op.params)
-                    .await
-                    .map_err(store_err)?;
+                batch.push(op.sql, op.params);
             }
-            Ok::<(), Error>(())
-        })
-        .await?;
+            return Err(error);
+        }
         self.counters.batch_commits.fetch_add(1, Ordering::Relaxed);
         // fix10: op counts are `usize`; loud on 32-bit overflow, infallible on 64-bit.
         let count_u64 = u64::try_from(count)
@@ -3685,6 +3960,7 @@ impl TursoStore {
     /// reader; a reader must be drained or dropped before checkpoint
     /// coordination expects a non-busy truncate.
     pub async fn open_reader(&self) -> crate::Result<turso::Connection> {
+        self.verify_state_root()?;
         let conn = self.db.connect().map_err(store_err)?;
         conn.busy_timeout(Duration::from_secs(5))
             .map_err(store_err)?;

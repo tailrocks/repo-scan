@@ -51,6 +51,19 @@ fn stdout_line(out: &std::process::Output, key: &str) -> String {
     panic!("missing `{key}:` in stdout:\n{text}");
 }
 
+/// Parse one stderr progress line into cumulative `(tasks_done, pending)`.
+/// Both counters are store-read per tick, so they describe durable state.
+/// Returns `None` for non-progress lines.
+fn parse_progress(line: &str) -> Option<(u64, u64)> {
+    let (_, rest) = line.split_once("tasks_done=")?;
+    let (done_s, rest) = rest.split_once('/')?;
+    let done = done_s.parse::<u64>().ok()?;
+    let (_, rest) = rest.split_once("pending=")?;
+    let pending_s = rest.split(|c: char| !c.is_ascii_digit()).next()?;
+    let pending = pending_s.parse::<u64>().ok()?;
+    Some((done, pending))
+}
+
 fn report_json(path: &Path) -> serde_json::Value {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     serde_json::from_slice(&bytes).expect("report is JSON")
@@ -123,9 +136,13 @@ fn resume01_kill_mid_scan_resume_completes_without_redo() {
         let mid_dir = root.join(format!("mid-{mid:02}"));
         for leaf in 0..LEAVES_PER_MID {
             let leaf_dir = mid_dir.join(format!("leaf-{leaf:02}"));
-            std::fs::create_dir_all(&leaf_dir).expect("mkdir");
+            repo_scan::privacy::private_dir_0700(&leaf_dir).expect("mkdir");
             for file in 0..FILES_PER_LEAF {
-                std::fs::write(leaf_dir.join(format!("f{file}.txt")), b"x").expect("write");
+                repo_scan::privacy::private_write_0600(
+                    &leaf_dir.join(format!("f{file}.txt")),
+                    b"x",
+                )
+                .expect("write");
             }
         }
     }
@@ -137,7 +154,12 @@ fn resume01_kill_mid_scan_resume_completes_without_redo() {
     let report_s = report.to_str().expect("utf8").to_string();
     let root_s = root.to_str().expect("utf8").to_string();
 
-    // Spawn the scan; kill it once durable commits are observable.
+    // Spawn the scan; SIGKILL it once durable acknowledgments are
+    // observable (never a blind sleep: a fixed grace races scan startup
+    // and kills before the first acknowledgment on a loaded host).
+    // Progress `tasks_done`/`pending` are store-read per tick, so an
+    // observed `tasks_done` count is already durable at kill time.
+    const MIN_ACKS: u64 = 5;
     let mut child = cmd(&state, tmp.path())
         .args([
             "scan",
@@ -151,31 +173,57 @@ fn resume01_kill_mid_scan_resume_completes_without_redo() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn scan");
-    let wal = state.join("payload").join("catalog.db-wal");
-    let deadline = Instant::now() + Duration::from_secs(90);
+    // Drain stderr on a helper thread: the kill gate reads progress
+    // lines live, and no pipe back-pressure can stall the scan.
+    let child_stderr = child.stderr.take().expect("piped stderr");
+    let (line_tx, line_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        let reader = std::io::BufReader::new(child_stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            if line_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut acked = 0u64;
     loop {
         if let Some(status) = child.try_wait().expect("poll child") {
             panic!("scan exited ({status}) before the kill window");
         }
-        if wal.metadata().map(|meta| meta.len()).unwrap_or(0) >= 8192 {
-            break;
+        match line_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(line) => {
+                if let Some((done, pending)) = parse_progress(&line) {
+                    acked = acked.max(done);
+                    if done >= MIN_ACKS && pending > 0 {
+                        break;
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("no durable acknowledgment within 120s (acked={acked})");
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // stderr closed: the child is exiting; re-polled above.
+            }
         }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("no durable commits observed within 90s");
-        }
-        std::thread::sleep(Duration::from_millis(50));
     }
-    // Let more work acknowledge, then SIGKILL mid-run.
-    std::thread::sleep(Duration::from_millis(1200));
+    // The gate broke on a tick with pending work, so the kill lands
+    // mid-scan; if the run still finished first, the tree is too small
+    // for this host's speed, not too big for its slowness.
     assert!(
         child.try_wait().expect("poll child").is_none(),
-        "scan finished during the grace window"
+        "scan finished before the kill landed"
     );
     child.kill().expect("SIGKILL mid-scan");
     let status = child.wait().expect("wait");
     assert!(!status.success(), "killed scan must not report success");
+    reader.join().expect("stderr reader");
 
     // Acknowledged work survives the crash.
     let rt = runtime();
@@ -210,7 +258,7 @@ fn resume01_kill_mid_scan_resume_completes_without_redo() {
         .await;
         assert!(
             !complete_ids.is_empty(),
-            "kill landed before any acknowledgment; tree too small for this host"
+            "kill gate observed {MIN_ACKS} durable dones yet none are complete"
         );
         let mut frozen = Vec::with_capacity(complete_ids.len());
         for id in &complete_ids {
@@ -311,7 +359,7 @@ fn resume02_stale_completion_keeps_newer_rev() {
     rt.block_on(async {
         let dir = tempfile::tempdir().expect("tempdir");
         let watched = dir.path().join("watched");
-        std::fs::create_dir_all(&watched).expect("mkdir");
+        repo_scan::privacy::private_dir_0700(&watched).expect("mkdir");
         let scope = repo_scan::config::scope_key_for_dir(&watched);
         let db = dir.path().join("payload").join("catalog.db");
         let store = TursoStore::open(&db).await.expect("open");

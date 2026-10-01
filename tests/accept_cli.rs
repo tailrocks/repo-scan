@@ -74,10 +74,10 @@ impl Env {
         let state = dir.path().join("state");
         let cwd_a = dir.path().join("cwd-a");
         let cwd_b = dir.path().join("cwd-b");
-        std::fs::create_dir_all(&cwd_a).expect("mkdir");
-        std::fs::create_dir_all(&cwd_b).expect("mkdir");
+        repo_scan::privacy::private_dir_0700(&cwd_a).expect("mkdir");
+        repo_scan::privacy::private_dir_0700(&cwd_b).expect("mkdir");
         let fixture = dir.path().join("fixture");
-        std::fs::create_dir_all(&fixture).expect("mkdir");
+        repo_scan::privacy::private_dir_0700(&fixture).expect("mkdir");
         fixture::normal_clone(&fixture, "repo");
         let fixture_str = fixture.to_str().expect("utf8").to_string();
         Self {
@@ -285,8 +285,9 @@ fn cli01_exit_codes() {
     let env = Env::new();
     // 0: a complete search with zero matches is still success.
     let empty = env.cwd_a.join("empty");
-    std::fs::create_dir_all(&empty).expect("mkdir");
-    std::fs::write(empty.join("notes.txt"), "no repos here").expect("write");
+    repo_scan::privacy::private_dir_0700(&empty).expect("mkdir");
+    repo_scan::privacy::private_write_0600(&empty.join("notes.txt"), "no repos here".as_bytes())
+        .expect("write");
     let empty_str = empty.to_str().expect("utf8").to_string();
     let out = run(
         &[
@@ -469,7 +470,7 @@ fn cli03_completed_resume_idempotent_across_cwd() {
 fn cli03_failed_publication_retries_to_absolute_dest() {
     let env = Env::new();
     let rodir = env.cwd_a.join("rodir");
-    std::fs::create_dir_all(&rodir).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&rodir).expect("mkdir");
     let dest = rodir.join("rep.json");
     let dest_str = dest.to_str().expect("utf8").to_string();
     #[cfg(unix)]
@@ -480,7 +481,7 @@ fn cli03_failed_publication_retries_to_absolute_dest() {
     }
     // Probe: a privileged user can still write; without a real failure this
     // test cannot set up its precondition.
-    if std::fs::write(rodir.join(".probe"), b"x").is_ok() {
+    if repo_scan::privacy::private_write_0600(&rodir.join(".probe"), b"x").is_ok() {
         let _ = std::fs::remove_file(rodir.join(".probe"));
         #[cfg(unix)]
         {
@@ -542,8 +543,8 @@ fn cli03_incomplete_resume_restores_dest_and_options() {
 
     let env = Env::new();
     let blocked = env.fixture.join("blocked");
-    std::fs::create_dir_all(&blocked).expect("mkdir");
-    std::fs::write(blocked.join("secret.txt"), b"x").expect("write");
+    repo_scan::privacy::private_dir_0700(&blocked).expect("mkdir");
+    repo_scan::privacy::private_write_0600(&blocked.join("secret.txt"), b"x").expect("write");
     std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o0)).expect("chmod 000");
     let _restore = Restore { path: &blocked };
     if std::fs::read_dir(&blocked).is_ok() {

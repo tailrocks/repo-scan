@@ -57,13 +57,14 @@ const ID: &[&str] = &[
 /// `git init` + one commit; returns the workdir path.
 fn init_with_commit(git_bin: &Path, dir: &Path) -> PathBuf {
     let home = dir.join("home");
-    std::fs::create_dir_all(&home).expect("home");
+    repo_scan::privacy::private_dir_0700(&home).expect("home");
     let work = dir.join("work");
-    std::fs::create_dir_all(&work).expect("work");
+    repo_scan::privacy::private_dir_0700(&work).expect("work");
     let mut args = ID.to_vec();
     args.push("init");
     git(git_bin, &home, &work, &args);
-    std::fs::write(work.join("file.txt"), "hello\n").expect("seed file");
+    repo_scan::privacy::private_write_0600(&work.join("file.txt"), "hello\n".as_bytes())
+        .expect("seed file");
     let mut args = ID.to_vec();
     args.extend(["add", "file.txt"]);
     git(git_bin, &home, &work, &args);
@@ -120,9 +121,9 @@ fn bare_store_with_arbitrary_name_opens() {
     };
     let scratch = tempfile::tempdir().expect("scratch");
     let home = scratch.path().join("home");
-    std::fs::create_dir_all(&home).expect("home");
+    repo_scan::privacy::private_dir_0700(&home).expect("home");
     let store = scratch.path().join("odd-store-name");
-    std::fs::create_dir_all(&store).expect("store");
+    repo_scan::privacy::private_dir_0700(&store).expect("store");
     let mut args = ID.to_vec();
     args.extend(["init", "--bare"]);
     git(&git_bin, &home, &store, &args);
@@ -230,9 +231,9 @@ fn unborn_head_observed() {
     };
     let scratch = tempfile::tempdir().expect("scratch");
     let home = scratch.path().join("home");
-    std::fs::create_dir_all(&home).expect("home");
+    repo_scan::privacy::private_dir_0700(&home).expect("home");
     let work = scratch.path().join("empty");
-    std::fs::create_dir_all(&work).expect("work");
+    repo_scan::privacy::private_dir_0700(&work).expect("work");
     let mut args = ID.to_vec();
     args.push("init");
     git(&git_bin, &home, &work, &args);
@@ -287,18 +288,22 @@ fn status_counts_match_git_semantics() {
     let work = init_with_commit(&git_bin, scratch.path());
     // One unstaged modification, one staged addition, one untracked dir
     // holding two files (collapsed to one entry in summary mode).
-    std::fs::write(work.join("file.txt"), "changed\n").expect("modify");
-    std::fs::write(work.join("staged.txt"), "new\n").expect("staged");
+    repo_scan::privacy::private_write_0600(&work.join("file.txt"), "changed\n".as_bytes())
+        .expect("modify");
+    repo_scan::privacy::private_write_0600(&work.join("staged.txt"), "new\n".as_bytes())
+        .expect("staged");
     let mut args = ID.to_vec();
     args.extend(["add", "staged.txt"]);
     git(&git_bin, &home, &work, &args);
     let newdir = work.join("newdir");
-    std::fs::create_dir(&newdir).expect("newdir");
-    std::fs::write(newdir.join("a.txt"), "a\n").expect("a");
-    std::fs::write(newdir.join("b.txt"), "b\n").expect("b");
+    repo_scan::privacy::private_dir_0700(&newdir).expect("newdir");
+    repo_scan::privacy::private_write_0600(&newdir.join("a.txt"), "a\n".as_bytes()).expect("a");
+    repo_scan::privacy::private_write_0600(&newdir.join("b.txt"), "b\n".as_bytes()).expect("b");
     // Ignored files are never counted (summary) nor listed (full).
-    std::fs::write(work.join(".gitignore"), "ignored.txt\n").expect("gitignore");
-    std::fs::write(work.join("ignored.txt"), "x\n").expect("ignored");
+    repo_scan::privacy::private_write_0600(&work.join(".gitignore"), "ignored.txt\n".as_bytes())
+        .expect("gitignore");
+    repo_scan::privacy::private_write_0600(&work.join("ignored.txt"), "x\n".as_bytes())
+        .expect("ignored");
 
     let inspector = GixInspector::new();
     let instance = inspector.open_exact(&work).expect("open");

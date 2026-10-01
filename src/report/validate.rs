@@ -20,6 +20,7 @@ pub fn validate_report(report: &Report) -> crate::Result<()> {
     check_envelope(report, &mut problems);
     check_ids(report, &mut problems);
     check_counts(report, &mut problems);
+    check_coverage(report, &mut problems);
     check_statuses(report, &mut problems);
     check_encodings(report, &mut problems);
     if problems.is_empty() {
@@ -609,6 +610,59 @@ fn check_counts(report: &Report, problems: &mut Vec<String>) {
              unresolvable candidates were emitted",
             report.coverage.unresolvable_candidates
         ));
+    }
+}
+
+/// Coverage honesty: completeness claims must agree with the emitted
+/// scan state (RSP-008). The builder derives these values; validation
+/// rejects any report — including a hand-crafted one — whose claims
+/// contradict its own records.
+fn check_coverage(report: &Report, problems: &mut Vec<String>) {
+    if report.coverage.filesystem == "complete" {
+        if report.coverage.tasks_pending != 0 {
+            problems.push(format!(
+                "coverage.filesystem is complete but tasks_pending is {}",
+                report.coverage.tasks_pending
+            ));
+        }
+        if report.coverage.gaps != 0 {
+            problems.push(format!(
+                "coverage.filesystem is complete but gaps is {}",
+                report.coverage.gaps
+            ));
+        }
+    }
+    if report.coverage.status == "complete" {
+        for checkout in &report.checkouts {
+            if checkout.status.state != "complete" {
+                problems.push(format!(
+                    "coverage.status is complete but checkout {} status is {:?}",
+                    checkout.id, checkout.status.state
+                ));
+            }
+        }
+    }
+    if report.coverage.status == "not_requested" && report.scan.status_mode != "metadata" {
+        problems.push(format!(
+            "coverage.status is not_requested but scan.status_mode is {:?}",
+            report.scan.status_mode
+        ));
+    }
+    if report.coverage.identity == "complete_under_policy" {
+        if report.coverage.unresolvable_candidates != 0 {
+            problems.push(format!(
+                "coverage.identity is complete_under_policy but unresolvable_candidates is {}",
+                report.coverage.unresolvable_candidates
+            ));
+        }
+        for repo in &report.repositories {
+            if repo.match_disposition == "unresolvable_identity" {
+                problems.push(format!(
+                    "coverage.identity is complete_under_policy but repository {} is unresolvable_identity",
+                    repo.id
+                ));
+            }
+        }
     }
 }
 

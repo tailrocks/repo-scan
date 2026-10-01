@@ -252,10 +252,63 @@ pub struct ValidatedCandidate {
     pub evidence: Vec<String>,
 }
 
+/// Marker prefix for the explicit config-include gap (SR-STATE-05).
+/// gix include following is disabled at the repository opener, so when
+/// [`config_include_gap`] finds
+/// `include`/`includeIf` directives the scheduler must persist this gap:
+/// remotes and values living in included files are NOT reflected.
+pub const CONFIG_INCLUDE_GAP: &str = "config-includes-unexpanded";
+
+/// Bounded pre-scan for config-include directives (SR-STATE-05).
+///
+/// Reads only `git_dir/config` and `common_dir/config` through
+/// [`read_bounded_string`] (regular-only, no-follow, byte-capped), scanning
+/// for `[include]`/`[includeIf ...]` section headers. Returns `Some`
+/// evidence line (prefixed with [`CONFIG_INCLUDE_GAP`]) when either file
+/// carries include directives — meaning the gix observations were made
+/// with includes unexpanded — else `None`. Unreadable configs yield `None`
+/// (their absence is already covered by [`GixInspector::config_dependencies`]
+/// evidence), never a silent all-clear misread: the scan only reports
+/// positively observed directives.
+pub fn config_include_gap(instance: &GitInstance) -> Option<String> {
+    let mut configs = vec![instance.git_dir.join("config")];
+    let common = instance.common_dir.join("config");
+    if common != configs[0] {
+        configs.push(common);
+    }
+    for config in configs {
+        let Some(text) = read_bounded_string(&config, MAX_GIT_CONTROL_BYTES) else {
+            continue;
+        };
+        if has_include_section(&text) {
+            return Some(format!(
+                "{CONFIG_INCLUDE_GAP}: {} names include directives, but gix include following is disabled; values from included files are not reflected in remotes/config observations",
+                config.display()
+            ));
+        }
+    }
+    None
+}
+
+/// True when config text holds an `[include]`/`[includeIf ...]` header.
+fn has_include_section(config_text: &str) -> bool {
+    for raw_line in config_text.lines() {
+        let line = raw_line.trim();
+        if line.starts_with('[') {
+            let section = line.to_lowercase();
+            if section == "[include]" || section.starts_with("[includeif ") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// One inspected configuration dependency (spec §8).
 ///
-/// gix resolves `include`/`includeIf` internally; these paths record which
-/// files were consulted so the scheduler can persist them. No helper is
+/// gix include following is disabled (SR-STATE-05), so these paths are
+/// evidence only: they record which files WOULD have been consulted, found
+/// by the bounded [`GixInspector::config_dependencies`] scan. No helper is
 /// ever executed: conditional guards are not evaluated, include paths are
 /// only listed.
 #[derive(Debug, Clone)]
@@ -287,6 +340,94 @@ pub struct SubmoduleObservation {
 /// stops and records `truncated` in `unknown_fields`; counts stay partial,
 /// never zeroed (spec §9).
 pub const STATUS_ITEM_CAP: u64 = 1_000_000;
+
+/// Maximum bytes read from one Git control file (config, include,
+/// alternates): adversarial inputs must never drive unbounded allocation
+/// (PATH-GIT-07). Reads past the cap fail closed (unreadable), never
+/// silently truncated.
+pub const MAX_GIT_CONTROL_BYTES: u64 = 256 * 1024;
+
+/// Maximum bytes read from one `.git` pointer file: only the first
+/// `gitdir:` line is ever inspected.
+pub const MAX_GITDIR_POINTER_BYTES: u64 = 8192;
+
+/// Bounded, regular-file-only read of one control file: symlinks, FIFOs,
+/// sockets, devices, and directories are refused, and content past
+/// `cap_bytes` fails closed. `None` means unreadable — the caller must
+/// treat the control file as unknown, never as empty evidence of absence.
+pub fn read_bounded_bytes(path: &std::path::Path, cap_bytes: u64) -> Option<Vec<u8>> {
+    // Fast lstat pre-check (no follow): links and special files never
+    // reach the open, so `/dev/zero`/FIFO substitutions cannot hang it.
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() || meta.len() > cap_bytes {
+        return None;
+    }
+    let file = open_control_file(path)?;
+    // Re-check on the open description (fd-bound): the path may have
+    // been swapped between the lstat and the open.
+    let live = file.metadata().ok()?;
+    if !live.file_type().is_file() || live.len() > cap_bytes {
+        return None;
+    }
+    let mut buf = Vec::new();
+    {
+        use std::io::Read;
+        file.take(cap_bytes.saturating_add(1))
+            .read_to_end(&mut buf)
+            .ok()?;
+    }
+    if buf.len() as u64 > cap_bytes {
+        return None;
+    }
+    Some(buf)
+}
+
+/// Bounded read of one control file as text (lossy): same rejections as
+/// [`read_bounded_bytes`].
+pub fn read_bounded_string(path: &std::path::Path, cap_bytes: u64) -> Option<String> {
+    read_bounded_bytes(path, cap_bytes).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Open one control file for a bounded read: `O_NOFOLLOW` refuses links
+/// and `O_NONBLOCK` refuses to wedge on a swapped-in FIFO, then `fstat`
+/// refuses anything non-regular.
+#[cfg(unix)]
+fn open_control_file(path: &std::path::Path) -> Option<std::fs::File> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::FromRawFd;
+
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.contains(&0) {
+        return None;
+    }
+    let c_path = std::ffi::CString::new(bytes).ok()?;
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    if file.metadata().is_ok_and(|m| m.file_type().is_file()) {
+        Some(file)
+    } else {
+        None
+    }
+}
+
+/// Open one control file for a bounded read (non-unix): lstat rejects
+/// links and special files before the open.
+#[cfg(not(unix))]
+fn open_control_file(path: &std::path::Path) -> Option<std::fs::File> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    std::fs::File::open(path).ok()
+}
 
 /// Read-only gix inspector. Cheap to clone; every method re-opens the
 /// repository from [`GitInstance::git_dir`] with a lazy object store, so
@@ -453,7 +594,9 @@ impl GixInspector {
     ///
     /// Always includes the gitdir/common `config` when present, plus
     /// `include.path` targets found by a narrow read-only scan (depth
-    /// capped, no helper execution, no condition evaluation).
+    /// capped, no helper execution, no condition evaluation). Evidence
+    /// only: gix opens with include following disabled (SR-STATE-05), so
+    /// listed include targets are not applied to observations.
     pub fn config_dependencies(&self, instance: &GitInstance) -> Vec<ConfigDependency> {
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -607,7 +750,9 @@ impl GixInspector {
         if depth > 4 || !seen.insert(path.to_path_buf()) {
             return;
         }
-        let exists = path.is_file();
+        // Regular files only (lstat, no follow): symlinked control files
+        // are recorded as absent, never read through (PATH-GIT-07).
+        let exists = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file());
         out.push(ConfigDependency {
             path: path.to_path_buf(),
             exists,
@@ -616,7 +761,12 @@ impl GixInspector {
         if !exists || depth == 4 {
             return;
         }
-        let text = std::fs::read_to_string(path).unwrap_or_default();
+        // Byte-capped: giant, special, or racing files yield no text, so
+        // no include paths are followed from them — never an unbounded
+        // read, never a `/dev/zero`/FIFO hang.
+        let Some(text) = read_bounded_string(path, MAX_GIT_CONTROL_BYTES) else {
+            return;
+        };
         let base = path.parent().unwrap_or_else(|| std::path::Path::new("."));
         for target in scan_include_paths(&text) {
             let resolved = resolve_include_path(&target, base);
@@ -804,16 +954,26 @@ impl GitInspect for GixInspector {
 /// Open a repository at its exact path: normal attempt first, then
 /// `open_path_as_is` for arbitrarily named bare stores (GIT_QUAL §1).
 /// Never searches upward.
+///
+/// Include following is DISABLED (SR-STATE-05): gix 0.88 `open` exposes
+/// only `Permissions.config.includes: bool` — no depth, file-count, or
+/// byte cap. The enabled path hardcodes `includes::Options::follow`
+/// (`max_depth: 10`, error past it) with unbounded per-file reads through
+/// gix's own loader (no regular-only/no-follow guard, no byte cap, fan-out
+/// across sibling includes uncounted). Bounding is impossible at this
+/// layer, so includes stay off and include-bearing repos are flagged by
+/// the bounded pre-scan [`config_include_gap`] (explicit gap evidence for
+/// the scheduler; included values are not reflected in observations).
 fn open_repo(path: &std::path::Path) -> crate::Result<gix::Repository> {
     let mut permissions = gix::open::Permissions::default();
-    permissions.config.includes = true;
+    permissions.config.includes = false;
     permissions.config.git_binary = false;
     let options = gix::open::Options::default().permissions(permissions);
     match gix::ThreadSafeRepository::open_opts(path.to_path_buf(), options) {
         Ok(repo) => Ok(repo.to_thread_local()),
         Err(first) => {
             let mut permissions = gix::open::Permissions::default();
-            permissions.config.includes = true;
+            permissions.config.includes = false;
             permissions.config.git_binary = false;
             let options = gix::open::Options::default()
                 .permissions(permissions)
@@ -877,7 +1037,7 @@ fn looks_like_git_dir(path: &std::path::Path) -> bool {
 
 /// Read a `.git` pointer file's `gitdir: <target>` line, if well-formed.
 fn read_gitdir_pointer(path: &std::path::Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = read_bounded_string(path, MAX_GITDIR_POINTER_BYTES)?;
     let line = text.lines().next()?;
     let target = line.strip_prefix("gitdir:")?.trim();
     if target.is_empty() {

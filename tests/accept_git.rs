@@ -118,7 +118,7 @@ fn repo_id(repo: &Value) -> &str {
 fn git01_same_branch_different_oids() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("ws");
-    std::fs::create_dir_all(&root).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
     let (a, b) = fixture::diverged_clones(&root);
     for repo in [&a, &b] {
         fixture::git(
@@ -164,7 +164,7 @@ fn git01_same_branch_different_oids() {
 fn git01_head_states_and_packed_refs() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("ws");
-    std::fs::create_dir_all(&root).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
     let detached = fixture::detached_head(&root, "detached");
     let unborn = fixture::unborn_branch(&root, "unborn");
     fixture::git(
@@ -237,12 +237,17 @@ fn git01_head_states_and_packed_refs() {
 fn git01_unsupported_marker_preserved_distinct() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("ws");
-    std::fs::create_dir_all(&root).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
     fixture::normal_clone(&root, "good");
     let broken = root.join("broken");
-    std::fs::create_dir_all(broken.join(".git")).expect("mkdir");
-    std::fs::write(broken.join(".git/HEAD"), "garbage-not-a-ref\n").expect("write");
-    std::fs::write(broken.join(".git/config"), "\x00not-ini\n").expect("write");
+    repo_scan::privacy::private_dir_0700(&broken.join(".git")).expect("mkdir");
+    repo_scan::privacy::private_write_0600(
+        &broken.join(".git/HEAD"),
+        "garbage-not-a-ref\n".as_bytes(),
+    )
+    .expect("write");
+    repo_scan::privacy::private_write_0600(&broken.join(".git/config"), "\x00not-ini\n".as_bytes())
+        .expect("write");
     let state = dir.path().join("state");
     let report_path = dir.path().join("rep.json");
     let out = scan(&root, &state, &report_path, &["--status", "metadata"]);
@@ -278,7 +283,7 @@ fn git01_unsupported_marker_preserved_distinct() {
 fn git02_shared_storage_keeps_clones_independent() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("ws");
-    std::fs::create_dir_all(&root).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
     let src = fixture::normal_clone(&root, "src");
     // Alternates-linked clone.
     let shared = fixture::shared_clone(&src, &root.join("via-alternates"));
@@ -341,7 +346,7 @@ fn git02_shared_storage_keeps_clones_independent() {
 fn git03_identity_policy_variants() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("ws");
-    std::fs::create_dir_all(&root).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
     fixture::normal_clone(&root, "via-https");
     let scp = fixture::normal_clone(&root, "via-scp");
     fixture::git(
@@ -504,7 +509,7 @@ fn git03_identity_policy_variants() {
 fn git04_ambiguous_identity_terminal_then_reeligible() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("ws");
-    std::fs::create_dir_all(&root).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
     let repo = fixture::normal_clone(&root, "ambiguous");
     fixture::git(&repo, &["remote", "remove", "origin"]);
     let state = dir.path().join("state");
@@ -570,7 +575,7 @@ fn git04_ambiguous_identity_terminal_then_reeligible() {
 fn status01_dirty_counts_and_nonmatch_unprobed() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("ws");
-    std::fs::create_dir_all(&root).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
     let layout = fixture::dirty_variants(&root, "dirty");
     assert!(layout.staged.is_file() && layout.ignored.is_file());
     let other = fixture::normal_clone(&root, "other");
@@ -656,7 +661,7 @@ fn read01_scan_leaves_repos_and_locks_untouched() {
     use std::time::SystemTime;
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("ws");
-    std::fs::create_dir_all(&root).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
     let repo = fixture::normal_clone(&root, "proj");
     fixture::commit_file(
         &repo,

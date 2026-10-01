@@ -100,7 +100,7 @@ fn rsf_sec_file_mode_private_layout_and_symlink_refusal() {
 
         // Pre-existing lax dirs are tightened, not left behind.
         let lax = dir.path().join("lax");
-        std::fs::create_dir_all(&lax).expect("lax");
+        repo_scan::privacy::private_dir_0700(&lax).expect("lax");
         std::fs::set_permissions(&lax, std::fs::Permissions::from_mode(0o755)).expect("chmod lax");
         ensure_private_dir_all(&lax).expect("tighten");
         assert_eq!(mode(&lax), 0o700);
@@ -115,9 +115,9 @@ fn rsf_sec_file_mode_private_layout_and_symlink_refusal() {
     #[cfg(unix)]
     {
         let real = dir.path().join("real-payload");
-        std::fs::create_dir_all(&real).expect("real");
+        repo_scan::privacy::private_dir_0700(&real).expect("real");
         let linked_state = dir.path().join("linked-state");
-        std::fs::create_dir_all(&linked_state).expect("linked state");
+        repo_scan::privacy::private_dir_0700(&linked_state).expect("linked state");
         std::os::unix::fs::symlink(&real, payload_dir(&linked_state)).expect("symlink");
         let err = OwnerGuard::acquire(&linked_state).expect_err("payload symlink refused");
         assert!(err.to_string().contains("symlink"), "{err}");

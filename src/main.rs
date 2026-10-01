@@ -38,6 +38,7 @@ use repo_scan::walk::{ChildKind, ListOptions, WalkItem};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 /// Set by the SIGINT handler; the scan loop polls it between tasks and
@@ -95,6 +96,21 @@ const MAX_ALIASES: usize = 4096;
 /// [`note_applied_scopes`]: past the cap new identities persist without
 /// dedupe and one `probe-index-overflow` gap row documents the loss.
 const MAX_PROBED_GIT_IDS: usize = 4096;
+/// Identity re-verification poll interval DURING Git inspection (XSEC-01).
+/// Between fast read stages the poll is interval-gated (a re-resolution
+/// costs microseconds; Git reads cost milliseconds); stage boundaries
+/// around slow reads and the pre-store gate always check. Residual: a
+/// swap fully contained inside one poll gap AND restored before the next
+/// check escapes detection — microseconds around a stage poll, up to one
+/// interval inside the status watch thread. Post-run verification still
+/// catches every net change.
+const IDENT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// Per-task total execution budget (SR-STATE-01): wall time from admission
+/// to abandonment, enforced cooperatively at every yield point (enum
+/// items, probe read stages, status interrupt flag). Exceeding it abandons
+/// the remaining work and parks the scope with a loud gap; a syscall that
+/// never yields cannot be preempted in-process (see [`OpDeadline`).
+const OP_DEADLINE_SECS: u64 = 300;
 
 fn main() {
     std::process::exit(dispatch().code());
@@ -247,7 +263,18 @@ async fn write_owner_marker(store: &TursoStore, state_dir: &Path) -> repo_scan::
             .create(true)
             .truncate(true)
             .mode(store::owner::STATE_FILE_MODE)
-            .open(&path)?
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|e| {
+                if e.raw_os_error() == Some(libc::ELOOP) {
+                    repo_scan::Error::Store(format!(
+                        "refusing to write through a symlinked ownership marker: {}",
+                        path.display()
+                    ))
+                } else {
+                    repo_scan::Error::from(e)
+                }
+            })?
     };
     #[cfg(not(unix))]
     let mut file = std::fs::OpenOptions::new()
@@ -664,7 +691,6 @@ async fn run_scan_inner(
         roots: roots.clone(),
         counters: runner.counters.clone(),
         pending: outcome.pending,
-        status_pending: outcome.status_pending,
         aliases: runner.aliases.clone(),
         root_cursors: root_cursors_for(&roots, &events, &cursors),
         event_note: events.note(),
@@ -1496,6 +1522,12 @@ async fn ingest_available_events(
     // Batch-read failures are collected, never dropped: each one
     // schedules a durable volume rescan with retry below (RSF-F940).
     let mut failures: Vec<(String, String)> = Vec::new();
+    // SR-EVENT-01 liveness contract: `Ok(None)` below means "no batch is
+    // available from a live stream on this drain", never "the stream is
+    // caught up". The macOS backend proves that: a rotation-aged or
+    // stall-suspect stream is recreated inline and yields a volume-wide
+    // rescan batch instead of silence, and a dead stream errors into
+    // `failures` (durable rescan with retry), never `None`.
     for m in session.monitored.iter_mut() {
         for _ in 0..16 {
             match m.batches.next_batch() {
@@ -2247,7 +2279,11 @@ impl Runner {
 /// in-loop abort ([`watchdog_inloop_abort`]) only fires between items when
 /// no entry completed within grace, preserving the partial enumeration as
 /// a `watchdog-no-progress` gap; it never claims cancellation it cannot
-/// perform.
+/// perform. [`OpDeadline`] extends the same honesty to total wall time:
+/// abandonment happens at yield points, and an unkillable syscall (D-state
+/// NFS, wedged FUSE) still wedges the process — the lease then expires
+/// store-side (no renewal without a yield) so a later owner reclaims the
+/// task, and the loud gap names the wedge for the operator.
 struct Watchdog {
     grace: Duration,
     tripped: u64,
@@ -2298,6 +2334,54 @@ fn watchdog_inloop_abort(
     grace: Duration,
 ) -> bool {
     !grace.is_zero() && entries_seen == progress_mark && stalled > grace
+}
+
+/// Per-task execution deadline (SR-STATE-01): wall time from admission.
+/// Created once per claimed task in [`run_until_boundary`] and enforced
+/// cooperatively at every yield point — between enum items, between probe
+/// read stages, and through the status interrupt flag. Enforcement is
+/// abandonment, not preemption: expired work stops at the next yield,
+/// parks the scope with a loud gap ([`park_on_timeout`]), and releases
+/// its lease through the normal completion. Nothing leaks: no worker
+/// thread is ever detached (the status watch thread always exits by
+/// itself), so abandonment is leak-free by construction. Residual, stated
+/// honestly: a syscall that never returns never reaches a yield point —
+/// the process wedges, the lease expires store-side on its TTL with no
+/// renewal, and a later owner reclaims the task; the wedge is bounded by
+/// the TTL plus operator attention, not by this wrapper.
+#[derive(Debug, Clone, Copy)]
+pub struct OpDeadline {
+    deadline: Instant,
+}
+
+impl OpDeadline {
+    /// Deadline `budget` from now.
+    pub fn new(budget: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + budget,
+        }
+    }
+
+    /// True once the budget is exhausted.
+    pub fn expired(&self) -> bool {
+        Instant::now() >= self.deadline
+    }
+
+    /// Time left, saturating at zero.
+    fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+}
+
+/// Parked outcome for a deadline-abandoned op (SR-STATE-01): loud on
+/// stderr now; `complete_task` records the durable gap row at completion,
+/// so the wedge is evidence, not just a log line.
+fn park_on_timeout(detail: &str) -> TaskOutcome {
+    eprintln!("repo-scan: {detail}");
+    TaskOutcome::Parked {
+        state: TaskState::Unavailable,
+        reason: detail.to_string(),
+    }
 }
 
 /// Claim and execute tasks until the boundary: no claimable work remains
@@ -2367,6 +2451,9 @@ async fn run_until_boundary(
             let started = Instant::now();
             let entries_before = runner.counters.entries;
             let dirs_before = runner.counters.dirs_complete;
+            // SR-STATE-01: one wall budget per admitted task, enforced at
+            // every yield point inside `execute_task`.
+            let deadline = OpDeadline::new(Duration::from_secs(OP_DEADLINE_SECS));
             let result = execute_task(
                 runner,
                 store,
@@ -2376,6 +2463,7 @@ async fn run_until_boundary(
                 canonical,
                 status_mode,
                 item,
+                &deadline,
             )
             .await;
             runner.admission.release(&permit);
@@ -2392,12 +2480,15 @@ async fn run_until_boundary(
                     elapsed.as_secs()
                 );
             }
-            // RSF-AD9D4AF7-3CC3-4B37-8168-E78DD6375C5B: the watchdog
-            // distinguishes blocked from advancing. Entries or completed
-            // directories observed during the task are progress even past
-            // grace; only a past-grace task with no observed progress is
-            // contained. The operation already returned, so containment
-            // isolates the volume instead of pretending to cancel in flight.
+            // RSF-AD9D4AF7-3CC3-4B37-8168-E78DD6375C5B + SR-STATE-01: the
+            // watchdog distinguishes blocked from advancing. Entries or
+            // completed directories observed during the task are progress
+            // even past grace; only a past-grace task with no observed
+            // progress trips. The operation already returned, so the
+            // breaker below is re-admission delay for a slow volume, NOT
+            // containment of the returned operation (nothing was stopped);
+            // the stall itself is recorded durably as a gap so the run
+            // carries evidence instead of stderr alone.
             let advanced = runner.counters.entries > entries_before
                 || runner.counters.dirs_complete > dirs_before;
             let timed_out = runner.watchdog.exceeded(started, Instant::now());
@@ -2416,9 +2507,35 @@ async fn run_until_boundary(
                     runner.breaker_failure(&volume);
                     runner.breaker_failure(&volume);
                     runner.breaker_failure(&volume);
+                    // SR-STATE-01: durable stall evidence. A past-grace
+                    // no-progress task that still completed did its work,
+                    // so the stall row is recorded then closed (auditable
+                    // in the catalog, not a false open gap); a failed task
+                    // keeps its own failure gap alongside.
+                    let stall_id = format!("watchdog-no-progress:{}", item.task.id);
+                    let stall_detail = format!(
+                        "watchdog: {} made no progress within {}s (elapsed {}s); \
+                         volume {volume} breaker opened",
+                        item.task.id,
+                        runner.watchdog.grace.as_secs(),
+                        elapsed.as_secs(),
+                    );
+                    let stall_now = store::now_ms();
+                    buffer_record_error(
+                        &mut runner.batch,
+                        &stall_id,
+                        &item.task.scope_key,
+                        "watchdog-no-progress",
+                        &stall_detail,
+                        None,
+                        stall_now,
+                    );
+                    buffer_resolve_error(&mut runner.batch, &stall_id, stall_now);
+                    let stall_due = runner.batch.should_flush();
+                    flush_if_due(runner, store, stall_due).await?;
                     eprintln!(
                         "repo-scan: watchdog: {} made no progress within {}s; \
-                         volume {volume} contained (breaker opened)",
+                         volume {volume} breaker opened (re-admission delayed), stall recorded",
                         item.task.id,
                         runner.watchdog.grace.as_secs(),
                     );
@@ -2525,13 +2642,25 @@ async fn release_claim(
 /// line says so.
 fn sample_footprint(runner: &mut Runner) {
     let admitted = runner.admission.snapshot();
+    // RSF-FALLBACK-HELPER-SECURITY(6): installed-git spawns charge
+    // HELPER_LEDGER at the spawn choke point, never the owner counters,
+    // so the ledger is the source of truth here; stuck/unknown helpers
+    // stay explicit and loud.
+    let helper_tally = git::fallback::helper_telemetry();
+    let helpers_live = admitted.helpers_live.max(helper_tally.live);
+    if helper_tally.stuck + helper_tally.unknown > 0 {
+        eprintln!(
+            "repo-scan: helper telemetry: {} live (cap {}), {} stuck, {} unknown",
+            helpers_live, helper_tally.cap, helper_tally.stuck, helper_tally.unknown,
+        );
+    }
     let sample = runner.sampler.sample_with(&SamplerInputs {
-        helpers_rss_bytes: live_helper_rss_bytes(admitted.helpers_live),
+        helpers_rss_bytes: live_helper_rss_bytes(helpers_live),
         helpers_cpu_seconds: 0.0,
         app_fds: admitted.app_fds,
         admitted_enum_ops: admitted.enum_in_use,
         admitted_git_probes: admitted.git_in_use,
-        helpers: admitted.helpers_live,
+        helpers: helpers_live,
     });
     runner.peak_rss_bytes = runner.peak_rss_bytes.max(sample.aggregate_rss_bytes);
     runner.cpu_seconds = sample.cpu_seconds;
@@ -3050,7 +3179,9 @@ struct ExecFail {
 
 /// Dispatch one claimed task by kind. Returns `Err` only for scheduler
 /// defects (lease mismatch, unknown task) that must abort the run; scope
-/// failures complete as retry/parked with preserved gaps.
+/// failures complete as retry/parked with preserved gaps. `deadline` is
+/// the task's wall budget (SR-STATE-01), enforced at each op's yield
+/// points as abandon-and-park, never as silent overrun.
 #[allow(clippy::too_many_arguments)]
 async fn execute_task(
     runner: &mut Runner,
@@ -3061,6 +3192,7 @@ async fn execute_task(
     canonical: &str,
     status_mode: StatusMode,
     claimed: &ClaimedTask,
+    deadline: &OpDeadline,
 ) -> repo_scan::Result<()> {
     // Event-continuity marker scopes (R5: `volume:`/`mounts:`) carry no
     // directory to re-enumerate; the enclosing traversal (or the fresh
@@ -3084,9 +3216,16 @@ async fn execute_task(
         return Ok(());
     }
     let outcome = match claimed.task.kind.as_str() {
-        KIND_ENUM | KIND_RECONCILE => exec_enumerate(runner, store, generation, claimed).await?,
-        KIND_PROBE => exec_probe(runner, store, generation, run_rev, canonical, claimed).await?,
-        KIND_STATUS => exec_status(runner, store, status_mode, claimed).await?,
+        KIND_ENUM | KIND_RECONCILE => {
+            exec_enumerate(runner, store, generation, claimed, deadline).await?
+        }
+        KIND_PROBE => {
+            exec_probe(
+                runner, store, generation, run_rev, canonical, claimed, deadline,
+            )
+            .await?
+        }
+        KIND_STATUS => exec_status(runner, store, status_mode, claimed, deadline).await?,
         other => {
             let detail = format!("unknown task kind: {other}");
             let due = buffer_record_error(
@@ -3228,26 +3367,46 @@ fn open_dir_fenced(fence: Option<&ScopeFence>, path: &Path) -> FencedDir {
     match fence.open_pinned(path) {
         Ok(FenceOpen::Dir(pinned)) => FencedDir::Pinned(pinned),
         Ok(FenceOpen::Symlink) => FencedDir::Link,
-        Err(FenceError::OutOfScope(p)) => FencedDir::Refused {
+        Err(e) => map_enum_fence_error(path, e),
+    }
+}
+
+/// Map one fenced-open failure to its enum outcome: every arm fails
+/// closed — parked gap or retryable error — never an enumeration outside
+/// the declared roots, and (PG-03) never a legacy pathname fallback where
+/// descriptors cannot pin. Off-unix targets report `Unsupported` for every
+/// fenced open, so enumeration parks `Unsupported` there with a preserved
+/// gap instead of listing without a fence.
+fn map_enum_fence_error(path: &Path, err: FenceError) -> FencedDir {
+    match err {
+        FenceError::OutOfScope(p) => FencedDir::Refused {
             state: TaskState::Unavailable,
             reason: format!("directory {} is outside the scan scope", p.display()),
         },
-        Err(FenceError::TooDeep(p)) => FencedDir::Refused {
+        FenceError::TooDeep(p) => FencedDir::Refused {
             state: TaskState::Unavailable,
             reason: format!("symlink chain too deep at {}", p.display()),
         },
-        Err(FenceError::NotAbsolute(p)) => FencedDir::Refused {
+        FenceError::NotAbsolute(p) => FencedDir::Refused {
             state: TaskState::Unavailable,
             reason: format!("scope path is not absolute: {}", p.display()),
         },
-        // Non-unix targets cannot pin descriptors: fall back to the
-        // legacy pathname open there (documented weaker posture).
-        Err(FenceError::Unsupported(_)) => FencedDir::Unfenced,
-        Err(FenceError::NotDirectory(p)) => FencedDir::StatFailed(std::io::Error::new(
+        // PG-03: descriptor pinning unavailable on this target fails
+        // closed — the scope parks `Unsupported` with a preserved gap;
+        // no legacy pathname enumeration runs without a fence.
+        FenceError::Unsupported(detail) => FencedDir::Refused {
+            state: TaskState::Unsupported,
+            reason: format!(
+                "directory {} cannot be pinned on this platform ({detail}); \
+                 refusing unfenced enumeration",
+                path.display()
+            ),
+        },
+        FenceError::NotDirectory(p) => FencedDir::StatFailed(std::io::Error::new(
             std::io::ErrorKind::NotADirectory,
             format!("not a directory: {}", p.display()),
         )),
-        Err(FenceError::Io(e)) => FencedDir::StatFailed(e),
+        FenceError::Io(e) => FencedDir::StatFailed(e),
     }
 }
 
@@ -3328,11 +3487,14 @@ async fn fail_list_open(
 /// through the topology layer, detect Git candidates by marker evidence
 /// (`.git` entry; `HEAD`+`objects`+`refs` for bare stores) for exact-path
 /// validation, and record the observation. Races are gaps, never absence.
+/// `deadline` (SR-STATE-01) bounds the item loop: expiry abandons the
+/// remainder and parks the scope instead of wedging the run.
 async fn exec_enumerate(
     runner: &mut Runner,
     store: &TursoStore,
     generation: u64,
     claimed: &ClaimedTask,
+    deadline: &OpDeadline,
 ) -> repo_scan::Result<TaskOutcome> {
     let Some(config::ScopeRef::Dir(path)) = config::parse_scope_key(&claimed.task.scope_key) else {
         return Ok(TaskOutcome::Parked {
@@ -3461,6 +3623,64 @@ async fn exec_enumerate(
     let mut last_progress = Instant::now();
     let mut progress_mark = 0u64;
     for item in listing {
+        // SR-STATE-01 lease bound: renew our own lease every 256 observed
+        // entries so a slow-but-advancing enumeration never lets it lapse
+        // mid-operation (a lapsed lease invites cross-generation reclaim).
+        // A renewal matching zero rows means the lease is gone: stop
+        // touching the scope and preserve a partial gap instead of racing
+        // a completion. A truly blocked `next()` never reaches this line,
+        // so the lease still expires on schedule and bounds the wedge from
+        // the store side. (TTL mirrors LEASE_TTL_MS; the WHERE clause
+        // mirrors `release_claim` and never touches another owner's lease.)
+        if let Some(new_expiry) = repo_scan::scheduler::admission::lease_renewal_expiry(
+            entries_seen,
+            256,
+            store::now_ms(),
+            60_000,
+        ) {
+            let lease_epoch = claimed.task.lease_epoch.unwrap_or(u64::MAX);
+            let renewed = store
+                .connection()
+                .execute(
+                    "UPDATE frontier_tasks SET lease_expires_ms = ?1, updated_at_ms = ?1 \
+                     WHERE id = ?2 AND state = 'leased' AND lease_token = ?3 \
+                     AND lease_epoch = ?4",
+                    vec![
+                        turso::Value::Integer(new_expiry),
+                        turso::Value::Text(claimed.task.id.clone()),
+                        turso::Value::Integer(claimed.token),
+                        turso::Value::Integer(lease_epoch as i64),
+                    ],
+                )
+                .await;
+            match renewed {
+                Ok(matched) if matched > 0 => {
+                    runner.counters.db_transactions += 1;
+                }
+                Ok(_) => {
+                    mid_error = Some(format!(
+                        "lease lost after {entries_seen} entries; partial enumeration",
+                    ));
+                    break;
+                }
+                Err(e) => {
+                    mid_error = Some(format!(
+                        "lease renewal failed after {entries_seen} entries ({e}); \
+                         partial enumeration",
+                    ));
+                    break;
+                }
+            }
+        }
+        // SR-STATE-01 lifetime bound: under memory pressure stop admitting
+        // more enumeration work between items; the partial result below is
+        // preserved and the task retries after pressure clears.
+        if runner.admission.under_pressure() {
+            mid_error = Some(format!(
+                "memory pressure after {entries_seen} entries; partial enumeration",
+            ));
+            break;
+        }
         // Progress-aware in-loop abort (RSF-SEC-WATCHDOG-ABORT): only a
         // stall with no completed entry inside grace aborts; the partial
         // enumeration below is preserved as a `watchdog-no-progress` gap.
@@ -3479,6 +3699,16 @@ async fn exec_enumerate(
         }
         if interrupted() {
             mid_error = Some(String::from("interrupted; partial enumeration"));
+            break;
+        }
+        // SR-STATE-01: the wall budget expired — abandon the remainder;
+        // the partial result below is preserved and the scope parks.
+        if deadline.expired() {
+            mid_error = Some(format!(
+                "timeout-abandoned: enumeration of {} exceeded the {OP_DEADLINE_SECS}s \
+                 execution budget after {entries_seen} entries; partial enumeration",
+                path.display()
+            ));
             break;
         }
         let child = match item {
@@ -3538,6 +3768,11 @@ async fn exec_enumerate(
         Ok(TaskOutcome::Complete)
     } else {
         let detail = mid_error.unwrap_or_else(|| String::from("partial enumeration"));
+        // SR-STATE-01: a deadline abandonment parks (never retries into
+        // the same wedge); `complete_task` records the loud gap row.
+        if detail.starts_with("timeout-abandoned:") {
+            return Ok(park_on_timeout(&detail));
+        }
         let category = if detail.starts_with("watchdog:") {
             "watchdog-no-progress"
         } else {
@@ -3777,6 +4012,105 @@ async fn enqueue_symlink_target(
     }
 }
 
+/// Provenance of a scheduled probe task (PG-01): where the scheduler
+/// observed the path. `Enum` probes come from directory enumeration and
+/// must resolve in-scope; `Relationship` probes come from explicit
+/// Git-relationship observations (registered worktree bases, spec §8) and
+/// may resolve outside the roots on their own descriptor pin. The
+/// provenance travels durably in the task id so execution-time
+/// verification never infers the relationship from the spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeProvenance {
+    /// Scheduled from directory enumeration: in-scope only.
+    Enum,
+    /// Scheduled from a Git-relationship observation: may sit outside.
+    Relationship,
+}
+
+/// Schedule-time observation carried through a probe task (PG-01): the
+/// `(dev, ino)` the path had when the scheduler saw it, plus the
+/// provenance token. [`verify_probe_path`] compares the pre-run pin
+/// against this identity; a mismatch is a schedule/execute swap and
+/// refuses. Unknown identity (`None`: unstattable at schedule time, or a
+/// non-unix target where [`dir_identity`] is `(0, 0)`) skips the
+/// comparison but still enforces provenance. Residual: an inode number
+/// reused for a replacement directory at the same spelling inside one
+/// schedule/execute window aliases past the comparison — the window is
+/// one claim latency, and the re-verification envelope still applies.
+#[derive(Debug, Clone, Copy)]
+pub struct ProbeSchedule {
+    /// Schedule-time `(dev, ino)`; `None` when unknown.
+    pub identity: Option<(u64, u64)>,
+    /// Scheduler provenance token.
+    pub provenance: ProbeProvenance,
+}
+
+impl ProbeSchedule {
+    /// Schedule for a legacy probe id (no carried observation): in-scope
+    /// only, no identity comparison — relationship routing refuses.
+    fn legacy_enum() -> Self {
+        Self {
+            identity: None,
+            provenance: ProbeProvenance::Enum,
+        }
+    }
+
+    /// Schedule for a status task (pre-PG-01 shape, no carried
+    /// observation): checkout rows always derive from Git observations,
+    /// so relationship routing stays available; identity comparison is
+    /// skipped and the pin/re-verify envelope still binds execution.
+    fn status_legacy() -> Self {
+        Self {
+            identity: None,
+            provenance: ProbeProvenance::Relationship,
+        }
+    }
+}
+
+/// Parse the schedule suffix off a probe task id:
+/// `probe:{generation}:{hex}[:r{rev}]:s{dev}x{ino}:{enum|rel}`.
+/// Anything else (legacy probe ids, status/enum/reconcile ids) yields
+/// `None`. `(0, 0)` decodes to unknown identity, matching the codebase
+/// convention that `(0, 0)` never denotes a real object.
+pub fn parse_probe_schedule(task_id: &str) -> Option<ProbeSchedule> {
+    let rest = task_id.strip_prefix("probe:")?;
+    let mut parts = rest.rsplit(':');
+    let provenance = match parts.next()? {
+        "enum" => ProbeProvenance::Enum,
+        "rel" => ProbeProvenance::Relationship,
+        _ => return None,
+    };
+    let ident = parts.next()?;
+    let pair = ident.strip_prefix('s')?;
+    let (dev_text, ino_text) = pair.split_once('x')?;
+    let dev: u64 = dev_text.parse().ok()?;
+    let ino: u64 = ino_text.parse().ok()?;
+    let identity = if (dev, ino) == (0, 0) {
+        None
+    } else {
+        Some((dev, ino))
+    };
+    Some(ProbeSchedule {
+        identity,
+        provenance,
+    })
+}
+
+/// Schedule suffix for a fresh probe task id: stat the path now (the
+/// schedule-time observation) and encode `:s{dev}x{ino}:{provenance}`.
+/// Unstattable paths and non-unix targets encode `(0, 0)` (unknown).
+fn schedule_suffix_for(path: &Path, provenance: ProbeProvenance) -> String {
+    let (dev, ino) = std::fs::symlink_metadata(path)
+        .ok()
+        .map(|md| dir_identity(&md))
+        .unwrap_or((0, 0));
+    let token = match provenance {
+        ProbeProvenance::Enum => "enum",
+        ProbeProvenance::Relationship => "rel",
+    };
+    format!(":s{dev}x{ino}:{token}")
+}
+
 /// Enqueue an exact-path Git probe. Reconcile-triggered probes carry the
 /// revision suffix so metadata invalidation genuinely re-probes.
 async fn enqueue_probe_task(
@@ -3793,7 +4127,11 @@ async fn enqueue_probe_task(
     } else {
         String::new()
     };
-    let id = format!("probe:{generation}:{hex}{suffix}");
+    // PG-01: carry the schedule-time identity + enum provenance in the
+    // task id so execution verifies against the observation, not the
+    // spelling.
+    let schedule = schedule_suffix_for(path, ProbeProvenance::Enum);
+    let id = format!("probe:{generation}:{hex}{suffix}{schedule}");
     let scope_key = config::scope_key_for_git(path);
     let expected_rev = store.scope_rev(&scope_key).await?;
     let idempotency = format!("idem:{id}");
@@ -3813,36 +4151,76 @@ async fn enqueue_probe_task(
 }
 
 /// Outcome of the pre-run fence verification for one probe/status path.
-enum ProbeFence {
+pub enum ProbeFence {
     /// No fence configured (unit-test runners): legacy unverified run.
     Unfenced,
     /// Pinned, in-scope execution: run Git, then re-verify identity.
     Pinned(PinnedDir),
-    /// Scheduled out-of-scope (explicit Git-relationship path, spec §8):
-    /// the scope fence cannot cover it; run without a pin.
-    Relationship,
+    /// Pinned out-of-scope execution (explicit Git-relationship path,
+    /// spec §8): the scope fence cannot cover it, so the path is pinned
+    /// through the unscoped descriptor walk and re-verified after Git
+    /// runs — untrusted worktree metadata names the spelling, the pin
+    /// binds the execution (PATH-GIT-01).
+    Relationship(PinnedDir),
     /// Refused without spawning Git: park with the reason, persist nothing.
     Refused { state: TaskState, reason: String },
     /// Open failed like the legacy stat: park or retry, no observation.
     StatFailed(std::io::Error),
 }
 
+/// True when the pre-run pin matches the schedule-time identity (PG-01).
+/// Unknown schedule identity (`None`: unstattable at schedule time, or a
+/// non-unix target) skips the comparison; every known identity must match
+/// exactly, or the path was swapped between scheduling and execution.
+fn schedule_identity_ok(pinned: &PinnedDir, schedule: &ProbeSchedule) -> bool {
+    match schedule.identity {
+        None => true,
+        Some((dev, ino)) => {
+            let stat = pinned.stat();
+            stat.meta.dev == dev && stat.meta.ino == ino
+        }
+    }
+}
+
 /// Pre-run fence verification for one probe/status path (`what` names the
-/// task kind for gap reasons): resolve through the pinned fence and refuse
-/// scope ESCAPE — a scheduled in-scope spelling whose execution-time
-/// resolution lands outside the declared roots (a swap between scheduling
-/// and execution). A spelling the scheduler itself placed out-of-scope
-/// (explicit Git-relationship path: registered worktree base, external
-/// common dir — spec §8) proceeds as [`ProbeFence::Relationship`]; the
-/// fence cannot distinguish its swaps, so nothing is pinned. A task path
-/// that is itself a link never proceeds: probes follow registry/pointer
-/// relationships, never a swapped-in link.
-fn verify_probe_path(fence: Option<&ScopeFence>, what: &str, path: &Path) -> ProbeFence {
+/// task kind for gap reasons): resolve through the pinned fence and compare
+/// the pre-run pin against the schedule-time identity carried in the task
+/// (PG-01) — never infer the relationship from the spelling. A scheduled
+/// in-scope probe whose execution-time pin differs from the schedule-time
+/// `(dev, ino)`, or whose resolution lands outside the declared roots, is a
+/// swap between scheduling and execution and refuses. Only a probe that
+/// carries relationship provenance (explicit Git-relationship path:
+/// registered worktree base, external common dir — spec §8) may proceed
+/// outside the roots, pinned through the unscoped descriptor walk with its
+/// identity re-verified after Git runs. A task path that is itself a link
+/// never proceeds: probes follow registry/pointer relationships, never a
+/// swapped-in link. Descriptor pinning unavailable on this target refuses
+/// (PATH-GIT-03): probes and status never run unfenced off a failed pin.
+pub fn verify_probe_path(
+    fence: Option<&ScopeFence>,
+    what: &str,
+    path: &Path,
+    schedule: &ProbeSchedule,
+) -> ProbeFence {
     let Some(fence) = fence else {
         return ProbeFence::Unfenced;
     };
     match fence.open_pinned(path) {
-        Ok(FenceOpen::Dir(pinned)) => ProbeFence::Pinned(pinned),
+        Ok(FenceOpen::Dir(pinned)) => {
+            if schedule_identity_ok(&pinned, schedule) {
+                ProbeFence::Pinned(pinned)
+            } else {
+                let (dev, ino) = schedule.identity.unwrap_or((0, 0));
+                ProbeFence::Refused {
+                    state: TaskState::Unavailable,
+                    reason: format!(
+                        "{what} path {} schedule-time identity mismatch (expected d{dev}i{ino}); \
+                         refusing swapped execution",
+                        path.display()
+                    ),
+                }
+            }
+        }
         Ok(FenceOpen::Symlink) => ProbeFence::Refused {
             state: TaskState::Unavailable,
             reason: format!(
@@ -3850,10 +4228,59 @@ fn verify_probe_path(fence: Option<&ScopeFence>, what: &str, path: &Path) -> Pro
                 path.display()
             ),
         },
-        Err(FenceError::OutOfScope(_)) if !fence.allows_path(path) => ProbeFence::Relationship,
-        Err(FenceError::OutOfScope(p)) => ProbeFence::Refused {
-            state: TaskState::Unavailable,
-            reason: format!("{what} path {} escaped the scan scope", p.display()),
+        Err(FenceError::OutOfScope(p)) => match schedule.provenance {
+            // Explicitly scheduled out-of-scope relationship path: pin it
+            // descriptor-relative (no scope check) so untrusted worktree
+            // metadata cannot redirect execution; the caller re-verifies
+            // the pinned identity after Git runs. Links, pin failures, and
+            // schedule-identity mismatches refuse closed.
+            ProbeProvenance::Relationship => match fence.open_relationship_pinned(path) {
+                Ok(FenceOpen::Dir(pinned)) if schedule_identity_ok(&pinned, schedule) => {
+                    ProbeFence::Relationship(pinned)
+                }
+                Ok(FenceOpen::Dir(_)) => {
+                    let (dev, ino) = schedule.identity.unwrap_or((0, 0));
+                    ProbeFence::Refused {
+                        state: TaskState::Unavailable,
+                        reason: format!(
+                            "{what} relationship path {} schedule-time identity mismatch \
+                             (expected d{dev}i{ino}); refusing swapped execution",
+                            path.display()
+                        ),
+                    }
+                }
+                Ok(FenceOpen::Symlink) => ProbeFence::Refused {
+                    state: TaskState::Unavailable,
+                    reason: format!(
+                        "{what} relationship path {} is a symlink; {what} never follows a swapped-in link",
+                        path.display()
+                    ),
+                },
+                Err(e) => ProbeFence::Refused {
+                    state: TaskState::Unavailable,
+                    reason: format!(
+                        "{what} relationship path {} cannot be pinned: {e}",
+                        path.display()
+                    ),
+                },
+            },
+            // No relationship provenance: an in-scope spelling resolving
+            // out of scope is a schedule/execute swap (escape); an
+            // out-of-scope spelling without provenance is not a scheduled
+            // relationship. Both refuse — the spelling alone never
+            // authorizes relationship routing (only the reason differs).
+            ProbeProvenance::Enum if fence.allows_path(path) => ProbeFence::Refused {
+                state: TaskState::Unavailable,
+                reason: format!("{what} path {} escaped the scan scope", p.display()),
+            },
+            ProbeProvenance::Enum => ProbeFence::Refused {
+                state: TaskState::Unavailable,
+                reason: format!(
+                    "{what} path {} is outside the scan scope and is not a scheduled Git \
+                     relationship; refusing",
+                    path.display()
+                ),
+            },
         },
         Err(FenceError::TooDeep(p)) => ProbeFence::Refused {
             state: TaskState::Unavailable,
@@ -3863,9 +4290,15 @@ fn verify_probe_path(fence: Option<&ScopeFence>, what: &str, path: &Path) -> Pro
             state: TaskState::Unavailable,
             reason: format!("scope path is not absolute: {}", p.display()),
         },
-        // Non-unix targets cannot pin descriptors: fall back to the
-        // legacy pathname run there (documented weaker posture).
-        Err(FenceError::Unsupported(_)) => ProbeFence::Unfenced,
+        // Descriptor pinning unavailable on this target: fail closed
+        // (PATH-GIT-03) — never an unfenced pathname run.
+        Err(FenceError::Unsupported(detail)) => ProbeFence::Refused {
+            state: TaskState::Unsupported,
+            reason: format!(
+                "{what} path {} cannot be pinned on this platform ({detail}); refusing unfenced execution",
+                path.display()
+            ),
+        },
         Err(FenceError::NotDirectory(p)) => ProbeFence::StatFailed(std::io::Error::new(
             std::io::ErrorKind::NotADirectory,
             format!("not a directory: {}", p.display()),
@@ -3898,11 +4331,117 @@ pub fn reverify_probe_path(fence: Option<&ScopeFence>, path: &Path, before: &Pin
     }
 }
 
+/// Owned identity snapshot for DURING-inspection re-verification (XSEC-01):
+/// the pre-run pin's true path plus `(dev, ino)`, without the descriptor.
+/// Owned (not borrowed) so stage polls and the status watch thread can
+/// re-resolve freely.
+#[derive(Debug, Clone)]
+pub struct IdentitySnapshot {
+    true_path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+/// Snapshot one pre-run pin.
+pub fn snapshot_of(pinned: &PinnedDir) -> IdentitySnapshot {
+    let stat = pinned.stat();
+    IdentitySnapshot {
+        true_path: pinned.true_path().to_path_buf(),
+        dev: stat.meta.dev,
+        ino: stat.meta.ino,
+    }
+}
+
+/// Re-resolve `path` through the fence and require the snapshot's true
+/// path plus `(dev, ino)` — the scoped walk first, falling back to the
+/// relationship walk when the pin sits outside the declared roots (same
+/// order as [`ScopeFence::reverify_pinned`]). `false` means the path was
+/// swapped: the caller must discard every observation. Unfenced runners
+/// (`None` fence or snapshot) always pass.
+pub fn snapshot_matches(
+    fence: Option<&ScopeFence>,
+    path: &Path,
+    snap: Option<&IdentitySnapshot>,
+) -> bool {
+    let (Some(fence), Some(snap)) = (fence, snap) else {
+        return true;
+    };
+    let matches = |after: &PinnedDir| {
+        let stat = after.stat();
+        after.true_path() == snap.true_path
+            && stat.meta.dev == snap.dev
+            && stat.meta.ino == snap.ino
+    };
+    match fence.open_pinned(path) {
+        Ok(FenceOpen::Dir(after)) => matches(&after),
+        Err(FenceError::OutOfScope(_)) => match fence.open_relationship_pinned(path) {
+            Ok(FenceOpen::Dir(after)) => matches(&after),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// DURING-inspection identity poller (XSEC-01): owns the fence, path, and
+/// pre-run snapshot (cloned once per probe — a few path buffers), so
+/// polls borrow nothing from the runner. [`IdentityPoll::ok_now`] always
+/// re-resolves; [`IdentityPoll::ok_throttled`] skips while the last check
+/// is fresher than [`IDENT_POLL_INTERVAL`].
+struct IdentityPoll {
+    fence: Option<ScopeFence>,
+    path: PathBuf,
+    snap: Option<IdentitySnapshot>,
+    last: Instant,
+}
+
+impl IdentityPoll {
+    fn new(fence: Option<&ScopeFence>, path: &Path, pinned: Option<&PinnedDir>) -> Self {
+        Self {
+            fence: fence.cloned(),
+            path: path.to_path_buf(),
+            snap: pinned.map(snapshot_of),
+            last: Instant::now(),
+        }
+    }
+
+    /// Re-verify now; `false` means the identity changed.
+    fn ok_now(&mut self) -> bool {
+        self.last = Instant::now();
+        snapshot_matches(self.fence.as_ref(), &self.path, self.snap.as_ref())
+    }
+
+    /// Re-verify unless the last check is within [`IDENT_POLL_INTERVAL`];
+    /// `false` means the identity changed.
+    fn ok_throttled(&mut self) -> bool {
+        if self.last.elapsed() < IDENT_POLL_INTERVAL {
+            return true;
+        }
+        self.ok_now()
+    }
+}
+
+/// Parked outcome for an identity change found during inspection (XSEC-01):
+/// every observation discards (nothing buffered yet — reads precede all
+/// writes), loud on stderr now, durable gap row at completion.
+fn park_on_identity_change(what: &str, path: &Path) -> TaskOutcome {
+    let reason = format!(
+        "{what} path {} changed during inspection; observations discarded",
+        path.display()
+    );
+    eprintln!("repo-scan: {reason}");
+    TaskOutcome::Parked {
+        state: TaskState::Unavailable,
+        reason,
+    }
+}
+
 /// Validate one Git candidate at its exact path and persist the instance,
 /// checkouts, remotes, refs, and HEAD observations. Marker evidence that
 /// fails validation becomes a preserved `probe-failed` gap (terminal for
 /// this probe; re-probe only after invalidation or rescan), never a fake
-/// absence and never an endless retry.
+/// absence and never an endless retry. Git reads run under DURING-inspection
+/// identity polls (XSEC-01) with all observations collected before the first
+/// buffered write, and under the task wall budget (SR-STATE-01).
 async fn exec_probe(
     runner: &mut Runner,
     store: &TursoStore,
@@ -3910,6 +4449,7 @@ async fn exec_probe(
     run_rev: u64,
     canonical: &str,
     claimed: &ClaimedTask,
+    deadline: &OpDeadline,
 ) -> repo_scan::Result<TaskOutcome> {
     let Some(config::ScopeRef::Git(path)) = config::parse_scope_key(&claimed.task.scope_key) else {
         return Ok(TaskOutcome::Parked {
@@ -3922,21 +4462,37 @@ async fn exec_probe(
         "probe:{}",
         config::encode_hex(&config::path_as_bytes(&path))
     );
-    // Probe fence (pre-run): verify the scheduled path through the pinned
-    // fence immediately before Git runs, refusing scope escape (a path
-    // swapped between scheduling and execution). Explicitly scheduled
-    // out-of-scope relationship paths proceed unpinned (spec §8);
-    // refusals park with a preserved gap and persist nothing.
-    let pinned: Option<PinnedDir> = match verify_probe_path(runner.fence.as_ref(), "probe", &path) {
-        ProbeFence::Unfenced | ProbeFence::Relationship => None,
-        ProbeFence::Pinned(pinned) => Some(pinned),
-        ProbeFence::Refused { state, reason } => {
-            return Ok(TaskOutcome::Parked { state, reason });
-        }
-        ProbeFence::StatFailed(e) => {
-            return fail_stat_open(runner, store, claimed, &path, &e).await;
-        }
-    };
+    // Probe fence (pre-run, PG-01): verify the scheduled path against the
+    // schedule-time identity carried in the task id — a swapped pin or an
+    // unprovenanced out-of-scope spelling refuses before Git runs.
+    // Explicitly scheduled out-of-scope relationship paths proceed on
+    // their own descriptor pin (spec §8); refusals park with a preserved
+    // gap and persist nothing.
+    let schedule = parse_probe_schedule(&claimed.task.id).unwrap_or(ProbeSchedule::legacy_enum());
+    let pinned: Option<PinnedDir> =
+        match verify_probe_path(runner.fence.as_ref(), "probe", &path, &schedule) {
+            ProbeFence::Unfenced => None,
+            ProbeFence::Pinned(pinned) | ProbeFence::Relationship(pinned) => Some(pinned),
+            ProbeFence::Refused { state, reason } => {
+                return Ok(TaskOutcome::Parked { state, reason });
+            }
+            ProbeFence::StatFailed(e) => {
+                return fail_stat_open(runner, store, claimed, &path, &e).await;
+            }
+        };
+    // SR-STATE-01: abandon before the first Git read when the budget is
+    // already gone.
+    if deadline.expired() {
+        return Ok(park_on_timeout(&format!(
+            "timeout-abandoned: probe of {} exceeded the {OP_DEADLINE_SECS}s execution \
+             budget; no Git reads ran",
+            path.display()
+        )));
+    }
+    // The pin binds the execution (XSEC-01): Git runs between the
+    // pre-run pin above and the DURING/post-run re-verification below, so a
+    // path swapped mid-run discards every observation. Inspection keeps
+    // the scheduling spelling, so persisted rows stay spelling-stable.
     let validated = match runner.inspector.validate(&path) {
         Ok(validated) => validated,
         Err(e) => {
@@ -3958,22 +4514,50 @@ async fn exec_probe(
             return Ok(TaskOutcome::Complete);
         }
     };
-    // Probe fence (post-run): re-verify identity after Git ran. A path
-    // swapped mid-run discards every observation — nothing reaches the
-    // batch — and parks the scope instead of persisting foreign rows.
-    if let Some(pinned) = &pinned {
-        if !reverify_probe_path(runner.fence.as_ref(), &path, pinned) {
-            return Ok(TaskOutcome::Parked {
-                state: TaskState::Unavailable,
-                reason: format!(
-                    "probe path {} changed during inspection; observations discarded",
-                    path.display()
-                ),
-            });
+    // Probe fence (DURING + post-run, XSEC-01): re-verify after validate,
+    // between every Git read stage in `collect_probe_reads`, and before
+    // the first buffered write. A path swapped mid-run discards every
+    // observation — nothing reaches the batch — and parks the scope
+    // instead of persisting foreign rows. Relationship pins re-verify
+    // through the unscoped descriptor walk.
+    let mut poll = IdentityPoll::new(runner.fence.as_ref(), &path, pinned.as_ref());
+    if !poll.ok_now() {
+        return Ok(park_on_identity_change("probe", &path));
+    }
+    let reads = match collect_probe_reads(runner, &validated.instance, &path, &mut poll, deadline) {
+        Ok(CollectOutcome::Reads(reads)) => reads,
+        Ok(CollectOutcome::IdentityChanged) => {
+            return Ok(park_on_identity_change("probe", &path));
         }
+        Ok(CollectOutcome::TimedOut) => {
+            return Ok(park_on_timeout(&format!(
+                "timeout-abandoned: probe of {} exceeded the {OP_DEADLINE_SECS}s execution \
+                 budget during Git reads; observations discarded",
+                path.display()
+            )));
+        }
+        // Operational Git read failures retry with backoff, then park with
+        // the gap preserved; store failures abort the run (exit 1).
+        Err(repo_scan::Error::Git(detail)) => {
+            return fail_task(
+                runner,
+                store,
+                claimed,
+                ExecFail {
+                    category: String::from("probe-read-error"),
+                    detail,
+                },
+            )
+            .await;
+        }
+        Err(e) => return Err(e),
+    };
+    // Pre-store gate: the last poll before the first buffered write.
+    if !poll.ok_now() {
+        return Ok(park_on_identity_change("probe", &path));
     }
     match persist_probe(
-        runner, store, generation, run_rev, canonical, &path, &validated, now,
+        runner, store, generation, run_rev, canonical, &path, &validated, *reads, now,
     )
     .await
     {
@@ -4017,11 +4601,74 @@ pub async fn test_probe_fenced_outcome(
     scope_path: &Path,
     before_exec: Option<Box<dyn FnOnce() + Send>>,
 ) -> repo_scan::Result<TaskOutcome> {
+    let deadline = OpDeadline::new(Duration::from_secs(OP_DEADLINE_SECS));
+    test_probe_outcome_impl(
+        store,
+        fence_roots,
+        generation,
+        run_rev,
+        canonical,
+        scope_path,
+        before_exec,
+        deadline,
+    )
+    .await
+}
+
+/// Execute one probe task under a fenced runner with an explicit wall
+/// budget (SR-STATE-01 wiring proof): identical to
+/// [`test_probe_fenced_outcome`] except the deadline, so a zero budget
+/// deterministically exercises the timeout-abandon path.
+#[cfg(test)]
+pub async fn test_probe_deadline_outcome(
+    store: &TursoStore,
+    fence_roots: &[PathBuf],
+    generation: u64,
+    run_rev: u64,
+    canonical: &str,
+    scope_path: &Path,
+    budget: Duration,
+) -> repo_scan::Result<TaskOutcome> {
+    test_probe_outcome_impl(
+        store,
+        fence_roots,
+        generation,
+        run_rev,
+        canonical,
+        scope_path,
+        None,
+        OpDeadline::new(budget),
+    )
+    .await
+}
+
+/// Shared hook implementation: schedule-time observation (PG-01) is taken
+/// at enqueue — the fence classifies the spelling only to pick the
+/// scheduler provenance token — and `before_exec` swaps before execution.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn test_probe_outcome_impl(
+    store: &TursoStore,
+    fence_roots: &[PathBuf],
+    generation: u64,
+    run_rev: u64,
+    canonical: &str,
+    scope_path: &Path,
+    before_exec: Option<Box<dyn FnOnce() + Send>>,
+    deadline: OpDeadline,
+) -> repo_scan::Result<TaskOutcome> {
     let mut runner = Runner::new(&config::ResourceLimits::default());
-    runner.fence = Some(ScopeFence::build(fence_roots));
+    let schedule_fence = ScopeFence::build(fence_roots);
+    let provenance = if schedule_fence.allows_path(scope_path) {
+        ProbeProvenance::Enum
+    } else {
+        ProbeProvenance::Relationship
+    };
+    runner.fence = Some(schedule_fence);
     let scope_key = config::scope_key_for_git(scope_path);
     let hex = config::encode_hex(&config::path_as_bytes(scope_path));
-    let id = format!("probe:{generation}:{hex}");
+    let schedule = schedule_suffix_for(scope_path, provenance);
+    let id = format!("probe:{generation}:{hex}{schedule}");
     let expected_rev = store.scope_rev(&scope_key).await?;
     let idempotency = format!("idem:{id}");
     let task = NewTask {
@@ -4043,16 +4690,178 @@ pub async fn test_probe_fenced_outcome(
     if let Some(swap) = before_exec {
         swap();
     }
-    let outcome = exec_probe(&mut runner, store, generation, run_rev, canonical, &claimed).await?;
+    let outcome = exec_probe(
+        &mut runner,
+        store,
+        generation,
+        run_rev,
+        canonical,
+        &claimed,
+        &deadline,
+    )
+    .await?;
     // Production flushes the writer batch before completing the task; the
     // hook does the same so "persists nothing" assertions are airtight.
     flush_runner_batch(&mut runner, store).await?;
     Ok(outcome)
 }
 
-/// Persist every observation from a validated probe. Remotes, refs, and HEAD
-/// fall back to installed git only on structural gaps; operational failures
-/// fail the task (retry, then park) instead of recording fake unknowns.
+/// Git reads for one probe, collected with DURING-inspection identity
+/// polls (XSEC-01) and deadline checks (SR-STATE-01) between stages.
+/// Buffers nothing: on `IdentityChanged`/`TimedOut` the caller parks and
+/// every in-memory observation drops, so a swapped identity can never
+/// reach the catalog — not even through an early batch flush.
+struct ProbeReads {
+    incarnation: String,
+    git_identity: Option<(u64, u64)>,
+    remotes: Vec<git::RemoteObservation>,
+    remotes_note: Option<String>,
+    head: git::HeadState,
+    relationship: &'static str,
+    work_present: Option<bool>,
+    worktrees: Vec<git::WorktreeObservation>,
+    refs: Vec<git::RefObservation>,
+    refs_notes: Vec<String>,
+    ref_errors: Vec<String>,
+    branch_upstreams: HashMap<String, Vec<u8>>,
+    config_dep_count: usize,
+}
+
+/// Outcome of [`collect_probe_reads`]: full reads, or an abandon signal.
+/// `IdentityChanged`/`TimedOut` mean "park, persist nothing".
+enum CollectOutcome {
+    Reads(Box<ProbeReads>),
+    IdentityChanged,
+    TimedOut,
+}
+
+// One-shot mid-inspection swap hook for the XSEC-01 regression test:
+// consumed between Git read stages (after remotes, before the poll), so
+// the test swaps the inspected directory mid-collection — the production
+// inspect-time race in miniature. Production builds have no hook.
+#[cfg(test)]
+thread_local! {
+    static MID_INSPECTION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Arm the one-shot mid-inspection hook, consumed by the next
+/// [`collect_probe_reads`] between read stages.
+#[cfg(test)]
+pub fn test_set_mid_inspection_hook(hook: impl FnOnce() + Send + 'static) {
+    MID_INSPECTION_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+fn collect_probe_reads(
+    runner: &mut Runner,
+    instance: &git::GitInstance,
+    path: &Path,
+    poll: &mut IdentityPoll,
+    deadline: &OpDeadline,
+) -> repo_scan::Result<CollectOutcome> {
+    if deadline.expired() {
+        return Ok(CollectOutcome::TimedOut);
+    }
+    let incarnation = std::fs::symlink_metadata(&instance.git_dir)
+        .map(|md| {
+            let (dev, ino) = dir_identity(&md);
+            format!("d{dev}i{ino}")
+        })
+        .unwrap_or_default();
+    let git_identity = std::fs::metadata(&instance.git_dir)
+        .ok()
+        .map(|md| dir_identity(&md))
+        .filter(|key| *key != (0, 0));
+    let config_dep_count = runner.inspector.config_dependencies(instance).len();
+    let mut remotes_note = None;
+    let remotes = match runner.inspector.remotes(instance) {
+        Ok(remotes) => remotes,
+        Err(e) if git::is_unsupported_error(&e) => {
+            remotes_note = Some(format!("remotes unsupported, treated as no remotes: {e}"));
+            Vec::new()
+        }
+        Err(e) => {
+            return Err(repo_scan::Error::Git(format!(
+                "remotes unreadable for {}: {e}",
+                path.display()
+            )));
+        }
+    };
+    #[cfg(test)]
+    MID_INSPECTION_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+    if !poll.ok_now() {
+        return Ok(CollectOutcome::IdentityChanged);
+    }
+    if deadline.expired() {
+        return Ok(CollectOutcome::TimedOut);
+    }
+    // RSF-FALLBACK-HELPER-SECURITY(5): refs/head fallbacks inherit the
+    // task deadline and SIGINT (mirrors the status path); cancellation
+    // ends even stuck readers instead of hanging the probe task.
+    let task_deadline = *deadline;
+    let cancel = git::fallback::WaitCancel::new(
+        move || INTERRUPTED.load(Ordering::SeqCst) || task_deadline.expired(),
+        None,
+    );
+    let head = git::fallback::with_wait_cancel(&cancel, || observed_head(runner, instance))?;
+    if !poll.ok_throttled() {
+        return Ok(CollectOutcome::IdentityChanged);
+    }
+    let relationship = match runner.inspector.checkout_kind(instance) {
+        Ok(git::CheckoutKind::Main) => "main",
+        Ok(git::CheckoutKind::Linked) => "linked",
+        Ok(git::CheckoutKind::Submodule) => "submodule",
+        Ok(git::CheckoutKind::Unknown) | Err(_) => "unknown",
+    };
+    if !poll.ok_throttled() {
+        return Ok(CollectOutcome::IdentityChanged);
+    }
+    let work_present = instance.work_dir.as_ref().map(|root| root.exists());
+    let worktrees = runner.inspector.worktrees(instance).unwrap_or_default();
+    if !poll.ok_throttled() {
+        return Ok(CollectOutcome::IdentityChanged);
+    }
+    if deadline.expired() {
+        return Ok(CollectOutcome::TimedOut);
+    }
+    let mut refs_notes = Vec::new();
+    let refs = git::fallback::with_wait_cancel(&cancel, || {
+        observed_refs(runner, instance, &mut refs_notes)
+    })?;
+    if !poll.ok_now() {
+        return Ok(CollectOutcome::IdentityChanged);
+    }
+    let ref_errors = runner.inspector.reference_errors(instance);
+    let branch_upstreams = load_branch_upstreams(&instance.common_dir);
+    Ok(CollectOutcome::Reads(Box::new(ProbeReads {
+        incarnation,
+        git_identity,
+        remotes,
+        remotes_note,
+        head,
+        relationship,
+        work_present,
+        worktrees,
+        refs,
+        refs_notes,
+        ref_errors,
+        branch_upstreams,
+        config_dep_count,
+    })))
+}
+
+/// Persist collected observations from a validated probe. Remotes, refs, and
+/// HEAD fall back to installed git only on structural gaps; operational
+/// failures fail the task (retry, then park) instead of recording fake
+/// unknowns. All Git reads happened in [`collect_probe_reads`] under
+/// DURING-inspection polls — this phase only buffers rows and schedules
+/// follow-up tasks, so a swap can no longer interleave reads with writes.
 #[allow(clippy::too_many_arguments)]
 async fn persist_probe(
     runner: &mut Runner,
@@ -4062,27 +4871,19 @@ async fn persist_probe(
     canonical: &str,
     path: &Path,
     validated: &git::ValidatedCandidate,
+    reads: ProbeReads,
     now_ms: i64,
 ) -> repo_scan::Result<()> {
     let instance = &validated.instance;
     let git_bytes = config::path_as_bytes(&instance.git_dir);
     let common_bytes = config::path_as_bytes(&instance.common_dir);
     let instance_id = format!("git:{}", config::encode_hex(&git_bytes));
-    let incarnation = std::fs::symlink_metadata(&instance.git_dir)
-        .map(|md| {
-            let (dev, ino) = dir_identity(&md);
-            format!("d{dev}i{ino}")
-        })
-        .unwrap_or_default();
+    let incarnation = reads.incarnation;
 
     // A second pathname spelling of an already-persisted object records an
     // alias instead of a duplicate instance (R7). Identity follows
     // symlinks; the `(0, 0)` fallback (non-unix) never dedupes.
-    let git_identity = std::fs::metadata(&instance.git_dir)
-        .ok()
-        .map(|md| dir_identity(&md))
-        .filter(|key| *key != (0, 0));
-    if let Some(key) = git_identity {
+    if let Some(key) = reads.git_identity {
         match runner.probed_git_ids.get(&key).cloned() {
             Some(first) if first != git_bytes => {
                 let due = runner.note_alias(git_bytes.clone(), first, "same_object", now_ms);
@@ -4099,22 +4900,15 @@ async fn persist_probe(
 
     let mut evidence = validated.evidence.clone();
     evidence.push(format!("matching-policy: {}", identity::MATCHING_POLICY));
-    let deps = runner.inspector.config_dependencies(instance);
-    evidence.push(format!("config files consulted: {}", deps.len()));
+    evidence.push(format!(
+        "config files consulted: {}",
+        reads.config_dep_count
+    ));
 
-    let remotes = match runner.inspector.remotes(instance) {
-        Ok(remotes) => remotes,
-        Err(e) if git::is_unsupported_error(&e) => {
-            evidence.push(format!("remotes unsupported, treated as no remotes: {e}"));
-            Vec::new()
-        }
-        Err(e) => {
-            return Err(repo_scan::Error::Git(format!(
-                "remotes unreadable for {}: {e}",
-                path.display()
-            )));
-        }
-    };
+    let remotes = reads.remotes;
+    if let Some(note) = reads.remotes_note {
+        evidence.push(note);
+    }
     let pairs: Vec<(String, String)> = remotes
         .iter()
         .map(|r| {
@@ -4172,21 +4966,15 @@ async fn persist_probe(
         flush_if_due(runner, store, due).await?;
     }
 
-    let head = observed_head(runner, instance)?;
+    let head = reads.head;
     let (head_state, head_ref, head_oid, head_algo) = head_columns(&head);
-    let relationship = match runner.inspector.checkout_kind(instance) {
-        Ok(git::CheckoutKind::Main) => "main",
-        Ok(git::CheckoutKind::Linked) => "linked",
-        Ok(git::CheckoutKind::Submodule) => "submodule",
-        Ok(git::CheckoutKind::Unknown) | Err(_) => "unknown",
-    };
+    let relationship = reads.relationship;
     let checkout_hex = config::encode_hex(&git_bytes);
     let main_checkout_id = format!("co:{checkout_hex}");
     let root_bytes = instance.work_dir.as_ref().map(|p| config::path_as_bytes(p));
-    let availability = match &instance.work_dir {
-        Some(root) if root.exists() => "present",
-        Some(_) => "missing",
-        None => "present",
+    let availability = match reads.work_present {
+        Some(false) => "missing",
+        Some(true) | None => "present",
     };
     let main_checkout = NewCheckout {
         id: &main_checkout_id,
@@ -4213,8 +5001,10 @@ async fn persist_probe(
     // Registered linked worktrees: own checkout rows plus explicit probes
     // for bases outside already discovered paths.
     let mut checkout_ids = vec![main_checkout_id];
-    if let Ok(worktrees) = runner.inspector.worktrees(instance) {
-        for wt in &worktrees {
+    // Worktrees were read + polled in `collect_probe_reads` (a read error
+    // there maps to no worktrees, as before); only non-empty lists loop.
+    if !reads.worktrees.is_empty() {
+        for wt in &reads.worktrees {
             // Never list an instance as its own linked worktree: opening a
             // linked-worktree git dir reports the shared registry, which
             // includes this very checkout.
@@ -4259,10 +5049,11 @@ async fn persist_probe(
         }
     }
 
-    let refs = observed_refs(runner, instance, &mut evidence)?;
+    let refs = reads.refs;
+    evidence.extend(reads.refs_notes);
     // Upstream tracking evidence from the repo config (R16), read once per
     // probe; absent/unreadable config yields no upstreams, never fake ones.
-    let branch_upstreams = load_branch_upstreams(&instance.common_dir);
+    let branch_upstreams = reads.branch_upstreams;
     let known: HashSet<&[u8]> = refs.iter().map(|r| r.name.as_slice()).collect();
     for reference in &refs {
         let name_text = String::from_utf8_lossy(&reference.name);
@@ -4305,13 +5096,13 @@ async fn persist_probe(
         let due = TursoStore::buffer_upsert_ref(&mut runner.batch, &new_ref, now_ms);
         flush_if_due(runner, store, due).await?;
     }
-    for broken in runner.inspector.reference_errors(instance) {
+    for broken in &reads.ref_errors {
         let due = buffer_record_error(
             &mut runner.batch,
             &format!("ref-err:{instance_id}:{}", fnv1a_hex(broken.as_bytes())),
             &config::scope_key_for_git(path),
             "invalid-ref",
-            &broken,
+            broken,
             None,
             now_ms,
         );
@@ -4352,10 +5143,14 @@ fn load_branch_upstreams(common_dir: &Path) -> HashMap<String, Vec<u8>> {
     }
 
     let mut out = HashMap::new();
-    let bytes = match std::fs::read(common_dir.join("config")) {
-        Ok(bytes) => bytes,
-        Err(_) => return out,
-    };
+    // Byte-capped, regular-file-only read (PATH-GIT-07): a giant,
+    // special, or swapped control file yields no upstreams instead of
+    // an unbounded allocation or a blocked scan.
+    let bytes =
+        match git::read_bounded_bytes(&common_dir.join("config"), git::MAX_GIT_CONTROL_BYTES) {
+            Some(bytes) => bytes,
+            None => return out,
+        };
     let mut branch: Option<String> = None;
     let mut remote: Option<String> = None;
     let mut merge: Option<String> = None;
@@ -4438,7 +5233,11 @@ async fn enqueue_probe_task_for_path(
     now_ms: i64,
 ) -> repo_scan::Result<()> {
     let hex = config::encode_hex(&config::path_as_bytes(path));
-    let id = format!("probe:{generation}:{hex}");
+    // PG-01: a worktree-base probe is an explicitly scheduled
+    // relationship — carry that provenance plus the schedule-time
+    // identity observed here.
+    let schedule = schedule_suffix_for(path, ProbeProvenance::Relationship);
+    let id = format!("probe:{generation}:{hex}{schedule}");
     let scope_key = config::scope_key_for_git(path);
     let expected_rev = store.scope_rev(&scope_key).await?;
     let idempotency = format!("idem:{id}");
@@ -4538,15 +5337,85 @@ fn head_columns(head: &git::HeadState) -> HeadColumns {
     }
 }
 
+/// Watch guard for one blocking status call (XSEC-01 + SR-STATE-01): a
+/// single short-lived thread polls identity every [`IDENT_POLL_INTERVAL`]
+/// while the main thread sits in the blocking gix status iteration, and
+/// trips the shared interrupt flag on identity change or deadline. The
+/// thread always exits by itself — on `done`, on change, or at the
+/// deadline — so even an unkillable status syscall leaks no thread; the
+/// wedge itself is the documented SR-STATE-01 residual (lease expires
+/// store-side, a later owner reclaims).
+struct StatusGuard {
+    interrupt: Arc<AtomicBool>,
+    changed: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+fn spawn_status_guard(
+    fence: Option<ScopeFence>,
+    path: PathBuf,
+    snap: Option<IdentitySnapshot>,
+    deadline: OpDeadline,
+) -> StatusGuard {
+    let mut guard = StatusGuard {
+        interrupt: Arc::new(AtomicBool::new(false)),
+        changed: Arc::new(AtomicBool::new(false)),
+        done: Arc::new(AtomicBool::new(false)),
+        handle: None,
+    };
+    let (interrupt, changed, done) = (
+        Arc::clone(&guard.interrupt),
+        Arc::clone(&guard.changed),
+        Arc::clone(&guard.done),
+    );
+    guard.handle = Some(std::thread::spawn(move || loop {
+        if done.load(Ordering::SeqCst) {
+            break;
+        }
+        if deadline.expired() {
+            interrupt.store(true, Ordering::SeqCst);
+            break;
+        }
+        if !snapshot_matches(fence.as_ref(), &path, snap.as_ref()) {
+            changed.store(true, Ordering::SeqCst);
+            interrupt.store(true, Ordering::SeqCst);
+            break;
+        }
+        std::thread::sleep(IDENT_POLL_INTERVAL.min(deadline.remaining()));
+    }));
+    guard
+}
+
+impl StatusGuard {
+    fn interrupt_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.interrupt)
+    }
+
+    /// Signal completion, join the watch thread (bounded: it wakes at
+    /// least every [`IDENT_POLL_INTERVAL`]), and report whether the
+    /// identity changed during the call.
+    fn finish(mut self) -> bool {
+        self.done.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        self.changed.load(Ordering::SeqCst)
+    }
+}
+
 /// Inspect one matching checkout's working state at the requested mode.
 /// `metadata` records a null-count observation without probing; `summary`
 /// collapses untracked directories; `full` counts untracked files. Unknown
-/// stays null — never zero, never clean.
+/// stays null — never zero, never clean. The blocking status call runs
+/// under DURING-inspection identity polls plus the task wall budget
+/// (XSEC-01 + SR-STATE-01): change or expiry discards the observation.
 async fn exec_status(
     runner: &mut Runner,
     store: &TursoStore,
     mode: StatusMode,
     claimed: &ClaimedTask,
+    deadline: &OpDeadline,
 ) -> repo_scan::Result<TaskOutcome> {
     let Some(config::ScopeRef::Status(checkout_id)) =
         config::parse_scope_key(&claimed.task.scope_key)
@@ -4596,10 +5465,11 @@ async fn exec_status(
     let git_path = config::path_from_bytes(checkout.git_path.clone());
     // Status fence (pre-run): same verify-run-reverify envelope as probes.
     // Refusals park with a preserved gap; nothing is persisted.
+    let schedule = ProbeSchedule::status_legacy();
     let pinned: Option<PinnedDir> =
-        match verify_probe_path(runner.fence.as_ref(), "status", &git_path) {
-            ProbeFence::Unfenced | ProbeFence::Relationship => None,
-            ProbeFence::Pinned(pinned) => Some(pinned),
+        match verify_probe_path(runner.fence.as_ref(), "status", &git_path, &schedule) {
+            ProbeFence::Unfenced => None,
+            ProbeFence::Pinned(pinned) | ProbeFence::Relationship(pinned) => Some(pinned),
             ProbeFence::Refused { state, reason } => {
                 return Ok(TaskOutcome::Parked { state, reason });
             }
@@ -4607,6 +5477,11 @@ async fn exec_status(
                 return fail_stat_open(runner, store, claimed, &git_path, &e).await;
             }
         };
+    // The pin binds the execution (XSEC-01): Git runs between the
+    // pre-run pin above and the DURING/post-run re-verification below, so a
+    // path swapped mid-run discards every observation. Inspection keeps
+    // the scheduling spelling, so persisted rows stay spelling-stable.
+    let mut poll = IdentityPoll::new(runner.fence.as_ref(), &git_path, pinned.as_ref());
     let instance = match runner.inspector.open_exact(&git_path) {
         Ok(instance) => instance,
         Err(e) if git::is_unsupported_error(&e) => {
@@ -4642,11 +5517,54 @@ async fn exec_status(
             .await;
         }
     };
+    // XSEC-01: the open is a read stage like any other — poll it.
+    if !poll.ok_now() {
+        return Ok(park_on_identity_change("status", &git_path));
+    }
     let started = store::now_ms();
-    let observation = match runner.inspector.status_interruptible(&instance, mode, None) {
+    // SR-STATE-01 + XSEC-01: the guard thread polls identity DURING the
+    // blocking status call and trips the interrupt flag on change or
+    // deadline. The flag is best-effort preemption; the checks after the
+    // call are the guarantee — even if gix ignores the flag, an expired
+    // or swapped observation never records.
+    let guard = spawn_status_guard(
+        runner.fence.clone(),
+        git_path.clone(),
+        pinned.as_ref().map(snapshot_of),
+        *deadline,
+    );
+    let status_result =
+        runner
+            .inspector
+            .status_interruptible(&instance, mode, Some(guard.interrupt_flag()));
+    let identity_changed = guard.finish();
+    if identity_changed {
+        return Ok(park_on_identity_change("status", &git_path));
+    }
+    if deadline.expired() {
+        return Ok(park_on_timeout(&format!(
+            "timeout-abandoned: status of {} exceeded the {OP_DEADLINE_SECS}s execution \
+             budget; observation discarded",
+            git_path.display()
+        )));
+    }
+    if !poll.ok_now() {
+        return Ok(park_on_identity_change("status", &git_path));
+    }
+    let observation = match status_result {
         Ok(obs) => Some(obs),
         Err(e) if git::is_unsupported_error(&e) => {
-            fallback_status_counts(runner, &instance, mode, &e)
+            // RSF-FALLBACK-HELPER-SECURITY(5): fallback spawns inherit
+            // the task deadline and SIGINT; cancellation ends even stuck
+            // readers instead of hanging the status task.
+            let task_deadline = *deadline;
+            let cancel = git::fallback::WaitCancel::new(
+                move || INTERRUPTED.load(Ordering::SeqCst) || task_deadline.expired(),
+                None,
+            );
+            git::fallback::with_wait_cancel(&cancel, || {
+                fallback_status_counts(runner, &instance, mode, &e)
+            })
         }
         Err(e) => {
             return fail_task(
@@ -4669,11 +5587,20 @@ async fn exec_status(
         Ok(_) => "checked",
         Err(_) => "unknown",
     };
+    // XSEC-01: one more read stage done — poll before recording.
+    if !poll.ok_now() {
+        return Ok(park_on_identity_change("status", &git_path));
+    }
     // Status fence (post-run): every Git read above is done; re-verify
     // identity before any status row is recorded. On mismatch the
-    // observation is discarded and the scope parks.
+    // observation is discarded and the scope parks. Relationship pins
+    // re-verify through the unscoped descriptor walk.
     if let Some(pinned) = &pinned {
-        if !reverify_probe_path(runner.fence.as_ref(), &git_path, pinned) {
+        let fence_ok = match runner.fence.as_ref() {
+            None => true,
+            Some(fence) => fence.reverify_pinned(&git_path, pinned),
+        };
+        if !fence_ok {
             return Ok(TaskOutcome::Parked {
                 state: TaskState::Unavailable,
                 reason: format!(
@@ -4959,7 +5886,6 @@ struct ScanReportInputs {
     roots: Vec<PlannedRoot>,
     counters: RunCounters,
     pending: u64,
-    status_pending: u64,
     aliases: Vec<ObservedAlias>,
     /// Per-root event cursors, aligned with `roots` (R5).
     root_cursors: Vec<RootCursors>,
@@ -5030,19 +5956,58 @@ async fn load_open_errors_page(
 /// agrees with the emitted records; nothing is dropped to fit memory.
 /// Scan accounting (`scanned`/`chunks`/`peak_chunk`) is surfaced to the
 /// regression hooks; production consumes only the derived records.
-#[allow(dead_code)]
-struct ErrorDerivations {
-    candidates: Vec<CandidateInput>,
-    /// Per-root error ids, aligned with the requested `root_scopes`.
-    root_error_ids: Vec<Vec<String>>,
-    scanned: u64,
-    chunks: u64,
-    peak_chunk: usize,
+/// Aggregate bounds for report-derivation accumulators (SR-STATE-03): one
+/// SQL page is small, but the derived vectors below once retained every
+/// row of their tables. Past a cap (or under memory pressure) the scan
+/// stops, records an explicit gap row, and leaves the remaining rows open
+/// in the catalog for a later pass — the report stays bounded and honest.
+#[derive(Debug, Clone, Copy)]
+pub struct DerivationCaps {
+    /// Maximum derived error candidates retained.
+    pub max_error_candidates: usize,
+    /// Maximum per-root error ids retained, summed over all roots.
+    pub max_root_error_ids: usize,
+    /// Maximum derived instance candidates retained.
+    pub max_instance_candidates: usize,
+    /// Maximum storage edges retained.
+    pub max_storage_links: usize,
+    /// Maximum common-path hubs retained.
+    pub max_first_common: usize,
 }
 
-async fn scan_error_derivations(
+impl DerivationCaps {
+    /// Production bounds: thousands of derived records (single-digit MiB),
+    /// matching the run's other aggregate caps (`MAX_ALIASES`).
+    pub const fn default_caps() -> Self {
+        Self {
+            max_error_candidates: 4096,
+            max_root_error_ids: 16384,
+            max_instance_candidates: 4096,
+            max_storage_links: 16384,
+            max_first_common: 16384,
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub struct ErrorDerivations {
+    pub candidates: Vec<CandidateInput>,
+    /// Per-root error ids, aligned with the requested `root_scopes`.
+    pub root_error_ids: Vec<Vec<String>>,
+    pub scanned: u64,
+    pub chunks: u64,
+    pub peak_chunk: usize,
+    /// True when the scan stopped early (cap or pressure); the gap row
+    /// named in `trunc_detail` carries the resume evidence.
+    pub truncated: bool,
+    /// Truncation detail (empty unless `truncated`).
+    pub trunc_detail: String,
+}
+
+pub async fn scan_error_derivations(
     store: &TursoStore,
     root_scopes: &[String],
+    caps: &DerivationCaps,
 ) -> repo_scan::Result<ErrorDerivations> {
     let mut out = ErrorDerivations {
         candidates: Vec::new(),
@@ -5050,7 +6015,15 @@ async fn scan_error_derivations(
         scanned: 0,
         chunks: 0,
         peak_chunk: 0,
+        truncated: false,
+        trunc_detail: String::new(),
     };
+    // Pressure backstop (SR-STATE-03): sample the aggregate footprint per
+    // page against the spec §5 threshold (`Config::load` always installs
+    // `ResourceLimits::default`, so this is the effective threshold).
+    let sampler = FootprintSampler::new();
+    let pressure_at = config::ResourceLimits::default().pressure_threshold_bytes;
+    let mut root_id_total: usize = 0;
     let mut offset: i64 = 0;
     loop {
         let chunk = load_open_errors_page(store, LOAD_CHUNK_ROWS, offset).await?;
@@ -5059,20 +6032,71 @@ async fn scan_error_derivations(
         }
         out.chunks += 1;
         out.peak_chunk = out.peak_chunk.max(chunk.len());
-        out.scanned += chunk.len() as u64;
         for error in &chunk {
+            if out.candidates.len() >= caps.max_error_candidates
+                || root_id_total >= caps.max_root_error_ids
+            {
+                out.truncated = true;
+                out.trunc_detail = format!(
+                    "error derivations stopped: {} candidates (cap {}) and {} root error ids \
+                     (cap {}) after {} scanned rows; remaining rows stay open for a later pass",
+                    out.candidates.len(),
+                    caps.max_error_candidates,
+                    root_id_total,
+                    caps.max_root_error_ids,
+                    out.scanned,
+                );
+                break;
+            }
+            out.scanned += 1;
             push_error_candidate(&mut out.candidates, error);
             for (n, scope) in root_scopes.iter().enumerate() {
                 if error.scope_key == *scope {
                     out.root_error_ids[n].push(error.id.clone());
+                    root_id_total += 1;
                 }
             }
+        }
+        if out.truncated {
+            break;
+        }
+        let pressured = sampler
+            .sample_with(&SamplerInputs {
+                helpers_rss_bytes: Some(0),
+                ..SamplerInputs::default()
+            })
+            .aggregate_rss_bytes
+            > pressure_at;
+        if pressured {
+            out.truncated = true;
+            out.trunc_detail = format!(
+                "error derivations stopped under memory pressure after {} scanned rows; \
+                 remaining rows stay open for a later pass",
+                out.scanned,
+            );
+            break;
         }
         if chunk.len() as i64 >= LOAD_CHUNK_ROWS {
             offset += chunk.len() as i64;
         } else {
             break;
         }
+    }
+    if out.truncated {
+        // Stable gap id: repeated truncated runs refresh one row instead
+        // of growing the table (attempts count the truncations). The gap
+        // streams into the report's errors section with the resume note.
+        store
+            .record_error(
+                "gap:report-derivation:errors",
+                "gap:report-derivation",
+                "report-derivation-truncated",
+                &out.trunc_detail,
+                None,
+                store::now_ms(),
+            )
+            .await?;
+        eprintln!("repo-scan: {}", out.trunc_detail);
     }
     Ok(out)
 }
@@ -5150,26 +6174,40 @@ async fn load_emitted_instances_page(
 /// storage edges) accumulate. Scan accounting is hook-surfaced (see
 /// [`ErrorDerivations`]).
 #[allow(dead_code)]
-struct InstanceDerivations {
-    candidates: Vec<CandidateInput>,
-    storage_links: Vec<StorageLinkInput>,
-    scanned: u64,
-    chunks: u64,
-    peak_chunk: usize,
+pub struct InstanceDerivations {
+    pub candidates: Vec<CandidateInput>,
+    pub storage_links: Vec<StorageLinkInput>,
+    pub scanned: u64,
+    pub chunks: u64,
+    pub peak_chunk: usize,
+    /// True when the scan stopped early (cap or pressure); the gap row
+    /// named in `trunc_detail` carries the resume evidence.
+    pub truncated: bool,
+    /// Truncation detail (empty unless `truncated`).
+    pub trunc_detail: String,
 }
 
-async fn scan_instance_derivations(store: &TursoStore) -> repo_scan::Result<InstanceDerivations> {
+pub async fn scan_instance_derivations(
+    store: &TursoStore,
+    caps: &DerivationCaps,
+) -> repo_scan::Result<InstanceDerivations> {
     let mut out = InstanceDerivations {
         candidates: Vec::new(),
         storage_links: Vec::new(),
         scanned: 0,
         chunks: 0,
         peak_chunk: 0,
+        truncated: false,
+        trunc_detail: String::new(),
     };
     // First instance id per common path (the shared-store hub). Chunk
     // order is id-ascending, so the hub is the same lowest id the old
     // whole-load group-and-sort produced.
     let mut first_common: HashMap<Vec<u8>, String> = HashMap::new();
+    // Pressure backstop (SR-STATE-03): same spec §5 threshold as the error
+    // scan above; `Config::load` always installs the default limits.
+    let sampler = FootprintSampler::new();
+    let pressure_at = config::ResourceLimits::default().pressure_threshold_bytes;
     let mut offset: i64 = 0;
     loop {
         let chunk = load_emitted_instances_page(store, LOAD_CHUNK_ROWS, offset).await?;
@@ -5178,8 +6216,30 @@ async fn scan_instance_derivations(store: &TursoStore) -> repo_scan::Result<Inst
         }
         out.chunks += 1;
         out.peak_chunk = out.peak_chunk.max(chunk.len());
-        out.scanned += chunk.len() as u64;
         for instance in &chunk {
+            // Checked per row, before this instance's links: one instance
+            // can add a bounded handful of edges, so the overshoot past
+            // the cap is at most one instance's contribution.
+            if out.candidates.len() >= caps.max_instance_candidates
+                || out.storage_links.len() >= caps.max_storage_links
+                || first_common.len() >= caps.max_first_common
+            {
+                out.truncated = true;
+                out.trunc_detail = format!(
+                    "instance derivations stopped: {} candidates (cap {}), {} storage links \
+                     (cap {}), {} common hubs (cap {}) after {} scanned rows; remaining rows \
+                     stay open for a later pass",
+                    out.candidates.len(),
+                    caps.max_instance_candidates,
+                    out.storage_links.len(),
+                    caps.max_storage_links,
+                    first_common.len(),
+                    caps.max_first_common,
+                    out.scanned,
+                );
+                break;
+            }
+            out.scanned += 1;
             if instance.disposition == "unresolvable_identity" {
                 out.candidates.push(CandidateInput {
                     id: format!("cand:{}", instance.id),
@@ -5196,11 +6256,44 @@ async fn scan_instance_derivations(store: &TursoStore) -> repo_scan::Result<Inst
             }
             push_instance_links(&mut out.storage_links, &mut first_common, instance);
         }
+        if out.truncated {
+            break;
+        }
+        let pressured = sampler
+            .sample_with(&SamplerInputs {
+                helpers_rss_bytes: Some(0),
+                ..SamplerInputs::default()
+            })
+            .aggregate_rss_bytes
+            > pressure_at;
+        if pressured {
+            out.truncated = true;
+            out.trunc_detail = format!(
+                "instance derivations stopped under memory pressure after {} scanned rows; \
+                 remaining rows stay open for a later pass",
+                out.scanned,
+            );
+            break;
+        }
         if chunk.len() as i64 >= LOAD_CHUNK_ROWS {
             offset += chunk.len() as i64;
         } else {
             break;
         }
+    }
+    if out.truncated {
+        // Stable gap id (see the error scan above).
+        store
+            .record_error(
+                "gap:report-derivation:instances",
+                "gap:report-derivation",
+                "report-derivation-truncated",
+                &out.trunc_detail,
+                None,
+                store::now_ms(),
+            )
+            .await?;
+        eprintln!("repo-scan: {}", out.trunc_detail);
     }
     Ok(out)
 }
@@ -5292,8 +6385,12 @@ async fn build_lib_inputs(
         .iter()
         .map(|root| config::scope_key_for_dir(&root.path))
         .collect();
-    let errors = scan_error_derivations(store, &root_scopes).await?;
-    let instances = scan_instance_derivations(store).await?;
+    // SR-STATE-03: bounded derivation scans — aggregate caps plus
+    // per-page pressure sampling; truncation records a gap row and leaves
+    // the remaining rows open for a later pass.
+    let errors =
+        scan_error_derivations(store, &root_scopes, &DerivationCaps::default_caps()).await?;
+    let instances = scan_instance_derivations(store, &DerivationCaps::default_caps()).await?;
     let volumes = load_volume_ids(store).await?;
     let mut boundaries = Vec::new();
     if inputs.scope_policy == "roots" {
@@ -5310,19 +6407,15 @@ async fn build_lib_inputs(
         "Unexposed VM/container filesystems are out of scope.",
     ));
     boundaries.push(inputs.event_note.clone());
-    // Required-status accounting is task-based (R3): the scheduler boundary
-    // counts enqueued-but-unfinished status work; checkouts that never
-    // needed a probe (other targets' leftovers excluded by the subject
-    // filter, unresolvable identities with no required probe) do not keep
-    // the run incomplete. The lib default would derive this from emitted
-    // checkout rows instead, so the override preserves the run boundary.
-    let coverage_status = if inputs.status_mode == StatusMode::Metadata {
-        "not_requested"
-    } else if inputs.status_pending > 0 {
-        "incomplete"
-    } else {
-        "complete"
-    };
+    // Coverage claims derive from emitted records inside the builder
+    // (RSP-008): an override must restate row truth, and the run-boundary
+    // task accounting (R3: `status_pending`) is not row truth — an
+    // emitted checkout with no status row (bare store, unresolvable
+    // identity with no required probe) refutes a "complete" claim and
+    // the builder refuses the publication. So no override is passed:
+    // required-status accounting stays task-based where it belongs (the
+    // scheduler boundary, scan state, and exit code), while
+    // `coverage.status` reports what the records support.
     let mut artifacts = vec![ArtifactInput {
         path_bytes: config::path_as_bytes(snapshot_path),
         kind: String::from("tool_state"),
@@ -5370,8 +6463,21 @@ async fn build_lib_inputs(
         include_nonmatching: false,
         coverage_filesystem: None,
         coverage_identity: None,
-        coverage_status: Some(coverage_status.to_string()),
-        roots: root_inputs_chunked(inputs, &errors.root_error_ids, &volumes),
+        coverage_status: None,
+        roots: {
+            // SR-STATE-03: a truncated derivation must never report a root
+            // "complete" — its error list is partial. Force "error" (the
+            // gap rows in `errors` name the truncation explicitly).
+            let mut roots = root_inputs_chunked(inputs, &errors.root_error_ids, &volumes);
+            if errors.truncated || instances.truncated {
+                for root in &mut roots {
+                    if root.state == "complete" {
+                        root.state = String::from("error");
+                    }
+                }
+            }
+            roots
+        },
         storage_links: instances.storage_links,
         aliases: alias_inputs(&inputs.aliases),
         candidates: {
@@ -5436,9 +6542,12 @@ fn scope_path(scope_key: &str) -> Option<PathBuf> {
 /// bounded to 64 entries per instance.
 fn alternates_targets(git_path: &[u8]) -> Vec<Vec<u8>> {
     let path = config::path_from_bytes(git_path.to_vec()).join("objects/info/alternates");
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(_) => return Vec::new(),
+    // Byte-capped, regular-file-only read (PATH-GIT-07): a giant,
+    // special, or swapped alternates file yields no targets instead of
+    // an unbounded allocation or a blocked scan.
+    let bytes = match git::read_bounded_bytes(&path, git::MAX_GIT_CONTROL_BYTES) {
+        Some(bytes) => bytes,
+        None => return Vec::new(),
     };
     String::from_utf8_lossy(&bytes)
         .lines()
@@ -5545,12 +6654,38 @@ fn reject_state_dir_dest(dest: &Path, state_dir: &Path) -> repo_scan::Result<()>
     Ok(())
 }
 
+/// Binary-side report-ID gate (mirrors the retention gate
+/// `report::publish::check_report_id`, which is crate-private to the lib):
+/// nonempty, at most 128 bytes, `[A-Za-z0-9._-]`, never `.`/`..`.
+/// Called before the ID is ever interpolated into a staging filename
+/// (RSP-006); shares the [`is_safe_report_id`] predicate with the
+/// `cache clear` filters so the rules cannot drift apart.
+fn check_binary_report_id(report_id: &str) -> repo_scan::Result<()> {
+    if is_safe_report_id(report_id) {
+        Ok(())
+    } else if report_id.is_empty() {
+        Err(repo_scan::Error::Report(
+            "report_id must be nonempty".to_string(),
+        ))
+    } else {
+        Err(repo_scan::Error::Report(format!(
+            "report_id {report_id:?} is not a safe snapshot name"
+        )))
+    }
+}
+
 /// File emission through the tested lib pieces (R3), stage-first: the
 /// staged report streams from the pinned catalog revision, is verified and
 /// immutably retained as the snapshot, and only then does the destination
 /// check + copy run. A refused destination therefore still leaves the
 /// retained snapshot behind for retry — the same guarantee the old binary
 /// path gave, now with lib validation, checksums, and no-clobber rules.
+/// Staging mirrors the lib `stage_report` shape (RSP-004/RSP-006/RSP-007):
+/// the report ID is validated before interpolation, the staging directory
+/// is held as a directory FD, the file is created
+/// `openat(O_CREAT|O_EXCL|O_NOFOLLOW)` relative to that FD with an explicit
+/// `0600` mode asserted after creation (no check-then-use by path), and a
+/// stream failure quarantines the partial file instead of leaving residue.
 /// Returns the snapshot path.
 async fn emit_file_report(
     store: &TursoStore,
@@ -5559,9 +6694,10 @@ async fn emit_file_report(
     state_dir: &Path,
     now_ms: i64,
 ) -> repo_scan::Result<PathBuf> {
-    use repo_scan::report::builder::stream_report_from_store;
+    use repo_scan::report::builder::{quarantine_staging, stream_report_from_store};
     use std::io::Write;
 
+    check_binary_report_id(&inputs.report_id)?;
     let staging = staging_dir(state_dir);
     // Owner-only report dirs; symlinked components are refused inside.
     store::owner::ensure_private_dir_all(&staging)?;
@@ -5572,27 +6708,77 @@ async fn emit_file_report(
         store::now_ms(),
         inputs.report_id,
     );
-    let staged = staging.join(staged_name);
+    let staged = staging.join(&staged_name);
     #[cfg(unix)]
-    let file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(store::owner::STATE_FILE_MODE)
-            .open(&staged)?
+    let (file, staging_fd) = {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        let dir = store::owner::open_dir_nofollow(&staging)?;
+        let name = std::ffi::CString::new(staged_name.as_bytes()).map_err(|_| {
+            repo_scan::Error::Report(format!(
+                "refusing staging name with NUL byte: {staged_name:?}"
+            ))
+        })?;
+        // SAFETY: dirfd is an open directory FD; the name is a generated
+        // NUL-free leaf resolved relative to it.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                store::owner::STATE_FILE_MODE as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                return Err(repo_scan::Error::Report(format!(
+                    "staging file already exists: {}",
+                    staged.display()
+                )));
+            }
+            return Err(repo_scan::Error::Report(format!(
+                "cannot create staging file {}: {e}",
+                staged.display()
+            )));
+        }
+        // SAFETY: `openat` returned a new owned FD; it moves into `File` once.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mode = file.metadata()?.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            quarantine_staging(&staged);
+            return Err(repo_scan::Error::Report(format!(
+                "staging file {} mode is {mode:o}, want no group/other access",
+                staged.display()
+            )));
+        }
+        (file, dir)
     };
     #[cfg(not(unix))]
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&staged)?;
-    let (mut file, _) = stream_report_from_store(store, inputs, file).await?;
-    file.flush()?;
-    file.sync_all()?;
-    drop(file);
-    if let Ok(dir) = std::fs::File::open(&staging) {
-        let _ = dir.sync_all();
+    let outcome: repo_scan::Result<()> = async {
+        let (mut file, _) = stream_report_from_store(store, inputs, file).await?;
+        file.flush()?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        {
+            let _ = staging_fd.sync_all();
+        }
+        #[cfg(not(unix))]
+        {
+            if let Ok(dir) = std::fs::File::open(&staging) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = outcome {
+        quarantine_staging(&staged);
+        return Err(error);
     }
     verified_retain_and_publish(
         store,
@@ -6170,7 +7356,7 @@ async fn run_clear(cfg: &config::Config, args: &repo_scan::cli::ClearArgs) -> Ex
             "cache clear requires --all".to_string(),
         ));
     }
-    match run_clear_inner(&cfg.state_dir) {
+    match run_clear_inner(&cfg.state_dir).await {
         Ok(()) => ExitCode::Success,
         Err(e) => fail(&e),
     }
@@ -6178,11 +7364,14 @@ async fn run_clear(cfg: &config::Config, args: &repo_scan::cli::ClearArgs) -> Ex
 
 /// Remove only verified tool-owned persisted payload (spec §15): exact
 /// known engine files + sidecars and internal snapshot/staging files, each
-/// verified as a regular file (never a symlink) before removal. Unknown
-/// files are preserved; symlink substitution anywhere on the reset path
-/// refuses the whole reset. Never a recursive delete of the configured
-/// directory; the coordination lock is always retained.
-fn run_clear_inner(state_dir: &Path) -> repo_scan::Result<()> {
+/// with per-file ownership proof (a tool-shaped name plus a catalog-bound
+/// checksum row or tool-marker bytes bound to its filename) and verified
+/// as a regular file (never a symlink) before removal. Unknown files are
+/// preserved; a foreign catalog authorizes nothing; symlink substitution
+/// anywhere on the reset path refuses the whole reset. Never a recursive
+/// delete of the configured directory; the coordination lock is always
+/// retained.
+async fn run_clear_inner(state_dir: &Path) -> repo_scan::Result<()> {
     let payload = store::owner::payload_dir(state_dir);
     // Coordinate first: clearing requires exclusive ownership. The
     // existence check lives inside the lock (R15) so the decision sees
@@ -6215,6 +7404,11 @@ fn run_clear_inner(state_dir: &Path) -> repo_scan::Result<()> {
     // bytes. A foreign SQLite database without either stays.
     let db_path = payload.join("catalog.db");
     let db_ours = verify_db_identity(state_dir, &db_path, &mut preserved)?;
+    // Snapshot row checksums while the catalog still exists: per-file
+    // ownership proof needs the rows before the engine files go. A
+    // missing/foreign/unreadable catalog yields no rows, so those files
+    // then need tool-marker bytes or stay preserved.
+    let snapshot_rows = load_snapshot_rows(&db_path, db_ours, &snapshots).await;
     if db_ours {
         for name in config::KNOWN_ENGINE_FILES
             .iter()
@@ -6228,8 +7422,22 @@ fn run_clear_inner(state_dir: &Path) -> repo_scan::Result<()> {
             db_path.display()
         ));
     }
-    clear_tool_dir(&snapshots, &mut removed, &mut preserved)?;
-    clear_tool_dir(&staging, &mut removed, &mut preserved)?;
+    clear_tool_dir(
+        &snapshots,
+        ClearDirKind::Snapshots,
+        db_ours,
+        &snapshot_rows,
+        &mut removed,
+        &mut preserved,
+    )?;
+    clear_tool_dir(
+        &staging,
+        ClearDirKind::Staging,
+        db_ours,
+        &snapshot_rows,
+        &mut removed,
+        &mut preserved,
+    )?;
     // The ownership marker is tool-owned by definition; drop it with the
     // state (a substituted symlink refuses, like any reset-path symlink).
     remove_known_file(&owner_marker_path(state_dir), &mut removed, &mut preserved)?;
@@ -6437,10 +7645,135 @@ fn remove_known_file(
     }
 }
 
-/// Remove regular files directly inside a known tool-owned directory
-/// (snapshots, staging): non-recursive, symlink-safe, unknown entries kept.
+/// Which tool-owned directory is being cleared: snapshot files are
+/// `<report_id>.json`, staging files are
+/// `.staging-<pid>-<ms>-<report_id>.json` (see `emit_file_report`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClearDirKind {
+    Snapshots,
+    Staging,
+}
+
+/// Snapshot-safe report IDs (mirrors the retention gate
+/// `report::publish::check_report_id`): nonempty, at most 128 bytes,
+/// `[A-Za-z0-9._-]`, never `.`/`..`.
+fn is_safe_report_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        && id != "."
+        && id != ".."
+}
+
+/// Stem of a tool-shaped snapshot filename `<report_id>.json`.
+fn snapshot_stem(file_name: &str) -> Option<String> {
+    let stem = file_name.strip_suffix(".json")?;
+    if !is_safe_report_id(stem) {
+        return None;
+    }
+    Some(stem.to_string())
+}
+
+/// Report ID claimed by a tool-shaped staging filename
+/// `.staging-<pid>-<ms>-<report_id>.json`.
+fn staging_report_id(file_name: &str) -> Option<String> {
+    let rest = file_name.strip_prefix(".staging-")?.strip_suffix(".json")?;
+    let mut parts = rest.splitn(3, '-');
+    let pid = parts.next()?;
+    let ms = parts.next()?;
+    let report_id = parts.next()?;
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if ms.is_empty() || !ms.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if !is_safe_report_id(report_id) {
+        return None;
+    }
+    Some(report_id.to_string())
+}
+
+/// Report ID claimed by tool-marker bytes: a JSON object carrying our
+/// schema version, `tool.name`, a nonempty tool version, and a
+/// snapshot-safe `report_id` (the lib's verified-prior-report fields).
+fn tool_report_id(bytes: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let object = value.as_object()?;
+    let schema_ok = object.get("schema_version").and_then(|v| v.as_str())
+        == Some(repo_scan::report::model::SCHEMA_VERSION);
+    let tool = object.get("tool")?.as_object()?;
+    let tool_ok =
+        tool.get("name").and_then(|v| v.as_str()) == Some(repo_scan::report::model::TOOL_NAME);
+    let version_ok = tool
+        .get("version")
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| !v.is_empty());
+    let id = object.get("report_id")?.as_str()?;
+    if !(schema_ok && tool_ok && version_ok) || !is_safe_report_id(id) {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+/// Checksums (`report_id` -> SHA-256 hex) for tool-shaped snapshot files
+/// currently on disk, read through a read-only catalog open that is
+/// closed before any removal (spec §15). A missing/foreign/unreadable
+/// catalog, or no tool-shaped files, yields no rows, so those files then
+/// need tool-marker bytes or stay preserved. Never fails the reset.
+async fn load_snapshot_rows(
+    db_path: &Path,
+    db_ours: bool,
+    snapshots: &Path,
+) -> HashMap<String, String> {
+    let mut rows = HashMap::new();
+    if !db_ours || !db_path.is_file() {
+        return rows;
+    }
+    let mut stems: HashSet<String> = HashSet::new();
+    if let Ok(entries) = std::fs::read_dir(snapshots) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(stem) = snapshot_stem(&name) {
+                stems.insert(stem);
+            }
+        }
+    }
+    if stems.is_empty() {
+        return rows;
+    }
+    let store = match TursoStore::open_read_only(db_path).await {
+        Ok(store) => store,
+        Err(_) => return rows,
+    };
+    for stem in &stems {
+        if let Ok(Some(row)) = store.get_report_snapshot(stem).await {
+            if let Some(checksum) = row.checksum {
+                rows.insert(
+                    stem.clone(),
+                    String::from_utf8_lossy(&checksum).into_owned(),
+                );
+            }
+        }
+    }
+    let _ = store.close().await;
+    rows
+}
+
+/// Remove only tool-owned regular files directly inside a known
+/// tool-owned directory (snapshots, staging): non-recursive,
+/// symlink-safe, unknown entries kept. Each file needs per-file ownership
+/// proof (spec §15): a tool-shaped name for its directory plus a
+/// catalog-bound checksum row matching its bytes or tool-marker bytes
+/// bound to its filename. A foreign catalog authorizes nothing; nested
+/// directories and symlinks are always retained.
 fn clear_tool_dir(
     dir: &Path,
+    kind: ClearDirKind,
+    db_ours: bool,
+    snapshot_rows: &HashMap<String, String>,
     removed: &mut u64,
     preserved: &mut Vec<String>,
 ) -> repo_scan::Result<()> {
@@ -6457,12 +7790,59 @@ fn clear_tool_dir(
         })?;
         if file_type.is_symlink() {
             preserved.push(format!("{} (symlink; preserved)", entry.path().display()));
-        } else if file_type.is_file() {
+            continue;
+        }
+        if !file_type.is_file() {
+            preserved.push(format!(
+                "{} (not a file; preserved)",
+                entry.path().display()
+            ));
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let claimed = match kind {
+            ClearDirKind::Snapshots => snapshot_stem(&name),
+            ClearDirKind::Staging => staging_report_id(&name),
+        };
+        let claimed = match claimed {
+            Some(claimed) => claimed,
+            None => {
+                preserved.push(format!(
+                    "{} (unknown name; preserved)",
+                    entry.path().display()
+                ));
+                continue;
+            }
+        };
+        if !db_ours {
+            preserved.push(format!(
+                "{} (catalog not verified; preserved)",
+                entry.path().display()
+            ));
+            continue;
+        }
+        // Bound open: no symlink follow, regular file, capped read (RSP-005).
+        let bound = match repo_scan::report::publish::BoundStaged::open(&entry.path()) {
+            Ok(bound) => bound,
+            Err(_) => {
+                preserved.push(format!(
+                    "{} (unreadable; preserved)",
+                    entry.path().display()
+                ));
+                continue;
+            }
+        };
+        let row_ok = kind == ClearDirKind::Snapshots
+            && snapshot_rows
+                .get(claimed.as_str())
+                .is_some_and(|sum| sum.as_str() == bound.sha256());
+        let marker_ok = tool_report_id(bound.bytes()).as_deref() == Some(claimed.as_str());
+        if row_ok || marker_ok {
             std::fs::remove_file(entry.path())?;
             *removed += 1;
         } else {
             preserved.push(format!(
-                "{} (not a file; preserved)",
+                "{} (unverified; preserved)",
                 entry.path().display()
             ));
         }
@@ -7035,7 +8415,8 @@ pub async fn test_scan_error_derivations(
     store: &TursoStore,
     root_scopes: &[String],
 ) -> repo_scan::Result<TestDerivationScan> {
-    let derived = scan_error_derivations(store, root_scopes).await?;
+    let derived =
+        scan_error_derivations(store, root_scopes, &DerivationCaps::default_caps()).await?;
     Ok(TestDerivationScan {
         scanned: derived.scanned,
         chunks: derived.chunks,
@@ -7050,7 +8431,7 @@ pub async fn test_scan_error_derivations(
 pub async fn test_scan_instance_derivations(
     store: &TursoStore,
 ) -> repo_scan::Result<TestDerivationScan> {
-    let derived = scan_instance_derivations(store).await?;
+    let derived = scan_instance_derivations(store, &DerivationCaps::default_caps()).await?;
     Ok(TestDerivationScan {
         scanned: derived.scanned,
         chunks: derived.chunks,
@@ -7531,5 +8912,23 @@ pub async fn test_enum_fenced_outcome(
     let claimed = claimed.into_iter().next().ok_or_else(|| {
         repo_scan::Error::Store(String::from("fenced enum hook: claim returned no task"))
     })?;
-    exec_enumerate(&mut runner, store, generation, &claimed).await
+    let deadline = OpDeadline::new(Duration::from_secs(OP_DEADLINE_SECS));
+    exec_enumerate(&mut runner, store, generation, &claimed, &deadline).await
+}
+
+/// PG-03 wiring proof (all platforms): the enum fence-error mapping must
+/// refuse `Unsupported` as `Unsupported` — never degrade to the legacy
+/// unfenced pathname open.
+#[cfg(test)]
+pub fn test_enum_unsupported_is_refused() -> bool {
+    matches!(
+        map_enum_fence_error(
+            Path::new("/unsupported-probe"),
+            FenceError::Unsupported(String::from("descriptor-relative traversal requires unix")),
+        ),
+        FencedDir::Refused {
+            state: TaskState::Unsupported,
+            ..
+        }
+    )
 }

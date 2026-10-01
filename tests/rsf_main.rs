@@ -29,7 +29,7 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 fn run(args: &[String], cwd: &Path, state: &Path) -> std::process::Output {
-    std::fs::create_dir_all(state).expect("state dir");
+    repo_scan::privacy::private_dir_0700(state).expect("state dir");
     let mut full = vec![
         "--state-dir".to_string(),
         state.to_str().expect("utf8 state dir").to_string(),
@@ -117,7 +117,7 @@ fn rsf751_publish_refuses_invalid_staged() {
         let store = open_store(&db).await;
         let now = repo_scan::store::now_ms();
         let state = tmp.path().join("state");
-        std::fs::create_dir_all(&state).unwrap();
+        repo_scan::privacy::private_dir_0700(&state).unwrap();
 
         // Deliberately invalid staged bytes: not a report at all.
         let dest = tmp.path().join("bad-report.json");
@@ -153,7 +153,7 @@ fn rsf751_publish_refuses_invalid_staged() {
         // Positive control through the same path: a genuinely emitted
         // report publishes.
         let root = tmp.path().join("root");
-        std::fs::create_dir_all(&root).unwrap();
+        repo_scan::privacy::private_dir_0700(&root).unwrap();
         fixture::normal_clone(&root, "repo");
         let estate = tmp.path().join("estate");
         let rep = tmp.path().join("rep.json");
@@ -191,10 +191,10 @@ fn rsf3e2_run_loop_claims_only_own_generation() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir1 = tmp.path().join("d1");
         let dir2 = tmp.path().join("d2");
-        std::fs::create_dir_all(&dir1).unwrap();
-        std::fs::create_dir_all(&dir2).unwrap();
-        std::fs::write(dir1.join("f.txt"), b"one").unwrap();
-        std::fs::write(dir2.join("f.txt"), b"two").unwrap();
+        repo_scan::privacy::private_dir_0700(&dir1).unwrap();
+        repo_scan::privacy::private_dir_0700(&dir2).unwrap();
+        repo_scan::privacy::private_write_0600(&dir1.join("f.txt"), b"one").unwrap();
+        repo_scan::privacy::private_write_0600(&dir2.join("f.txt"), b"two").unwrap();
 
         let db = tmp.path().join("catalog.db");
         let store = open_store(&db).await;
@@ -277,10 +277,10 @@ fn rsf_ac46_batch_and_checkpoint_cadence() {
     rt.block_on(async {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().join("root");
-        std::fs::create_dir_all(root.join("a")).unwrap();
-        std::fs::create_dir_all(root.join("b")).unwrap();
-        std::fs::write(root.join("a").join("f.txt"), b"a").unwrap();
-        std::fs::write(root.join("b").join("f.txt"), b"b").unwrap();
+        repo_scan::privacy::private_dir_0700(&root.join("a")).unwrap();
+        repo_scan::privacy::private_dir_0700(&root.join("b")).unwrap();
+        repo_scan::privacy::private_write_0600(&root.join("a").join("f.txt"), b"a").unwrap();
+        repo_scan::privacy::private_write_0600(&root.join("b").join("f.txt"), b"b").unwrap();
 
         let db = tmp.path().join("catalog.db");
         let store = open_store(&db).await;
@@ -326,7 +326,7 @@ fn rsf_ac46_batch_and_checkpoint_cadence() {
 fn rsf02c3_cached_query_readonly_under_lock() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().join("root");
-    std::fs::create_dir_all(&root).unwrap();
+    repo_scan::privacy::private_dir_0700(&root).unwrap();
     let repo = fixture::normal_clone(&root, "repo");
     fixture::git(&repo, &["remote", "set-url", "origin", URL_A]);
     let state = tmp.path().join("state");
@@ -362,7 +362,7 @@ fn rsf23d_measured_resources_and_bounded_loads() {
     // Measured resources end to end: no None-after-run.
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().join("root");
-    std::fs::create_dir_all(&root).unwrap();
+    repo_scan::privacy::private_dir_0700(&root).unwrap();
     fixture::normal_clone(&root, "repo");
     let state = tmp.path().join("state");
     let rep = tmp.path().join("rep.json");
@@ -421,8 +421,8 @@ fn rsf23d_measured_resources_and_bounded_loads() {
 
         // Run-loop telemetry is measured, not None.
         let dir = tmp.path().join("d");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("f.txt"), b"x").unwrap();
+        repo_scan::privacy::private_dir_0700(&dir).unwrap();
+        repo_scan::privacy::private_write_0600(&dir.join("f.txt"), b"x").unwrap();
         let gen = store
             .create_generation("roots", "running", None, now)
             .await
@@ -477,9 +477,9 @@ fn rsf_ad9d_watchdog_blocked_vs_advancing() {
         let tmp = tempfile::tempdir().expect("tempdir");
         // Flat directory: entries advance, no children, no probes.
         let dir = tmp.path().join("d");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.txt"), b"a").unwrap();
-        std::fs::write(dir.join("b.txt"), b"b").unwrap();
+        repo_scan::privacy::private_dir_0700(&dir).unwrap();
+        repo_scan::privacy::private_write_0600(&dir.join("a.txt"), b"a").unwrap();
+        repo_scan::privacy::private_write_0600(&dir.join("b.txt"), b"b").unwrap();
 
         let db = tmp.path().join("catalog.db");
         let store = open_store(&db).await;
@@ -566,7 +566,7 @@ fn rsf_chainargos_progress_rate_and_content() {
     // The binary's stderr progress carries the same context end to end.
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().join("root");
-    std::fs::create_dir_all(&root).unwrap();
+    repo_scan::privacy::private_dir_0700(&root).unwrap();
     fixture::normal_clone(&root, "repo");
     let state = tmp.path().join("state");
     let rep = tmp.path().join("rep.json");

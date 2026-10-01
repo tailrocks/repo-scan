@@ -61,9 +61,9 @@ fn fence_pins_execution_and_parks_escapes() {
         let root = tmp.path().join("root");
         let sub = root.join("sub");
         let outside = tmp.path().join("outside");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-        std::fs::write(sub.join("f.txt"), b"hi").unwrap();
+        repo_scan::privacy::private_dir_0700(&sub).unwrap();
+        repo_scan::privacy::private_dir_0700(&outside).unwrap();
+        repo_scan::privacy::private_write_0600(&sub.join("f.txt"), b"hi").unwrap();
         std::os::unix::fs::symlink(&outside, root.join("link_out")).unwrap();
         std::os::unix::fs::symlink("sub", root.join("link_in")).unwrap();
 

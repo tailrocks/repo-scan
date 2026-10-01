@@ -1,6 +1,10 @@
 # RSF-SEC-AUDIT-GATE: dependency policy enforced by .github/workflows/audit.yml.
 # Scopes: advisories + licenses + sources. Matches the current Cargo.lock:
 # every locked package resolves from registry+https://github.com/rust-lang/crates.io-index.
+# Trust boundary (CI-SC-03): this file is read from the PR merge tree, so a PR
+# can propose policy changes; enforcement depends on branch protection
+# requiring the `audit` check plus review (see docs/AUDIT_GATE.md). Any
+# exception needs an owner call with advisory ID and expiry recorded inline.
 
 [advisories]
 vulnerability = "deny"

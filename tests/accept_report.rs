@@ -425,10 +425,11 @@ fn report_01_emitted_report_matches_shipped_schema() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state = dir.path().join("state");
     let root = dir.path().join("root");
-    std::fs::create_dir_all(&root).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
     fixture::normal_clone(&root, "repo");
     fixture::bare_store(&root, "store.backup");
-    std::fs::write(root.join("notes.txt"), "unrelated\n").expect("write");
+    repo_scan::privacy::private_write_0600(&root.join("notes.txt"), "unrelated\n".as_bytes())
+        .expect("write");
     let root_str = root.to_str().expect("utf8").to_string();
 
     let out = run(
@@ -495,7 +496,7 @@ fn report_01_metadata_and_full_modes_validate() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state = dir.path().join("state");
     let root = dir.path().join("root");
-    std::fs::create_dir_all(&root).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
     fixture::normal_clone(&root, "repo");
     let root_str = root.to_str().expect("utf8").to_string();
 
@@ -589,13 +590,13 @@ fn sibling_leftovers(parent: &Path) -> Vec<PathBuf> {
 fn report_02_publish_is_atomic_old_or_new_never_partial() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state = dir.path().join("state");
-    std::fs::create_dir_all(&state).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&state).expect("mkdir");
     let dest = dir.path().join("report.json");
     let staged = dir.path().join("staged.json");
 
     // Fresh destination: published bytes equal staged bytes exactly.
     let new_bytes = prior_report_bytes("report-new");
-    std::fs::write(&staged, &new_bytes).expect("write staged");
+    repo_scan::privacy::private_write_0600(&staged, &new_bytes).expect("write staged");
     assert_eq!(
         check_destination(&dest, &state).expect("check missing"),
         DestinationKind::Missing
@@ -611,14 +612,15 @@ fn report_02_publish_is_atomic_old_or_new_never_partial() {
     // Crash simulation: a partial temporary sibling beside the destination
     // never affects readers of the destination itself (old-or-new).
     let sibling = dir.path().join(".report.json.tmp-1-1-1");
-    std::fs::write(&sibling, &new_bytes[..new_bytes.len() / 2]).expect("partial sibling");
+    repo_scan::privacy::private_write_0600(&sibling, &new_bytes[..new_bytes.len() / 2])
+        .expect("partial sibling");
     assert_eq!(std::fs::read(&dest).expect("read"), new_bytes);
     std::fs::remove_file(&sibling).expect("cleanup sibling");
 
     // Replacement of a verified prior report: new bytes land whole.
     let old_bytes = std::fs::read(&dest).expect("read old");
     let newer_bytes = prior_report_bytes("report-newer");
-    std::fs::write(&staged, &newer_bytes).expect("write staged");
+    repo_scan::privacy::private_write_0600(&staged, &newer_bytes).expect("write staged");
     assert_eq!(
         check_destination(&dest, &state).expect("check prior"),
         DestinationKind::VerifiedPriorReport
@@ -638,8 +640,8 @@ fn report_02_publish_is_atomic_old_or_new_never_partial() {
 
     // Failed publication (unrelated file appears) keeps old bytes and
     // leaves no sibling.
-    std::fs::write(&dest, b"user data, not a report").expect("overwrite");
-    std::fs::write(&staged, &new_bytes).expect("write staged");
+    repo_scan::privacy::private_write_0600(&dest, b"user data, not a report").expect("overwrite");
+    repo_scan::privacy::private_write_0600(&staged, &new_bytes).expect("write staged");
     assert!(check_destination(&dest, &state).is_err());
     assert!(publish_staged(&staged, &dest, &state).is_err());
     assert_eq!(
@@ -663,7 +665,7 @@ fn report_02_stalled_publish_does_not_pin_reader() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state = dir.path().join("state");
     let root = dir.path().join("root");
-    std::fs::create_dir_all(&root).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
     fixture::normal_clone(&root, "repo");
     let root_str = root.to_str().expect("utf8").to_string();
 
@@ -708,14 +710,15 @@ fn report_02_failed_publish_retries_from_snapshot() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state = dir.path().join("state");
     let root = dir.path().join("root");
-    std::fs::create_dir_all(&root).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
     fixture::normal_clone(&root, "repo");
     let root_str = root.to_str().expect("utf8").to_string();
 
     // Block publication with an unrelated file: scan discovers fine but
     // publication fails (exit 1) while the snapshot is retained.
     let dest = dir.path().join("blocked.json");
-    std::fs::write(&dest, "precious user bytes").expect("write blocker");
+    repo_scan::privacy::private_write_0600(&dest, "precious user bytes".as_bytes())
+        .expect("write blocker");
     let out = run(
         &[
             "scan",
@@ -761,7 +764,7 @@ fn report_02_inside_tree_report_is_honest() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state = dir.path().join("state");
     let root = dir.path().join("root");
-    std::fs::create_dir_all(&root).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
     fixture::normal_clone(&root, "repo");
     let root_str = root.to_str().expect("utf8").to_string();
     let inside = root.join("scan-report.json");
@@ -807,14 +810,14 @@ fn report_02_unrelated_files_never_overwritten() {
     }
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("root");
-    std::fs::create_dir_all(&root).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
     let repo = fixture::normal_clone(&root, "repo");
     let root_str = root.to_str().expect("utf8").to_string();
 
     // Case 1: existing unrelated file is refused; bytes and snapshot kept.
     let state = dir.path().join("state-1");
     let dest = dir.path().join("user.json");
-    std::fs::write(&dest, "{\"user\": true}").expect("write");
+    repo_scan::privacy::private_write_0600(&dest, "{\"user\": true}".as_bytes()).expect("write");
     let out = run(
         &[
             "scan",
@@ -876,12 +879,12 @@ fn report_02_symlink_destination_is_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state = dir.path().join("state");
     let root = dir.path().join("root");
-    std::fs::create_dir_all(&root).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
     fixture::normal_clone(&root, "repo");
     let root_str = root.to_str().expect("utf8").to_string();
 
     let target = dir.path().join("target.txt");
-    std::fs::write(&target, "do not touch").expect("write");
+    repo_scan::privacy::private_write_0600(&target, "do not touch".as_bytes()).expect("write");
     let link = dir.path().join("link.json");
     std::os::unix::fs::symlink(&target, &link).expect("symlink");
     let out = run(
@@ -909,7 +912,7 @@ fn report_01_live_report_validates_against_real_json_schema() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state = dir.path().join("state");
     let root = dir.path().join("root");
-    std::fs::create_dir_all(&root).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
     fixture::normal_clone(&root, "repo");
     let root_str = root.to_str().expect("utf8").to_string();
 

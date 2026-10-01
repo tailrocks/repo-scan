@@ -8,7 +8,13 @@
 //! snapshots), foreground-only gc (`gc.autoDetach=false`), and
 //! `protocol.file.allow=always` (local `file://` submodule/file transports
 //! only — no network).
+//!
+//! Private-output contract (CONSUMER-SCOPE-PRIVACY-001): every directory and
+//! file created below goes through `repo_scan::privacy` (`0o700` dirs,
+//! `0o600` files, symlink refusal, no umask dependence). Scratch roots must
+//! come from [`scratch_root`] (`/tmp`, `0o700`); never a machine-wide path.
 
+use repo_scan::privacy::{private_dir_0700, private_write_0600};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -81,13 +87,25 @@ pub fn git_str(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&git(dir, args)).trim().to_owned()
 }
 
+/// Private scratch root for fixture/state/report/log trees: a fresh
+/// owner-only (`0o700`) tempdir pinned under `/tmp`. All fixture builders
+/// take their `parent` from the returned dir; never pass a machine-wide path.
+pub fn scratch_root(prefix: &str) -> tempfile::TempDir {
+    let dir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in("/tmp")
+        .expect("scratch tempdir under /tmp");
+    private_dir_0700(dir.path()).expect("scratch root is 0700");
+    dir
+}
+
 /// Write `name` under `dir`, stage it, and commit. Returns the new HEAD oid.
 pub fn commit_file(dir: &Path, name: &str, contents: &str, message: &str) -> String {
     let path = dir.join(name);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).unwrap();
+        private_dir_0700(parent).unwrap();
     }
-    fs::write(&path, contents).unwrap();
+    private_write_0600(&path, contents.as_bytes()).unwrap();
     git(dir, &["add", "--", name]);
     git(dir, &["commit", "-q", "-m", message]);
     git_str(dir, &["rev-parse", "HEAD"])
@@ -97,7 +115,7 @@ pub fn commit_file(dir: &Path, name: &str, contents: &str, message: &str) -> Str
 /// Returns the repo root.
 pub fn normal_clone(parent: &Path, name: &str) -> PathBuf {
     let dir = parent.join(name);
-    fs::create_dir_all(&dir).unwrap();
+    private_dir_0700(&dir).unwrap();
     git(&dir, &["init", "-q"]);
     commit_file(&dir, "README.md", "# fixture\n", "initial");
     git(&dir, &["branch", "-M", "main"]);
@@ -109,10 +127,10 @@ pub fn normal_clone(parent: &Path, name: &str) -> PathBuf {
 /// ref pushed from a scratch repo over a local path. Returns the bare dir.
 pub fn bare_store(parent: &Path, name: &str) -> PathBuf {
     let bare = parent.join(name);
-    fs::create_dir_all(parent).unwrap();
+    private_dir_0700(parent).unwrap();
     git(parent, &["init", "-q", "--bare", name]);
     let scratch = parent.join(format!(".seed-{name}"));
-    fs::create_dir_all(&scratch).unwrap();
+    private_dir_0700(&scratch).unwrap();
     git(&scratch, &["init", "-q"]);
     commit_file(&scratch, "seed.txt", "seed\n", "seed");
     git(&scratch, &["branch", "-M", "main"]);
@@ -156,7 +174,7 @@ pub fn submodule_repo(parent: &Path) -> (PathBuf, PathBuf) {
 pub fn nested_repo(parent: &Path) -> (PathBuf, PathBuf) {
     let outer = normal_clone(parent, "outer");
     let inner = outer.join("nested/inner");
-    fs::create_dir_all(&inner).unwrap();
+    private_dir_0700(&inner).unwrap();
     git(&inner, &["init", "-q"]);
     commit_file(&inner, "inner.txt", "inner\n", "inner initial");
     git(&inner, &["branch", "-M", "main"]);
@@ -177,7 +195,7 @@ pub fn packed_refs_repo(parent: &Path, name: &str) -> PathBuf {
 /// Fresh `git init` with no commits: HEAD is unborn. Returns the repo root.
 pub fn unborn_branch(parent: &Path, name: &str) -> PathBuf {
     let dir = parent.join(name);
-    fs::create_dir_all(&dir).unwrap();
+    private_dir_0700(&dir).unwrap();
     git(&dir, &["init", "-q"]);
     dir
 }
@@ -187,9 +205,9 @@ pub fn unborn_branch(parent: &Path, name: &str) -> PathBuf {
 pub fn external_git_dir(parent: &Path) -> (PathBuf, PathBuf) {
     let work = parent.join("work");
     let gitdir = parent.join("elsewhere/common.git");
-    fs::create_dir_all(parent).unwrap();
+    private_dir_0700(parent).unwrap();
     if let Some(gitdir_parent) = gitdir.parent() {
-        fs::create_dir_all(gitdir_parent).unwrap();
+        private_dir_0700(gitdir_parent).unwrap();
     }
     let gitdir_arg = gitdir.to_string_lossy().into_owned();
     let work_arg = work.to_string_lossy().into_owned();
@@ -206,13 +224,13 @@ pub fn external_git_dir(parent: &Path) -> (PathBuf, PathBuf) {
 /// (GIT-01: same branch name, different work). Returns `(a, b)`.
 pub fn diverged_clones(parent: &Path) -> (PathBuf, PathBuf) {
     let a = parent.join("clone-a");
-    fs::create_dir_all(&a).unwrap();
+    private_dir_0700(&a).unwrap();
     git(&a, &["init", "-q"]);
     commit_file(&a, "work.txt", "contents-a\n", "work a");
     git(&a, &["branch", "-M", "main"]);
 
     let b = parent.join("clone-b");
-    fs::create_dir_all(&b).unwrap();
+    private_dir_0700(&b).unwrap();
     git(&b, &["init", "-q"]);
     commit_file(&b, "work.txt", "contents-b\n", "work b");
     git(&b, &["branch", "-M", "main"]);
@@ -223,7 +241,7 @@ pub fn diverged_clones(parent: &Path) -> (PathBuf, PathBuf) {
 /// Returns the clone root.
 pub fn shared_clone(src: &Path, dst: &Path) -> PathBuf {
     if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent).unwrap();
+        private_dir_0700(parent).unwrap();
     }
     let src_arg = src.to_string_lossy().into_owned();
     let dst_arg = dst.to_string_lossy().into_owned();
@@ -248,7 +266,7 @@ pub fn scope_layouts(root: &Path) -> Vec<PathBuf> {
         "node_modules/pkg/repo",
     ] {
         let dir = root.join(rel);
-        fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        private_dir_0700(dir.parent().unwrap()).unwrap();
         let name = dir.file_name().unwrap().to_string_lossy().into_owned();
         repos.push(normal_clone(dir.parent().unwrap(), &name));
     }
@@ -257,7 +275,7 @@ pub fn scope_layouts(root: &Path) -> Vec<PathBuf> {
     repos.push(normal_clone(&outer, "inner"));
     // Clone inside another repo's administrative recovery area.
     let recovery = outer.join(".git/recovery");
-    fs::create_dir_all(&recovery).unwrap();
+    private_dir_0700(&recovery).unwrap();
     repos.push(normal_clone(&recovery, "salvaged"));
     repos.push(outer);
     repos
@@ -268,7 +286,7 @@ pub fn scope_layouts(root: &Path) -> Vec<PathBuf> {
 #[cfg(unix)]
 pub fn symlink_cycle(root: &Path) -> PathBuf {
     let dir = root.join("cycle");
-    fs::create_dir_all(&dir).unwrap();
+    private_dir_0700(&dir).unwrap();
     std::os::unix::fs::symlink("b", dir.join("a")).unwrap();
     std::os::unix::fs::symlink("a", dir.join("b")).unwrap();
     std::os::unix::fs::symlink("self-loop", dir.join("self-loop")).unwrap();
@@ -283,9 +301,9 @@ pub fn non_utf8_names(root: &Path) -> (PathBuf, PathBuf) {
     let dir_name = OsString::from_vec(b"bad-\xff-dir".to_vec());
     let file_name = OsString::from_vec(b"ctrl-\xfe-\xff.txt".to_vec());
     let dir = root.join(&dir_name);
-    fs::create_dir_all(&dir).unwrap();
+    private_dir_0700(&dir).unwrap();
     let file = dir.join(&file_name);
-    fs::write(&file, b"bytes\n").unwrap();
+    private_write_0600(&file, b"bytes\n").unwrap();
     (dir, file)
 }
 
@@ -293,9 +311,9 @@ pub fn non_utf8_names(root: &Path) -> (PathBuf, PathBuf) {
 /// Returns the directory.
 pub fn huge_flat(root: &Path, count: usize) -> PathBuf {
     let dir = root.join("flat");
-    fs::create_dir_all(&dir).unwrap();
+    private_dir_0700(&dir).unwrap();
     for i in 0..count {
-        fs::write(dir.join(format!("f{i:06}")), b"x").unwrap();
+        private_write_0600(&dir.join(format!("f{i:06}")), b"x").unwrap();
     }
     dir
 }
@@ -304,14 +322,14 @@ pub fn huge_flat(root: &Path, count: usize) -> PathBuf {
 /// bottom (FS-05 deep-path input). Returns `(top, bottom_file)`.
 pub fn deep_path(root: &Path, depth: usize) -> (PathBuf, PathBuf) {
     let mut dir = root.join("deep");
-    fs::create_dir_all(&dir).unwrap();
+    private_dir_0700(&dir).unwrap();
     let top = dir.clone();
     for i in 0..depth {
         dir = dir.join(format!("d{i:03}"));
-        fs::create_dir(&dir).unwrap();
+        private_dir_0700(&dir).unwrap();
     }
     let marker = dir.join("bottom.txt");
-    fs::write(&marker, b"bottom\n").unwrap();
+    private_write_0600(&marker, b"bottom\n").unwrap();
     (top, marker)
 }
 
@@ -336,19 +354,19 @@ pub struct DirtyLayout {
 pub fn dirty_variants(parent: &Path, name: &str) -> DirtyLayout {
     let repo = normal_clone(parent, name);
     let staged = repo.join("staged-new.txt");
-    fs::write(&staged, b"staged\n").unwrap();
+    private_write_0600(&staged, b"staged\n").unwrap();
     git(&repo, &["add", "--", "staged-new.txt"]);
     let modified = repo.join("README.md");
-    fs::write(&modified, "# fixture\nmodified\n").unwrap();
+    private_write_0600(&modified, b"# fixture\nmodified\n").unwrap();
     let untracked_file = repo.join("untracked.txt");
-    fs::write(&untracked_file, b"untracked\n").unwrap();
+    private_write_0600(&untracked_file, b"untracked\n").unwrap();
     let untracked_dir = repo.join("untracked-dir");
-    fs::create_dir_all(&untracked_dir).unwrap();
-    fs::write(untracked_dir.join("a.txt"), b"a\n").unwrap();
-    fs::write(untracked_dir.join("b.txt"), b"b\n").unwrap();
-    fs::write(repo.join(".gitignore"), b"ignored.txt\n").unwrap();
+    private_dir_0700(&untracked_dir).unwrap();
+    private_write_0600(&untracked_dir.join("a.txt"), b"a\n").unwrap();
+    private_write_0600(&untracked_dir.join("b.txt"), b"b\n").unwrap();
+    private_write_0600(&repo.join(".gitignore"), b"ignored.txt\n").unwrap();
     let ignored = repo.join("ignored.txt");
-    fs::write(&ignored, b"ignored\n").unwrap();
+    private_write_0600(&ignored, b"ignored\n").unwrap();
     DirtyLayout {
         repo,
         staged,

@@ -5,8 +5,17 @@
 //! diagnostics stay on stderr by construction: this module never touches
 //! stderr, so machine-readable output is never polluted by progress text.
 
+use crate::identity::scrub_text;
 use crate::report::encode::escape_display;
 use crate::report::model::Report;
+
+/// Scrub privacy-bearing prose (embedded credential URLs, secret pairs)
+/// before display escaping. Reports built by the pipeline are already
+/// scrubbed at emission; this boundary keeps terminal output safe for any
+/// report handed to the renderer (RSP-001/RSP-011 defense in depth).
+fn show_prose(text: &str) -> String {
+    escape_display(&scrub_text(text))
+}
 
 /// Render a readable summary of `report` to `out` (normally stdout).
 /// Bounded detail: repositories, checkouts, candidates, errors, and
@@ -47,7 +56,7 @@ pub fn render_terminal(report: &Report, out: &mut dyn std::io::Write) -> crate::
         report.coverage.unresolvable_candidates
     ))?;
     for boundary in &report.coverage.scope_boundaries {
-        w(&format!("boundary: {}\n", escape_display(boundary)))?;
+        w(&format!("boundary: {}\n", show_prose(boundary)))?;
     }
 
     let paths: std::collections::HashMap<&str, &str> = report
@@ -75,7 +84,7 @@ pub fn render_terminal(report: &Report, out: &mut dyn std::io::Write) -> crate::
             escape_display(&repo.object_format)
         ))?;
         for line in &repo.evidence {
-            w(&format!("    evidence: {}\n", escape_display(line)))?;
+            w(&format!("    evidence: {}\n", show_prose(line)))?;
         }
     }
 
@@ -143,7 +152,7 @@ pub fn render_terminal(report: &Report, out: &mut dyn std::io::Write) -> crate::
             "  [{}] {} {}\n",
             escape_display(&candidate.disposition),
             show_path(&candidate.path_id),
-            escape_display(&candidate.reason)
+            show_prose(&candidate.reason)
         ))?;
     }
 
@@ -154,7 +163,7 @@ pub fn render_terminal(report: &Report, out: &mut dyn std::io::Write) -> crate::
             "  [{}] {} {} attempts={} retryable={}\n",
             escape_display(&error.category),
             escape_display(&error.operation),
-            escape_display(&error.message),
+            show_prose(&error.message),
             error.attempts,
             error.retryable
         ))?;

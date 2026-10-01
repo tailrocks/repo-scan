@@ -7,6 +7,7 @@ pub mod git;
 pub mod identity;
 pub mod model;
 pub mod platform;
+pub mod privacy;
 pub mod report;
 pub mod scheduler;
 pub mod store;

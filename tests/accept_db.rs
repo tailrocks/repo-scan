@@ -257,7 +257,7 @@ fn db02_reader_checkpoint_migration_durability() {
 fn db02_storage_failure_is_visible() {
     let dir = tempfile::tempdir().expect("tempdir");
     let blocker = dir.path().join("blocker");
-    std::fs::write(&blocker, b"not a directory").expect("write");
+    repo_scan::privacy::private_write_0600(&blocker, b"not a directory").expect("write");
     let rt = runtime();
     rt.block_on(async {
         let err = TursoStore::open(&blocker.join("catalog.db"))
@@ -566,8 +566,8 @@ fn db03_corrupt_and_truncated_payload_fail_visibly() {
     let rt = runtime();
     let garbage = tempfile::tempdir().expect("tempdir");
     let garbage_db = fresh_db(&garbage);
-    std::fs::create_dir_all(garbage_db.parent().expect("parent")).expect("mkdir");
-    std::fs::write(&garbage_db, vec![0x58u8; 4096]).expect("write");
+    repo_scan::privacy::private_dir_0700(garbage_db.parent().expect("parent")).expect("mkdir");
+    repo_scan::privacy::private_write_0600(&garbage_db, &vec![0x58u8; 4096]).expect("write");
     rt.block_on(assert_no_phantom_ack(&garbage_db));
 
     let trunc = tempfile::tempdir().expect("tempdir");
@@ -646,10 +646,10 @@ fn error01_permission_denied_then_restored() {
     let state = tmp.path().join("state");
     let root = tmp.path().join("fixture");
     let ok = root.join("ok");
-    std::fs::create_dir_all(&ok).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&ok).expect("mkdir");
     fixture::normal_clone(&ok, "repo");
     let denied = root.join("denied");
-    std::fs::create_dir_all(&denied).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&denied).expect("mkdir");
     fixture::normal_clone(&denied, "repo");
     let report = tmp.path().join("rep.json");
     let report_s = report.to_str().expect("utf8").to_string();
@@ -861,8 +861,8 @@ fn cache01_invalidate_force_rescan_clear_distinct() {
     let state = tmp.path().join("state");
     let root = tmp.path().join("fixture");
     let area = root.join("area");
-    std::fs::create_dir_all(&area).expect("mkdir");
-    std::fs::write(area.join("note.txt"), b"note").expect("write");
+    repo_scan::privacy::private_dir_0700(&area).expect("mkdir");
+    repo_scan::privacy::private_write_0600(&area.join("note.txt"), b"note").expect("write");
     fixture::normal_clone(&root, "repo");
     let report = tmp.path().join("rep.json");
     let report_s = report.to_str().expect("utf8").to_string();
@@ -1012,13 +1012,18 @@ fn cache01_clear_fences_live_owner() {
 fn cache02_symlink_state_dir_refuses() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let outside = tmp.path().join("outside.txt");
-    std::fs::write(&outside, b"precious").expect("write");
+    repo_scan::privacy::private_write_0600(&outside, b"precious").expect("write");
 
     // Case A: the state dir itself is a symlink.
     let real = tmp.path().join("real");
-    std::fs::create_dir_all(real.join("payload")).expect("mkdir");
-    std::fs::write(real.join("payload").join("keep.txt"), b"precious").expect("write");
-    std::fs::write(real.join("payload").join("catalog.db"), b"victim-bytes").expect("write");
+    repo_scan::privacy::private_dir_0700(&real.join("payload")).expect("mkdir");
+    repo_scan::privacy::private_write_0600(&real.join("payload").join("keep.txt"), b"precious")
+        .expect("write");
+    repo_scan::privacy::private_write_0600(
+        &real.join("payload").join("catalog.db"),
+        b"victim-bytes",
+    )
+    .expect("write");
     let link = tmp.path().join("link-state");
     std::os::unix::fs::symlink(&real, &link).expect("symlink");
     let link_s = link.to_str().expect("utf8").to_string();
@@ -1044,9 +1049,9 @@ fn cache02_symlink_state_dir_refuses() {
 
     // Case B: the engine file is a symlink to an outside victim.
     let state_b = tmp.path().join("state-b");
-    std::fs::create_dir_all(state_b.join("payload")).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&state_b.join("payload")).expect("mkdir");
     let victim = tmp.path().join("victim.txt");
-    std::fs::write(&victim, b"precious").expect("write");
+    repo_scan::privacy::private_write_0600(&victim, b"precious").expect("write");
     std::os::unix::fs::symlink(&victim, state_b.join("payload").join("catalog.db"))
         .expect("symlink");
     let out = run(&["cache", "clear", "--all"], tmp.path(), &state_b);
@@ -1067,10 +1072,11 @@ fn cache02_symlink_state_dir_refuses() {
 
     // Case C: the snapshots dir is a symlink elsewhere.
     let elsewhere = tmp.path().join("elsewhere");
-    std::fs::create_dir_all(&elsewhere).expect("mkdir");
-    std::fs::write(elsewhere.join("keep.txt"), b"precious").expect("write");
+    repo_scan::privacy::private_dir_0700(&elsewhere).expect("mkdir");
+    repo_scan::privacy::private_write_0600(&elsewhere.join("keep.txt"), b"precious")
+        .expect("write");
     let state_c = tmp.path().join("state-c");
-    std::fs::create_dir_all(state_c.join("payload")).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&state_c.join("payload")).expect("mkdir");
     std::os::unix::fs::symlink(&elsewhere, state_c.join("payload").join("report-snapshots"))
         .expect("symlink");
     let out = run(&["cache", "clear", "--all"], tmp.path(), &state_c);
@@ -1094,7 +1100,7 @@ fn cache02_symlink_state_dir_refuses() {
 fn cache02_foreign_files_preserved() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let outside = tmp.path().join("outside.txt");
-    std::fs::write(&outside, b"precious").expect("write");
+    repo_scan::privacy::private_write_0600(&outside, b"precious").expect("write");
     let state = tmp.path().join("state");
     let root = tmp.path().join("fixture");
     fixture::normal_clone(&root, "repo");
@@ -1117,12 +1123,14 @@ fn cache02_foreign_files_preserved() {
     assert!(snapshots_hold_json(&state));
 
     let payload = state.join("payload");
-    std::fs::write(payload.join("notes.txt"), b"mine").expect("write");
-    std::fs::create_dir_all(payload.join("other")).expect("mkdir");
-    std::fs::write(payload.join("other").join("keep"), b"mine").expect("write");
+    repo_scan::privacy::private_write_0600(&payload.join("notes.txt"), b"mine").expect("write");
+    repo_scan::privacy::private_dir_0700(&payload.join("other")).expect("mkdir");
+    repo_scan::privacy::private_write_0600(&payload.join("other").join("keep"), b"mine")
+        .expect("write");
     let snapshots = payload.join("report-snapshots");
-    std::fs::create_dir_all(snapshots.join("subdir")).expect("mkdir");
-    std::fs::write(snapshots.join("subdir").join("keep"), b"mine").expect("write");
+    repo_scan::privacy::private_dir_0700(&snapshots.join("subdir")).expect("mkdir");
+    repo_scan::privacy::private_write_0600(&snapshots.join("subdir").join("keep"), b"mine")
+        .expect("write");
     #[cfg(unix)]
     std::os::unix::fs::symlink(payload.join("notes.txt"), snapshots.join("sneaky-link"))
         .expect("symlink");
@@ -1164,9 +1172,14 @@ fn cache02_foreign_files_preserved() {
     // Foreign content at the engine path is preserved, with success.
     let state_foreign = tmp.path().join("state-foreign");
     let payload_foreign = state_foreign.join("payload");
-    std::fs::create_dir_all(&payload_foreign).expect("mkdir");
-    std::fs::write(payload_foreign.join("catalog.db"), vec![0x51u8; 4096]).expect("write");
-    std::fs::write(payload_foreign.join("notes.txt"), b"mine").expect("write");
+    repo_scan::privacy::private_dir_0700(&payload_foreign).expect("mkdir");
+    repo_scan::privacy::private_write_0600(
+        &payload_foreign.join("catalog.db"),
+        &vec![0x51u8; 4096],
+    )
+    .expect("write");
+    repo_scan::privacy::private_write_0600(&payload_foreign.join("notes.txt"), b"mine")
+        .expect("write");
     let out = run(&["cache", "clear", "--all"], tmp.path(), &state_foreign);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
     assert_eq!(

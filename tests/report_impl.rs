@@ -459,7 +459,7 @@ fn stream_from_catalog_resolves_and_agrees() {
     assert_eq!(stats.errors, 1);
 
     let staged = dir.path().join("staged.json");
-    std::fs::write(&staged, &bytes).expect("write");
+    repo_scan::privacy::private_write_0600(&staged, &bytes).expect("write");
     let report = verify_staged_report(&staged).expect("validates");
     assert_eq!(report.coverage.gaps, 1);
     assert_eq!(report.coverage.filesystem, "incomplete"); // Open gap.
@@ -493,9 +493,10 @@ fn terminal_render_goes_to_caller_writer() {
 fn no_clobber_policy() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state_dir = dir.path().join("state");
-    std::fs::create_dir_all(state_dir.join("payload")).expect("payload");
+    repo_scan::privacy::private_dir_0700(&state_dir.join("payload")).expect("payload");
     let staged = dir.path().join("staged.json");
-    std::fs::write(&staged, include_bytes!("data/example-report.json")).expect("staged");
+    repo_scan::privacy::private_write_0600(&staged, include_bytes!("data/example-report.json"))
+        .expect("staged");
 
     // Missing destination is fine.
     let fresh = dir.path().join("fresh.json");
@@ -506,7 +507,7 @@ fn no_clobber_policy() {
 
     // Unrelated existing file is refused.
     let unrelated = dir.path().join("notes.txt");
-    std::fs::write(&unrelated, "user data").expect("write");
+    repo_scan::privacy::private_write_0600(&unrelated, "user data".as_bytes()).expect("write");
     let err = check_destination(&unrelated, &state_dir).expect_err("no-clobber");
     assert!(err.to_string().contains("no-clobber"), "{err}");
     let err = publish_staged(&staged, &unrelated, &state_dir).expect_err("publish refused");
@@ -515,7 +516,8 @@ fn no_clobber_policy() {
 
     // Verified prior report may be replaced.
     let prior = dir.path().join("prior.json");
-    std::fs::write(&prior, include_bytes!("data/example-report.json")).expect("prior");
+    repo_scan::privacy::private_write_0600(&prior, include_bytes!("data/example-report.json"))
+        .expect("prior");
     assert_eq!(
         check_destination(&prior, &state_dir).expect("prior ok"),
         DestinationKind::VerifiedPriorReport
@@ -533,7 +535,7 @@ fn no_clobber_policy() {
 
     // Git-administrative destination is refused.
     let git_dir = dir.path().join("repo").join(".git");
-    std::fs::create_dir_all(&git_dir).expect("git");
+    repo_scan::privacy::private_dir_0700(&git_dir).expect("git");
     let git_dest = git_dir.join("report.json");
     let err = check_destination(&git_dest, &state_dir).expect_err("git refused");
     assert!(err.to_string().contains("Git administrative"), "{err}");
@@ -553,13 +555,14 @@ fn no_clobber_policy() {
 fn symlink_destination_is_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state_dir = dir.path().join("state");
-    std::fs::create_dir_all(state_dir.join("payload")).expect("payload");
+    repo_scan::privacy::private_dir_0700(&state_dir.join("payload")).expect("payload");
     let target = dir.path().join("target.json");
-    std::fs::write(&target, "{}").expect("write");
+    repo_scan::privacy::private_write_0600(&target, "{}".as_bytes()).expect("write");
     let link = dir.path().join("link.json");
     std::os::unix::fs::symlink(&target, &link).expect("symlink");
     let staged = dir.path().join("staged.json");
-    std::fs::write(&staged, include_bytes!("data/example-report.json")).expect("staged");
+    repo_scan::privacy::private_write_0600(&staged, include_bytes!("data/example-report.json"))
+        .expect("staged");
     let err = check_destination(&link, &state_dir).expect_err("symlink refused");
     assert!(err.to_string().contains("symlink"), "{err}");
     let err = publish_staged(&staged, &link, &state_dir).expect_err("publish refused");
@@ -580,7 +583,7 @@ fn emit_to_file_with_inside_tree_artifact() {
     // The report lands inside the scanned tree: status was observed before
     // publication and the artifact is listed honestly.
     let dest: PathBuf = dir.path().join("repo").join("report.json");
-    std::fs::create_dir_all(dest.parent().expect("parent")).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(dest.parent().expect("parent")).expect("mkdir");
     let mut inputs = test_inputs("report-inside-tree-1");
     inputs.generated_artifacts.push(ArtifactInput {
         path_bytes: dest.as_os_str().as_encoded_bytes().to_vec(),
@@ -666,7 +669,11 @@ fn snapshot_immutability_and_retry() {
     assert_eq!(retry.checksum, first.checksum);
 
     let other_staged = dir.path().join("other.json");
-    std::fs::write(&other_staged, include_bytes!("data/example-report.json")).expect("write");
+    repo_scan::privacy::private_write_0600(
+        &other_staged,
+        include_bytes!("data/example-report.json"),
+    )
+    .expect("write");
     let err = runtime()
         .block_on(async {
             repo_scan::report::publish::retain_snapshot(
@@ -741,7 +748,7 @@ fn caller_owned_sections_stream() {
     assert_eq!(stats.aliases, 1);
     assert_eq!(stats.candidates, 1);
     let staged = dir.path().join("staged.json");
-    std::fs::write(&staged, &bytes).expect("write");
+    repo_scan::privacy::private_write_0600(&staged, &bytes).expect("write");
     let report = verify_staged_report(&staged).expect("validates");
     assert_eq!(report.coverage.unresolvable_candidates, 1);
     assert_eq!(report.coverage.identity, "unproven");

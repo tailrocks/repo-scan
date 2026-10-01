@@ -29,7 +29,7 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 fn run(args: &[String], cwd: &Path, state: &Path) -> std::process::Output {
-    std::fs::create_dir_all(state).expect("state dir");
+    repo_scan::privacy::private_dir_0700(state).expect("state dir");
     let mut full = vec![
         "--state-dir".to_string(),
         state.to_str().expect("utf8 state dir").to_string(),
@@ -97,7 +97,7 @@ fn resume(state: &Path, scan_id: &str) -> std::process::Output {
 fn r1_per_target_disposition() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().join("root");
-    std::fs::create_dir_all(&root).unwrap();
+    repo_scan::privacy::private_dir_0700(&root).unwrap();
     let a = fixture::normal_clone(&root, "a");
     fixture::git(&a, &["remote", "set-url", "origin", URL_A]);
     let b = fixture::normal_clone(&root, "b");
@@ -140,14 +140,14 @@ fn r1_per_target_disposition() {
 fn r3_lib_path_staging_publish() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().join("root");
-    std::fs::create_dir_all(&root).unwrap();
+    repo_scan::privacy::private_dir_0700(&root).unwrap();
     fixture::normal_clone(&root, "repo");
 
     // Symlinked parent smuggling into the payload namespace is refused.
     #[cfg(unix)]
     {
         let state = tmp.path().join("state");
-        std::fs::create_dir_all(state.join("payload")).unwrap();
+        repo_scan::privacy::private_dir_0700(&state.join("payload")).unwrap();
         let link = tmp.path().join("link");
         std::os::unix::fs::symlink(state.join("payload"), &link).unwrap();
         let smuggled = link.join("report.json");
@@ -166,7 +166,7 @@ fn r3_lib_path_staging_publish() {
     let state2 = tmp.path().join("state2");
     let prior = tmp.path().join("prior.json");
     let prior_bytes = br#"{"tool": {"name": "repo-scan"}, "note": "no report id"}"#;
-    std::fs::write(&prior, prior_bytes).unwrap();
+    repo_scan::privacy::private_write_0600(&prior, prior_bytes).unwrap();
     let out = scan(&state2, URL_A, &[&root], &prior, &["--status", "metadata"]);
     assert_eq!(out.status.code(), Some(1), "id-less prior refused: {out:?}");
     assert_eq!(
@@ -254,7 +254,7 @@ fn r5_events_ingest_reconcile() {
 
         // Plain batch: cursor persisted, path + parent scopes invalidated.
         let changed = tmp.path().join("sub");
-        std::fs::create_dir_all(&changed).unwrap();
+        repo_scan::privacy::private_dir_0700(&changed).unwrap();
         let batch = EventBatch {
             volume_key: "vol-test".to_string(),
             high_water: EventCursorId(50),
@@ -330,7 +330,7 @@ fn r5_events_ingest_reconcile() {
 
         // The report carries an honest event-history boundary note.
         let root = tmp.path().join("scanroot");
-        std::fs::create_dir_all(&root).unwrap();
+        repo_scan::privacy::private_dir_0700(&root).unwrap();
         fixture::normal_clone(&root, "repo");
         let state = tmp.path().join("state");
         let rep = tmp.path().join("rep.json");
@@ -361,7 +361,7 @@ fn r5_events_ingest_reconcile() {
 fn r7_alias_records() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().join("root");
-    std::fs::create_dir_all(&root).unwrap();
+    repo_scan::privacy::private_dir_0700(&root).unwrap();
     let real = fixture::normal_clone(&root, "real");
     fixture::git(&real, &["remote", "set-url", "origin", URL_A]);
     #[cfg(unix)]
@@ -429,7 +429,7 @@ fn r9_watchdog_grace() {
 fn r13_db_transactions() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().join("root");
-    std::fs::create_dir_all(&root).unwrap();
+    repo_scan::privacy::private_dir_0700(&root).unwrap();
     fixture::normal_clone(&root, "repo");
     let state = tmp.path().join("state");
     let rep = tmp.path().join("rep.json");
@@ -443,7 +443,7 @@ fn r13_db_transactions() {
 
     // Even an empty scan performs (and counts) setup transactions.
     let empty = tmp.path().join("empty");
-    std::fs::create_dir_all(&empty).unwrap();
+    repo_scan::privacy::private_dir_0700(&empty).unwrap();
     let state2 = tmp.path().join("state2");
     let rep2 = tmp.path().join("rep2.json");
     let out = scan(&state2, URL_A, &[&empty], &rep2, &["--status", "metadata"]);
@@ -460,7 +460,7 @@ fn r13_db_transactions() {
 fn r14_generation_binding() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().join("root");
-    std::fs::create_dir_all(&root).unwrap();
+    repo_scan::privacy::private_dir_0700(&root).unwrap();
     let repo = fixture::normal_clone(&root, "repo");
     fixture::git(&repo, &["remote", "set-url", "origin", URL_A]);
     fixture::symlink_cycle(&root);
@@ -507,11 +507,11 @@ fn r15_foreign_sqlite_preserved() {
     // catalog schema markers.
     let state = tmp.path().join("state");
     let payload = state.join("payload");
-    std::fs::create_dir_all(&payload).unwrap();
+    repo_scan::privacy::private_dir_0700(&payload).unwrap();
     let db = payload.join("catalog.db");
     let mut foreign = b"SQLite format 3\0".to_vec();
     foreign.resize(8192, 0);
-    std::fs::write(&db, &foreign).unwrap();
+    repo_scan::privacy::private_write_0600(&db, &foreign).unwrap();
     let out = run_str(&["cache", "clear", "--all"], &state, &state);
     assert_eq!(out.status.code(), Some(0), "clear: {out:?}");
     assert!(db.is_file(), "foreign database preserved");
@@ -521,7 +521,7 @@ fn r15_foreign_sqlite_preserved() {
 
     // Tool-owned state (marker bound by a real scan) is still removed.
     let root = tmp.path().join("root");
-    std::fs::create_dir_all(&root).unwrap();
+    repo_scan::privacy::private_dir_0700(&root).unwrap();
     fixture::normal_clone(&root, "repo");
     let state2 = tmp.path().join("state2");
     let rep = tmp.path().join("rep.json");
@@ -544,7 +544,7 @@ fn r16_refs_submodules_snapshot() {
 
     // Upstream tracking from repo config.
     let root = tmp.path().join("root");
-    std::fs::create_dir_all(&root).unwrap();
+    repo_scan::privacy::private_dir_0700(&root).unwrap();
     let repo = fixture::normal_clone(&root, "repo");
     fixture::git(&repo, &["remote", "set-url", "origin", URL_A]);
     fixture::git(&repo, &["config", "branch.main.remote", "origin"]);
@@ -567,7 +567,7 @@ fn r16_refs_submodules_snapshot() {
 
     // Submodule coverage is examined, not hardcoded.
     let sup_root = tmp.path().join("suproot");
-    std::fs::create_dir_all(&sup_root).unwrap();
+    repo_scan::privacy::private_dir_0700(&sup_root).unwrap();
     let (sup, _sub) = fixture::submodule_repo(&sup_root);
     fixture::git(&sup, &["remote", "set-url", "origin", URL_A]);
     let state2 = tmp.path().join("state2");
@@ -594,7 +594,7 @@ fn r16_refs_submodules_snapshot() {
 
     // Same-scan restage mints a fresh snapshot ID; history is kept.
     let cyc_root = tmp.path().join("cyc");
-    std::fs::create_dir_all(&cyc_root).unwrap();
+    repo_scan::privacy::private_dir_0700(&cyc_root).unwrap();
     let crepo = fixture::normal_clone(&cyc_root, "repo");
     fixture::git(&crepo, &["remote", "set-url", "origin", URL_A]);
     fixture::symlink_cycle(&cyc_root);

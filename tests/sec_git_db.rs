@@ -28,7 +28,7 @@ fn git_fixture(dir: &std::path::Path, name: &str, banner: &str, body: &str) -> s
     let script = format!(
         "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\necho \"{banner}\"\nexit 0\nfi\n{body}\n"
     );
-    std::fs::write(&path, script).expect("write fixture");
+    repo_scan::privacy::private_write_0600(&path, script.as_bytes()).expect("write fixture");
     let mut perms = std::fs::metadata(&path).expect("meta").permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&path, perms).expect("chmod");

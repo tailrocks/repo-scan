@@ -374,7 +374,7 @@ fn binary_clear_preserves_foreign_files() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state = dir.path().join("state");
     let payload = state.join("payload");
-    std::fs::create_dir_all(payload.join("report-snapshots")).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&payload.join("report-snapshots")).expect("mkdir");
     // A real catalog plus tool-owned snapshot bytes.
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -385,12 +385,23 @@ fn binary_clear_preserves_foreign_files() {
             .expect("open");
         store.close().await.expect("close");
     });
-    std::fs::write(payload.join("report-snapshots").join("report-x.json"), "{}").expect("write");
+    // Tool-owned snapshot bytes: tool-marker fields bound to the filename.
+    let owned_report = "{\"schema_version\":\"1.0.0\",\
+        \"tool\":{\"name\":\"repo-scan\",\"version\":\"test\"},\
+        \"report_id\":\"report-x\"}";
+    repo_scan::privacy::private_write_0600(
+        &payload.join("report-snapshots").join("report-x.json"),
+        owned_report.as_bytes(),
+    )
+    .expect("write");
     // Foreign files that must survive.
-    std::fs::write(payload.join("notes.txt"), "mine").expect("write");
-    std::fs::create_dir_all(payload.join("other")).expect("mkdir");
-    std::fs::write(payload.join("other").join("keep"), "mine").expect("write");
-    std::fs::write(state.join("keep.txt"), "mine").expect("write");
+    repo_scan::privacy::private_write_0600(&payload.join("notes.txt"), "mine".as_bytes())
+        .expect("write");
+    repo_scan::privacy::private_dir_0700(&payload.join("other")).expect("mkdir");
+    repo_scan::privacy::private_write_0600(&payload.join("other").join("keep"), "mine".as_bytes())
+        .expect("write");
+    repo_scan::privacy::private_write_0600(&state.join("keep.txt"), "mine".as_bytes())
+        .expect("write");
 
     let out = run(&["cache", "clear", "--all"], dir.path(), &state);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
@@ -410,13 +421,15 @@ fn binary_scan_resume_query_lifecycle() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state = dir.path().join("state");
     let fixture = dir.path().join("fixture");
-    std::fs::create_dir_all(fixture.join("a").join("b")).expect("mkdir");
-    std::fs::write(fixture.join("a").join("file.txt"), "hello").expect("write");
-    std::fs::write(fixture.join("top.txt"), "top").expect("write");
+    repo_scan::privacy::private_dir_0700(&fixture.join("a").join("b")).expect("mkdir");
+    repo_scan::privacy::private_write_0600(&fixture.join("a").join("file.txt"), "hello".as_bytes())
+        .expect("write");
+    repo_scan::privacy::private_write_0600(&fixture.join("top.txt"), "top".as_bytes())
+        .expect("write");
     let cwd_a = dir.path().join("cwd-a");
     let cwd_b = dir.path().join("cwd-b");
-    std::fs::create_dir_all(&cwd_a).expect("mkdir");
-    std::fs::create_dir_all(&cwd_b).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&cwd_a).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&cwd_b).expect("mkdir");
     let fixture_str = fixture.to_str().expect("utf8").to_string();
 
     // Scan with a relative --report from cwd-a: the destination resolves

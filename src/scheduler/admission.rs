@@ -14,6 +14,7 @@
 
 use crate::config::ResourceLimits;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Class of an expensive operation requesting admission.
@@ -257,4 +258,271 @@ fn rate_gate(last: &mut Option<Instant>, interval: Duration) -> bool {
             true
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Choke-point budgets and pure policy predicates (SR-STATE-01/02, SR-EVENT-01)
+// ---------------------------------------------------------------------------
+
+/// Hard cap for the process-wide helper ledger: 4 live helper children,
+/// mirroring `ResourceLimits::max_helpers` (spec §5). Installed-git spawns
+/// run below the owner's [`Admission`] handle, so they charge this ledger
+/// at the spawn choke point instead of the unenforced owner counters.
+pub const HELPER_LEDGER_CAP: usize = 4;
+
+/// How long a spawn site waits for a ledger slot before refusing loudly.
+/// Production spawns are sequential, so the wait only absorbs transient
+/// contention; past it the spawn fails with an explicit ledger error.
+pub const HELPER_LEDGER_WAIT: Duration = Duration::from_secs(1);
+
+/// Aggregate native event-stream bounds (SR-STATE-02): at most 64 live
+/// streams (one stream costs at least one descriptor, so this stays within
+/// the `max_app_fds` class) and 16 MiB of queued callback path bytes
+/// across every volume of the process.
+pub const NATIVE_STREAM_CAP: usize = 64;
+/// Aggregate queued callback path bytes (see [`NATIVE_STREAM_CAP`]).
+pub const NATIVE_STREAM_BYTES_CAP: usize = 16 * 1024 * 1024;
+
+/// Process-wide live-helper ledger (SR-STATE-02). Lock-free so spawn sites
+/// without the owner's [`Admission`] handle can still enforce the helper
+/// ceiling; releases saturate at zero and never corrupt the count.
+pub struct HelperLedger {
+    live: AtomicUsize,
+    cap: usize,
+}
+
+impl HelperLedger {
+    /// Ledger enforcing `cap` concurrent holders.
+    pub const fn new(cap: usize) -> Self {
+        Self {
+            live: AtomicUsize::new(0),
+            cap,
+        }
+    }
+
+    /// Maximum concurrent holders.
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// Currently live holders.
+    pub fn live(&self) -> usize {
+        self.live.load(Ordering::Relaxed)
+    }
+
+    /// Take one holder slot. Returns false (taking nothing) at the cap.
+    pub fn try_acquire(&self) -> bool {
+        let mut current = self.live.load(Ordering::Relaxed);
+        loop {
+            if current >= self.cap {
+                return false;
+            }
+            match self.live.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    /// Free one holder slot. Saturates at zero (never wraps, never panics).
+    pub fn release(&self) {
+        let mut current = self.live.load(Ordering::Relaxed);
+        loop {
+            if current == 0 {
+                return;
+            }
+            match self.live.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(next) => current = next,
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for HelperLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HelperLedger")
+            .field("live", &self.live())
+            .field("cap", &self.cap)
+            .finish()
+    }
+}
+
+/// The process-wide helper ledger every installed-git spawn charges.
+pub static HELPER_LEDGER: HelperLedger = HelperLedger::new(HELPER_LEDGER_CAP);
+
+/// Aggregate native event-stream budget (SR-STATE-02): one admission budget
+/// shared by every volume stream of the process, covering live-stream count
+/// plus queued callback path bytes. Streams are admitted before creation;
+/// callback bytes are charged per event and released on dequeue or drop.
+/// Counters saturate and never wrap.
+pub struct StreamBudget {
+    streams_live: AtomicUsize,
+    streams_cap: usize,
+    bytes_queued: AtomicUsize,
+    bytes_cap: usize,
+}
+
+impl StreamBudget {
+    /// Budget enforcing `streams_cap` live streams and `bytes_cap` queued
+    /// callback bytes in aggregate.
+    pub const fn new(streams_cap: usize, bytes_cap: usize) -> Self {
+        Self {
+            streams_live: AtomicUsize::new(0),
+            streams_cap,
+            bytes_queued: AtomicUsize::new(0),
+            bytes_cap,
+        }
+    }
+
+    /// Currently live streams.
+    pub fn streams_live(&self) -> usize {
+        self.streams_live.load(Ordering::Relaxed)
+    }
+
+    /// Currently queued callback bytes.
+    pub fn bytes_queued(&self) -> usize {
+        self.bytes_queued.load(Ordering::Relaxed)
+    }
+
+    /// Admit one stream. Returns false (admitting nothing) at the cap.
+    pub fn try_acquire_stream(&self) -> bool {
+        let mut current = self.streams_live.load(Ordering::Relaxed);
+        loop {
+            if current >= self.streams_cap {
+                return false;
+            }
+            match self.streams_live.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    /// Release one stream slot. Saturates at zero.
+    pub fn release_stream(&self) {
+        let mut current = self.streams_live.load(Ordering::Relaxed);
+        loop {
+            if current == 0 {
+                return;
+            }
+            match self.streams_live.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    /// Charge `n` queued callback bytes. Returns false (charging nothing)
+    /// when the aggregate byte cap would be exceeded.
+    pub fn try_charge_bytes(&self, n: usize) -> bool {
+        let mut current = self.bytes_queued.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = current.checked_add(n) else {
+                return false;
+            };
+            if next > self.bytes_cap {
+                return false;
+            }
+            match self.bytes_queued.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Release `n` queued callback bytes. Saturates at zero.
+    pub fn release_bytes(&self, n: usize) {
+        let mut current = self.bytes_queued.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(n);
+            match self.bytes_queued.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for StreamBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamBudget")
+            .field("streams_live", &self.streams_live())
+            .field("streams_cap", &self.streams_cap)
+            .field("bytes_queued", &self.bytes_queued())
+            .field("bytes_cap", &self.bytes_cap)
+            .finish()
+    }
+}
+
+/// The process-wide native-stream budget every volume stream charges.
+pub static NATIVE_STREAM_BUDGET: StreamBudget =
+    StreamBudget::new(NATIVE_STREAM_CAP, NATIVE_STREAM_BYTES_CAP);
+
+/// Lease-renewal policy for long in-loop operations (SR-STATE-01): renew
+/// the task lease every `every` observed entries (including the first check
+/// at zero) so a slow-but-advancing operation never lets its lease lapse
+/// mid-operation. Returns the new expiry (`now_ms + ttl_ms`, saturating)
+/// when renewal is due, else `None`. Pure and unit-testable.
+pub fn lease_renewal_expiry(
+    entries_seen: u64,
+    every: u64,
+    now_ms: i64,
+    ttl_ms: i64,
+) -> Option<i64> {
+    if every == 0 || !entries_seen.is_multiple_of(every) {
+        return None;
+    }
+    Some(now_ms.saturating_add(ttl_ms))
+}
+
+/// Native-stream rotation policy (SR-EVENT-01): a stream older than
+/// `max_age_ms` must be recreated, bounding any silent native-teardown
+/// window to one rotation period. Pure and unit-testable.
+pub fn stream_restart_due(opened_ms: u64, now_ms: u64, max_age_ms: u64) -> bool {
+    now_ms.saturating_sub(opened_ms) > max_age_ms
+}
+
+/// Native-stream stall suspicion (SR-EVENT-01): the global event clock
+/// advanced (some volume saw activity) while this stream delivered no
+/// callback for longer than `idle_grace_ms`. An idle filesystem (clock
+/// static) is never suspicion. Pure and unit-testable.
+pub fn stream_stall_suspected(
+    last_callback_ms: u64,
+    now_ms: u64,
+    last_global: u64,
+    live_global: u64,
+    idle_grace_ms: u64,
+) -> bool {
+    live_global > last_global && now_ms.saturating_sub(last_callback_ms) > idle_grace_ms
 }

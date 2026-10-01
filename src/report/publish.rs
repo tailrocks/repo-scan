@@ -19,7 +19,7 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(unix)]
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -108,8 +108,12 @@ impl BoundStaged {
     }
 
     /// Open, fstat, and bounded-read `staged` under an explicit cap.
+    /// The open FD must be a regular file (RSP-005): FIFOs, devices,
+    /// sockets, and directories are refused before any read, so a swapped
+    /// staging/snapshot path cannot hang or exhaust the reader.
     pub fn open_capped(staged: &Path, cap_bytes: u64) -> crate::Result<Self> {
         let mut file = open_nofollow(staged)?;
+        require_regular_file(&file, staged)?;
         let (dev, ino, size) = fd_identity(&file)?;
         if size > cap_bytes {
             return Err(Error::Report(format!(
@@ -181,13 +185,16 @@ impl BoundStaged {
     }
 }
 
-/// Open `path` for reading without following a trailing symlink.
+/// Open `path` for reading without following a trailing symlink
+/// (RSP-005): `O_NOFOLLOW|O_NONBLOCK`, then `fstat` must show a regular
+/// file, then `O_NONBLOCK` is cleared before any read. A FIFO can
+/// therefore never hang the opener; it is refused as non-regular.
 fn open_nofollow(path: &Path) -> crate::Result<File> {
     #[cfg(unix)]
     {
-        std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
             .map_err(|e| {
                 if e.raw_os_error() == Some(libc::ELOOP) {
@@ -198,7 +205,10 @@ fn open_nofollow(path: &Path) -> crate::Result<File> {
                 } else {
                     Error::Io(e.to_string())
                 }
-            })
+            })?;
+        require_regular_file(&file, path)?;
+        clear_nonblock(&file)?;
+        Ok(file)
     }
     #[cfg(not(unix))]
     {
@@ -229,6 +239,43 @@ fn fd_identity(file: &File) -> crate::Result<(u64, u64, u64)> {
     }
 }
 
+/// Require the open FD to be a regular file (RSP-005). Checked with
+/// `fstat` on the FD itself, so a path swapped to a FIFO, device, socket,
+/// or directory after open is still refused before any read.
+fn require_regular_file(file: &File, path: &Path) -> crate::Result<()> {
+    if file.metadata()?.is_file() {
+        return Ok(());
+    }
+    Err(Error::Report(format!(
+        "refusing non-regular staged report {}",
+        path.display()
+    )))
+}
+
+/// Clear `O_NONBLOCK` on an already-verified regular-file FD (RSP-005),
+/// restoring blocking reads. Unix only.
+#[cfg(unix)]
+fn clear_nonblock(file: &File) -> crate::Result<()> {
+    // SAFETY: `fcntl` on an owned open FD changes only that FD's flags.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(Error::Io(format!(
+            "cannot get file flags: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let cleared = flags & !libc::O_NONBLOCK;
+    // SAFETY: as above.
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, cleared) };
+    if rc != 0 {
+        return Err(Error::Io(format!(
+            "cannot clear O_NONBLOCK: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
 /// Default controlled staging directory: `<state_dir>/payload/report_staging`.
 pub fn default_staging_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("payload").join("report_staging")
@@ -250,9 +297,14 @@ pub enum DestinationKind {
 
 /// Validate a report destination without writing anything. `dest` must be
 /// absolute (resolved when the scan request was created). Refuses:
-/// Git-administrative paths (any `.git` component), the active persistence
-/// payload, symlinks anywhere on the resolved path, directories, and
-/// existing unrelated files.
+/// Git-administrative paths (any `.git` component), anything inside the
+/// tool state directory (not just the active payload), the coordination
+/// lock, symlinks anywhere on the resolved path, directories, and existing
+/// unrelated files. On unix the parent directory is additionally bound
+/// through an `O_NOFOLLOW|O_DIRECTORY` FD and the state/payload refusal is
+/// re-checked by resolved ancestor identity, so a symlink/alias pointing
+/// into state (or a transient ancestor swap) cannot bypass the string
+/// tests (RSP-004/XSEC-05).
 pub fn check_destination(dest: &Path, state_dir: &Path) -> crate::Result<DestinationKind> {
     if !dest.is_absolute() {
         return Err(Error::Report(format!(
@@ -314,11 +366,35 @@ pub fn check_destination(dest: &Path, state_dir: &Path) -> crate::Result<Destina
             ));
         }
     }
+    // Refuse the whole state directory identity (XSEC-05): the payload
+    // check above leaves the state root itself and non-payload children
+    // (staging, snapshots) publishable through a resolved alias.
+    let state_candidates = [
+        state_dir.to_path_buf(),
+        state_dir.canonicalize().unwrap_or(state_dir.to_path_buf()),
+    ];
+    for candidate in &state_candidates {
+        if effective == *candidate || effective.starts_with(candidate) {
+            return Err(report_refusal(
+                dest,
+                "refusing to publish inside tool state dir",
+            ));
+        }
+    }
     if effective == crate::store::owner::lock_path(state_dir) {
         return Err(report_refusal(
             dest,
             "refusing to publish over the coordination lock",
         ));
+    }
+    // Bind the resolved parent through a no-follow directory FD and
+    // re-verify the policy by identity (unix). A symlink/alias into state
+    // (or a transient ancestor swap after canonicalization) is caught
+    // here even when the string tests above passed.
+    #[cfg(unix)]
+    {
+        let bound = crate::store::owner::open_dir_nofollow(&canonical_parent)?;
+        verify_bound_parent(&bound, &canonical_parent, dest, state_dir)?;
     }
     match std::fs::symlink_metadata(&effective) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DestinationKind::Missing),
@@ -336,7 +412,7 @@ pub fn check_destination(dest: &Path, state_dir: &Path) -> crate::Result<Destina
             if meta.is_dir() {
                 return Err(report_refusal(dest, "refusing to overwrite a directory"));
             }
-            if is_verified_prior_report(&effective)? {
+            if is_verified_prior_report_in_state(&effective, state_dir)? {
                 Ok(DestinationKind::VerifiedPriorReport)
             } else {
                 Err(report_refusal(
@@ -352,13 +428,71 @@ fn report_refusal(dest: &Path, reason: &str) -> Error {
     Error::Report(format!("{}: {}", dest.display(), reason))
 }
 
+/// `(dev, ino)` of `path` by `stat`, or `None` when it cannot be stated
+/// (missing path: no identity to refuse). Unix only.
+#[cfg(unix)]
+fn path_identity(path: &Path) -> Option<(u64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+/// Re-verify the destination policy against an already-bound parent
+/// directory FD (unix): the FD must still be what `canonical_parent`
+/// names (transient-swap detector), its resolved ancestor chain must not
+/// pass through the tool state directory or the active payload (XSEC-05),
+/// and the bound path must not sit under a `.git` component. String checks
+/// in [`check_destination`] stay as the fast path; these identity checks
+/// are authoritative against symlink/alias and swap races.
+#[cfg(unix)]
+fn verify_bound_parent(
+    bound: &File,
+    canonical_parent: &Path,
+    dest: &Path,
+    state_dir: &Path,
+) -> crate::Result<()> {
+    let here = crate::store::owner::fd_identity(bound)?;
+    if path_identity(canonical_parent) != Some(here) {
+        return Err(report_refusal(
+            dest,
+            "destination parent changed during publication; refusing",
+        ));
+    }
+    let chain = crate::store::owner::ancestor_identities(bound)?;
+    let payload = crate::store::owner::payload_dir(state_dir);
+    for identity in &chain {
+        if Some(*identity) == path_identity(state_dir) {
+            return Err(report_refusal(
+                dest,
+                "refusing to publish inside tool state dir",
+            ));
+        }
+        if Some(*identity) == path_identity(&payload) {
+            return Err(report_refusal(
+                dest,
+                "refusing to publish into the active persistence payload",
+            ));
+        }
+    }
+    if let Some(resolved) = crate::store::owner::fd_path(bound) {
+        if resolved.components().any(|c| c.as_os_str() == ".git") {
+            return Err(report_refusal(
+                dest,
+                "refusing to publish inside a Git administrative directory",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// True when the existing file parses as a `repo-scan` report: a JSON
-/// object with `schema_version: "1.0.0"`, `tool.name: "repo-scan"`, and a
-/// nonempty `report_id`. A filename extension alone is never proof. Reads
-/// from an `O_NOFOLLOW` FD under the staged-report cap so a swapped-in
-/// symlink or huge file cannot slip through.
+/// object with `schema_version: "1.0.0"`, `tool.name: "repo-scan"`, a
+/// nonempty tool version, and a nonempty snapshot-safe `report_id`. A
+/// filename extension alone is never proof. Reads from an `O_NOFOLLOW`
+/// regular-file FD under the staged-report cap so a swapped-in symlink,
+/// special file, or huge file cannot slip through.
 pub fn is_verified_prior_report(path: &Path) -> crate::Result<bool> {
     let mut file = open_nofollow(path)?;
+    require_regular_file(&file, path)?;
     let mut bytes = Vec::new();
     Read::by_ref(&mut file)
         .take(MAX_STAGED_REPORT_BYTES.saturating_add(1))
@@ -371,26 +505,67 @@ pub fn is_verified_prior_report(path: &Path) -> crate::Result<bool> {
 
 /// Byte-level prior-report check over bytes already read from an FD.
 pub fn is_verified_prior_report_bytes(bytes: &[u8]) -> bool {
-    let value: serde_json::Value = match serde_json::from_slice(bytes) {
-        Ok(value) => value,
-        Err(_) => return false,
-    };
-    let Some(object) = value.as_object() else {
-        return false;
-    };
+    prior_report_id(bytes).is_some()
+}
+
+/// Extract the claimed `report_id` when `bytes` carry the verified-prior
+/// provenance fields (schema, tool name/version, snapshot-safe report ID).
+fn prior_report_id(bytes: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let object = value.as_object()?;
     let schema_ok = object.get("schema_version").and_then(|v| v.as_str())
         == Some(crate::report::model::SCHEMA_VERSION);
-    let tool_ok = object
-        .get("tool")
-        .and_then(|v| v.as_object())
-        .and_then(|t| t.get("name"))
+    let tool = object.get("tool")?.as_object()?;
+    let tool_ok =
+        tool.get("name").and_then(|v| v.as_str()) == Some(crate::report::model::TOOL_NAME);
+    let version_ok = tool
+        .get("version")
         .and_then(|v| v.as_str())
-        == Some(crate::report::model::TOOL_NAME);
-    let id_ok = object
-        .get("report_id")
-        .and_then(|v| v.as_str())
-        .is_some_and(|id| !id.is_empty());
-    schema_ok && tool_ok && id_ok
+        .is_some_and(|v| !v.is_empty());
+    let id = object.get("report_id")?.as_str()?;
+    if !(schema_ok && tool_ok && version_ok) || check_report_id(id).is_err() {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+/// State-bound prior-report check (XSEC-04): field verification plus, when
+/// this state directory retains a snapshot for the claimed report ID,
+/// byte-equality against the owner-private snapshot file. A planted
+/// plausible report naming a retained report ID must match its bytes;
+/// foreign/legacy priors with no snapshot here fall back to field
+/// verification. (Full catalog-checksum/revision binding needs a store
+/// handle, which the publication call graph does not thread through, so
+/// the snapshot file — always byte-identical to what was published — is
+/// the binding available at this layer. No database is opened.)
+pub fn is_verified_prior_report_in_state(path: &Path, state_dir: &Path) -> crate::Result<bool> {
+    let mut file = open_nofollow(path)?;
+    require_regular_file(&file, path)?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_STAGED_REPORT_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_STAGED_REPORT_BYTES {
+        return Ok(false);
+    }
+    let Some(prior_id) = prior_report_id(&bytes) else {
+        return Ok(false);
+    };
+    let snapshot = default_snapshot_dir(state_dir).join(format!("{prior_id}.json"));
+    match std::fs::symlink_metadata(&snapshot) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(_) => Ok(false),
+        Ok(meta) => {
+            if !meta.is_file() || meta.file_type().is_symlink() {
+                return Ok(false);
+            }
+            let retained = match BoundStaged::open(&snapshot) {
+                Ok(bound) => bound,
+                Err(_) => return Ok(false),
+            };
+            Ok(retained.bytes() == bytes.as_slice())
+        }
+    }
 }
 
 /// Receipt for a successful publication.
@@ -423,9 +598,10 @@ pub fn publish_staged(
 /// is race-free for new files (`link` fails with `EEXIST` when a file
 /// appeared after the final gate) and FD-verified for replacements (the
 /// destination's bytes are re-read from a fresh `O_NOFOLLOW` FD and must
-/// still parse as a prior report before the rename). Receipt digests are
-/// computed over the bytes actually copied into the sibling, never over a
-/// re-open of the staging path.
+/// still parse as a prior report before the rename, with an expected
+/// `(dev, ino)` compare-and-swap recheck immediately before commit).
+/// Receipt digests are computed over the bytes actually copied into the
+/// sibling, never over a re-open of the staging path.
 pub fn publish_bound(
     bound: &BoundStaged,
     dest: &Path,
@@ -449,9 +625,19 @@ pub fn publish_bound(
         .file_name()
         .ok_or_else(|| Error::Report("report destination has no file name".to_string()))?;
     // Hold the destination directory FD for the whole install so every
-    // sibling/destination operation is dir-relative (Unix); best-effort
-    // elsewhere, where std path operations are used instead.
-    let dir = File::open(&canonical_parent).ok();
+    // sibling/destination operation is dir-relative. On unix the bind is
+    // mandatory (no-follow, fail closed) and an exclusive directory lock
+    // covers verification through install so cooperating publishers
+    // serialize; elsewhere std path operations are used instead.
+    #[cfg(unix)]
+    let dir = {
+        let bound_dir = crate::store::owner::open_dir_nofollow(&canonical_parent)?;
+        verify_bound_parent(&bound_dir, &canonical_parent, dest, state_dir)?;
+        lock_dir_exclusive(&bound_dir, dest)?;
+        Some(bound_dir)
+    };
+    #[cfg(not(unix))]
+    let dir: Option<File> = File::open(&canonical_parent).ok();
     let sibling = unique_sibling(&canonical_parent, file_name);
     let receipt = publish_bound_via_sibling(
         bound,
@@ -463,7 +649,7 @@ pub fn publish_bound(
     );
     // The sibling must never be left behind on failure.
     if receipt.is_err() {
-        let _ = std::fs::remove_file(&sibling);
+        remove_sibling(dir.as_ref(), &sibling);
     }
     let (bytes, checksum, sha256, replaced) = receipt?;
     Ok(PublishReceipt {
@@ -474,6 +660,60 @@ pub fn publish_bound(
     })
 }
 
+/// Remove a staging sibling, dir-FD-relative on unix (the only path form
+/// the install ever uses there), by path elsewhere. Best-effort.
+fn remove_sibling(dir: Option<&File>, sibling: &Path) {
+    #[cfg(not(unix))]
+    let _ = dir;
+    #[cfg(unix)]
+    {
+        if let Some(dir) = dir {
+            if let Ok(name) = relative_cstring(sibling) {
+                // SAFETY: dirfd is an open directory FD; the name is a
+                // NUL-free leaf resolved relative to it.
+                let rc = unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) };
+                if rc == 0 {
+                    return;
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_file(sibling);
+}
+
+/// Exclusive non-blocking lock on the destination directory FD, held from
+/// verification through install (RSP-003). Serializes cooperating
+/// publishers; a contended destination fails fast instead of hanging.
+#[cfg(unix)]
+fn lock_dir_exclusive(dir: &File, dest: &Path) -> crate::Result<()> {
+    // SAFETY: `flock` on an owned open directory FD is confined to that
+    // FD and changes no process-global state.
+    // Settle window before reporting contention: every EWOULDBLOCK
+    // holder is transient (flock releases on process death; fork-shared
+    // references clear at exec/exit within milliseconds), so a brief
+    // bounded wait absorbs spurious conflicts while genuine contention
+    // still fails fast instead of hanging.
+    for _ in 0..crate::store::owner::FLOCK_SETTLE_POLLS {
+        let rc = unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let errno = std::io::Error::last_os_error();
+        if errno.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(Error::Report(format!(
+                "cannot lock destination directory for {}: {errno}",
+                dest.display()
+            )));
+        }
+        std::thread::sleep(crate::store::owner::FLOCK_SETTLE_INTERVAL);
+    }
+    // Settle window exhausted: genuine contention, fail fast.
+    Err(Error::Report(format!(
+        "destination {} is busy (another publication holds it)",
+        dest.display()
+    )))
+}
+
 fn publish_bound_via_sibling(
     bound: &BoundStaged,
     dir: Option<&File>,
@@ -482,6 +722,9 @@ fn publish_bound_via_sibling(
     dest: &Path,
     state_dir: &Path,
 ) -> crate::Result<(u64, String, String, DestinationKind)> {
+    #[cfg(unix)]
+    let mut output = open_sibling_nofollow(dir, sibling)?;
+    #[cfg(not(unix))]
     let mut output = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -513,7 +756,7 @@ fn publish_bound_via_sibling(
     match replaced {
         DestinationKind::Missing => install_new(dir, sibling, dest)?,
         DestinationKind::VerifiedPriorReport => {
-            install_replacement(dir, canonical_parent, sibling, dest)?;
+            install_replacement(dir, canonical_parent, sibling, dest, state_dir)?;
         }
     }
     // Best-effort directory fsync for install durability; never masks success.
@@ -585,15 +828,82 @@ fn install_new(_dir: Option<&File>, sibling: &Path, dest: &Path) -> crate::Resul
     Ok(())
 }
 
+/// Create the staging sibling dir-FD-relative with
+/// `O_CREAT|O_EXCL|O_NOFOLLOW` and owner-only `0600` mode (unix): an atomic
+/// no-clobber create that can neither follow a swapped-in symlink nor leak
+/// report bytes to other local users. The mode is asserted after creation
+/// so it never depends on the process umask (RSP-007). Unix only.
+#[cfg(unix)]
+fn open_sibling_nofollow(dir: Option<&File>, sibling: &Path) -> crate::Result<File> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = dir.ok_or_else(|| {
+        Error::Report(format!(
+            "cannot open destination directory for {}",
+            sibling.display()
+        ))
+    })?;
+    let name = relative_cstring(sibling)?;
+    // SAFETY: dirfd is an open directory FD held by the caller; the name
+    // is a generated NUL-free leaf resolved relative to it.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            crate::store::owner::STATE_FILE_MODE as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(Error::Report(format!(
+            "cannot create staging sibling {}: {}",
+            sibling.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: `openat` returned a new owned FD; it moves into `File` once.
+    let file = unsafe { File::from_raw_fd(fd) };
+    let mode = file.metadata()?.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(Error::Report(format!(
+            "staging sibling {} mode is {mode:o}, want no group/other access",
+            sibling.display()
+        )));
+    }
+    Ok(file)
+}
+
+/// `(dev, ino)` of a dir-FD-relative leaf by `fstatat(NOFOLLOW)`, without
+/// opening it. Unix only.
+#[cfg(unix)]
+fn leaf_identity(dirfd: libc::c_int, name: &std::ffi::CString) -> crate::Result<(u64, u64)> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: dirfd is an open directory FD; `stat` is a valid
+    // out-parameter; the name is a NUL-free leaf.
+    let rc = unsafe { libc::fstatat(dirfd, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) };
+    if rc != 0 {
+        return Err(Error::Io(std::io::Error::last_os_error().to_string()));
+    }
+    Ok((stat.st_dev as u64, stat.st_ino as u64))
+}
+
 /// Replace a verified prior report: re-verify the destination's bytes from
-/// a freshly opened `O_NOFOLLOW` FD (never a bare path re-read), then
-/// rename the sibling over it through the open directory FD.
+/// a freshly opened dir-FD-relative `O_NOFOLLOW` FD (never a bare path
+/// re-read), bind the state's snapshot when one is retained for the
+/// claimed report ID (XSEC-04), then rename the sibling over it through
+/// the open directory FD. The verified FD's `(dev, ino)` is rechecked
+/// against the live leaf immediately before commit (RSP-003
+/// compare-and-swap); on mismatch the destination changed and the rename
+/// is refused. POSIX offers no atomic conditional rename, so the
+/// directory lock held by the caller serializes cooperating publishers
+/// while the CAS recheck narrows the residual window to the `renameat`
+/// syscall itself.
 #[cfg(unix)]
 fn install_replacement(
     dir: Option<&File>,
-    canonical_parent: &Path,
+    _canonical_parent: &Path,
     sibling: &Path,
     dest: &Path,
+    state_dir: &Path,
 ) -> crate::Result<()> {
     let dir = dir.ok_or_else(|| {
         Error::Report(format!(
@@ -601,18 +911,33 @@ fn install_replacement(
             dest.display()
         ))
     })?;
-    let leaf = dest
-        .file_name()
-        .ok_or_else(|| Error::Report("report destination has no file name".to_string()))?;
-    let effective = canonical_parent.join(leaf);
-    let mut fd = open_nofollow(&effective).map_err(|e| {
-        Error::Report(format!(
-            "destination {} changed during publication: {e}",
-            dest.display()
-        ))
-    })?;
+    let dirfd = dir.as_raw_fd();
+    let dest_c = relative_cstring(dest)?;
+    // SAFETY: dirfd is an open directory FD held by the caller; the name
+    // is a NUL-free leaf resolved relative to it. `O_NONBLOCK` (RSP-005)
+    // so a FIFO swapped in as the destination cannot hang the verifier;
+    // cleared after the regular-file check.
+    let fd = unsafe {
+        libc::openat(
+            dirfd,
+            dest_c.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(Error::Report(format!(
+            "destination {} changed during publication: {}",
+            dest.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: `openat` returned a new owned FD; it moves into `File` once.
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    require_regular_file(&file, dest)?;
+    clear_nonblock(&file)?;
+    let expected = crate::store::owner::fd_identity(&file)?;
     let mut bytes = Vec::new();
-    Read::by_ref(&mut fd)
+    Read::by_ref(&mut file)
         .take(MAX_STAGED_REPORT_BYTES.saturating_add(1))
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_STAGED_REPORT_BYTES || !is_verified_prior_report_bytes(&bytes) {
@@ -621,9 +946,52 @@ fn install_replacement(
             "destination changed during publication; refusing to overwrite",
         ));
     }
-    let dirfd = dir.as_raw_fd();
+    if let Some(prior_id) = prior_report_id(&bytes) {
+        let snapshot = default_snapshot_dir(state_dir).join(format!("{prior_id}.json"));
+        if std::fs::symlink_metadata(&snapshot).is_ok() {
+            let retained = BoundStaged::open(&snapshot).map_err(|_| {
+                report_refusal(
+                    dest,
+                    "prior report snapshot is unreadable; refusing to overwrite",
+                )
+            })?;
+            if retained.bytes() != bytes.as_slice() {
+                return Err(report_refusal(
+                    dest,
+                    "destination does not match the retained snapshot; refusing to overwrite",
+                ));
+            }
+            // The verified FD must still be the live leaf: recheck the
+            // expected identity after the (slower) snapshot bind, then
+            // commit immediately.
+            if leaf_identity(dirfd, &dest_c).map_err(|_| {
+                report_refusal(
+                    dest,
+                    "destination changed during publication; refusing to overwrite",
+                )
+            })? != expected
+            {
+                return Err(report_refusal(
+                    dest,
+                    "destination changed during publication; refusing to overwrite",
+                ));
+            }
+        }
+    }
+    // Final CAS recheck immediately before commit.
+    if leaf_identity(dirfd, &dest_c).map_err(|_| {
+        report_refusal(
+            dest,
+            "destination changed during publication; refusing to overwrite",
+        )
+    })? != expected
+    {
+        return Err(report_refusal(
+            dest,
+            "destination changed during publication; refusing to overwrite",
+        ));
+    }
     let sibling_c = relative_cstring(sibling)?;
-    let dest_c = relative_cstring(dest)?;
     // SAFETY: as in install_new.
     let rc = unsafe { libc::renameat(dirfd, sibling_c.as_ptr(), dirfd, dest_c.as_ptr()) };
     if rc != 0 {
@@ -642,6 +1010,7 @@ fn install_replacement(
     canonical_parent: &Path,
     sibling: &Path,
     dest: &Path,
+    state_dir: &Path,
 ) -> crate::Result<()> {
     let leaf = dest
         .file_name()
@@ -653,6 +1022,7 @@ fn install_replacement(
             dest.display()
         ))
     })?;
+    require_regular_file(&fd, dest)?;
     let mut bytes = Vec::new();
     Read::by_ref(&mut fd)
         .take(MAX_STAGED_REPORT_BYTES.saturating_add(1))
@@ -662,6 +1032,23 @@ fn install_replacement(
             dest,
             "destination changed during publication; refusing to overwrite",
         ));
+    }
+    if let Some(prior_id) = prior_report_id(&bytes) {
+        let snapshot = default_snapshot_dir(state_dir).join(format!("{prior_id}.json"));
+        if std::fs::symlink_metadata(&snapshot).is_ok() {
+            let retained = BoundStaged::open(&snapshot).map_err(|_| {
+                report_refusal(
+                    dest,
+                    "prior report snapshot is unreadable; refusing to overwrite",
+                )
+            })?;
+            if retained.bytes() != bytes.as_slice() {
+                return Err(report_refusal(
+                    dest,
+                    "destination does not match the retained snapshot; refusing to overwrite",
+                ));
+            }
+        }
     }
     std::fs::rename(sibling, &effective)?;
     Ok(())
@@ -746,7 +1133,7 @@ pub async fn retain_bound(
     now_ms: i64,
 ) -> crate::Result<SnapshotReceipt> {
     check_report_id(report_id)?;
-    std::fs::create_dir_all(snapshot_dir)?;
+    crate::store::owner::ensure_private_dir_all(snapshot_dir)?;
     let snapshot_path = snapshot_dir.join(format!("{report_id}.json"));
 
     match persist_bound_bytes(bound, &snapshot_path, snapshot_dir)? {
@@ -822,7 +1209,9 @@ pub async fn retain_bound(
 
 /// Report IDs become snapshot filenames; only a conservative charset is
 /// allowed so `<report_id>.json` cannot escape the snapshot directory.
-fn check_report_id(report_id: &str) -> crate::Result<()> {
+/// Shared with the staging path so the public pipeline validates the ID
+/// before it is ever interpolated into a filename (RSP-006).
+pub(crate) fn check_report_id(report_id: &str) -> crate::Result<()> {
     if report_id.is_empty() {
         return Err(Error::Report("report_id must be nonempty".to_string()));
     }
@@ -848,33 +1237,92 @@ enum PersistOutcome {
 
 /// Write bound bytes to `dest` with `create_new` semantics (atomic
 /// no-clobber create), then sync the file and its directory. Returns
-/// whether the file was created or already existed.
+/// whether the file was created or already existed. Snapshots carry
+/// inventory and remote metadata, so they are created owner-only (`0600`
+/// on unix, asserted after creation so the mode never depends on the
+/// process umask) inside a directory the caller bound with
+/// `ensure_private_dir_all` (RSP-004/RSP-007). On unix the directory is
+/// held as an `O_NOFOLLOW|O_DIRECTORY` FD and the file is created with
+/// `openat(O_CREAT|O_EXCL|O_NOFOLLOW)` relative to it: no
+/// check-then-use by path between the directory check and the create.
 fn persist_bound_bytes(
     bound: &BoundStaged,
     dest: &Path,
     dir: &Path,
 ) -> crate::Result<PersistOutcome> {
-    let mut output = match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(dest)
+    #[cfg(unix)]
     {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Ok(PersistOutcome::Existed)
+        persist_bound_bytes_at(bound, dest, dir)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        let mut output = match opts.open(dest) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Ok(PersistOutcome::Existed)
+            }
+            Err(e) => {
+                return Err(Error::Report(format!(
+                    "cannot create snapshot {}: {e}",
+                    dest.display()
+                )))
+            }
+        };
+        output.write_all(bound.bytes())?;
+        output.sync_all()?;
+        drop(output);
+        if let Ok(dir_fd) = File::open(dir) {
+            let _ = dir_fd.sync_all();
         }
-        Err(e) => {
-            return Err(Error::Report(format!(
-                "cannot create snapshot {}: {e}",
-                dest.display()
-            )))
-        }
+        Ok(PersistOutcome::Created)
+    }
+}
+
+/// Unix `openat`-relative snapshot create (RSP-004). Holds the snapshot
+/// directory FD for the create plus the directory fsync.
+#[cfg(unix)]
+fn persist_bound_bytes_at(
+    bound: &BoundStaged,
+    dest: &Path,
+    dir: &Path,
+) -> crate::Result<PersistOutcome> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir_fd = crate::store::owner::open_dir_nofollow(dir)?;
+    let name = relative_cstring(dest)?;
+    // SAFETY: dirfd is an open directory FD; the name is a NUL-free leaf
+    // resolved relative to it.
+    let fd = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            crate::store::owner::STATE_FILE_MODE as libc::c_uint,
+        )
     };
+    if fd < 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            return Ok(PersistOutcome::Existed);
+        }
+        return Err(Error::Report(format!(
+            "cannot create snapshot {}: {e}",
+            dest.display()
+        )));
+    }
+    // SAFETY: `openat` returned a new owned FD; it moves into `File` once.
+    let mut output = unsafe { File::from_raw_fd(fd) };
+    let mode = output.metadata()?.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(Error::Report(format!(
+            "snapshot {} mode is {mode:o}, want no group/other access",
+            dest.display()
+        )));
+    }
     output.write_all(bound.bytes())?;
     output.sync_all()?;
     drop(output);
-    if let Ok(dir_fd) = File::open(dir) {
-        let _ = dir_fd.sync_all();
-    }
+    let _ = dir_fd.sync_all();
     Ok(PersistOutcome::Created)
 }

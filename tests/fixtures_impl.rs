@@ -223,7 +223,7 @@ fn non_utf8_names_round_trip_bytes() {
     let probe = tmp
         .path()
         .join(std::ffi::OsString::from_vec(b"probe-\xff".to_vec()));
-    if fs::create_dir_all(&probe).is_err() {
+    if repo_scan::privacy::private_dir_0700(&probe).is_err() {
         eprintln!("skipping: filesystem rejects invalid-UTF-8 names");
         return;
     }

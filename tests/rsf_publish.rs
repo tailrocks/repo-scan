@@ -205,7 +205,7 @@ fn emit_to_file_verifies_before_retain() {
     let mut invalid = test_inputs("report-bogus-1");
     invalid.coverage_status = Some("bogus".to_string());
     let bad_dest: PathBuf = dir.path().join("repo").join("bad.json");
-    std::fs::create_dir_all(bad_dest.parent().expect("parent")).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(bad_dest.parent().expect("parent")).expect("mkdir");
     let err = runtime()
         .block_on(async {
             ReportPipeline::emit_to_file(

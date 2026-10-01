@@ -4,13 +4,16 @@
 //! SSH-alias remotes needing `Host` resolution, unparseable index or
 //! worktree admin, or object-format gaps. Never a per-directory scanner.
 //!
-//! Safety contract: explicit candidate paths (no bare `git` from an
-//! unexamined `PATH` entry without recording it), argv arrays with no shell
-//! interpolation, `GIT_OPTIONAL_LOCKS=0`, `--no-optional-locks` where
-//! supported, `core.hooksPath=/dev/null` plus `core.fsmonitor=false`
-//! overrides, `GIT_HTTP_*`/proxy variables unset, no fetch/clone/pull/push
-//! subcommand ever invoked, and no configured filter/fsmonitor/helper
-//! executed (cases needing one stay `partial`/`unsupported`).
+//! Safety contract: explicit candidate paths (group/other-writable
+//! `$PATH` entries refused outright, never probed), argv arrays with no
+//! shell interpolation, `GIT_OPTIONAL_LOCKS=0`, `--no-optional-locks`
+//! where supported, repo-selected execution neutralized per vector
+//! (hooks, fsmonitor, pager, ssh/askpass, templates, includes via
+//! `-c`/env/flags; clean/smudge/process filter drivers by
+//! detect-and-refuse), `GIT_HTTP_*`/proxy variables unset, no
+//! fetch/clone/pull/push subcommand ever invoked, and no configured
+//! filter/fsmonitor/helper executed (cases needing one stay
+//! `partial`/`unsupported`).
 //!
 //! Every spawn additionally runs inside one envelope
 //! (RSF-SEC-GIT-PROBE): stdin is nulled, config-redirect environment
@@ -27,9 +30,12 @@
 //! and vendor backports can report a version while lacking an assumed
 //! option, so the probe must succeed or the capability stays false.
 
+use std::cell::RefCell;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::{HeadState, Oid, RefObservation, RefTarget};
@@ -52,6 +58,17 @@ pub const GIT_SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
 /// lists or status text must never read as complete results.
 pub const MAX_CAPTURE_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Post-exit reader-drain budget (RSF-FALLBACK-HELPER-SECURITY(2)): after
+/// the child exits its pipes should EOF promptly. A descendant holding a
+/// pipe open past this budget fails the call as an explicit incomplete
+/// gap — never a hang, never silently partial bytes.
+pub const POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Grace to join output readers after a kill (timeout, cap, cancel, or
+/// drain paths). Readers still unfinished past it are detached loudly and
+/// reported stuck; the helper charge is kept (termination unproven).
+const READER_JOIN_GRACE: Duration = Duration::from_millis(500);
+
 /// Where [`FallbackGit::discover`] found the binary. Trusted absolute
 /// paths (explicit arguments, then [`KNOWN_GIT_PATHS`]) win over `$PATH`
 /// entries; a `$PATH` selection is recorded here (with the absolute
@@ -65,6 +82,91 @@ pub enum BinarySource {
     Known,
     /// Resolved by joining a `$PATH` entry with `git`.
     Path,
+}
+
+/// Cooperative cancellation for fallback waits
+/// (RSF-FALLBACK-HELPER-SECURITY(5)): SIGINT or a task deadline ends even
+/// stuck readers. Every wait slice (ledger wait, child wait, reader joins,
+/// post-exit drain) polls [`WaitCancel::cancelled`]; a cancelled wait
+/// terminates (group-kill unless the child is already reaped — the drain
+/// paths skip the kill, their pgid may be reused), grace-joins, and fails
+/// loudly — never hangs, never leaks silently.
+#[derive(Clone)]
+pub struct WaitCancel {
+    check: Arc<dyn Fn() -> bool + Send + Sync>,
+    deadline: Option<Instant>,
+}
+
+impl WaitCancel {
+    /// A token that never cancels (probes and detached use).
+    pub fn never() -> Self {
+        Self {
+            check: Arc::new(|| false),
+            deadline: None,
+        }
+    }
+
+    /// Cancel when `check` fires or `deadline` passes (either; `None`
+    /// disables that arm).
+    pub fn new(
+        check: impl Fn() -> bool + Send + Sync + 'static,
+        deadline: Option<Instant>,
+    ) -> Self {
+        Self {
+            check: Arc::new(check),
+            deadline,
+        }
+    }
+
+    /// True once cancelled (flag fired or deadline passed).
+    pub fn cancelled(&self) -> bool {
+        if self.deadline.is_some_and(|end| Instant::now() >= end) {
+            return true;
+        }
+        (self.check)()
+    }
+}
+
+impl Default for WaitCancel {
+    fn default() -> Self {
+        Self::never()
+    }
+}
+
+impl std::fmt::Debug for WaitCancel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WaitCancel")
+            .field("cancelled", &self.cancelled())
+            .field("deadline", &self.deadline)
+            .finish()
+    }
+}
+
+thread_local! {
+    /// Dynamically scoped wait token: [`spawn_enveloped`] reads this when
+    /// no explicit token is passed, so call-sites that cannot change
+    /// signatures (unsupported-gap fallbacks) still inherit SIGINT and the
+    /// task deadline via [`with_wait_cancel`].
+    static CURRENT_WAIT_CANCEL: RefCell<Option<WaitCancel>> = const { RefCell::new(None) };
+}
+
+/// Run `f` with `cancel` as the wait token for every fallback spawn on
+/// this thread (nesting-safe: the previous token is restored).
+pub fn with_wait_cancel<R>(cancel: &WaitCancel, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<WaitCancel>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CURRENT_WAIT_CANCEL.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let previous = CURRENT_WAIT_CANCEL.with(|slot| slot.borrow_mut().replace(cancel.clone()));
+    let _restore = Restore(previous);
+    f()
+}
+
+/// The scoped wait token, or a never-cancelling token outside a scope.
+fn current_wait_cancel() -> WaitCancel {
+    CURRENT_WAIT_CANCEL.with(|slot| slot.borrow().clone().unwrap_or_else(WaitCancel::never))
 }
 
 /// Capability record for one installed-git identity.
@@ -95,6 +197,133 @@ pub struct FallbackGit {
     path: PathBuf,
     source: BinarySource,
     capabilities: Capabilities,
+    identity: BinaryIdentity,
+}
+
+/// Executable identity pinned at probe time and re-verified before every
+/// spawn (XSEC-02): a binary swapped, replaced, re-permissioned, or
+/// modified in place between probe and spawn is refused, never executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BinaryIdentity {
+    dev: u64,
+    ino: u64,
+    uid: u32,
+    mode: u32,
+    len: u64,
+    mtime_nanos: i128,
+}
+
+/// Capture the current identity of `path`: a regular executable file only.
+/// `None` refuses directories, links, special files, and non-executables.
+#[cfg(unix)]
+fn binary_identity(path: &Path) -> Option<BinaryIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let md = std::fs::symlink_metadata(path).ok()?;
+    if !md.file_type().is_file() || (md.mode() & 0o111) == 0 {
+        return None;
+    }
+    Some(BinaryIdentity {
+        dev: md.dev(),
+        ino: md.ino(),
+        uid: md.uid(),
+        mode: md.mode(),
+        len: md.len(),
+        mtime_nanos: mtime_nanos(&md),
+    })
+}
+
+/// Capture the current identity of `path` (non-unix): regular files only,
+/// with size+mtime binding the content.
+#[cfg(not(unix))]
+fn binary_identity(path: &Path) -> Option<BinaryIdentity> {
+    let md = std::fs::symlink_metadata(path).ok()?;
+    if !md.file_type().is_file() {
+        return None;
+    }
+    Some(BinaryIdentity {
+        dev: 0,
+        ino: 0,
+        uid: 0,
+        mode: 0,
+        len: md.len(),
+        mtime_nanos: mtime_nanos(&md),
+    })
+}
+
+/// Modification time as epoch nanos for identity binding (0 when unknown).
+fn mtime_nanos(md: &std::fs::Metadata) -> i128 {
+    md.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i128)
+        .unwrap_or(0)
+}
+
+/// Validate one git binary path: absolute, canonical (no `.`/`..`/link
+/// misbinding), a regular file, executable. Empty, relative, missing,
+/// directory, or non-executable paths are refused (PATH-GIT-06). The
+/// canonical path is what runs; the discovered spelling stays reported.
+fn canonical_executable(path: &Path) -> Option<PathBuf> {
+    if path.as_os_str().is_empty() || !path.is_absolute() {
+        return None;
+    }
+    let canonical = path.canonicalize().ok()?;
+    if !canonical.is_absolute() {
+        return None;
+    }
+    let md = std::fs::symlink_metadata(&canonical).ok()?;
+    if !md.file_type().is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if (md.permissions().mode() & 0o111) == 0 {
+            return None;
+        }
+    }
+    Some(canonical)
+}
+
+/// True when a `$PATH` entry may supply a `git` binary
+/// (RSF-FALLBACK-HELPER-SECURITY(7)): absolute, canonicalizable, a
+/// directory, and NOT group/other-writable. A writable entry lets another
+/// user swap the binary between probe and spawn, so it is refused before
+/// probing (never executed). Explicit and well-known paths are
+/// operator-trusted and exempt. Residual, stated honestly: the entry
+/// owner (or root) can still swap the file inside the microsecond
+/// verify→exec window; pre-spawn identity re-verification (XSEC-02)
+/// shrinks the race to that window, it cannot close it.
+#[cfg(unix)]
+fn path_entry_trusted(entry: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    if entry.as_os_str().is_empty() || !entry.is_absolute() {
+        return false;
+    }
+    let canonical = match entry.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(_) => return false,
+    };
+    let md = match std::fs::symlink_metadata(&canonical) {
+        Ok(md) => md,
+        Err(_) => return false,
+    };
+    if !md.file_type().is_dir() {
+        return false;
+    }
+    // Mode bits, not access checks: deterministic regardless of the
+    // running uid (root passes access checks on any mode).
+    (md.mode() & 0o022) == 0
+}
+
+/// True when a `$PATH` entry may supply a `git` binary (non-unix): no
+/// mode bits exist, so only the empty/relative refusal applies
+/// (documented residual: writable-entry refusal is unix-only).
+#[cfg(not(unix))]
+fn path_entry_trusted(entry: &Path) -> bool {
+    !entry.as_os_str().is_empty() && entry.is_absolute()
 }
 
 impl FallbackGit {
@@ -112,7 +341,9 @@ impl FallbackGit {
     /// Discovery with injectable search lists, so tests can prove the
     /// trust order (explicit, then known, then `$PATH`) and the recorded
     /// [`BinarySource`] without touching the real installation paths.
-    fn discover_from(
+    /// `pub` as the integration seam for `tests/fail_fallback.rs` (the
+    /// production path, [`FallbackGit::discover`], reads the real `$PATH`).
+    pub fn discover_from(
         explicit: &[PathBuf],
         known: &[&str],
         path_var: Option<String>,
@@ -129,6 +360,14 @@ impl FallbackGit {
         }
         if let Some(path_var) = path_var {
             for entry in std::env::split_paths(&path_var) {
+                // Reject untrusted `$PATH` entries (PATH-GIT-06,
+                // RSF-FALLBACK-HELPER-SECURITY(7)): empty/relative entries
+                // would resolve a binary other than the recorded
+                // candidate, and group/other-writable directories let
+                // another user swap the binary between probe and spawn.
+                if !path_entry_trusted(&entry) {
+                    continue;
+                }
                 let path = entry.join("git");
                 if !candidates.iter().any(|(candidate, _)| candidate == &path) {
                     candidates.push((path, BinarySource::Path));
@@ -160,8 +399,18 @@ impl FallbackGit {
     /// `--version` spawn runs inside the shared envelope (timeout+kill,
     /// capture cap, sanitized environment) and must exit successfully.
     fn probe_with_source(path: &Path, source: BinarySource) -> Option<Self> {
-        let mut version_cmd = Command::new(path);
+        // Bind the executable before any spawn: the canonical path is
+        // what runs, and its identity must be unchanged across the
+        // version and feature probes (PATH-GIT-06, XSEC-02). The
+        // discovered spelling stays reported in `path`.
+        let canonical = canonical_executable(path)?;
+        let identity = binary_identity(&canonical)?;
+        let mut version_cmd = Command::new(&canonical);
         version_cmd.arg("--version");
+        // Sanitize-only (no repo neutralization): `--version` runs with no
+        // `--git-dir`, prints one line, and never pages, reads worktree
+        // content, or executes helpers — there is no repo-selected vector
+        // to neutralize on this argv.
         sanitize_git_env(&mut version_cmd);
         let outcome = spawn_enveloped(
             &mut version_cmd,
@@ -180,7 +429,13 @@ impl FallbackGit {
         let tuple = parse_git_version(&version);
         let at_least =
             |major: u32, minor: u32| tuple.0 > major || (tuple.0 == major && tuple.1 >= minor);
-        let feature_probe_ok = probe_porcelain_v2(path);
+        if binary_identity(&canonical) != Some(identity) {
+            return None;
+        }
+        let feature_probe_ok = probe_porcelain_v2(&canonical);
+        if binary_identity(&canonical) != Some(identity) {
+            return None;
+        }
         Some(Self {
             path: path.to_path_buf(),
             source,
@@ -192,6 +447,7 @@ impl FallbackGit {
                 worktree_list: at_least(2, 7),
                 feature_probe_ok,
             },
+            identity,
         })
     }
 
@@ -335,6 +591,17 @@ impl FallbackGit {
                 self.capabilities.version
             )));
         }
+        // Repo-selected conversion drivers (filter.<name>.clean/smudge/
+        // process) would execute during worktree-content comparison on git
+        // versions that convert; driver names are unbounded so `-c` cannot
+        // enumerate them — refuse and stay `unsupported`, never execute.
+        if self.filters_configured(git_dir, work_tree) {
+            return Err(crate::Error::Git(format!(
+                "{}installed git ({}) refuses status: executable filter drivers configured; refusing to execute",
+                super::UNSUPPORTED_MARKER,
+                self.capabilities.version
+            )));
+        }
         let untracked = if collapsed {
             "--untracked-files=normal"
         } else {
@@ -398,15 +665,54 @@ impl FallbackGit {
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
 
+    /// Repo-config scan for executable filter drivers
+    /// (RSF-FALLBACK-HELPER-SECURITY(1)): `config --local --list` never
+    /// executes helpers itself, and it sees through `include.path`
+    /// chains, so a repo-selected `filter.<driver>.clean|smudge|process`
+    /// command in the repo config (or anything it includes) refuses
+    /// worktree-content reads. Scoped to `--local` deliberately:
+    /// user/system-configured drivers are the operator's own trust
+    /// domain, not repo-selected code. Any scan error fails closed
+    /// (unknown → refuse).
+    fn filters_configured(&self, git_dir: &Path, work_tree: Option<&Path>) -> bool {
+        match self.run(git_dir, work_tree, &["config", "--local", "--list"]) {
+            Ok(out) => String::from_utf8_lossy(&out).lines().any(|line| {
+                line.split_once('=')
+                    .is_some_and(|(key, _)| Self::is_exec_filter_key(&key.to_ascii_lowercase()))
+            }),
+            Err(e) => {
+                eprintln!(
+                    "repo-scan: fallback: filter-driver scan failed, refusing content reads: {e}"
+                );
+                true
+            }
+        }
+    }
+
+    /// True when `key` (lowercased `section.name.attr` from `config
+    /// --list`) selects code git would execute for a filter driver:
+    /// clean/smudge/process commands. `required` and other flags are
+    /// inert; diff/merge/external drivers never run under the read-only
+    /// subcommands this module invokes (no diff display, no merge).
+    fn is_exec_filter_key(key: &str) -> bool {
+        let mut parts = key.split('.');
+        match (parts.next(), parts.next_back()) {
+            (Some("filter"), Some(attr)) => matches!(attr, "clean" | "smudge" | "process"),
+            _ => false,
+        }
+    }
+
     /// Run a read-only git subcommand with the safety envelope.
     ///
     /// Repository selection travels in argv (`--git-dir`, `--work-tree`);
-    /// no shell is involved; locks, hooks, fsmonitor, and proxy/helpful
-    /// network variables are neutralized. Only read-only subcommands are
+    /// no shell is involved; locks and every repo-selected execution
+    /// vector (hooks, fsmonitor, pager, ssh/askpass, includes) are
+    /// neutralized via [`apply_repo_neutralization`], and proxy/helpful
+    /// network variables are stripped. Only read-only subcommands are
     /// ever passed by this module (for-each-ref, symbolic-ref, rev-parse,
-    /// status, config --get). The spawn runs inside the shared envelope
+    /// status, config). The spawn runs inside the shared envelope
     /// (timeout+kill, capture cap, sanitized config environment,
-    /// `-c help.format=man`); over-cap output and unexpected status fail
+    /// scoped wait token); over-cap output and unexpected status fail
     /// rather than returning partial data.
     fn run(
         &self,
@@ -414,7 +720,23 @@ impl FallbackGit {
         work_tree: Option<&Path>,
         args: &[&str],
     ) -> crate::Result<Vec<u8>> {
-        let mut command = Command::new(&self.path);
+        // Re-bind the executable before every spawn (XSEC-02): the
+        // binary must still be the probed (dev, ino, owner, mode, size,
+        // mtime) — a swapped, replaced, or re-permissioned binary is
+        // refused, never spawned.
+        let canonical = self.path.canonicalize().map_err(|e| {
+            crate::Error::Git(format!(
+                "installed git ({}): refusing spawn: cannot resolve binary: {e}",
+                self.path.display()
+            ))
+        })?;
+        if binary_identity(&canonical) != Some(self.identity) {
+            return Err(crate::Error::Git(format!(
+                "installed git ({}): refusing spawn: binary identity changed since probe",
+                self.path.display()
+            )));
+        }
+        let mut command = Command::new(&canonical);
         command.arg(format!("--git-dir={}", git_dir.display()));
         sanitize_git_env(&mut command);
         command.env("GIT_OPTIONAL_LOCKS", "0");
@@ -427,14 +749,8 @@ impl FallbackGit {
         if self.capabilities.no_optional_locks {
             command.arg("--no-optional-locks");
         }
-        command
-            .arg("-c")
-            .arg("core.hooksPath=/dev/null")
-            .arg("-c")
-            .arg("core.fsmonitor=false")
-            .arg("-c")
-            .arg("help.format=man")
-            .args(args);
+        apply_repo_neutralization(&mut command);
+        command.args(args);
         let outcome = spawn_enveloped(&mut command, false, GIT_SPAWN_TIMEOUT, MAX_CAPTURE_BYTES)
             .map_err(|reason| {
                 crate::Error::Git(format!(
@@ -462,35 +778,188 @@ impl FallbackGit {
     }
 }
 
-/// Ambient-environment sanitization shared by every installed-git spawn:
-/// repository-selection, proxy, and config-redirect variables are
-/// stripped so the ambient environment cannot redirect the repository,
-/// inject configuration, or enable network use. Only the *redirects* are
-/// stripped — file-based config still applies, so legitimate settings
-/// (e.g. `safe.directory` exceptions) keep working. Unsetting
-/// `GIT_CONFIG_COUNT` alone neutralizes `GIT_CONFIG_KEY_*`/`VALUE_*`
-/// pairs, which git only reads when the count is set.
+/// Append the repo-selected-execution neutralizations to one fallback
+/// `git` argv (RSF-FALLBACK-HELPER-SECURITY(1)); call AFTER
+/// [`sanitize_git_env`] so these values win:
+/// - hooks: `core.hooksPath=/dev/null`
+/// - fsmonitor: `core.fsmonitor=false` (wins over repo config AND
+///   `include.path` chains by `-c` precedence — proven by the marker test)
+/// - pager: `--no-pager` flag + `core.pager=cat` + `GIT_PAGER=cat`
+/// - ssh: `core.sshCommand=false` (any transport attempt fails closed;
+///   the fallback never runs transport subcommands) + `GIT_SSH*` removed
+///   + `GIT_TERMINAL_PROMPT=0`
+/// - askpass: `GIT_ASKPASS`/`SSH_ASKPASS*` removed (no credential-prompt
+///   helper can be smuggled in)
+/// - templates: probe `init` pins `--template=<probe-owned empty dir>`;
+///   [`FallbackGit`] read subcommands never init (nothing to neutralize)
+/// - includes: `-c` precedence wins over any included file;
+///   `GIT_CONFIG_COUNT` is stripped so env-injected includes cannot
+///   smuggle overrides
+/// - clean/smudge/process filters: driver names are unbounded —
+///   neutralized by detect-and-refuse (`status_counts` stays
+///   `unsupported`), never executed
+fn apply_repo_neutralization(cmd: &mut Command) {
+    cmd.arg("--no-pager")
+        .arg("-c")
+        .arg("core.hooksPath=/dev/null")
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .arg("-c")
+        .arg("help.format=man")
+        .arg("-c")
+        .arg("core.pager=cat")
+        .arg("-c")
+        .arg("core.sshCommand=false");
+    cmd.env("GIT_PAGER", "cat").env("GIT_TERMINAL_PROMPT", "0");
+}
+
+/// Ambient-environment allowlist shared by every installed-git spawn
+/// (XSEC-03): only explicitly allowlisted `GIT_*` variables may reach the
+/// child — every other ambient `GIT_*` variable is stripped, so
+/// repository redirects, config injection (`GIT_CONFIG_*`), helper
+/// overrides (`GIT_SSH*`, `GIT_ASKPASS`, `GIT_EDITOR`, ...), or network
+/// use cannot be smuggled in. Proxy, pager, askpass, and browser
+/// variables are stripped too.
+/// Only the *environment redirects* are stripped — file-based config
+/// still applies, so legitimate settings (e.g. `safe.directory`
+/// exceptions) keep working. Callers set allowlisted values AFTER
+/// sanitizing.
 fn sanitize_git_env(cmd: &mut Command) {
+    const ALLOWED_GIT_VARS: &[&str] =
+        &["GIT_OPTIONAL_LOCKS", "GIT_CEILING_DIRECTORIES", "GIT_PAGER"];
+    // Strip every ambient `GIT_*` outside the allowlist (covers `GIT_DIR`,
+    // `GIT_WORK_TREE`, `GIT_PREFIX`, `GIT_CONFIG_*` pairs, `GIT_SSH*`, ...).
+    // `vars_os` (not `vars`): a non-Unicode ambient value must never panic
+    // the scan from inside sanitization.
+    for (key, _) in std::env::vars_os() {
+        if let Some(key_str) = key.to_str() {
+            if key_str.starts_with("GIT_") && !ALLOWED_GIT_VARS.contains(&key_str) {
+                cmd.env_remove(key_str);
+            }
+        }
+    }
+    // Explicit removals: also cover values set on the command before
+    // sanitizing, plus non-`GIT_` injection vectors.
     cmd.env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_PREFIX")
+        .env_remove("GIT_SSH")
+        .env_remove("GIT_SSH_COMMAND")
+        .env_remove("GIT_ASKPASS")
+        .env_remove("SSH_ASKPASS")
+        .env_remove("SSH_ASKPASS_REQUIRE")
+        .env_remove("GIT_TERMINAL_PROMPT")
+        .env_remove("GIT_EDITOR")
+        .env_remove("GIT_SEQUENCE_EDITOR")
+        .env_remove("GIT_EXTERNAL_DIFF")
+        .env_remove("GIT_CONFIG_GLOBAL")
+        .env_remove("GIT_CONFIG_SYSTEM")
+        .env_remove("GIT_CONFIG_COUNT")
         .env_remove("GIT_HTTP_PROXY")
         .env_remove("GIT_HTTPS_PROXY")
         .env_remove("HTTP_PROXY")
         .env_remove("HTTPS_PROXY")
         .env_remove("ALL_PROXY")
-        .env_remove("GIT_CONFIG_GLOBAL")
-        .env_remove("GIT_CONFIG_SYSTEM")
-        .env_remove("GIT_CONFIG_COUNT");
+        .env_remove("http_proxy")
+        .env_remove("https_proxy")
+        .env_remove("all_proxy")
+        .env_remove("PAGER")
+        .env_remove("MANPAGER")
+        .env_remove("BROWSER");
 }
 
-/// Outcome of one enveloped spawn.
+/// Sticky process-lifetime counts of helpers whose termination was NOT
+/// proven (RSF-FALLBACK-HELPER-SECURITY(4, 6)): stuck readers past the
+/// join grace, or a failed group kill leaving liveness unknown. Never
+/// decremented — leaked charges stay visible until process exit.
+static HELPER_STUCK: AtomicUsize = AtomicUsize::new(0);
+static HELPER_UNKNOWN: AtomicUsize = AtomicUsize::new(0);
+
+/// Record a helper with readers stuck past the join grace (a descendant
+/// outlived the group kill — or the kill was skipped after reap — and
+/// still holds a pipe).
+fn record_stuck_helper() {
+    HELPER_STUCK.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record a helper whose group kill failed (liveness unknown).
+fn record_unknown_helper() {
+    HELPER_UNKNOWN.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Unified helper tally (RSF-FALLBACK-HELPER-SECURITY(6)):
+/// [`HELPER_LEDGER`](crate::scheduler::admission::HELPER_LEDGER) live
+/// count plus sticky stuck/unknown evidence. The ledger is the source of
+/// truth — owner-side counters never see these spawns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HelperTelemetry {
+    /// Currently live (charged) helper spawns.
+    pub live: usize,
+    /// Process-lifetime helpers with stuck readers (termination unproven).
+    pub stuck: usize,
+    /// Process-lifetime helpers with failed group kills (liveness unknown).
+    pub unknown: usize,
+    /// Ledger cap (mirrors `HELPER_LEDGER_CAP`).
+    pub cap: usize,
+}
+
+/// Read the unified helper tally for telemetry.
+pub fn helper_telemetry() -> HelperTelemetry {
+    HelperTelemetry {
+        live: crate::scheduler::admission::HELPER_LEDGER.live(),
+        stuck: HELPER_STUCK.load(Ordering::Relaxed),
+        unknown: HELPER_UNKNOWN.load(Ordering::Relaxed),
+        cap: crate::scheduler::admission::HELPER_LEDGER_CAP,
+    }
+}
+
+/// One charged ledger slot; dropping releases it.
+struct HelperPermit;
+
+impl Drop for HelperPermit {
+    fn drop(&mut self) {
+        crate::scheduler::admission::HELPER_LEDGER.release();
+    }
+}
+
+/// Keep a leaked helper charged: when termination is unproven (stuck
+/// readers, unknown kill), forget the ledger permit instead of releasing
+/// it — the slot stays occupied until process exit (3, 4).
+fn leak_charge_if_unproven(permit: &mut Option<HelperPermit>, report: &CleanupReport) {
+    if !report.termination_unproven() {
+        return;
+    }
+    if let Some(held) = permit.take() {
+        std::mem::forget(held);
+    }
+}
+
+/// Outcome of one enveloped spawn. Opaque outside the crate: external
+/// callers match on the `Err` side; readers live in this module.
 #[derive(Debug)]
-struct SpawnOutcome {
+pub struct SpawnOutcome {
     status: std::process::ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     truncated: bool,
+}
+
+/// Spawn `cmd` with stdin nulled and enforce the shared envelope (see
+/// [`spawn_enveloped_cancel`]), using the thread-scoped wait token (or a
+/// never-cancelling token outside [`with_wait_cancel`]).
+pub fn spawn_enveloped(
+    cmd: &mut Command,
+    capture_stderr: bool,
+    timeout: Duration,
+    cap_bytes: u64,
+) -> Result<SpawnOutcome, String> {
+    spawn_enveloped_cancel(
+        cmd,
+        capture_stderr,
+        timeout,
+        cap_bytes,
+        &current_wait_cancel(),
+    )
 }
 
 /// Spawn `cmd` with stdin nulled and enforce the shared envelope: a
@@ -500,12 +969,66 @@ struct SpawnOutcome {
 /// output). Stdout is always captured; stderr only when `capture_stderr`
 /// (otherwise it is discarded, never inherited). Reader threads keep a
 /// verbose stderr from wedging stdout.
-fn spawn_enveloped(
+///
+/// Every wait polls `cancel`: a fired token terminates the helper and
+/// fails loudly (group-kill, skipped once the child is reaped and its
+/// pgid may be reused). Past the child exit, reader drains are bounded by
+/// [`POST_EXIT_DRAIN_TIMEOUT`] (a descendant-held pipe is an explicit
+/// incomplete gap, never a hang). Timeout, cap, cancel, error, and drain
+/// paths all terminate through [`cleanup_child`] (group-kill unless the
+/// child is already reaped — the drain paths skip the kill, their pgid
+/// may be reused — plus reap and grace-join); helpers whose termination
+/// stays unproven keep their ledger charge and are recorded stuck/unknown.
+pub fn spawn_enveloped_cancel(
     cmd: &mut Command,
     capture_stderr: bool,
     timeout: Duration,
     cap_bytes: u64,
+    cancel: &WaitCancel,
 ) -> Result<SpawnOutcome, String> {
+    // Process-group isolation (PATH-GIT-04/XSEC-07): the child leads a
+    // fresh group so timeout kills reach descendants too (no orphaned
+    // grandchildren holding pipes or the volume busy). A setpgid failure
+    // aborts the spawn: silently joining the parent's group would let a
+    // group kill hit our own process group.
+    #[cfg(unix)]
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(cmd, || {
+            // SAFETY: setpgid(0, 0) is async-signal-safe; no locks, no
+            // allocation. Failure aborts the spawn via the Err return.
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    // Helper accounting (SR-STATE-02): installed-git spawns run below the
+    // owner's Admission handle, so they charge the process-wide ledger at
+    // this choke point instead. The bounded wait absorbs transient
+    // contention; past it the spawn is refused loudly, never queued
+    // without bound. Live children never exceed the cap.
+    let ledger = &crate::scheduler::admission::HELPER_LEDGER;
+    let acquire_until = Instant::now() + crate::scheduler::admission::HELPER_LEDGER_WAIT;
+    while !ledger.try_acquire() {
+        if cancel.cancelled() {
+            return Err(String::from(
+                "cancelled by task token (SIGINT/deadline) while waiting for a helper-ledger slot",
+            ));
+        }
+        if Instant::now() >= acquire_until {
+            return Err(format!(
+                "helper ledger: {} live helpers (cap {}); spawn refused, no slot freed",
+                ledger.live(),
+                ledger.cap()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // RAII release: every return path below frees the ledger slot —
+    // unless a leak path proves non-termination and forgets the permit
+    // instead: leaked helpers stay charged until termination is proven.
+    let mut helper_permit: Option<HelperPermit> = Some(HelperPermit);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(if capture_stderr {
@@ -528,16 +1051,46 @@ fn spawn_enveloped(
     let mut early_stdout: Option<(Vec<u8>, bool)> = None;
     let mut early_stderr: Option<(Vec<u8>, bool)> = None;
     let status = loop {
-        match child.try_wait().map_err(|e| format!("wait failed: {e}"))? {
-            Some(status) => break status,
-            None => {
+        if cancel.cancelled() {
+            let report = cleanup_child(
+                &mut child,
+                &mut stdout_thread,
+                &mut stderr_thread,
+                cap_bytes,
+                false, // unreaped: try_wait never returned Some, pid reserved
+            );
+            leak_charge_if_unproven(&mut helper_permit, &report);
+            return Err(format!(
+                "cancelled by task token (SIGINT/deadline); {}",
+                report.notes
+            ));
+        }
+        match child.try_wait() {
+            Err(e) => {
+                // Error paths terminate through the same cleanup: a
+                // failed wait must still kill, join, and account.
+                let report = cleanup_child(
+                    &mut child,
+                    &mut stdout_thread,
+                    &mut stderr_thread,
+                    cap_bytes,
+                    false, // unreaped: a failed wait reaps nothing
+                );
+                leak_charge_if_unproven(&mut helper_permit, &report);
+                return Err(format!("wait failed: {e}; {}", report.notes));
+            }
+            Ok(Some(status)) => break status,
+            Ok(None) => {
                 if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    // Reader threads are detached on timeout: joining
-                    // could wedge on a pipe a grandchild inherited. They
-                    // own their buffers and exit at EOF.
-                    return Err(format!("timed out after {timeout:?}; child killed"));
+                    let report = cleanup_child(
+                        &mut child,
+                        &mut stdout_thread,
+                        &mut stderr_thread,
+                        cap_bytes,
+                        false, // unreaped: try_wait returned None, pid reserved
+                    );
+                    leak_charge_if_unproven(&mut helper_permit, &report);
+                    return Err(format!("timed out after {timeout:?}; {}", report.notes));
                 }
                 // Prompt over-cap kill: a finished reader with the child
                 // still alive means the child is wedged writing past the
@@ -556,10 +1109,28 @@ fn spawn_enveloped(
                     early_stderr = Some((err, trunc));
                 }
                 if cap_hit {
-                    let _ = child.kill();
-                    let status = child.wait().map_err(|e| format!("wait failed: {e}"))?;
-                    // Unfinished readers are detached (see timeout path);
-                    // their content is moot — callers fail on `truncated`.
+                    // Over-cap output terminates through the same cleanup:
+                    // group-kill (a lone `child.kill` would orphan
+                    // grandchildren), reap, grace-join. Unfinished reader
+                    // content is moot — callers fail on `truncated` — but
+                    // stuck/unknown helpers still leak their charge loudly.
+                    let report = cleanup_child(
+                        &mut child,
+                        &mut stdout_thread,
+                        &mut stderr_thread,
+                        cap_bytes,
+                        false, // unreaped: try_wait returned None, pid reserved
+                    );
+                    leak_charge_if_unproven(&mut helper_permit, &report);
+                    if report.termination_unproven() {
+                        eprintln!(
+                            "repo-scan: fallback spawn: over-cap cleanup: {}",
+                            report.notes
+                        );
+                    }
+                    let Some(status) = report.status else {
+                        return Err(format!("over-cap output; {}", report.notes));
+                    };
                     let (stdout, _) = early_stdout.unwrap_or_default();
                     let (stderr, _) = early_stderr.unwrap_or_default();
                     return Ok(SpawnOutcome {
@@ -573,6 +1144,50 @@ fn spawn_enveloped(
             }
         }
     };
+    // Post-exit bounded drain: the child is gone (reaped by `try_wait`)
+    // but a descendant may still hold a pipe open — joining unbounded
+    // would hang forever. Past the drain budget the call fails as an
+    // explicit incomplete gap, never a hang and never silently partial
+    // bytes; the group kill is skipped (the reaped pgid may be reused),
+    // so surviving holders detach loudly past the grace with the charge
+    // kept.
+    let drain_until = Instant::now() + POST_EXIT_DRAIN_TIMEOUT;
+    loop {
+        let readers_pending = stdout_thread.as_ref().is_some_and(|h| !h.is_finished())
+            || stderr_thread.as_ref().is_some_and(|h| !h.is_finished());
+        if !readers_pending {
+            break;
+        }
+        if cancel.cancelled() {
+            let report = cleanup_child(
+                &mut child,
+                &mut stdout_thread,
+                &mut stderr_thread,
+                cap_bytes,
+                true, // reaped by try_wait: skip the group kill, pgid may be reused
+            );
+            leak_charge_if_unproven(&mut helper_permit, &report);
+            return Err(format!(
+                "cancelled during post-exit drain; {}",
+                report.notes
+            ));
+        }
+        if Instant::now() >= drain_until {
+            let report = cleanup_child(
+                &mut child,
+                &mut stdout_thread,
+                &mut stderr_thread,
+                cap_bytes,
+                true, // reaped by try_wait: skip the group kill, pgid may be reused
+            );
+            leak_charge_if_unproven(&mut helper_permit, &report);
+            return Err(format!(
+                "incomplete: post-exit reader drain timed out after {POST_EXIT_DRAIN_TIMEOUT:?} (descendant-held pipe?); {}",
+                report.notes
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let (stdout, stdout_truncated) = match early_stdout {
         Some(pair) => pair,
         None => join_reader(stdout_thread, cap_bytes, "stdout")?,
@@ -587,6 +1202,188 @@ fn spawn_enveloped(
         stderr,
         truncated: stdout_truncated || stderr_truncated,
     })
+}
+
+/// Report from [`cleanup_child`]: what termination did, and whether
+/// any helper's termination stays unproven (leaked charge plus sticky
+/// stuck/unknown counters).
+struct CleanupReport {
+    notes: String,
+    stuck: bool,
+    unknown: bool,
+    status: Option<std::process::ExitStatus>,
+}
+
+impl CleanupReport {
+    /// True when some helper may still be alive: readers stuck past the
+    /// grace (a descendant escaped the group) or a failed group kill.
+    fn termination_unproven(&self) -> bool {
+        self.stuck || self.unknown
+    }
+}
+
+/// Centralized termination + join + accounting
+/// (RSF-FALLBACK-HELPER-SECURITY(3)): the timeout, cap, cancel, error,
+/// and drain paths ALL land here — group-kill (never a lone
+/// `child.kill`, which orphans grandchildren), reap, grace-join readers.
+/// The drain paths pass `child_reaped`: their child was already reaped
+/// by `try_wait`, so the group kill is skipped (the pgid may be reused
+/// by an unrelated group) and the wait is not retried — readers still
+/// grace-join, stuck ones detach loudly. Stuck readers or a failed group
+/// kill mark termination unproven: the caller keeps the ledger charge
+/// (never releases a maybe-live helper) and the sticky counters preserve
+/// the state for telemetry. Every stage is loud: a lost kill or a stuck
+/// reader must never read as clean.
+#[allow(clippy::type_complexity)]
+fn cleanup_child(
+    child: &mut std::process::Child,
+    stdout_thread: &mut Option<std::thread::JoinHandle<(std::io::Result<usize>, Vec<u8>)>>,
+    stderr_thread: &mut Option<std::thread::JoinHandle<(std::io::Result<usize>, Vec<u8>)>>,
+    cap_bytes: u64,
+    child_reaped: bool,
+) -> CleanupReport {
+    let (kill_note, unknown) = terminate_child_group(child, child_reaped);
+    // A reaped child must not be waited again: the second `wait` can
+    // only fail (ECHILD) and would misread as a lost reap.
+    let (reap_note, status) = if child_reaped {
+        (String::from("already reaped"), None)
+    } else {
+        match child.wait() {
+            Ok(status) => (String::from("reaped"), Some(status)),
+            Err(e) => (format!("wait FAILED: {e}"), None),
+        }
+    };
+    // Join readers with a grace: pipes EOF once the group is dead. A
+    // descendant that escaped the group can still hold a pipe, so a
+    // stuck reader is reported loudly instead of hanging.
+    let join_until = Instant::now() + READER_JOIN_GRACE;
+    while Instant::now() < join_until
+        && (stdout_thread.as_ref().is_some_and(|h| !h.is_finished())
+            || stderr_thread.as_ref().is_some_and(|h| !h.is_finished()))
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut reader_notes = Vec::new();
+    let mut stuck = false;
+    for (name, thread) in [
+        ("stdout", stdout_thread.take()),
+        ("stderr", stderr_thread.take()),
+    ] {
+        match thread {
+            None => {}
+            Some(handle) if handle.is_finished() => {
+                match join_reader(Some(handle), cap_bytes, name) {
+                    Ok(_) => reader_notes.push(format!("{name} joined")),
+                    Err(e) => {
+                        reader_notes.push(format!("{name} join FAILED: {e}"));
+                    }
+                }
+            }
+            Some(handle) => {
+                // Last resort, loud: the thread owns its buffer and exits
+                // at EOF; dropping the handle detaches it.
+                drop(handle);
+                stuck = true;
+                record_stuck_helper();
+                reader_notes.push(format!("{name} STUCK past grace (detached, loud)"));
+            }
+        }
+    }
+    if reader_notes.is_empty() {
+        reader_notes.push(String::from("already joined"));
+    }
+    CleanupReport {
+        notes: format!(
+            "{}; {}; readers: {}",
+            kill_note,
+            reap_note,
+            reader_notes.join(", ")
+        ),
+        stuck,
+        unknown,
+        status,
+    }
+}
+
+/// SIGKILL the child's process group so descendants die with it.
+/// Returns the loud note plus whether helper liveness stays UNKNOWN: a
+/// failed group kill (anything but already-gone) preserves the
+/// unknown-helper state and keeps the charge (4).
+#[cfg(unix)]
+fn terminate_child_group(child: &mut std::process::Child, child_reaped: bool) -> (String, bool) {
+    // A reaped child owns no pid anymore: `try_wait` reaps on `Ok(Some)`,
+    // so past the wait loop the pgid may already address an unrelated
+    // reused group — killpg must be skipped, never fired (a stale kill
+    // would SIGKILL strangers). In-group pipe holders then survive; their
+    // readers detach loudly past the grace and the charge stays kept.
+    if child_reaped {
+        return (
+            format!(
+                "group kill skipped (child already reaped; pgid {} may be reused)",
+                child.id()
+            ),
+            false,
+        );
+    }
+    // SAFETY: the child is unreaped here, so its pid is still reserved
+    // for us and cannot be recycled; pre_exec made it a group leader, so
+    // killpg cannot reach our own process group. If the group is gone the
+    // kill reports ESRCH (benign: the child exited between the last wait
+    // and the kill).
+    let pgid = child.id() as libc::pid_t;
+    if unsafe { libc::killpg(pgid, libc::SIGKILL) } == 0 {
+        (String::from("group killed"), false)
+    } else {
+        let errno = std::io::Error::last_os_error();
+        let (note, unknown) = classify_killpg_error(errno.raw_os_error(), pgid, &errno);
+        if unknown {
+            record_unknown_helper();
+        }
+        (note, unknown)
+    }
+}
+
+/// Kill one child (non-unix: no process groups). A failed kill leaves
+/// liveness unknown: preserved plus loud, charge kept.
+#[cfg(not(unix))]
+fn terminate_child_group(child: &mut std::process::Child, child_reaped: bool) -> (String, bool) {
+    // Mirrors the unix arm: no kill after reap (the handle is spent; a
+    // kill here could only fail loudly and misrecord UNKNOWN).
+    if child_reaped {
+        return (String::from("kill skipped (child already reaped)"), false);
+    }
+    match child.kill() {
+        Ok(()) => (String::from("child killed"), false),
+        Err(e) => {
+            record_unknown_helper();
+            (
+                format!("kill FAILED: {e} (UNKNOWN-HELPER: liveness unproven, charge kept)"),
+                true,
+            )
+        }
+    }
+}
+
+/// Pure classification of a failed `killpg` (unit-tested):
+/// ESRCH is benign (the group was already gone — the child exited
+/// between the last wait and the kill); anything else fails closed to
+/// UNKNOWN-helper (loud note, sticky counter, kept charge).
+#[cfg(unix)]
+fn classify_killpg_error(
+    raw_errno: Option<i32>,
+    pgid: libc::pid_t,
+    errno: &std::io::Error,
+) -> (String, bool) {
+    if raw_errno == Some(libc::ESRCH) {
+        (String::from("group already gone"), false)
+    } else {
+        (
+            format!(
+                "killpg({pgid}) FAILED: {errno} (UNKNOWN-HELPER: liveness unproven, charge kept)"
+            ),
+            true,
+        )
+    }
 }
 
 /// Read one child pipe up to `cap_bytes + 1` (the extra byte is the
@@ -631,56 +1428,85 @@ fn join_reader(
 /// validating options at all — bogus options fail identically) outside
 /// a repo, so ambient-CWD probing would misread real git as incapable
 /// whenever the process starts outside a repository. `LC_ALL=C` pins
-/// English diagnostics so error matching is locale-independent. Pagers
-/// are neutralized and `-c help.format=man` forbids browser renderers
-/// (a `help.format=web` config would otherwise open a browser); both
+/// English diagnostics so error matching is locale-independent. Both
 /// spawns run inside the shared envelope (timeout+kill, capture cap,
-/// sanitized config environment).
+/// allowlisted environment, scoped wait token) with the same
+/// repo-selected-execution neutralization as the normal spawns. A
+/// tempdir failure fails closed (PATH-GIT-05): the
+/// probe never runs in the ambient CWD, and `init` uses an empty
+/// probe-owned template so file-based `init.templateDir` config cannot
+/// trigger arbitrary template reads or copies.
 fn probe_porcelain_v2(path: &Path) -> bool {
-    let repo = tempfile::tempdir().ok();
-    if let Some(dir) = repo.as_ref() {
-        // Best effort: fixtures answer `init` from their canned script
-        // (outcome ignored — the probe argv below is the verdict either
-        // way); real git always inits an empty temp dir.
-        let mut init = Command::new(path);
-        init.arg("init")
-            .arg("-q")
-            .current_dir(dir.path())
-            .env("LC_ALL", "C");
-        sanitize_git_env(&mut init);
-        let _ = spawn_enveloped(&mut init, false, GIT_SPAWN_TIMEOUT, MAX_CAPTURE_BYTES);
+    let repo = match tempfile::tempdir() {
+        Ok(dir) => dir,
+        Err(_) => return false,
+    };
+    let empty_template = repo.path().join("probe-template");
+    if std::fs::create_dir(&empty_template).is_err() {
+        return false;
+    }
+    // Best effort: fixtures answer `init` from their canned script
+    // (outcome ignored — the probe argv below is the verdict either
+    // way); real git always inits an empty temp dir.
+    let mut init = Command::new(path);
+    sanitize_git_env(&mut init);
+    apply_repo_neutralization(&mut init);
+    init.arg("init")
+        .arg("-q")
+        .arg(format!("--template={}", empty_template.display()))
+        .current_dir(repo.path())
+        .env("LC_ALL", "C");
+    // Best effort, but loud (XSEC-07): an init failure is noted so a
+    // fail-closed "incapable" verdict below stays explainable.
+    if let Err(e) = spawn_enveloped(&mut init, false, GIT_SPAWN_TIMEOUT, MAX_CAPTURE_BYTES) {
+        eprintln!("repo-scan: git probe: temp-repo init failed (best effort): {e}");
     }
     let mut probe = Command::new(path);
+    sanitize_git_env(&mut probe);
+    apply_repo_neutralization(&mut probe);
     probe
-        .arg("-c")
-        .arg("help.format=man")
         .arg("status")
         .arg("--porcelain=v2")
         .arg("--help")
+        .current_dir(repo.path())
         .env("LC_ALL", "C")
         .env("GIT_PAGER", "cat")
         .env("PAGER", "cat")
         .env("MANPAGER", "cat");
-    sanitize_git_env(&mut probe);
-    if let Some(dir) = repo.as_ref() {
-        probe.current_dir(dir.path());
-    }
     match spawn_enveloped(&mut probe, true, GIT_SPAWN_TIMEOUT, MAX_CAPTURE_BYTES) {
         Ok(outcome) => {
             if outcome.truncated {
+                eprintln!(
+                    "repo-scan: git probe: porcelain-v2 help output past capture cap; incapable"
+                );
                 return false;
             }
             if !matches!(outcome.status.code(), Some(0) | Some(129)) {
+                eprintln!(
+                    "repo-scan: git probe: porcelain-v2 help exited {:?}; incapable",
+                    outcome.status.code()
+                );
                 return false;
             }
             let mut text = String::from_utf8_lossy(&outcome.stdout).into_owned();
             text.push_str(&String::from_utf8_lossy(&outcome.stderr));
             let lower = text.to_ascii_lowercase();
-            lower.contains("porcelain")
+            let capable = lower.contains("porcelain")
                 && !lower.contains("unknown option")
-                && !lower.contains("unsupported porcelain")
+                && !lower.contains("unsupported porcelain");
+            if !capable {
+                eprintln!(
+                    "repo-scan: git probe: porcelain-v2 help text missing the feature; incapable"
+                );
+            }
+            capable
         }
-        Err(_) => false,
+        Err(e) => {
+            // Loud fail-closed (XSEC-07): timeouts, kills, and ledger
+            // refusals surface here instead of a silent `false`.
+            eprintln!("repo-scan: git probe: porcelain-v2 help spawn failed: {e}; incapable");
+            false
+        }
     }
 }
 
@@ -717,6 +1543,19 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    /// Serializes the spawn-charging tests: installed-git spawns share
+    /// the process-wide cap-4 helper ledger, and parallel tests on a
+    /// loaded machine exhaust the 1s bounded wait, failing probes that
+    /// would pass in isolation. Mirrors `spawn_serial` in the
+    /// integration tests.
+    static SPAWN_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn spawn_serial() -> std::sync::MutexGuard<'static, ()> {
+        SPAWN_SERIAL
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
     /// Write an executable `git` fixture: `--version` prints `banner`,
     /// every other argv runs `body`.
     fn git_fixture(dir: &Path, name: &str, banner: &str, body: &str) -> PathBuf {
@@ -735,6 +1574,7 @@ mod tests {
 
     #[test]
     fn envelope_kills_past_timeout() {
+        let _serial = spawn_serial();
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c").arg("exec sleep 5");
         let err = spawn_enveloped(&mut cmd, false, Duration::from_millis(100), 1024)
@@ -744,6 +1584,7 @@ mod tests {
 
     #[test]
     fn envelope_caps_captured_bytes() {
+        let _serial = spawn_serial();
         let mut cmd = Command::new("head");
         cmd.args(["-c", "4096", "/dev/zero"]);
         let outcome =
@@ -754,6 +1595,7 @@ mod tests {
 
     #[test]
     fn sanitize_strips_config_redirects() {
+        let _serial = spawn_serial();
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c")
             .arg("echo \"global=${GIT_CONFIG_GLOBAL-unset} count=${GIT_CONFIG_COUNT-unset}\"");
@@ -769,6 +1611,7 @@ mod tests {
 
     #[test]
     fn discover_records_path_selection() {
+        let _serial = spawn_serial();
         let dir = tempfile::tempdir().expect("tempdir");
         let git = git_fixture(dir.path(), "git", "git version 2.47.1", CAPABLE_BODY);
         let path_var = dir.path().to_str().expect("utf8").to_string();
@@ -779,6 +1622,7 @@ mod tests {
 
     #[test]
     fn discover_prefers_trusted_paths() {
+        let _serial = spawn_serial();
         let dir = tempfile::tempdir().expect("tempdir");
         let explicit = git_fixture(
             dir.path(),
@@ -814,6 +1658,7 @@ mod tests {
 
     #[test]
     fn probe_reports_explicit_source() {
+        let _serial = spawn_serial();
         let dir = tempfile::tempdir().expect("tempdir");
         let git = git_fixture(dir.path(), "git", "git version 2.47.1", CAPABLE_BODY);
         let found = FallbackGit::probe(&git).expect("probe");
@@ -822,6 +1667,7 @@ mod tests {
 
     #[test]
     fn feature_probe_rejects_unexpected_status() {
+        let _serial = spawn_serial();
         let dir = tempfile::tempdir().expect("tempdir");
         let marker = "echo \" --porcelain[<version>]  machine-readable output\"";
         // Stock git (0) and Apple Git (129) pass with the marker ...
@@ -850,5 +1696,165 @@ mod tests {
                 "exit {code} with the marker must fail"
             );
         }
+    }
+
+    #[test]
+    fn killpg_classification_fails_closed() {
+        let gone = std::io::Error::from_raw_os_error(libc::ESRCH);
+        assert_eq!(
+            classify_killpg_error(Some(libc::ESRCH), 4242, &gone),
+            (String::from("group already gone"), false)
+        );
+        for raw in [Some(libc::EPERM), Some(libc::EINVAL), None] {
+            let errno = raw
+                .map(std::io::Error::from_raw_os_error)
+                .unwrap_or_else(|| std::io::Error::other("no errno"));
+            let (note, unknown) = classify_killpg_error(raw, 4242, &errno);
+            assert!(unknown, "{raw:?} must classify unknown");
+            assert!(
+                note.contains("FAILED") && note.contains("UNKNOWN-HELPER"),
+                "unknown kill must be loud: {note}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_filter_key_matching() {
+        for key in [
+            "filter.lfs.clean",
+            "filter.evil.smudge",
+            "filter.proc.process",
+            "FILTER.UPPER.CLEAN",
+        ] {
+            assert!(
+                FallbackGit::is_exec_filter_key(&key.to_ascii_lowercase()),
+                "{key} must match"
+            );
+        }
+        for key in [
+            "filter.lfs.required",
+            "core.fsmonitor",
+            "core.sshcommand",
+            "diff.text.command",
+            "merge.custom.driver",
+            "credential.helper",
+            "filter",
+        ] {
+            assert!(
+                !FallbackGit::is_exec_filter_key(key),
+                "{key} must not match"
+            );
+        }
+    }
+
+    #[test]
+    fn wait_cancel_flag_and_deadline() {
+        assert!(!WaitCancel::never().cancelled());
+        let past = WaitCancel::new(|| false, Some(Instant::now() - Duration::from_secs(1)));
+        assert!(past.cancelled(), "a past deadline cancels");
+        let future = WaitCancel::new(|| false, Some(Instant::now() + Duration::from_secs(60)));
+        assert!(!future.cancelled(), "a future deadline waits");
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let moved = Arc::clone(&flag);
+        let token = WaitCancel::new(
+            move || moved.load(std::sync::atomic::Ordering::SeqCst),
+            None,
+        );
+        assert!(!token.cancelled());
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(token.cancelled(), "a fired flag cancels");
+    }
+
+    #[test]
+    fn helper_telemetry_reports_ledger_and_stickies() {
+        let _serial = spawn_serial();
+        let before = helper_telemetry();
+        assert_eq!(
+            before.live,
+            crate::scheduler::admission::HELPER_LEDGER.live(),
+            "telemetry live must read the ledger"
+        );
+        record_stuck_helper();
+        record_unknown_helper();
+        let after = helper_telemetry();
+        assert_eq!(after.stuck, before.stuck + 1);
+        assert_eq!(after.unknown, before.unknown + 1);
+        assert_eq!(after.cap, crate::scheduler::admission::HELPER_LEDGER_CAP);
+    }
+
+    #[test]
+    fn path_entries_reject_writable_dirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(path_entry_trusted(dir.path()), "0700 tempdir trusted");
+        let open = dir.path().join("open");
+        std::fs::create_dir(&open).expect("mkdir");
+        let mut perms = std::fs::metadata(&open).expect("meta").permissions();
+        perms.set_mode(0o777);
+        std::fs::set_permissions(&open, perms).expect("chmod");
+        assert!(!path_entry_trusted(&open), "0777 entry refused");
+        assert!(!path_entry_trusted(Path::new("")), "empty refused");
+        assert!(
+            !path_entry_trusted(Path::new("relative/dir")),
+            "relative refused"
+        );
+    }
+
+    /// PGID-reuse friendly-fire: `try_wait` reaps on `Ok(Some)`, so the
+    /// drain paths clean up an already-reaped child whose pgid may be
+    /// reused — the group kill must be skipped (loudly), with no failed
+    /// wait and no unknown-helper recorded. The unreaped arm still kills.
+    #[test]
+    fn reaped_child_skips_group_kill() {
+        let _serial = spawn_serial();
+        let unknown_before = helper_telemetry().unknown;
+        // Reaped arm: spawn, reap, then clean up — no killpg, no wait.
+        let mut reaped = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn");
+        assert!(reaped.wait().expect("reap").success());
+        let (note, unknown) = terminate_child_group(&mut reaped, true);
+        assert!(note.contains("skipped"), "{note}");
+        assert!(note.contains("reaped"), "{note}");
+        assert!(!unknown, "a skipped kill is proven, never unknown");
+        let mut stdout_thread = None;
+        let mut stderr_thread = None;
+        let report = cleanup_child(
+            &mut reaped,
+            &mut stdout_thread,
+            &mut stderr_thread,
+            1024,
+            true,
+        );
+        assert!(report.notes.contains("skipped"), "{}", report.notes);
+        assert!(report.notes.contains("already reaped"), "{}", report.notes);
+        assert!(!report.notes.contains("FAILED"), "{}", report.notes);
+        assert!(!report.termination_unproven());
+        assert!(report.status.is_none());
+        assert_eq!(
+            helper_telemetry().unknown,
+            unknown_before,
+            "skipped kills record no unknown"
+        );
+        // Unreaped arm: a live group leader is still group-killed (own
+        // group via pre_exec, exactly like the production spawns).
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("exec sleep 30");
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let mut live = cmd.spawn().expect("spawn");
+        let (note, unknown) = terminate_child_group(&mut live, false);
+        assert_eq!(note, "group killed");
+        assert!(!unknown);
+        let status = live.wait().expect("reap after kill");
+        assert!(!status.success(), "SIGKILL must not read as success");
     }
 }

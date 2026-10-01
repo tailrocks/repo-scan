@@ -676,7 +676,7 @@ fn git_wrapper(dir: &std::path::Path, name: &str, banner: &str, probe_body: &str
          fi\n\
          {probe_body}\n"
     );
-    std::fs::write(&path, script).expect("write wrapper");
+    repo_scan::privacy::private_write_0600(&path, script.as_bytes()).expect("write wrapper");
     let mut perms = std::fs::metadata(&path).expect("meta").permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&path, perms).expect("chmod");

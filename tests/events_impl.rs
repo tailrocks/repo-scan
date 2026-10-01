@@ -478,9 +478,9 @@ fn own_bookkeeping_exact_identity_never_parent_exclusion() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let state_file = tmp.path().join("catalog.db");
-    std::fs::write(&state_file, b"state").unwrap();
+    repo_scan::privacy::private_write_0600(&state_file, b"state").unwrap();
     let sibling = tmp.path().join("other.db");
-    std::fs::write(&sibling, b"other").unwrap();
+    repo_scan::privacy::private_write_0600(&sibling, b"other").unwrap();
 
     let mut own = OwnBookkeeping::new();
     let id = own.register(&state_file).expect("register");
@@ -495,9 +495,9 @@ fn own_bookkeeping_exact_identity_never_parent_exclusion() {
 
     // Registering a directory never suppresses its children.
     let subdir = tmp.path().join("payload");
-    std::fs::create_dir(&subdir).unwrap();
+    repo_scan::privacy::private_dir_0700(&subdir).unwrap();
     let child = subdir.join("wal");
-    std::fs::write(&child, b"wal").unwrap();
+    repo_scan::privacy::private_write_0600(&child, b"wal").unwrap();
     own.register(&subdir).expect("register dir");
     assert_eq!(own.classify(&child), BookkeepingClass::Foreign);
 
@@ -521,7 +521,7 @@ fn own_bookkeeping_exact_identity_never_parent_exclusion() {
 fn ingest_suppresses_only_exact_own_files() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let state_file = tmp.path().join("catalog.db");
-    std::fs::write(&state_file, b"state").unwrap();
+    repo_scan::privacy::private_write_0600(&state_file, b"state").unwrap();
 
     let mut r = Reconciler::new(MemoryCursorJournal::new());
     r.note_stream_opened(
@@ -870,4 +870,62 @@ fn live_stream_open_pins_boundary() {
     );
     assert!(!decision.history_invalid());
     assert_eq!(r.boundary(&first.volume.0), Some(boundary));
+}
+
+/// Native macOS evidence: stream teardown never races an in-flight
+/// dispatch-queue callback. `FSEventStreamStop` is asynchronous with
+/// respect to the queue, so teardown must barrier-drain the queue
+/// before freeing the callback context; without the barrier, dropping
+/// a stream while the volume delivers events is a use-after-free
+/// (SIGSEGV observed under parallel-test load, faulting inside
+/// `fsevents_callback`). Rapid open/poll/drop cycles against a
+/// churning volume exercise that window; the test passes iff every
+/// teardown survives. Linux expectation: compiled out.
+#[cfg(target_os = "macos")]
+#[test]
+fn live_stream_teardown_under_callback_load() {
+    use repo_scan::platform::macos::{FsEventsSource, MacOsMountTable};
+    use repo_scan::platform::MountTable;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    // Churn on the watched volume so callbacks are plausibly in flight
+    // at teardown: cover the tempdir with its longest-prefix mount.
+    // Best-effort cover — even an idle volume still exercises the
+    // open/barrier-drop path every iteration.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let churn_root = dir.path().canonicalize().expect("canonical churn");
+    let mounts = MacOsMountTable.mounts().expect("mounts");
+    let mount_idx = mounts
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| churn_root.starts_with(&m.mount_path))
+        .max_by_key(|(_, m)| m.mount_path.as_os_str().len())
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let mount = mounts.into_iter().nth(mount_idx).expect("one mount");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer_stop = Arc::clone(&stop);
+    let writer_dir = dir.path().to_path_buf();
+    let writer = std::thread::spawn(move || {
+        let mut i = 0u64;
+        while !writer_stop.load(Ordering::Relaxed) {
+            let p = writer_dir.join(format!("churn-{i}.tmp"));
+            let _ = std::fs::write(&p, b"x");
+            let _ = std::fs::remove_file(&p);
+            i = i.wrapping_add(1);
+        }
+    });
+    let mut source = FsEventsSource;
+    for _ in 0..25 {
+        let (_boundary, mut iter) = source.open_stream(&mount.volume, None).expect("open");
+        // Poll while the writer churns so callbacks land mid-lifetime.
+        for _ in 0..4 {
+            let _ = iter.next_batch().expect("drain");
+        }
+        drop(iter);
+    }
+    stop.store(true, Ordering::Relaxed);
+    writer.join().expect("writer");
 }

@@ -40,14 +40,14 @@ fn swapped_probe_path_parks_and_persists_nothing() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().join("root");
         let outside = tmp.path().join("outside");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
+        repo_scan::privacy::private_dir_0700(&root).unwrap();
+        repo_scan::privacy::private_dir_0700(&outside).unwrap();
         // Out-of-scope repo with real observations to leak: without the
         // fence this read would persist instance + checkout + ref rows.
         let foreign = fixture::normal_clone(&outside, "foreign");
         // In-scope scheduled path: a plain directory at schedule time.
         let victim = root.join("victim");
-        std::fs::create_dir_all(&victim).unwrap();
+        repo_scan::privacy::private_dir_0700(&victim).unwrap();
 
         let db = tmp.path().join("probe.db");
         let store = TursoStore::open(&db).await.expect("open");
@@ -121,7 +121,7 @@ fn swapped_probe_path_parks_and_persists_nothing() {
         // directory, confirm the pin verifies, swap it, confirm refusal.
         let fence = ScopeFence::build(std::slice::from_ref(&root));
         let guarded: PathBuf = root.join("guarded");
-        std::fs::create_dir_all(&guarded).unwrap();
+        repo_scan::privacy::private_dir_0700(&guarded).unwrap();
         let pinned = match fence.open_pinned(&guarded).expect("pin") {
             FenceOpen::Dir(pinned) => pinned,
             FenceOpen::Symlink => panic!("guarded is not a link"),

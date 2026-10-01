@@ -37,9 +37,9 @@ fn publish_receipt_carries_sha256_and_byte_count() {
     );
     let dir = tempfile::tempdir().expect("tempdir");
     let state_dir = dir.path().join("state");
-    std::fs::create_dir_all(state_dir.join("payload")).expect("payload");
+    repo_scan::privacy::private_dir_0700(&state_dir.join("payload")).expect("payload");
     let staged = dir.path().join("staged.bin");
-    std::fs::write(&staged, b"abc").expect("write");
+    repo_scan::privacy::private_write_0600(&staged, b"abc").expect("write");
     let dest = dir.path().join("out.bin");
     let receipt = publish_staged(&staged, &dest, &state_dir).expect("publish");
     assert_eq!(receipt.bytes, 3);
@@ -59,11 +59,11 @@ fn publish_receipt_carries_sha256_and_byte_count() {
 fn publish_refuses_unrelated_file_and_leaves_no_sibling() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state_dir = dir.path().join("state");
-    std::fs::create_dir_all(state_dir.join("payload")).expect("payload");
+    repo_scan::privacy::private_dir_0700(&state_dir.join("payload")).expect("payload");
     let staged = dir.path().join("staged.bin");
-    std::fs::write(&staged, b"abc").expect("write");
+    repo_scan::privacy::private_write_0600(&staged, b"abc").expect("write");
     let unrelated = dir.path().join("notes.txt");
-    std::fs::write(&unrelated, "user data").expect("write");
+    repo_scan::privacy::private_write_0600(&unrelated, "user data".as_bytes()).expect("write");
     let err = publish_staged(&staged, &unrelated, &state_dir).expect_err("no-clobber");
     assert!(err.to_string().contains("no-clobber"), "{err}");
     assert_eq!(std::fs::read(&unrelated).expect("read"), b"user data");
@@ -77,9 +77,9 @@ fn publish_refuses_unrelated_file_and_leaves_no_sibling() {
 fn symlinked_staged_input_is_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state_dir = dir.path().join("state");
-    std::fs::create_dir_all(state_dir.join("payload")).expect("payload");
+    repo_scan::privacy::private_dir_0700(&state_dir.join("payload")).expect("payload");
     let target = dir.path().join("target.bin");
-    std::fs::write(&target, b"abc").expect("write");
+    repo_scan::privacy::private_write_0600(&target, b"abc").expect("write");
     let staged = dir.path().join("staged.bin");
     std::os::unix::fs::symlink(&target, &staged).expect("symlink");
     let err = BoundStaged::open(&staged).expect_err("symlink refused");
@@ -95,7 +95,7 @@ fn symlinked_staged_input_is_refused() {
 fn staged_reads_are_byte_capped() {
     let dir = tempfile::tempdir().expect("tempdir");
     let staged = dir.path().join("staged.bin");
-    std::fs::write(&staged, b"12345678").expect("write");
+    repo_scan::privacy::private_write_0600(&staged, b"12345678").expect("write");
     let err = BoundStaged::open_capped(&staged, 4).expect_err("over cap refused");
     assert!(err.to_string().contains("cap"), "{err}");
     let bound = BoundStaged::open_capped(&staged, 8).expect("at cap ok");
@@ -109,9 +109,9 @@ fn staged_reads_are_byte_capped() {
 fn failed_staging_is_quarantined() {
     let dir = tempfile::tempdir().expect("tempdir");
     let staging = dir.path().join("staging");
-    std::fs::create_dir_all(&staging).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&staging).expect("mkdir");
     let staged = staging.join(".staging-1.json");
-    std::fs::write(&staged, "bogus").expect("write");
+    repo_scan::privacy::private_write_0600(&staged, "bogus".as_bytes()).expect("write");
     quarantine_staging(&staged);
     assert!(!staged.exists(), "failed staging moved away");
     assert!(

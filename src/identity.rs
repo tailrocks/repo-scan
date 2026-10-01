@@ -182,51 +182,213 @@ pub fn classify_remotes<'a>(
     (verdict, evidence)
 }
 
+/// Fixed placeholder emitted when a URL cannot be represented without
+/// secret-spill risk (control characters, malformed authority smuggling).
+/// It carries no `://`, so it never re-enters URL handling as a credential
+/// shape and normalizes to `None` (fail closed).
+pub const REDACTED_URL: &str = "<redacted-url>";
+
+/// Split `scheme://rest`. Returns `(scheme_prefix, rest)`.
+fn split_scheme(url: &str) -> Option<(&str, &str)> {
+    let end = url.find("://")? + 3;
+    Some(url.split_at(end))
+}
+
+/// Length of the authority component of `rest` (the part after `://`):
+/// up to the first `/`, `?`, or `#`, whichever comes first.
+fn authority_len(rest: &str) -> usize {
+    rest.find(['/', '?', '#']).unwrap_or(rest.len())
+}
+
+/// True when `key` names secret-bearing material. Matching is over the
+/// lowercased (percent-decoded by callers where needed) key: exact match
+/// for short names, substring match for descriptive names. Over-matching
+/// only over-redacts a value, which is the safe direction.
+fn is_sensitive_key(lower_key: &str) -> bool {
+    const EXACT: &[&str] = &["key", "sig", "pin", "pwd", "otp", "pass"];
+    if EXACT.contains(&lower_key) {
+        return true;
+    }
+    const SUBSTR: &[&str] = &[
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "auth",
+        "credential",
+        "private",
+        "signature",
+        "session",
+        "bearer",
+        "apikey",
+        "api_key",
+        "access_key",
+        "secret_key",
+        "client_secret",
+        "passcode",
+    ];
+    SUBSTR.iter().any(|s| lower_key.contains(s))
+}
+
+/// Percent-decode `text` for detection purposes only (matching keys through
+/// `%XX` encoding). Malformed escapes are passed through literally.
+/// Byte-oriented so multibyte input can never panic slicing.
+fn percent_decode_for_match(text: &str) -> String {
+    fn hex_val(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push((hi * 16 + lo) as char);
+                i += 3;
+                continue;
+            }
+        }
+        // ASCII passes through exactly; non-ASCII bytes decode to the
+        // matching space lossy (they can never match an ASCII sensitive
+        // key, which is the only use of this output).
+        if bytes[i].is_ascii() {
+            out.push(bytes[i] as char);
+        } else {
+            out.push('\u{FFFD}');
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Value-redact sensitive `key=value` pairs inside one query/fragment
+/// section (`&`/`;` separated). Non-sensitive pairs pass through
+/// untouched; a sensitive key's value becomes [`REDACTED`].
+fn scrub_pairs(section: &str) -> String {
+    let mut out = String::with_capacity(section.len());
+    let mut rest = section;
+    // Split manually so the original separators are preserved byte for byte
+    // (a section with no sensitive keys round-trips unchanged).
+    loop {
+        let split = rest.find(['&', ';']);
+        let (pair, separator) = match split {
+            Some(i) => (&rest[..i], Some(rest.as_bytes()[i] as char)),
+            None => (rest, None),
+        };
+        match pair.split_once('=') {
+            Some((key, _)) => {
+                let match_key = percent_decode_for_match(key).to_lowercase();
+                if is_sensitive_key(&match_key) {
+                    out.push_str(key);
+                    out.push('=');
+                    out.push_str(REDACTED);
+                } else {
+                    out.push_str(pair);
+                }
+            }
+            None => out.push_str(pair),
+        }
+        match separator {
+            Some(sep) => {
+                out.push(sep);
+                rest = &rest[pair.len() + 1..];
+            }
+            None => return out,
+        }
+    }
+}
+
+/// Scrub the query/fragment of a URL tail (the part after the authority).
+/// Sensitive parameter values become [`REDACTED`]; path, structure, and
+/// non-sensitive parameters are preserved.
+fn scrub_query_fragment(tail: &str) -> String {
+    // Split off the fragment first (`#` may legally follow `?`).
+    let (before_frag, fragment) = match tail.split_once('#') {
+        Some((head, frag)) => (head, Some(frag)),
+        None => (tail, None),
+    };
+    let (path, query) = match before_frag.split_once('?') {
+        Some((head, query)) => (head, Some(query)),
+        None => (before_frag, None),
+    };
+    let mut out = String::with_capacity(tail.len());
+    out.push_str(path);
+    if let Some(query) = query {
+        out.push('?');
+        out.push_str(&scrub_pairs(query));
+    }
+    if let Some(fragment) = fragment {
+        out.push('#');
+        out.push_str(&scrub_pairs(fragment));
+    }
+    out
+}
+
 /// Strip embedded credentials from a remote URL for reports and logs.
 ///
 /// URL-form userinfo `user:pass@` becomes `user:<redacted>@`; a bare
 /// `token@` (no colon, the common token-as-username shape) becomes
-/// `<redacted>@`. Scp-like `user@host:path` carries no password field and
-/// is returned unchanged.
+/// `<redacted>@`. Sensitive query/fragment parameter values become
+/// `<redacted>` while structure is preserved. Scp-like `user@host:path`
+/// carries no password field and is returned unchanged. Inputs that
+/// cannot be represented safely (control characters, or an `@` past the
+/// authority that signals malformed smuggled userinfo such as
+/// `https://user:secret/ret@host/...`) collapse to [`REDACTED_URL`].
 pub fn redact_credentials(url: &str) -> String {
-    let scheme_end = match url.find("://") {
-        Some(i) => i + 3,
-        None => return url.to_string(),
+    let Some((scheme, rest)) = split_scheme(url) else {
+        return url.to_string();
     };
-    let (scheme, rest) = url.split_at(scheme_end);
-    let authority_end = rest.find('/').unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(authority_end);
+    if url.chars().any(|c| c.is_control()) {
+        return REDACTED_URL.to_string();
+    }
+    let end = authority_len(rest);
+    let (authority, tail) = rest.split_at(end);
+    // An `@` past the authority boundary is not a legal path character in
+    // practice; it signals malformed smuggled userinfo containing `/`.
+    // Fail closed rather than emit a half-parsed secret.
+    let path_part = tail.split(['?', '#']).next().unwrap_or(tail);
+    if path_part.contains('@') {
+        return REDACTED_URL.to_string();
+    }
+    let scrubbed_tail = scrub_query_fragment(tail);
     let Some(at) = authority.rfind('@') else {
-        return url.to_string();
+        return format!("{scheme}{authority}{scrubbed_tail}");
     };
-    let (userinfo, host) = authority.split_at(at + 1);
-    let userinfo = &userinfo[..userinfo.len() - 1];
+    let userinfo = &authority[..at];
+    let host = &authority[at + 1..];
     if userinfo.is_empty() {
-        return url.to_string();
+        return format!("{scheme}{authority}{scrubbed_tail}");
     }
     let redacted_user = match userinfo.find(':') {
         Some(i) => format!("{}:{REDACTED}", &userinfo[..i]),
         None => REDACTED.to_string(),
     };
-    format!("{scheme}{redacted_user}@{host}{tail}")
+    format!("{scheme}{redacted_user}@{host}{scrubbed_tail}")
 }
 
 /// True when a scheme URL carries a non-empty `userinfo@` authority prefix
-/// (the credential-bearing shape [`redact_credentials`] redacts). Scp-like
+/// or a malformed smuggled-userinfo shape (an `@` past the authority
+/// boundary, which [`redact_credentials`] collapses). Scp-like
 /// `user@host:path` has no `://` and carries no password field, so it
 /// reports false, matching redaction behavior.
 pub fn has_userinfo(url: &str) -> bool {
-    let scheme_end = match url.find("://") {
-        Some(i) => i + 3,
-        None => return false,
+    let Some((_, rest)) = split_scheme(url) else {
+        return false;
     };
-    let rest = &url[scheme_end..];
-    let authority_end = rest.find('/').unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
-    match authority.rfind('@') {
-        Some(at) => !authority[..at].is_empty(),
-        None => false,
+    let end = authority_len(rest);
+    let (authority, tail) = rest.split_at(end);
+    if let Some(at) = authority.rfind('@') {
+        if !authority[..at].is_empty() {
+            return true;
+        }
     }
+    let path_part = tail.split(['?', '#']).next().unwrap_or(tail);
+    path_part.contains('@')
 }
 
 /// Strip `userinfo@` from a scheme URL entirely, for internal reuse of a
@@ -234,21 +396,142 @@ pub fn has_userinfo(url: &str) -> bool {
 /// rejected credentials). Unlike [`redact_credentials`] the result carries
 /// no `@` at all, so it re-enters normalization without tripping the
 /// userinfo reject while resolving to the same canonical target. Scp-like
-/// input is returned unchanged.
+/// input is returned unchanged; malformed smuggled-userinfo shapes collapse
+/// to [`REDACTED_URL`] (fail closed: unresolvable, never raw).
 pub fn strip_userinfo(url: &str) -> String {
-    let scheme_end = match url.find("://") {
-        Some(i) => i + 3,
-        None => return url.to_string(),
+    let Some((scheme, rest)) = split_scheme(url) else {
+        return url.to_string();
     };
-    let (scheme, rest) = url.split_at(scheme_end);
-    let authority_end = rest.find('/').unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(authority_end);
+    let end = authority_len(rest);
+    let (authority, tail) = rest.split_at(end);
+    let path_part = tail.split(['?', '#']).next().unwrap_or(tail);
+    if path_part.contains('@') {
+        return REDACTED_URL.to_string();
+    }
     match authority.rfind('@') {
         Some(at) if !authority[..at].is_empty() => {
             format!("{scheme}{}{tail}", &authority[at + 1..])
         }
         _ => url.to_string(),
     }
+}
+
+/// Scrub free text (evidence lines, error strings, reasons) for report
+/// emission: every embedded `scheme://...` token is passed through
+/// [`redact_credentials`], and bare sensitive `key=value`/`key:value` pairs
+/// have their values replaced with [`REDACTED`]. Ordinary prose passes
+/// through unchanged.
+pub fn scrub_text(text: &str) -> String {
+    let scrubbed_urls = scrub_embedded_urls(text);
+    scrub_secret_pairs(&scrubbed_urls)
+}
+
+/// Redact embedded URL tokens inside free text.
+fn scrub_embedded_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let Some(offset) = rest.find("://") else {
+            out.push_str(rest);
+            return out;
+        };
+        // Walk the scheme start backwards over scheme characters.
+        let mut start = offset;
+        while start > 0 {
+            let byte = rest.as_bytes()[start - 1];
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.') {
+                start -= 1;
+            } else {
+                break;
+            }
+        }
+        // Walk the token end forwards to a delimiter.
+        let bytes = rest.as_bytes();
+        let mut end = offset + 3;
+        while end < bytes.len() {
+            let byte = bytes[end];
+            if byte.is_ascii_whitespace() || matches!(byte, b'"' | b'\'' | b'<' | b'>' | b'`') {
+                break;
+            }
+            end += 1;
+        }
+        // No scheme name (e.g. `://foo`) is not a URL; keep scanning past it.
+        if start == offset {
+            out.push_str(&rest[..end]);
+            rest = &rest[end..];
+            continue;
+        }
+        out.push_str(&rest[..start]);
+        out.push_str(&redact_credentials(&rest[start..end]));
+        rest = &rest[end..];
+    }
+}
+
+/// Value-redact bare sensitive pairs (`key=value`, `key: value`) in text
+/// outside URLs. Tokens are whitespace/comma/semicolon separated; only the
+/// value of a sensitive key is replaced.
+fn scrub_secret_pairs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut token_start: Option<usize> = None;
+    let chars = text.char_indices();
+    let flush = |out: &mut String, token: &str| {
+        if let Some(scrubbed) = scrub_pair_token(token) {
+            out.push_str(&scrubbed);
+        } else {
+            out.push_str(token);
+        }
+    };
+    for (index, ch) in chars {
+        let is_delim = ch.is_whitespace() || ch == ',' || ch == ';';
+        if is_delim {
+            if let Some(start) = token_start.take() {
+                flush(&mut out, &text[start..index]);
+            }
+            out.push(ch);
+        } else if token_start.is_none() {
+            token_start = Some(index);
+        }
+    }
+    if let Some(start) = token_start.take() {
+        flush(&mut out, &text[start..]);
+    }
+    out
+}
+
+/// Redact one whitespace-delimited token when it is a sensitive pair.
+fn scrub_pair_token(token: &str) -> Option<String> {
+    // Skip anything already URL-shaped (handled by the URL pass) and
+    // anything too long to be a `key=value` pair.
+    if token.contains("://") || token.len() > 1024 {
+        return None;
+    }
+    let (key, separator, _) = split_pair(token)?;
+    let clean_key: String = key
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .collect();
+    let match_key = percent_decode_for_match(&clean_key).to_lowercase();
+    if match_key.is_empty() || !is_sensitive_key(&match_key) {
+        return None;
+    }
+    Some(format!("{key}{separator}{REDACTED}"))
+}
+
+/// Split a `key=value` or `key: value` token. A bare `C:\...`-style drive
+/// prefix is not a pair (single-letter key with no `=`).
+fn split_pair(token: &str) -> Option<(&str, &str, &str)> {
+    if let Some((key, value)) = token.split_once('=') {
+        if !key.is_empty() && !value.is_empty() {
+            return Some((key, "=", value));
+        }
+        return None;
+    }
+    if let Some((key, value)) = token.split_once(':') {
+        if key.len() > 1 && !value.is_empty() {
+            return Some((key, ":", value));
+        }
+    }
+    None
 }
 
 /// True when `host` is github.com directly or via an SSH alias.
@@ -267,22 +550,42 @@ pub fn resolve_ssh_alias(host: &str) -> Option<String> {
     load_ssh_aliases().get(&host.to_lowercase()).cloned()
 }
 
+/// Maximum bytes read from an SSH config file (SR-STATE-05). Past the
+/// cap the file reads as absent (empty map), never truncated content.
+pub const MAX_SSH_CONFIG_BYTES: u64 = 64 * 1024;
+
+/// Maximum aliases retained from one SSH config (SR-STATE-05). Past the
+/// cap further `Host` names are ignored; first-wins order is preserved.
+pub const MAX_SSH_CONFIG_ALIASES: usize = 1024;
+
 /// Load `Host` -> `HostName` mappings from the user's SSH config.
 ///
 /// Best-effort: missing or unreadable files yield an empty map. Only
 /// simple (wildcard-free) aliases are recorded; matching is case-insensitive
 /// and the first `HostName` per alias wins, per ssh_config semantics.
+/// The read is bounded (SR-STATE-05): regular-file-only, no symlink
+/// following (so FIFO/device swaps cannot hang it), byte-capped at
+/// [`MAX_SSH_CONFIG_BYTES`].
 pub fn load_ssh_aliases() -> HashMap<String, String> {
     let home = std::env::var("HOME").unwrap_or_default();
     if home.is_empty() {
         return HashMap::new();
     }
-    let path = std::path::Path::new(&home).join(".ssh").join("config");
-    let text = std::fs::read_to_string(path).unwrap_or_default();
-    if text.is_empty() {
+    load_ssh_aliases_from(&std::path::Path::new(&home).join(".ssh").join("config"))
+}
+
+/// Load `Host` -> `HostName` mappings from one explicit SSH config path.
+///
+/// Same bounded read as [`load_ssh_aliases`]; split out so tests can
+/// prove the guards without mutating `HOME`.
+pub fn load_ssh_aliases_from(path: &std::path::Path) -> HashMap<String, String> {
+    let Some(bytes) = crate::git::read_bounded_bytes(path, MAX_SSH_CONFIG_BYTES) else {
+        return HashMap::new();
+    };
+    if bytes.is_empty() {
         return HashMap::new();
     }
-    parse_ssh_config(&text)
+    parse_ssh_config(&String::from_utf8_lossy(&bytes))
 }
 
 /// Narrow ssh_config parser: `Host` patterns plus first `HostName` each.
@@ -290,6 +593,7 @@ pub fn load_ssh_aliases() -> HashMap<String, String> {
 /// Pure function over file text so callers and tests need no filesystem.
 /// Comments, blank lines, `=` separators, and case-insensitive keywords are
 /// handled; wildcard patterns and all other directives are ignored.
+/// At most [`MAX_SSH_CONFIG_ALIASES`] aliases are retained (SR-STATE-05).
 pub fn parse_ssh_config(text: &str) -> HashMap<String, String> {
     let mut aliases = HashMap::new();
     let mut current: Vec<String> = Vec::new();
@@ -306,6 +610,7 @@ pub fn parse_ssh_config(text: &str) -> HashMap<String, String> {
             current = words
                 .flat_map(|w| w.split('=').filter(|s| !s.is_empty()))
                 .filter(|w| !w.contains(['*', '?', '!']))
+                .take(MAX_SSH_CONFIG_ALIASES)
                 .map(|w| w.to_lowercase())
                 .collect();
         } else if keyword.eq_ignore_ascii_case("hostname") {
@@ -321,6 +626,9 @@ pub fn parse_ssh_config(text: &str) -> HashMap<String, String> {
                 continue;
             }
             for alias in &current {
+                if aliases.len() >= MAX_SSH_CONFIG_ALIASES && !aliases.contains_key(alias) {
+                    continue;
+                }
                 aliases
                     .entry(alias.clone())
                     .or_insert_with(|| value.clone());

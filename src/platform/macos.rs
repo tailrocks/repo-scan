@@ -15,10 +15,13 @@
 
 use super::{EventBatchIter, EventSource, MountPoint, MountTable, VolumeId};
 use crate::events::{ContinuitySignal, EventBatch, EventCursorId, VolumeCursor};
+use crate::scheduler::admission::{
+    stream_restart_due, stream_stall_suspected, StreamBudget, NATIVE_STREAM_BUDGET,
+};
 use std::ffi::{CStr, CString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // Mount table (getfsstat + getattrlist volume UUID)
@@ -239,6 +242,27 @@ const STREAM_LATENCY: f64 = 0.3;
 /// 256 entries each).
 const CHANNEL_DEPTH: usize = 512;
 
+/// Stall-suspicion grace (SR-EVENT-01): when the global FSEvents clock
+/// advances while one stream delivers no callback for this long, the
+/// stream is recreated and the volume rescanned instead of reporting
+/// caught-up over a possibly unobserved gap.
+const STALL_SUSPICION_GRACE_MS: u64 = 60_000;
+
+/// Preventive stream rotation (SR-EVENT-01): silent native teardown is
+/// undetectable without activity, so every stream is recreated past this
+/// age, bounding any unobserved gap to one rotation window.
+const STREAM_ROTATION_MAX_AGE_MS: u64 = 30 * 60 * 1000;
+
+/// Milliseconds since the Unix epoch, saturating on clock failure. Used
+/// for stream-heartbeat stamps; a plain clock read, safe to call on the
+/// dispatch-queue callback thread.
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
 /// One raw callback triple: path bytes (lossless), event flags, event ID.
 struct RawEvent {
     path: Vec<u8>,
@@ -252,6 +276,13 @@ struct RawEvent {
 struct StreamContext {
     tx: std::sync::mpsc::SyncSender<RawEvent>,
     overflow: AtomicBool,
+    /// Aggregate budget (SR-STATE-02): every queued event's path bytes are
+    /// charged here and released on dequeue or drop; over-budget events
+    /// drop with the overflow latch set, preserving the volume-wide
+    /// rescan signal instead of growing memory.
+    budget: &'static StreamBudget,
+    /// Last callback delivery in unix millis (SR-EVENT-01 heartbeat).
+    last_callback_ms: AtomicU64,
 }
 
 /// FSEvents history callback. Runs on the stream's dispatch queue; only
@@ -271,8 +302,9 @@ unsafe extern "C-unwind" fn fsevents_callback(
         return;
     }
     // SAFETY: info is the Box<StreamContext> installed at creation, alive
-    // until Drop after FSEventStreamStop + Invalidate; the arrays have
-    // num_events entries per the FSEvents contract.
+    // until teardown drains the queue (Stop + Invalidate + synchronous
+    // barrier) before freeing it, so no callback runs against a freed
+    // box; the arrays have num_events entries per the FSEvents contract.
     let ctx = unsafe { &*(info as *const StreamContext) };
     let paths = event_paths.as_ptr() as *const *const libc::c_char;
     let flags = event_flags.as_ptr() as *const FSEventStreamEventFlags;
@@ -282,13 +314,24 @@ unsafe extern "C-unwind" fn fsevents_callback(
         if path_ptr.is_null() {
             continue;
         }
+        // path_ptr is a NUL-terminated C string per the FSEvents contract.
+        let path_bytes = unsafe { CStr::from_ptr(path_ptr) }.to_bytes();
+        ctx.last_callback_ms.store(unix_millis(), Ordering::Relaxed);
+        if !ctx.budget.try_charge_bytes(path_bytes.len()) {
+            // Aggregate queue-byte budget exhausted (SR-STATE-02): drop
+            // the path but keep the volume-wide rescan signal — never
+            // grow memory, never go silent.
+            ctx.overflow.store(true, Ordering::Relaxed);
+            continue;
+        }
         let event = RawEvent {
-            path: unsafe { CStr::from_ptr(path_ptr) }.to_bytes().to_vec(),
+            path: path_bytes.to_vec(),
             flags: unsafe { *flags.add(i) },
             id: unsafe { *ids.add(i) },
         };
         if ctx.tx.try_send(event).is_err() {
             ctx.overflow.store(true, Ordering::Relaxed);
+            ctx.budget.release_bytes(path_bytes.len());
         }
     }
 }
@@ -362,76 +405,7 @@ impl EventSource for FsEventsSource {
         // Completion is claimed relative to it; later arrivals stay queued.
         let boundary = EventCursorId(live_id);
 
-        // Whole-volume watch path array: ["/"] relative to the device.
-        let root: CFRetained<CFString> = unsafe {
-            CFString::with_c_string(
-                None,
-                c"/".as_ptr(),
-                CFStringBuiltInEncodings::EncodingUTF8.0,
-            )
-        }
-        .ok_or_else(|| crate::Error::Events(String::from("CFString for / failed")))?;
-        let mut values: [*const std::ffi::c_void; 1] =
-            [&*root as *const CFString as *const std::ffi::c_void];
-        // NULL callbacks: the array does not retain its values, which is
-        // sound here because `root` outlives the Create call below, and
-        // FSEventStreamCreateRelativeToDevice copies the watch paths.
-        let paths: CFRetained<CFArray> =
-            unsafe { CFArray::new(None, values.as_mut_ptr(), 1, std::ptr::null()) }.ok_or_else(
-                || crate::Error::Events(String::from("CFArray for watch paths failed")),
-            )?;
-
-        let (tx, rx) = std::sync::mpsc::sync_channel(CHANNEL_DEPTH);
-        let ctx = Box::new(StreamContext {
-            tx,
-            overflow: AtomicBool::new(false),
-        });
-        let info = Box::into_raw(ctx) as *mut std::ffi::c_void;
-        let mut context = FSEventStreamContext {
-            version: 0,
-            info,
-            retain: None,
-            release: None,
-            copyDescription: None,
-        };
-        // SAFETY: callback is implemented correctly; context points at a
-        // live FSEventStreamContext; paths is a CFArray of CFString.
-        let stream: FSEventStreamRef = unsafe {
-            FSEventStreamCreateRelativeToDevice(
-                None,
-                Some(fsevents_callback),
-                std::ptr::addr_of_mut!(context),
-                dev,
-                &paths,
-                since_when,
-                STREAM_LATENCY,
-                STREAM_FLAGS,
-            )
-        };
-        if stream.is_null() {
-            unsafe {
-                let _ = Box::from_raw(info as *mut StreamContext);
-            }
-            return Err(crate::Error::Events(String::from(
-                "FSEventStreamCreateRelativeToDevice returned NULL",
-            )));
-        }
-        let queue = DispatchQueue::new("repo-scan.fsevents", None);
-        // SAFETY: stream is valid; the stream retains the queue.
-        unsafe { FSEventStreamSetDispatchQueue(stream, Some(&*queue)) };
-        // SAFETY: stream is valid and scheduled.
-        let started = unsafe { FSEventStreamStart(stream) };
-        if !started {
-            unsafe {
-                FSEventStreamInvalidate(stream);
-                FSEventStreamRelease(stream);
-                let _ = Box::from_raw(info as *mut StreamContext);
-            }
-            return Err(crate::Error::Events(String::from(
-                "FSEventStreamStart failed",
-            )));
-        }
-
+        let (stream, info, rx, queue) = create_stream(dev, since_when, &volume.0)?;
         Ok((
             boundary,
             Box::new(FsEventStreamIter {
@@ -439,12 +413,123 @@ impl EventSource for FsEventsSource {
                 info,
                 rx,
                 volume_key: volume.0.clone(),
+                dev,
+                open_since: since_when,
+                opened_ms: unix_millis(),
+                last_global_id: live_id,
                 last_high_water: 0,
                 initial_signals,
                 _queue: queue,
             }),
         ))
     }
+}
+
+/// Create, schedule, and start one whole-volume FSEventStream for `dev`,
+/// delivering events after `since_when`. Shared by [`EventSource::open_stream`]
+/// and the inline restart path so both enforce the same contract.
+///
+/// Aggregate admission (SR-STATE-02) runs BEFORE the stream, dispatch
+/// queue, and 512-slot channel are created: past the live-stream cap the
+/// call fails and the volume degrades honestly instead of retaining
+/// unbounded queues and path buffers. Every failure path unwinds partial
+/// state and releases the budget slot, so a failed creation never leaks.
+fn create_stream(
+    dev: libc::dev_t,
+    since_when: FSEventStreamEventId,
+    volume_key: &str,
+) -> crate::Result<(
+    FSEventStreamRef,
+    *mut std::ffi::c_void,
+    std::sync::mpsc::Receiver<RawEvent>,
+    dispatch2::DispatchRetained<DispatchQueue>,
+)> {
+    if !NATIVE_STREAM_BUDGET.try_acquire_stream() {
+        return Err(crate::Error::Events(format!(
+            "FSEvents stream refused for volume {volume_key}: {} live streams (aggregate cap)",
+            NATIVE_STREAM_BUDGET.streams_live()
+        )));
+    }
+    // Whole-volume watch path array: ["/"] relative to the device.
+    let root: CFRetained<CFString> = unsafe {
+        CFString::with_c_string(
+            None,
+            c"/".as_ptr(),
+            CFStringBuiltInEncodings::EncodingUTF8.0,
+        )
+    }
+    .ok_or_else(|| {
+        NATIVE_STREAM_BUDGET.release_stream();
+        crate::Error::Events(String::from("CFString for / failed"))
+    })?;
+    let mut values: [*const std::ffi::c_void; 1] =
+        [&*root as *const CFString as *const std::ffi::c_void];
+    // NULL callbacks: the array does not retain its values, which is
+    // sound here because `root` outlives the Create call below, and
+    // FSEventStreamCreateRelativeToDevice copies the watch paths.
+    let paths: CFRetained<CFArray> =
+        unsafe { CFArray::new(None, values.as_mut_ptr(), 1, std::ptr::null()) }.ok_or_else(
+            || {
+                NATIVE_STREAM_BUDGET.release_stream();
+                crate::Error::Events(String::from("CFArray for watch paths failed"))
+            },
+        )?;
+
+    let (tx, rx) = std::sync::mpsc::sync_channel(CHANNEL_DEPTH);
+    let ctx = Box::new(StreamContext {
+        tx,
+        overflow: AtomicBool::new(false),
+        budget: &NATIVE_STREAM_BUDGET,
+        last_callback_ms: AtomicU64::new(unix_millis()),
+    });
+    let info = Box::into_raw(ctx) as *mut std::ffi::c_void;
+    let mut context = FSEventStreamContext {
+        version: 0,
+        info,
+        retain: None,
+        release: None,
+        copyDescription: None,
+    };
+    // SAFETY: callback is implemented correctly; context points at a
+    // live FSEventStreamContext; paths is a CFArray of CFString.
+    let stream: FSEventStreamRef = unsafe {
+        FSEventStreamCreateRelativeToDevice(
+            None,
+            Some(fsevents_callback),
+            std::ptr::addr_of_mut!(context),
+            dev,
+            &paths,
+            since_when,
+            STREAM_LATENCY,
+            STREAM_FLAGS,
+        )
+    };
+    if stream.is_null() {
+        unsafe {
+            let _ = Box::from_raw(info as *mut StreamContext);
+        }
+        NATIVE_STREAM_BUDGET.release_stream();
+        return Err(crate::Error::Events(String::from(
+            "FSEventStreamCreateRelativeToDevice returned NULL",
+        )));
+    }
+    let queue = DispatchQueue::new("repo-scan.fsevents", None);
+    // SAFETY: stream is valid; the stream retains the queue.
+    unsafe { FSEventStreamSetDispatchQueue(stream, Some(&*queue)) };
+    // SAFETY: stream is valid and scheduled.
+    let started = unsafe { FSEventStreamStart(stream) };
+    if !started {
+        unsafe {
+            FSEventStreamInvalidate(stream);
+            FSEventStreamRelease(stream);
+            let _ = Box::from_raw(info as *mut StreamContext);
+        }
+        NATIVE_STREAM_BUDGET.release_stream();
+        return Err(crate::Error::Events(String::from(
+            "FSEventStreamStart failed",
+        )));
+    }
+    Ok((stream, info, rx, queue))
 }
 
 /// Live-stream batch iterator: drains the bounded callback channel into
@@ -456,26 +541,155 @@ struct FsEventStreamIter {
     info: *mut std::ffi::c_void,
     rx: std::sync::mpsc::Receiver<RawEvent>,
     volume_key: String,
+    /// Device the stream watches (restart recreates on the same device).
+    dev: libc::dev_t,
+    /// Cursor the stream opened from (restart resumes from the high-water
+    /// mark when one was observed, else from this).
+    open_since: FSEventStreamEventId,
+    /// When the current native stream was (re)created, unix millis.
+    opened_ms: u64,
+    /// Global FSEvents clock at the last health check.
+    last_global_id: FSEventStreamEventId,
     last_high_water: FSEventStreamEventId,
     initial_signals: Vec<ContinuitySignal>,
     _queue: dispatch2::DispatchRetained<DispatchQueue>,
 }
 
 // SAFETY: the FSEventStream handle is created, started, and destroyed on
-// this thread; the dispatch-queue callback only touches the SyncSender and
-// the overflow AtomicBool, both safe to share.
+// this thread; the dispatch-queue callback only touches the SyncSender,
+// the overflow latch, the heartbeat stamp, and the aggregate budget's
+// atomics, all safe to share.
 unsafe impl Send for FsEventStreamIter {}
+
+/// Tear down one started native stream and reclaim its callback context.
+///
+/// `FSEventStreamStop` is asynchronous with respect to the dispatch
+/// queue: a callback already enqueued or running can still execute
+/// after Stop/Invalidate/Release return. The context box must therefore
+/// stay alive until a synchronous barrier on the stream's private
+/// serial queue proves no callback is in flight; freeing it earlier is
+/// a use-after-free (SIGSEGV observed under parallel-test load, with
+/// the faulting frame inside `fsevents_callback` after Drop had freed
+/// the context).
+///
+/// Must run on the scan thread, never on the stream's own queue (a
+/// synchronous dispatch onto the current serial queue deadlocks). The
+/// barrier cannot deadlock against the dropping thread: the callback
+/// only uses `try_send` and atomics, so in-flight callbacks always
+/// finish without help from this thread.
+fn teardown_stream(stream: FSEventStreamRef, info: *mut std::ffi::c_void, queue: &DispatchQueue) {
+    unsafe {
+        FSEventStreamStop(stream);
+        FSEventStreamInvalidate(stream);
+        FSEventStreamRelease(stream);
+    }
+    // The queue is serial and private to this stream, and the stream is
+    // stopped and invalidated, so when this empty block runs, every
+    // previously enqueued callback has finished and none can follow:
+    // the context is unreachable from the queue from here on.
+    queue.exec_sync(|| {});
+    unsafe {
+        let _ = Box::from_raw(info as *mut StreamContext);
+    }
+}
 
 impl Drop for FsEventStreamIter {
     fn drop(&mut self) {
-        unsafe {
-            // Stop delivery before invalidating so no callback can run
-            // against the freed context; then reclaim the context box.
-            FSEventStreamStop(self.stream);
-            FSEventStreamInvalidate(self.stream);
-            FSEventStreamRelease(self.stream);
-            let _ = Box::from_raw(self.info as *mut StreamContext);
+        teardown_stream(self.stream, self.info, &self._queue);
+        // Freeing the context dropped the only sender, so no new charges
+        // are possible: this drain releases every still-queued byte
+        // exactly once (SR-STATE-02). Then free the stream slot.
+        for event in self.rx.try_iter() {
+            NATIVE_STREAM_BUDGET.release_bytes(event.path.len());
         }
+        NATIVE_STREAM_BUDGET.release_stream();
+    }
+}
+
+impl FsEventStreamIter {
+    /// Liveness gate for an empty poll (SR-EVENT-01): an empty connected
+    /// channel is "nothing delivered", never "caught up". A rotation-aged
+    /// or stall-suspect stream is recreated inline and yields a
+    /// volume-wide rescan batch instead of silence. Returns `Ok(None)`
+    /// when the stream is idle with no suspicion.
+    fn check_stream_health(&mut self) -> crate::Result<Option<EventBatch>> {
+        let now_ms = unix_millis();
+        // SAFETY: no preconditions.
+        let live_global = unsafe { FSEventsGetCurrentEventId() };
+        // SAFETY: the context box is alive until Drop/restart (which
+        // stop the stream and barrier-drain the queue before freeing),
+        // and next_batch cannot run during Drop.
+        let last_callback = unsafe { &*(self.info as *const StreamContext) }
+            .last_callback_ms
+            .load(Ordering::Relaxed);
+        let previous_global = self.last_global_id;
+        self.last_global_id = live_global;
+        let rotate = stream_restart_due(self.opened_ms, now_ms, STREAM_ROTATION_MAX_AGE_MS);
+        let suspect = stream_stall_suspected(
+            last_callback,
+            now_ms,
+            previous_global,
+            live_global,
+            STALL_SUSPICION_GRACE_MS,
+        );
+        if !rotate && !suspect {
+            return Ok(None);
+        }
+        self.restart_stream(live_global, now_ms, rotate)
+    }
+
+    /// Recreate the native stream inline (SR-EVENT-01 restart path) and
+    /// force a volume-wide rescan: the teardown window may have dropped
+    /// events, so silence is never reported. The new stream is created
+    /// before the old one is torn down, so a recreation failure leaves the
+    /// old stream in place and returns an error (the owner's batch-error
+    /// path schedules the same rescan durably).
+    fn restart_stream(
+        &mut self,
+        live_global: FSEventStreamEventId,
+        now_ms: u64,
+        rotate: bool,
+    ) -> crate::Result<Option<EventBatch>> {
+        let since = if self.last_high_water > 0 {
+            self.last_high_water
+        } else {
+            self.open_since
+        };
+        let (stream, info, rx, queue) = create_stream(self.dev, since, &self.volume_key)?;
+        // The new stream is live: tear down the old one exactly like Drop
+        // (stop / invalidate / release / queue barrier / free), then
+        // drain its channel — freeing the context dropped the only
+        // sender, so the drain releases every still-queued byte exactly
+        // once. `self._queue` is still the OLD queue here (replaced
+        // below), which is what the barrier must drain.
+        let old_rx = std::mem::replace(&mut self.rx, rx);
+        teardown_stream(self.stream, self.info, &self._queue);
+        for event in old_rx.try_iter() {
+            NATIVE_STREAM_BUDGET.release_bytes(event.path.len());
+        }
+        // The new stream acquired its own budget slot; release the old one.
+        NATIVE_STREAM_BUDGET.release_stream();
+        self.stream = stream;
+        self.info = info;
+        self._queue = queue;
+        self.opened_ms = now_ms;
+        self.last_global_id = live_global;
+        eprintln!(
+            "repo-scan: FSEvents stream for volume {} recreated ({})",
+            self.volume_key,
+            if rotate {
+                "rotation"
+            } else {
+                "stall suspicion"
+            },
+        );
+        Ok(Some(EventBatch {
+            volume_key: self.volume_key.clone(),
+            high_water: EventCursorId(self.last_high_water),
+            invalidations: Vec::new(),
+            history_done: false,
+            signals: vec![ContinuitySignal::MustScanSubDirs],
+        }))
     }
 }
 
@@ -535,6 +749,8 @@ impl EventBatchIter for FsEventStreamIter {
                 Ok(event) => {
                     count += 1;
                     bytes += event.path.len();
+                    // Dequeued: release the aggregate byte charge (SR-STATE-02).
+                    NATIVE_STREAM_BUDGET.release_bytes(event.path.len());
                     let flags = event.flags;
                     if flags & kFSEventStreamEventFlagHistoryDone != 0 {
                         // Sentinel ends the historical phase; its path is
@@ -570,8 +786,9 @@ impl EventBatchIter for FsEventStreamIter {
         // Channel overflow coalesces to a volume-wide MustScanSubDirs: an
         // empty invalidation list plus that signal means "rescan the watched
         // roots", never "nothing changed".
-        // SAFETY: the context box is alive until Drop (which stops the
-        // stream first), and next_batch cannot run during Drop.
+        // SAFETY: the context box is alive until Drop/restart (which
+        // stop the stream and barrier-drain the queue before freeing),
+        // and next_batch cannot run during Drop.
         let overflowed = unsafe { &*(self.info as *const StreamContext) }
             .overflow
             .swap(false, Ordering::Relaxed);
@@ -580,6 +797,13 @@ impl EventBatchIter for FsEventStreamIter {
         }
 
         if count == 0 && signals.is_empty() && !history_done {
+            // SR-EVENT-01: prove liveness before reporting idle — an empty
+            // channel must not imply caught-up. A stale stream restarts
+            // inline (volume-wide rescan batch) or errors; only a healthy
+            // idle stream returns `None`.
+            if let Some(batch) = self.check_stream_health()? {
+                return Ok(Some(batch));
+            }
             return Ok(None);
         }
         signals.sort_by_key(|s| *s as u8);

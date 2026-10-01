@@ -43,6 +43,104 @@ pub enum ObserveOutcome {
     Duplicate,
 }
 
+/// Schedule-time identity/provenance token (PG-01 support).
+///
+/// Minted when a path is scheduled, carrying the physical identity it was
+/// scheduled under plus the scheduling spelling for provenance. The
+/// executor re-checks [`ScheduleProvenance::matches`] against the pinned
+/// identity before trusting the schedule: a path swapped between
+/// scheduling and execution carries a different `(dev, ino)` and fails the
+/// match. Rendered form is `rs1:<dev>:<ino>:<ns-bytes>:<namespace>:<hex-path>`
+/// (namespace length-prefixed so `:` inside it cannot shift fields; the
+/// path is hex so arbitrary bytes survive round-trip).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleProvenance {
+    /// Namespace the path was scheduled under (mount/snapshot tag).
+    pub namespace: String,
+    /// Device number observed at schedule time.
+    pub dev: u64,
+    /// Inode / file ID observed at schedule time.
+    pub ino: u64,
+    /// Scheduling spelling (provenance only: aliases share identity).
+    pub path: PathBuf,
+}
+
+/// Maximum namespace bytes accepted by [`ScheduleProvenance::parse`].
+pub const MAX_PROVENANCE_NAMESPACE_BYTES: usize = 4096;
+
+/// Maximum hex-path characters accepted by [`ScheduleProvenance::parse`]
+/// (32 KiB of path bytes; far past `PATH_MAX`, still bounded).
+pub const MAX_PROVENANCE_PATH_HEX: usize = 65_536;
+
+impl ScheduleProvenance {
+    /// Mint a token for `path` scheduled under identity `id`.
+    pub fn mint(id: &PhysicalDirId, path: &Path) -> Self {
+        Self {
+            namespace: id.namespace.clone(),
+            dev: id.dev,
+            ino: id.ino,
+            path: path.to_path_buf(),
+        }
+    }
+
+    /// Physical identity this token was minted for.
+    pub fn identity(&self) -> PhysicalDirId {
+        PhysicalDirId {
+            dev: self.dev,
+            ino: self.ino,
+            namespace: self.namespace.clone(),
+        }
+    }
+
+    /// True when `id` is the identity this token was minted for
+    /// (namespace + `(dev, ino)`; the path spelling is provenance, not
+    /// identity, so aliases of one directory still match).
+    pub fn matches(&self, id: &PhysicalDirId) -> bool {
+        self.dev == id.dev && self.ino == id.ino && self.namespace == id.namespace
+    }
+
+    /// Render the token for scheduler/store transport.
+    pub fn render(&self) -> String {
+        format!(
+            "rs1:{}:{}:{}:{}:{}",
+            self.dev,
+            self.ino,
+            self.namespace.len(),
+            self.namespace,
+            crate::config::encode_hex(&crate::config::path_as_bytes(&self.path)),
+        )
+    }
+
+    /// Parse [`ScheduleProvenance::render`] output; `None` on any
+    /// malformed, over-cap, or miscounted input (fail closed).
+    pub fn parse(token: &str) -> Option<Self> {
+        let rest = token.strip_prefix("rs1:")?;
+        let (dev, rest) = rest.split_once(':')?;
+        let (ino, rest) = rest.split_once(':')?;
+        let (ns_len, rest) = rest.split_once(':')?;
+        let dev: u64 = dev.parse().ok()?;
+        let ino: u64 = ino.parse().ok()?;
+        let ns_len: usize = ns_len.parse().ok()?;
+        if ns_len > MAX_PROVENANCE_NAMESPACE_BYTES || rest.len() < ns_len {
+            return None;
+        }
+        let (namespace, rest) = rest.as_bytes().split_at(ns_len);
+        let namespace = std::str::from_utf8(namespace).ok()?;
+        let rest = std::str::from_utf8(rest).ok()?;
+        let hex_path = rest.strip_prefix(':')?;
+        if hex_path.len() > MAX_PROVENANCE_PATH_HEX {
+            return None;
+        }
+        let path = crate::config::path_from_bytes(crate::config::decode_hex(hex_path)?);
+        Some(Self {
+            namespace: namespace.to_string(),
+            dev,
+            ino,
+            path,
+        })
+    }
+}
+
 /// Process-local cycle/dedupe guard for in-flight traversal.
 ///
 /// This is the cheap in-memory guard against symlink cycles and firmlink
@@ -290,7 +388,11 @@ impl ScopeFence {
     /// True when a pinned true path plus its `fstat` identity sit inside
     /// the declared roots. A true path equal to a canonical root must
     /// also match the root's recorded identity, so a swapped-in impostor
-    /// directory at the root spelling is refused.
+    /// directory at the root spelling is refused. Descendant paths are
+    /// covered by the descent-time root check in [`ScopeFence::walk_pinned`]
+    /// (PATH-GIT-02), which verifies the root prefix descriptor itself —
+    /// this prefix test alone would accept a descendant under a replaced
+    /// root or mount.
     fn allows_verified(&self, true_path: &Path, dev: u64, ino: u64) -> bool {
         self.roots.iter().any(|root| {
             if *true_path == root.canonical {
@@ -302,16 +404,48 @@ impl ScopeFence {
         })
     }
 
-    /// Execution-time open of one task directory: resolve `path`
-    /// component by component from the filesystem root through pinned
-    /// directory descriptors, restarting from the root past each
-    /// intermediate symlink (bounded by [`MAX_SYMLINK_HOPS`]), and fence
-    /// the resulting true path plus its `fstat` identity against the
-    /// declared roots. The returned [`PinnedDir`] lists through its own
-    /// descriptor, so a path swapped after this call cannot redirect the
-    /// enumeration.
+    /// True when `fd` — an open descriptor for `prefix` — still matches
+    /// the identity the fence recorded for the declared root at `prefix`,
+    /// or when no declared root sits exactly at `prefix`. The check runs
+    /// on the descriptor just opened, so there is no pathname re-stat
+    /// gap for a root or mount replacement to slip through (PATH-GIT-02).
+    /// Roots with no recorded identity (unstatable at build) cannot be
+    /// verified and pass, preserving the legacy prefix behavior for them.
     #[cfg(unix)]
-    pub fn open_pinned(&self, path: &Path) -> Result<FenceOpen, FenceError> {
+    fn root_prefix_verified(&self, prefix: &Path, fd: RawFd) -> bool {
+        for root in &self.roots {
+            if *prefix != root.canonical {
+                continue;
+            }
+            match root.identity {
+                None => continue,
+                Some((root_dev, root_ino)) => match fstat_self(fd) {
+                    Ok(st) => {
+                        let meta = stat_to_entry(&st);
+                        if meta.dev != root_dev || meta.ino != root_ino {
+                            return false;
+                        }
+                    }
+                    Err(_) => return false,
+                },
+            }
+        }
+        true
+    }
+
+    /// Pinned no-follow descent shared by [`ScopeFence::open_pinned`] and
+    /// [`ScopeFence::open_relationship_pinned`]: resolve `path` component
+    /// by component from the filesystem root through pinned directory
+    /// descriptors, restarting from the root past each intermediate
+    /// symlink (bounded by [`MAX_SYMLINK_HOPS`]). Every time the descent
+    /// crosses a declared root prefix it verifies the open descriptor's
+    /// `(dev, ino)` against the build-time identity, so a root directory
+    /// or mount replaced after scheduling cannot redirect descendant
+    /// lookups. No scope-membership check here: the caller applies it.
+    /// The returned [`PinnedDir`] lists through its own descriptor, so a
+    /// path swapped after this call cannot redirect the enumeration.
+    #[cfg(unix)]
+    fn walk_pinned(&self, path: &Path) -> Result<FenceOpen, FenceError> {
         use std::collections::VecDeque;
         use std::os::unix::ffi::OsStrExt;
 
@@ -326,6 +460,9 @@ impl ScopeFence {
             .collect();
         let mut stack: Vec<OsString> = Vec::new();
         let mut fd = open_root_dir().map_err(FenceError::Io)?;
+        if !self.root_prefix_verified(Path::new("/"), fd.as_raw_fd()) {
+            return Err(FenceError::OutOfScope(PathBuf::from("/")));
+        }
         let mut hops = 0u32;
         while let Some(name) = pending.pop_front() {
             let last = pending.is_empty();
@@ -378,6 +515,9 @@ impl ScopeFence {
                     .collect();
                 stack.clear();
                 fd = open_root_dir().map_err(FenceError::Io)?;
+                if !self.root_prefix_verified(Path::new("/"), fd.as_raw_fd()) {
+                    return Err(FenceError::OutOfScope(PathBuf::from("/")));
+                }
                 continue;
             }
             if kind != ChildKind::Directory {
@@ -389,6 +529,16 @@ impl ScopeFence {
             let child = openat_dir(fd.as_raw_fd(), &c_name).map_err(FenceError::Io)?;
             stack.push(name);
             fd = child;
+            // Bind descendant lookups to the root descriptor (PATH-GIT-02):
+            // when the descent crosses a declared root, the just-opened
+            // descriptor must still carry the build-time identity.
+            let mut prefix = PathBuf::from("/");
+            for part in &stack {
+                prefix.push(part);
+            }
+            if !self.root_prefix_verified(&prefix, fd.as_raw_fd()) {
+                return Err(FenceError::OutOfScope(prefix));
+            }
         }
         let mut true_path = PathBuf::from("/");
         for part in &stack {
@@ -396,9 +546,6 @@ impl ScopeFence {
         }
         let final_stat = fstat_self(fd.as_raw_fd()).map_err(FenceError::Io)?;
         let stat = stat_to_dir_stat(&final_stat);
-        if !self.allows_verified(&true_path, stat.meta.dev, stat.meta.ino) {
-            return Err(FenceError::OutOfScope(true_path));
-        }
         Ok(FenceOpen::Dir(PinnedDir {
             fd,
             stat,
@@ -406,14 +553,106 @@ impl ScopeFence {
         }))
     }
 
+    /// Execution-time open of one task directory: the pinned descent
+    /// plus the scope-membership check on the resulting true path and
+    /// its `fstat` identity. Descent-time root verification (see
+    /// [`ScopeFence::walk_pinned`]) already bound every root prefix to
+    /// its build-time descriptor identity.
+    #[cfg(unix)]
+    pub fn open_pinned(&self, path: &Path) -> Result<FenceOpen, FenceError> {
+        match self.walk_pinned(path)? {
+            FenceOpen::Dir(pinned) => {
+                let stat = pinned.stat();
+                if !self.allows_verified(pinned.true_path(), stat.meta.dev, stat.meta.ino) {
+                    let sp = pinned.true_path().to_path_buf();
+                    return Err(FenceError::OutOfScope(sp));
+                }
+                Ok(FenceOpen::Dir(pinned))
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// Descriptor-relative open of an explicitly scheduled out-of-scope
+    /// relationship path (PATH-GIT-01): the same pinned no-follow walk
+    /// as [`ScopeFence::open_pinned`] but without the scope-membership
+    /// check, so the caller can pin and re-verify a Git-relationship
+    /// path the fence cannot cover. Untrusted worktree metadata names
+    /// the spelling; the pin binds the execution. Root-prefix
+    /// verification still applies to any declared root crossed. Links
+    /// are reported, never followed.
+    #[cfg(unix)]
+    pub fn open_relationship_pinned(&self, path: &Path) -> Result<FenceOpen, FenceError> {
+        self.walk_pinned(path)
+    }
+
+    /// Post-run re-verification for a relationship pin: re-resolve `path`
+    /// through the unscoped descriptor walk and require the same true
+    /// path plus `(dev, ino)` identity. `false` means the path was
+    /// swapped mid-run: the caller must discard every observation.
+    #[cfg(unix)]
+    pub fn reverify_relationship(&self, path: &Path, before: &PinnedDir) -> bool {
+        match self.open_relationship_pinned(path) {
+            Ok(FenceOpen::Dir(after)) => {
+                let before_stat = before.stat();
+                let after_stat = after.stat();
+                after.true_path() == before.true_path()
+                    && after_stat.meta.dev == before_stat.meta.dev
+                    && after_stat.meta.ino == before_stat.meta.ino
+            }
+            _ => false,
+        }
+    }
+
+    /// Post-run re-verification for either pin kind: the scoped walk
+    /// first, falling back to the relationship walk when the pin sits
+    /// outside the declared roots. Either mismatch (or a link where the
+    /// directory was) returns `false`; the caller must discard every
+    /// observation and park.
+    #[cfg(unix)]
+    pub fn reverify_pinned(&self, path: &Path, before: &PinnedDir) -> bool {
+        match self.open_pinned(path) {
+            Ok(FenceOpen::Dir(after)) => {
+                let before_stat = before.stat();
+                let after_stat = after.stat();
+                after.true_path() == before.true_path()
+                    && after_stat.meta.dev == before_stat.meta.dev
+                    && after_stat.meta.ino == before_stat.meta.ino
+            }
+            Err(FenceError::OutOfScope(_)) => self.reverify_relationship(path, before),
+            _ => false,
+        }
+    }
+
     /// Non-unix targets cannot pin descriptors: always refuse so the
-    /// caller falls back to the legacy pathname open.
+    /// caller fails closed (PATH-GIT-03) — never an unfenced run.
     #[cfg(not(unix))]
     pub fn open_pinned(&self, path: &Path) -> Result<FenceOpen, FenceError> {
         let _ = path;
         Err(FenceError::Unsupported(
             "descriptor-relative traversal requires unix".to_string(),
         ))
+    }
+
+    /// Non-unix targets cannot pin descriptors: always refuse.
+    #[cfg(not(unix))]
+    pub fn open_relationship_pinned(&self, path: &Path) -> Result<FenceOpen, FenceError> {
+        let _ = path;
+        Err(FenceError::Unsupported(
+            "descriptor-relative traversal requires unix".to_string(),
+        ))
+    }
+
+    /// Non-unix targets cannot re-verify pins: always fail.
+    #[cfg(not(unix))]
+    pub fn reverify_relationship(&self, _path: &Path, _before: &PinnedDir) -> bool {
+        false
+    }
+
+    /// Non-unix targets cannot re-verify pins: always fail.
+    #[cfg(not(unix))]
+    pub fn reverify_pinned(&self, _path: &Path, _before: &PinnedDir) -> bool {
+        false
     }
 }
 

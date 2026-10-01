@@ -32,7 +32,7 @@ pub use catalog::{
     VolumeRow, WalStatus,
 };
 pub use checkpoint::{CheckpointCoordinator, CheckpointPolicy, CheckpointStats};
-pub use owner::{catalog_db_path, lock_path, payload_dir, OwnerGuard};
+pub use owner::{catalog_db_path, lock_path, payload_dir, OwnerGuard, StateRootAnchor};
 pub use writer::{
     PendingOp, WriterBatch, WRITER_BATCH_BYTES, WRITER_BATCH_MAX_AGE, WRITER_BATCH_ROWS,
 };

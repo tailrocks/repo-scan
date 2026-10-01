@@ -68,13 +68,13 @@ fn list_all(
 fn build_tree() -> (tempfile::TempDir, PathBuf) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().join("tree");
-    std::fs::create_dir(&root).unwrap();
-    std::fs::write(root.join("visible.txt"), b"v").unwrap();
-    std::fs::write(root.join(".hidden"), b"h").unwrap();
-    std::fs::create_dir(root.join(".hdir")).unwrap();
-    std::fs::write(root.join(".hdir").join("inner.txt"), b"i").unwrap();
-    std::fs::create_dir(root.join("sub")).unwrap();
-    std::fs::write(root.join("sub").join("deep.txt"), b"d").unwrap();
+    repo_scan::privacy::private_dir_0700(&root).unwrap();
+    repo_scan::privacy::private_write_0600(&root.join("visible.txt"), b"v").unwrap();
+    repo_scan::privacy::private_write_0600(&root.join(".hidden"), b"h").unwrap();
+    repo_scan::privacy::private_dir_0700(&root.join(".hdir")).unwrap();
+    repo_scan::privacy::private_write_0600(&root.join(".hdir").join("inner.txt"), b"i").unwrap();
+    repo_scan::privacy::private_dir_0700(&root.join("sub")).unwrap();
+    repo_scan::privacy::private_write_0600(&root.join("sub").join("deep.txt"), b"d").unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStringExt;
@@ -85,7 +85,7 @@ fn build_tree() -> (tempfile::TempDir, PathBuf) {
         let raw = std::ffi::OsString::from_vec(b"bad\xffname".to_vec());
         // Best-effort: APFS rejects non-UTF-8 names (EILSEQ). Tests that
         // need this fixture check for its presence and skip without it.
-        let _ = std::fs::write(root.join(raw), b"x");
+        let _ = repo_scan::privacy::private_write_0600(&root.join(raw), b"x");
     }
     (tmp, root)
 }

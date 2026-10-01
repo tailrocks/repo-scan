@@ -1,0 +1,50 @@
+# Privacy Defaults (CONSUMER-SCOPE-PRIVACY-001)
+
+All tool and fixture outputs are owner-only by default: directories `0o700`,
+files `0o600` (unix). No group/other read, write, or traversal.
+
+## Constructors
+
+Two choke points, split by layer (there is no single one):
+
+- General outputs — [src/privacy.rs](../src/privacy.rs):
+  `private_dir_0700(path)` (`mkdir -p`, `0o700`, explicit chmod),
+  `private_file_0600(path)` (exclusive `O_CREAT|O_EXCL|O_NOFOLLOW`
+  create, `0o600`, explicit chmod), `private_write_0600(path,
+  bytes)` (create-or-truncate, `O_NOFOLLOW`, `0o600`, explicit
+  chmod). Used by report/log/scratch writers and test fixtures.
+- State layout — [src/store/owner.rs](../src/store/owner.rs):
+  `ensure_private_dir_all` plus the `instance.lock` creation in
+  `OwnerGuard::acquire`. Same `0o700`/`0o600` contract, with
+  FD-bound hardening the general constructors lack: the new
+  directory is bound through an `O_NOFOLLOW|O_DIRECTORY` FD,
+  tightened with `fchmod` on the FD (never the path), and
+  re-verified by `(dev, ino)` identity so a transient ancestor
+  swap is refused loudly instead of silently trusted.
+
+Both refuse symlinked targets (fail closed, never write through a
+link) and apply modes explicitly, so the result never depends on
+the caller's umask. Parents are not created by the file
+constructors — build them with `private_dir_0700` first.
+
+## Scope
+
+- State, payload, staging, snapshot, report, and log paths go
+  through these constructors (state layout via `owner.rs`, the
+  rest via `privacy.rs`).
+- Test fixtures: every builder in `tests/common/fixture.rs` and
+  fixture construction across `tests/` create roots via
+  `private_dir_0700` / `private_write_0600` / `private_file_0600`;
+  scratch roots come from `fixture::scratch_root()` (fresh
+  tempdir pinned under `/tmp`, `0o700`). Fixtures never touch
+  machine-wide paths. Reads, queries, removals, permission-probing
+  setup, and `io::ErrorKind`-matching platform probes stay raw —
+  only directory/file construction goes through the helpers.
+
+## Verifying
+
+- Regression test `private_constructors_enforce_owner_only` in
+  `src/privacy.rs` asserts modes, `O_EXCL` rerun failure, and symlink
+  refusal (builder runs `cargo test`; workers never run cargo here).
+- Manual: `stat -c '%a %n' <state_dir> <state_dir>/payload/*` must show
+  `700` dirs and `600` files.

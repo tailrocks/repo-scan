@@ -106,7 +106,7 @@ fn event_01_while_stopped_insertion_reconciled() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state = dir.path().join("state");
     let root = dir.path().join("root");
-    std::fs::create_dir_all(&root).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
     fixture::normal_clone(&root, "repo-a");
     let root_str = root.to_str().expect("utf8").to_string();
 
@@ -130,7 +130,7 @@ fn event_01_while_stopped_insertion_reconciled() {
     // While stopped: insert a fresh clone and move in a repo from outside.
     fixture::normal_clone(&root, "repo-b");
     let outside = dir.path().join("outside");
-    std::fs::create_dir_all(&outside).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&outside).expect("mkdir");
     let moved = fixture::normal_clone(&outside, "repo-c");
     let moved_target = root.join("repo-c");
     std::fs::rename(&moved, &moved_target).expect("move in");
@@ -365,7 +365,7 @@ fn event_02_kill_mid_scan_resumes_to_complete_report() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state = dir.path().join("state");
     let root = dir.path().join("root");
-    std::fs::create_dir_all(&root).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
     fixture::normal_clone(&root, "repo-a");
     fixture::normal_clone(&root, "repo-b");
     fixture::huge_flat(&root, fixture::HUGE_FLAT_CI);
@@ -476,7 +476,7 @@ fn event_02_unrelated_file_flood_scan_still_completes() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state = dir.path().join("state");
     let root = dir.path().join("root");
-    std::fs::create_dir_all(&root).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
     fixture::normal_clone(&root, "repo");
     fixture::huge_flat(&root, fixture::HUGE_FLAT_CI);
     let root_str = root.to_str().expect("utf8").to_string();
@@ -542,7 +542,8 @@ fn event_02_live_stream_flood_yields_finite_boundary() {
 
     // Flood: create files after the stream opened, then drain boundedly.
     for i in 0..200 {
-        std::fs::write(dir.path().join(format!("flood-{i:04}")), b"x").expect("write");
+        repo_scan::privacy::private_write_0600(&dir.path().join(format!("flood-{i:04}")), b"x")
+            .expect("write");
     }
     let mut drained = 0usize;
     let mut last_high_water = 0u64;
@@ -723,10 +724,11 @@ fn perf_01_live_scan_counters_agree_with_work() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state = dir.path().join("state");
     let root = dir.path().join("root");
-    std::fs::create_dir_all(&root).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
     fixture::normal_clone(&root, "repo");
     for name in ["a.txt", "b.txt", "c.txt"] {
-        std::fs::write(root.join(name), "data\n").expect("write");
+        repo_scan::privacy::private_write_0600(&root.join(name), "data\n".as_bytes())
+            .expect("write");
     }
     let root_str = root.to_str().expect("utf8").to_string();
 

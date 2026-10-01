@@ -57,7 +57,7 @@ fn rsf_f940_production_drain_restores_and_ingests_atomically() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db = tmp.path().join("catalog.db");
         let sub = tmp.path().join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
+        repo_scan::privacy::private_dir_0700(&sub).unwrap();
         let now = now_ms();
 
         // Prior run: cursor 200 ingested, only 100 reconciled — then a kill.
@@ -155,7 +155,7 @@ fn rsf_f940_production_batch_error_schedules_rescan_with_retry() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db = tmp.path().join("catalog.db");
         let sub = tmp.path().join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
+        repo_scan::privacy::private_dir_0700(&sub).unwrap();
         let (store, generation) = open_generation(&db).await;
 
         let before = now_ms();
@@ -217,7 +217,7 @@ fn rsf_f940_production_claims_gate_on_history_done() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db = tmp.path().join("catalog.db");
         let sub = tmp.path().join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
+        repo_scan::privacy::private_dir_0700(&sub).unwrap();
         let (store, generation) = open_generation(&db).await;
         let batches = vec![
             batch("vol-a", 10, std::slice::from_ref(&sub), false),
@@ -249,7 +249,7 @@ fn rsf_f940_production_claims_gate_on_history_done() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db = tmp.path().join("catalog.db");
         let sub = tmp.path().join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
+        repo_scan::privacy::private_dir_0700(&sub).unwrap();
         let (store, generation) = open_generation(&db).await;
         let batches = vec![
             batch("vol-a", 10, std::slice::from_ref(&sub), false),

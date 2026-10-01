@@ -196,9 +196,9 @@ impl Env {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = dir.path().join("state");
         let cwd = dir.path().join("cwd");
-        std::fs::create_dir_all(&cwd).expect("mkdir");
+        repo_scan::privacy::private_dir_0700(&cwd).expect("mkdir");
         let root = dir.path().join("root");
-        std::fs::create_dir_all(&root).expect("mkdir");
+        repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
         Self {
             _dir: dir,
             state,
@@ -401,7 +401,7 @@ fn fs03_symlink_cycle_terminates_without_duplicates() {
 fn fs03_path_replacement_reconciles_without_duplicates() {
     let env = Env::new();
     let victim_parent = env.root.join("v");
-    std::fs::create_dir_all(&victim_parent).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&victim_parent).expect("mkdir");
     fixture::normal_clone(&victim_parent, "victim");
     let victim = victim_parent.join("victim");
     let out = env.scan(&env.root, "rep1.json");
@@ -485,7 +485,7 @@ fn fs04_non_utf8_and_controls_round_trip() {
     // Invalid-UTF-8 directory: some filesystems (APFS) reject these names,
     // so a failed creation skips loudly instead of failing.
     let bad_dir = env.root.join(OsString::from_vec(b"bad-\xff-dir".to_vec()));
-    if std::fs::create_dir_all(&bad_dir).is_err() {
+    if repo_scan::privacy::private_dir_0700(&bad_dir).is_err() {
         eprintln!("fs04: filesystem rejects non-UTF-8 names; skipping");
         return;
     }

@@ -141,7 +141,7 @@ fn rsf_speed003_store_pending_and_cumulative_totals() {
             .expect("gen");
         for (id, name) in [("task-a", "a"), ("task-b", "b"), ("task-c", "c")] {
             let dir = tmp.path().join(name);
-            std::fs::create_dir_all(&dir).unwrap();
+            repo_scan::privacy::private_dir_0700(&dir).unwrap();
             let scope = repo_scan::config::scope_key_for_dir(&dir);
             let rev = store.scope_rev(&scope).await.expect("rev");
             let idem = format!("idem:{id}");

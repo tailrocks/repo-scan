@@ -246,7 +246,8 @@ fn evidence_dir(label: &str) -> PathBuf {
     let dir = target_dir()
         .join("perf_evidence")
         .join(format!("{label}-{}-{millis}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
+    repo_scan::privacy::private_dir_0700(&dir)
+        .unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
     dir
 }
 
@@ -299,13 +300,13 @@ fn write_evidence(
     stderr: &[u8],
     jsonl_src: &Path,
 ) -> serde_json::Value {
-    std::fs::write(dir.join("harness_stdout.log"), stdout)
+    repo_scan::privacy::private_write_0600(&dir.join("harness_stdout.log"), stdout)
         .unwrap_or_else(|e| panic!("tee stdout: {e}"));
-    std::fs::write(dir.join("harness_stderr.log"), stderr)
+    repo_scan::privacy::private_write_0600(&dir.join("harness_stderr.log"), stderr)
         .unwrap_or_else(|e| panic!("tee stderr: {e}"));
     let jsonl_bytes =
         std::fs::read(jsonl_src).unwrap_or_else(|e| panic!("read {}: {e}", jsonl_src.display()));
-    std::fs::write(dir.join("perf_gates.jsonl"), &jsonl_bytes)
+    repo_scan::privacy::private_write_0600(&dir.join("perf_gates.jsonl"), &jsonl_bytes)
         .unwrap_or_else(|e| panic!("copy jsonl: {e}"));
     let evidence = serde_json::json!({
         "test": test,
@@ -321,9 +322,11 @@ fn write_evidence(
         "harness_stdout_bytes": stdout.len(),
         "harness_stderr_bytes": stderr.len(),
     });
-    std::fs::write(
-        dir.join("evidence.json"),
-        serde_json::to_string_pretty(&evidence).expect("serialize evidence"),
+    repo_scan::privacy::private_write_0600(
+        &dir.join("evidence.json"),
+        serde_json::to_string_pretty(&evidence)
+            .expect("serialize evidence")
+            .as_bytes(),
     )
     .unwrap_or_else(|e| panic!("write evidence.json: {e}"));
     eprintln!("perf gates: durable evidence at {}", dir.display());
@@ -773,7 +776,7 @@ fn evidence_helpers_timeout_and_hash() {
     );
     let tmp = tempfile::tempdir().expect("tempdir");
     let file = tmp.path().join("sample.jsonl");
-    std::fs::write(&file, b"{\"record\":\"env\"}\n").expect("write sample");
+    repo_scan::privacy::private_write_0600(&file, b"{\"record\":\"env\"}\n").expect("write sample");
     let bytes = std::fs::read(&file).expect("read sample");
     assert_eq!(sha256_hex(&bytes), sha256_hex(b"{\"record\":\"env\"}\n"));
 }
