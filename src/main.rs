@@ -177,8 +177,13 @@ fn dispatch() -> ExitCode {
 }
 
 /// Report an operational failure on stderr and map it to its exit code.
+///
+/// The message passes the centralized scrubber (RETEST-7): error strings
+/// can embed lower-layer URL material or secret pairs (credential-bearing
+/// input echoed by validation, git/config paths), and terminal
+/// diagnostics must never emit them raw.
 fn fail(e: &repo_scan::Error) -> ExitCode {
-    eprintln!("repo-scan: error: {e}");
+    eprintln!("repo-scan: error: {}", identity::scrub_text(&e.to_string()));
     e.exit_code()
 }
 
@@ -262,7 +267,10 @@ async fn open_owned_with_wait(state_dir: &Path) -> repo_scan::Result<(OwnerGuard
     // removing the engine file. Best-effort: a marker write failure must
     // not fail the command that owns real work.
     if let Err(e) = write_owner_marker(&store, state_dir).await {
-        eprintln!("repo-scan: warning: cannot write ownership marker: {e}");
+        eprintln!(
+            "repo-scan: warning: cannot write ownership marker: {}",
+            identity::scrub_text(&e.to_string())
+        );
     }
     Ok((guard, store))
 }
@@ -851,7 +859,10 @@ async fn run_scan_inner(
             match emit_file_report(&store, &lib_inputs, dest, &cfg.state_dir, finished_ms).await {
                 Ok(_) => true,
                 Err(e) => {
-                    eprintln!("repo-scan: report publication failed: {e}");
+                    eprintln!(
+                        "repo-scan: report publication failed: {}",
+                        identity::scrub_text(&e.to_string())
+                    );
                     store
                         .update_scan_state(
                             &scan_id,
@@ -890,7 +901,10 @@ async fn run_scan_inner(
             {
                 Ok(_) => true,
                 Err(e) => {
-                    eprintln!("repo-scan: terminal report failed: {e}");
+                    eprintln!(
+                        "repo-scan: terminal report failed: {}",
+                        identity::scrub_text(&e.to_string())
+                    );
                     store
                         .update_scan_state(
                             &scan_id,
@@ -1608,7 +1622,8 @@ async fn open_event_session(
                 Err(e) => {
                     eprintln!(
                         "repo-scan: events: volume {} degraded ({}); traversal covers it",
-                        volume.key, e,
+                        volume.key,
+                        identity::scrub_text(&e.to_string()),
                     );
                     session.degraded.push(volume.key.clone());
                 }
@@ -1816,8 +1831,9 @@ async fn apply_batch_error(
     applied.failed_volumes.push(volume_key.to_string());
     note_applied_scopes(session, volume_key, std::slice::from_ref(&action.scope_key));
     eprintln!(
-        "repo-scan: events: batch error on {volume_key}: {error}; \
+        "repo-scan: events: batch error on {volume_key}: {}; \
          volume rescan scheduled with retry",
+        identity::scrub_text(error),
     );
     Ok(())
 }
@@ -2090,7 +2106,8 @@ async fn reconcile_event_cursors(
         if !claim.complete {
             eprintln!(
                 "repo-scan: events: volume {} event completeness not claimed: {}",
-                claim.volume, claim.detail,
+                claim.volume,
+                identity::scrub_text(&claim.detail),
             );
             let action = events::plan_claim_error(&claim.volume, &claim.detail);
             store
@@ -2506,7 +2523,7 @@ impl Runner {
             if let Some(found) = &self.fallback {
                 eprintln!(
                     "repo-scan: installed-git fallback: {} ({})",
-                    found.path().display(),
+                    identity::scrub_text(&found.path().display().to_string()),
                     found.capabilities().version,
                 );
             }
@@ -2627,7 +2644,7 @@ impl OpDeadline {
 /// stderr now; `complete_task` records the durable gap row at completion,
 /// so the wedge is evidence, not just a log line.
 fn park_on_timeout(detail: &str) -> TaskOutcome {
-    eprintln!("repo-scan: {detail}");
+    eprintln!("repo-scan: {}", identity::scrub_text(detail));
     TaskOutcome::Parked {
         state: TaskState::Unavailable,
         reason: detail.to_string(),
@@ -4694,7 +4711,7 @@ fn park_on_identity_change(what: &str, path: &Path) -> TaskOutcome {
         "{what} path {} changed during inspection; observations discarded",
         path.display()
     );
-    eprintln!("repo-scan: {reason}");
+    eprintln!("repo-scan: {}", identity::scrub_text(&reason));
     TaskOutcome::Parked {
         state: TaskState::Unavailable,
         reason,
@@ -4756,7 +4773,7 @@ async fn retry_on_lease_lost(
     claimed: &ClaimedTask,
     detail: &str,
 ) -> repo_scan::Result<TaskOutcome> {
-    eprintln!("repo-scan: {detail}");
+    eprintln!("repo-scan: {}", identity::scrub_text(detail));
     fail_task(
         runner,
         store,
@@ -5703,7 +5720,10 @@ fn observed_head(
                 match fallback.head(&instance.git_dir, instance.work_dir.as_deref()) {
                     Ok(head) => return Ok(head),
                     Err(fe) => {
-                        eprintln!("repo-scan: fallback HEAD failed: {fe}");
+                        eprintln!(
+                            "repo-scan: fallback HEAD failed: {}",
+                            identity::scrub_text(&fe.to_string())
+                        );
                     }
                 }
             }
@@ -5729,7 +5749,10 @@ fn observed_refs(
                         return Ok(refs);
                     }
                     Err(fe) => {
-                        eprintln!("repo-scan: fallback refs failed: {fe}");
+                        eprintln!(
+                            "repo-scan: fallback refs failed: {}",
+                            identity::scrub_text(&fe.to_string())
+                        );
                     }
                 }
             }
@@ -6942,7 +6965,8 @@ async fn build_lib_inputs(
         catalog_revision: catalog_rev,
         // Defense-in-depth (RSF-SEC-TARGET-URL): the report's `Scan.target_url`
         // never carries credentials even if a legacy stored target did.
-        target_url: identity::redact_credentials(&inputs.target_raw),
+        // Strict form (RETEST-2): opaque query/fragment tails drop too.
+        target_url: identity::redact_remote_url(&inputs.target_raw),
         canonical_url: Some(inputs.canonical.clone()),
         scope: inputs.scope_policy.clone(),
         scan_state: inputs.scan_state.clone(),
@@ -7681,7 +7705,10 @@ async fn retry_publication(
     // revalidated and checksum-verified before it is copied out.
     if let Some(dest) = &dest {
         if let Err(e) = reject_state_dir_dest(dest, &cfg.state_dir) {
-            eprintln!("repo-scan: publication retry failed: {e}");
+            eprintln!(
+                "repo-scan: publication retry failed: {}",
+                identity::scrub_text(&e.to_string())
+            );
             return Ok(ExitCode::OperationalFailure);
         }
     }
@@ -7698,7 +7725,10 @@ async fn retry_publication(
             {
                 Ok(_) => true,
                 Err(e) => {
-                    eprintln!("repo-scan: publication retry failed: {e}");
+                    eprintln!(
+                        "repo-scan: publication retry failed: {}",
+                        identity::scrub_text(&e.to_string())
+                    );
                     store
                         .set_snapshot_publication(&recorded.report_id, "failed")
                         .await?;

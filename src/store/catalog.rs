@@ -302,6 +302,19 @@ fn v_opt_blob(value: Option<Vec<u8>>) -> turso::Value {
     value.map_or(turso::Value::Null, turso::Value::Blob)
 }
 
+/// Persist-safe scan-target bytes (RETEST-5): the catalog upholds the
+/// no-credential-bytes invariant even when callers bypass CLI sanitization.
+/// Valid UTF-8 targets are normalized with
+/// [`crate::identity::sanitize_target_url`] (scp user → `git`, userinfo and
+/// query/fragment tails stripped); non-UTF-8 targets are refused, never
+/// persisted lossy. The refusal carries no input bytes (they may hold
+/// secrets and may not be UTF-8).
+fn sanitized_target_bytes(url_raw: &[u8], what: &str) -> crate::Result<Vec<u8>> {
+    let text = std::str::from_utf8(url_raw)
+        .map_err(|_| Error::InvalidArgs(format!("scan {what} URL is not valid UTF-8; refusing")))?;
+    Ok(crate::identity::sanitize_target_url(text).into_bytes())
+}
+
 fn req_i64(row: &turso::Row, idx: usize) -> crate::Result<i64> {
     match row.get_value(idx).map_err(store_err)? {
         turso::Value::Integer(value) => Ok(value),
@@ -2380,9 +2393,10 @@ pub struct NewStatus<'a> {
 pub struct ScanRow {
     /// Scan id.
     pub id: String,
-    /// Target URL, exact bytes as supplied.
+    /// Sanitized target URL bytes (rows predating RETEST-5 may still hold
+    /// legacy credential forms; readers must redact before display).
     pub url_raw: Vec<u8>,
-    /// Canonical URL, exact bytes, when supported.
+    /// Sanitized canonical URL bytes, when supported.
     pub url_canonical: Option<Vec<u8>>,
     /// Requested scope.
     pub scope: String,
@@ -2425,9 +2439,9 @@ impl ScanRow {
 pub struct NewScan<'a> {
     /// Scan id.
     pub id: &'a str,
-    /// Target URL, exact bytes.
+    /// Target URL bytes (UTF-8); sanitized on persist, never stored raw.
     pub url_raw: &'a [u8],
-    /// Canonical URL, exact bytes.
+    /// Canonical URL bytes (UTF-8); sanitized on persist, never stored raw.
     pub url_canonical: Option<&'a [u8]>,
     /// Requested scope.
     pub scope: &'a str,
@@ -3090,12 +3104,24 @@ impl TursoStore {
     }
 
     /// Create a scan request idempotently. Returns true when newly inserted.
+    ///
+    /// RETEST-5 no-credential-bytes boundary: `url_raw`/`url_canonical` are
+    /// sanitized inside this method (see `sanitized_target_bytes`), so
+    /// direct API callers that bypass CLI sanitization still persist no
+    /// credential bytes. The CLI rejects credential forms loudly before
+    /// calling; this layer normalizes silently (defense-in-depth) and only
+    /// refuses non-UTF-8 targets.
     pub async fn create_scan_request(
         &self,
         scan: &NewScan<'_>,
         now_ms: i64,
     ) -> crate::Result<bool> {
         self.forbid_write("create_scan_request")?;
+        let url_raw = sanitized_target_bytes(scan.url_raw, "target")?;
+        let url_canonical = scan
+            .url_canonical
+            .map(|bytes| sanitized_target_bytes(bytes, "canonical"))
+            .transpose()?;
         let rows = self
             .conn
             .execute(
@@ -3104,8 +3130,8 @@ impl TursoStore {
                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?7)",
                 vec![
                     v_text(scan.id),
-                    v_blob(scan.url_raw.to_vec()),
-                    v_opt_blob(scan.url_canonical.map(<[u8]>::to_vec)),
+                    v_blob(url_raw),
+                    v_opt_blob(url_canonical),
                     v_text(scan.scope),
                     v_text(scan.status_mode),
                     v_opt_blob(scan.report_dest.map(<[u8]>::to_vec)),

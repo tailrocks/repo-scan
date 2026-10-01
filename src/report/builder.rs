@@ -17,7 +17,7 @@
 //! when they dangle.
 
 use crate::error::Error;
-use crate::identity::{redact_credentials, scrub_text};
+use crate::identity::{redact_remote_url, scrub_text};
 use crate::model::StatusMode;
 use crate::report::encode::{
     cap_report_field, encode_bytes, encode_name, guess_oid_algorithm, ms_to_rfc3339,
@@ -1082,11 +1082,11 @@ async fn stream_with_pre_pass<W: Write>(
         generation: inputs.generation,
         epoch: inputs.epoch,
         catalog_revision,
-        target_url: redact_credentials(&inputs.target_url),
+        target_url: redact_remote_url(&inputs.target_url),
         canonical_url: inputs
             .canonical_url
             .as_ref()
-            .map(|url| redact_credentials(url)),
+            .map(|url| redact_remote_url(url)),
         matching_policy: crate::identity::MATCHING_POLICY.to_string(),
         scope: inputs.scope.clone(),
         state: inputs.scan_state.clone(),
@@ -1400,11 +1400,11 @@ async fn stream_with_pre_pass<W: Write>(
                 checkout_scope_id: scope,
                 name: encode_name(&req_blob(&row, 3)?),
                 role: req_text(&row, 4)?,
-                url: cap_report_field(&redact_credentials(&String::from_utf8_lossy(&req_blob(
+                url: cap_report_field(&redact_remote_url(&String::from_utf8_lossy(&req_blob(
                     &row, 5,
                 )?))),
                 canonical_url: opt_blob(&row, 6)?.map(|bytes| {
-                    cap_report_field(&redact_credentials(&String::from_utf8_lossy(&bytes)))
+                    cap_report_field(&redact_remote_url(&String::from_utf8_lossy(&bytes)))
                 }),
                 observed_at: ms_to_rfc3339(req_i64(&row, 7)?),
             })?;

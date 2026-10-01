@@ -96,7 +96,10 @@ pub fn classify_remote(
     remote_url: &str,
     role: &str,
 ) -> (MatchDisposition, Vec<String>) {
-    let redacted = redact_credentials(remote_url.trim());
+    // Evidence lines persist into the catalog and the report, so they
+    // use the strict remote form: opaque query/fragment tails drop
+    // entirely rather than leaking through key-based scrubbing (RETEST-2).
+    let redacted = redact_remote_url(remote_url.trim());
     if remote_url.trim().is_empty() {
         return (
             MatchDisposition::UnresolvableIdentity,
@@ -268,9 +271,108 @@ fn percent_decode_for_match(text: &str) -> String {
     out
 }
 
+/// Backslash-unescape `text` for detection purposes only (matching keys
+/// through JSON-style `\uXXXX` / `\xXX` / single-character escapes such
+/// as `"\u0073ecret"`). Unknown escapes drop the backslash and keep the
+/// character; truncated escapes pass through literally. Output feeds
+/// key matching only, never emission.
+fn unescape_key_for_match(text: &str) -> String {
+    if !text.contains('\\') {
+        return text.to_string();
+    }
+    fn hex_val(byte: u8) -> Option<u32> {
+        match byte {
+            b'0'..=b'9' => Some((byte - b'0') as u32),
+            b'a'..=b'f' => Some((byte - b'a' + 10) as u32),
+            b'A'..=b'F' => Some((byte - b'A' + 10) as u32),
+            _ => None,
+        }
+    }
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            let next = bytes[i + 1];
+            if next == b'u' && i + 5 < bytes.len() {
+                let mut value = 0u32;
+                let mut ok = true;
+                for k in 0..4 {
+                    match hex_val(bytes[i + 2 + k]) {
+                        Some(digit) => value = value * 16 + digit,
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    out.push(char::from_u32(value).unwrap_or('\u{FFFD}'));
+                    i += 6;
+                    continue;
+                }
+            }
+            if next == b'x' && i + 3 < bytes.len() {
+                if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 2]), hex_val(bytes[i + 3])) {
+                    out.push(char::from_u32(hi * 16 + lo).unwrap_or('\u{FFFD}'));
+                    i += 4;
+                    continue;
+                }
+            }
+            match next {
+                b'n' => out.push('\n'),
+                b't' => out.push('\t'),
+                b'r' => out.push('\r'),
+                b'b' => out.push('\u{0008}'),
+                b'f' => out.push('\u{000C}'),
+                b'v' => out.push('\u{000B}'),
+                b'\\' => out.push('\\'),
+                b'"' => out.push('"'),
+                b'\'' => out.push('\''),
+                b'/' => out.push('/'),
+                _ => {
+                    if next.is_ascii() {
+                        out.push(next as char);
+                    } else {
+                        out.push('\u{FFFD}');
+                    }
+                }
+            }
+            i += 2;
+            continue;
+        }
+        if bytes[i].is_ascii() {
+            out.push(bytes[i] as char);
+        } else {
+            out.push('\u{FFFD}');
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Normalize a raw key for sensitivity matching (RETEST-4): unescape
+/// then match. Percent-decoding and backslash-unescaping run in both
+/// orders (a second pass catches `%5Cu...` and `\u0025...` alike), then
+/// only match-significant characters survive, lowercased. Shared by the
+/// query/fragment, same-token, and spaced/JSON/CLI pair passes so an
+/// escaped key cannot evade one shape while another catches it.
+fn normalize_key_for_match(raw_key: &str) -> String {
+    let once = unescape_key_for_match(&percent_decode_for_match(raw_key));
+    let twice = unescape_key_for_match(&percent_decode_for_match(&once));
+    twice
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .collect::<String>()
+        .to_lowercase()
+}
+
 /// Value-redact sensitive `key=value` pairs inside one query/fragment
 /// section (`&`/`;` separated). Non-sensitive pairs pass through
-/// untouched; a sensitive key's value becomes [`REDACTED`].
+/// untouched; a sensitive key's value becomes [`REDACTED`]. Valueless
+/// (opaque, non-`key=value`) segments cannot be key-identified and
+/// become [`REDACTED`] as well (RETEST-2); empty segments from `&&`/`;;`
+/// runs pass through to preserve structure.
 fn scrub_pairs(section: &str) -> String {
     let mut out = String::with_capacity(section.len());
     let mut rest = section;
@@ -284,7 +386,7 @@ fn scrub_pairs(section: &str) -> String {
         };
         match pair.split_once('=') {
             Some((key, _)) => {
-                let match_key = percent_decode_for_match(key).to_lowercase();
+                let match_key = normalize_key_for_match(key);
                 if is_sensitive_key(&match_key) {
                     out.push_str(key);
                     out.push('=');
@@ -293,7 +395,13 @@ fn scrub_pairs(section: &str) -> String {
                     out.push_str(pair);
                 }
             }
-            None => out.push_str(pair),
+            None => {
+                if pair.is_empty() {
+                    out.push_str(pair);
+                } else {
+                    out.push_str(REDACTED);
+                }
+            }
         }
         match separator {
             Some(sep) => {
@@ -333,17 +441,27 @@ fn scrub_query_fragment(tail: &str) -> String {
 
 /// Strip embedded credentials from a remote URL for reports and logs.
 ///
-/// URL-form userinfo `user:pass@` becomes `user:<redacted>@`; a bare
-/// `token@` (no colon, the common token-as-username shape) becomes
-/// `<redacted>@`. Sensitive query/fragment parameter values become
-/// `<redacted>` while structure is preserved. Scp-like `user@host:path`
-/// has its user component redacted (`<redacted>@host:path`): a
-/// token-as-username (`secret@github.com:o/r`) is indistinguishable from
-/// the conventional `git` login without an allowlist, so every scp-like
-/// user redacts (RS-PRIV-10). Inputs that cannot be represented safely
-/// (control characters, or an `@` past the authority that signals
-/// malformed smuggled userinfo such as
+/// URL-form userinfo `user:pass@` becomes `user:<redacted>@`, except a
+/// PAT-shaped username is itself credential material and becomes
+/// `<redacted>:<redacted>@` (RETEST-1); a bare `token@` (no colon, the
+/// common token-as-username shape) becomes `<redacted>@`. Sensitive
+/// query/fragment parameter values become `<redacted>` while structure
+/// is preserved; valueless (opaque, non-`key=value`) query/fragment
+/// segments cannot be key-identified and become `<redacted>` as well.
+/// Scp-like `user@host:path` has its user component redacted
+/// (`<redacted>@host:path`): a token-as-username
+/// (`secret@github.com:o/r`) is indistinguishable from the conventional
+/// `git` login without an allowlist, so every scp-like user redacts
+/// (RS-PRIV-10); scp syntax has no query semantics, so any `?`/`#` tail
+/// on the path is opaque and stripped. Inputs that cannot be
+/// represented safely (control characters, or an `@` past the authority
+/// that signals malformed smuggled userinfo such as
 /// `https://user:secret/ret@host/...`) collapse to [`REDACTED_URL`].
+///
+/// Remote, submodule, and catalog report fields must use
+/// [`redact_remote_url`] instead: it additionally drops every
+/// query/fragment tail (opaque `?next=...` values are not
+/// key-identifiable), while this key-based scrub is for free text.
 pub fn redact_credentials(url: &str) -> String {
     let Some((scheme, rest)) = split_scheme(url) else {
         return redact_scp_like(url).unwrap_or_else(|| url.to_string());
@@ -369,11 +487,127 @@ pub fn redact_credentials(url: &str) -> String {
     if userinfo.is_empty() {
         return format!("{scheme}{authority}{scrubbed_tail}");
     }
-    let redacted_user = match userinfo.find(':') {
-        Some(i) => format!("{}:{REDACTED}", &userinfo[..i]),
-        None => REDACTED.to_string(),
-    };
+    let redacted_user = redact_userinfo(userinfo);
     format!("{scheme}{redacted_user}@{host}{scrubbed_tail}")
+}
+
+/// Redact one `userinfo` authority component: `user:pass@` becomes
+/// `user:<redacted>@`, except a PAT-shaped username is itself
+/// credential material and yields `<redacted>:<redacted>@` (RETEST-1);
+/// a bare `token@` (no colon) becomes `<redacted>@`. Shared by
+/// [`redact_credentials`] and [`redact_remote_url`] so every
+/// remote/submodule/catalog report path treats usernames identically.
+fn redact_userinfo(userinfo: &str) -> String {
+    match userinfo.find(':') {
+        Some(i) => {
+            let user = &userinfo[..i];
+            if is_credential_username(user) {
+                format!("{REDACTED}:{REDACTED}")
+            } else {
+                format!("{user}:{REDACTED}")
+            }
+        }
+        None => REDACTED.to_string(),
+    }
+}
+
+/// True when a URL username is itself credential-shaped (RETEST-1) and
+/// must never be emitted intact: known PAT/OAuth/secret markers, or a
+/// long mixed random-looking string (a marker-less token-as-username).
+/// Matching runs over the percent-decoded lowercase form; over-matching
+/// only over-redacts a display string, which is the safe direction.
+fn is_credential_username(user: &str) -> bool {
+    let decoded = percent_decode_for_match(user);
+    if decoded.is_empty() {
+        return false;
+    }
+    let lower = decoded.to_lowercase();
+    const MARKERS: &[&str] = &[
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "glpat-",
+        "gldt-",
+        "xoxa-",
+        "xoxb-",
+        "xoxp-",
+        "xoxs-",
+        "xoxo-",
+        "x-access-token",
+        "oauth",
+        "token",
+        "secret",
+        "passwd",
+        "password",
+        "passcode",
+        "bearer",
+        "jwt",
+        "pat_",
+        "pat-",
+        "pat",
+        "private",
+        "credential",
+        "auth",
+        "apikey",
+        "api_key",
+        "api-key",
+        "access_key",
+        "secret_key",
+        "client_secret",
+        "session",
+        "signature",
+        "akia",
+        "sk-live",
+        "sk-test",
+    ];
+    if MARKERS.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+    // Marker-less fallback: conventional logins are short and rarely mix
+    // letters with digits at length; a long mixed (or very long)
+    // username is token-shaped.
+    let has_letter = lower.bytes().any(|b| b.is_ascii_alphabetic());
+    let has_digit = lower.bytes().any(|b| b.is_ascii_digit());
+    if decoded.len() >= 16 && has_letter && has_digit {
+        return true;
+    }
+    decoded.len() >= 32
+}
+
+/// Display/persist-safe form of a repository URL for remote, submodule,
+/// and catalog report construction paths (RETEST-2): userinfo redacts
+/// exactly as in [`redact_credentials`] (PAT-shaped usernames included),
+/// and any query/fragment tail is dropped entirely — opaque values such
+/// as `?next=...` are not key-identifiable, so key-based scrubbing
+/// cannot make them safe to persist. Scp-like `user@host:path` likewise
+/// loses any `?`/`#` tail. Malformed input collapses to
+/// [`REDACTED_URL`], mirroring [`redact_credentials`].
+pub fn redact_remote_url(url: &str) -> String {
+    let Some((scheme, rest)) = split_scheme(url) else {
+        return redact_scp_like(url).unwrap_or_else(|| url.to_string());
+    };
+    if url.chars().any(|c| c.is_control()) {
+        return REDACTED_URL.to_string();
+    }
+    let end = authority_len(rest);
+    let (authority, tail) = rest.split_at(end);
+    let path = tail.split(['?', '#']).next().unwrap_or(tail);
+    if path.contains('@') {
+        return REDACTED_URL.to_string();
+    }
+    let Some(at) = authority.rfind('@') else {
+        return format!("{scheme}{authority}{path}");
+    };
+    let userinfo = &authority[..at];
+    let host = &authority[at + 1..];
+    if userinfo.is_empty() {
+        return format!("{scheme}{authority}{path}");
+    }
+    let redacted_user = redact_userinfo(userinfo);
+    format!("{scheme}{redacted_user}@{host}{path}")
 }
 
 /// Redact the user component of a scp-like `user@host:path` shape, if
@@ -381,14 +615,17 @@ pub fn redact_credentials(url: &str) -> String {
 /// `user@host`, paths, prose): the shape requires a non-empty single-token
 /// user, a non-empty host with no `/`, and a `host:path` remainder.
 /// Control characters fail closed to [`REDACTED_URL`], mirroring scheme
-/// URLs. Used by [`redact_credentials`] and the free-text scp pass of
-/// [`scrub_text`] (RS-PRIV-10).
+/// URLs. Scp syntax has no query semantics, so any `?`/`#` tail on the
+/// path is opaque and stripped (RETEST-2). Used by
+/// [`redact_credentials`], [`redact_remote_url`], and the free-text scp
+/// pass of [`scrub_text`] (RS-PRIV-10).
 fn redact_scp_like(url: &str) -> Option<String> {
     let rest = scp_host_path(url)?;
     if rest.chars().any(|c| c.is_control()) {
         return Some(REDACTED_URL.to_string());
     }
-    Some(format!("{REDACTED}@{rest}"))
+    let head = rest.split(['?', '#']).next().unwrap_or(rest);
+    Some(format!("{REDACTED}@{head}"))
 }
 
 /// Split an scp-like `user@host:path` shape into its `host:path` remainder,
@@ -511,7 +748,11 @@ pub fn sanitize_target_url(url: &str) -> String {
         if rest.chars().any(|c| c.is_control()) {
             return REDACTED_URL.to_string();
         }
-        return format!("git@{rest}");
+        // Defense-in-depth behind [`must_reject_target`]: scp-like tails
+        // strip exactly like scheme tails, so a direct call can never
+        // persist an opaque `host:path?...` value.
+        let head = rest.split(['?', '#']).next().unwrap_or(rest);
+        return format!("git@{head}");
     }
     let Some((scheme, rest)) = split_scheme(trimmed) else {
         return trimmed.to_string();
@@ -536,9 +777,38 @@ pub fn sanitize_target_url(url: &str) -> String {
 /// entirely (opaque values are not key-identifiable, so key-based redaction
 /// cannot make them safe to echo), spaced/JSON/CLI pairs scrubbed. Never
 /// carries secret bytes; host/path structure is preserved for the user.
+///
+/// Fails closed (RETEST-3): malformed or unparseable input — empty,
+/// whitespace/control-bearing, or neither `scheme://` nor scp-like
+/// shaped — collapses to [`REDACTED_URL`] instead of echoing. Redact or
+/// refuse; never echo.
 pub fn redact_target_for_display(url: &str) -> String {
-    let head = url.split(['?', '#']).next().unwrap_or(url);
-    scrub_text(&redact_credentials(head))
+    let trimmed = url.trim();
+    if trimmed.is_empty() || trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return REDACTED_URL.to_string();
+    }
+    let shaped = split_scheme(trimmed).is_some() || scp_host_path(trimmed).is_some();
+    if !shaped {
+        return REDACTED_URL.to_string();
+    }
+    let head = trimmed.split(['?', '#']).next().unwrap_or(trimmed);
+    let redacted = redact_credentials(head);
+    // `redact_credentials` echoes non-URL input unchanged by design; only
+    // URL-shaped output (or the fail-closed placeholder) may pass, and it
+    // must carry no smuggled whitespace.
+    if redacted
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace())
+    {
+        return REDACTED_URL.to_string();
+    }
+    let out_shaped = redacted == REDACTED_URL
+        || split_scheme(&redacted).is_some()
+        || scp_host_path(&redacted).is_some();
+    if !out_shaped {
+        return REDACTED_URL.to_string();
+    }
+    scrub_text(&redacted)
 }
 
 /// Scrub free text (evidence lines, error strings, reasons) for report
@@ -686,11 +956,7 @@ fn scrub_pair_token(token: &str) -> Option<String> {
         return None;
     }
     let (key, separator, _) = split_pair(token)?;
-    let clean_key: String = key
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-        .collect();
-    let match_key = percent_decode_for_match(&clean_key).to_lowercase();
+    let match_key = normalize_key_for_match(key);
     if match_key.is_empty() || !is_sensitive_key(&match_key) {
         return None;
     }
@@ -794,12 +1060,13 @@ fn scrub_spaced_pairs(text: &str) -> String {
     out
 }
 
-/// Match a sensitive key starting at byte `i`: bare (`password`), quoted
-/// (`"password"`), or CLI-flag (`--password`) form. Returns the byte end
-/// of the key, the cleaned-key length (for the drive-letter guard), and
-/// whether the key is a `--flag`. The match must start at a key boundary
-/// (start of text or a non-key character before `i`) and the raw key is
-/// capped at 128 bytes.
+/// Match a sensitive key starting at byte `i`: bare (`password`),
+/// quoted (`"password"`), CLI-flag (`--password`), or backslash-escaped
+/// (`\u0073ecret`) form. Returns the byte end of the key, the
+/// normalized-key length (for the drive-letter guard), and whether the
+/// key is a `--flag`. The match must start at a key boundary (start of
+/// text or a non-key character before `i`) and the raw key is capped at
+/// 128 bytes.
 fn match_key_at(text: &str, i: usize) -> Option<(usize, usize, bool)> {
     let bytes = text.as_bytes();
     if i > 0 {
@@ -818,10 +1085,13 @@ fn match_key_at(text: &str, i: usize) -> Option<(usize, usize, bool)> {
             return None;
         }
         (&text[i + 1..j], j + 1)
-    } else if first.is_ascii_alphabetic() || first == b'_' || first == b'-' {
+    } else if first.is_ascii_alphabetic() || first == b'_' || first == b'-' || first == b'\\' {
         let mut j = i;
+        // Backslashes scan as key characters so `\uXXXX`-escaped key
+        // starts unescape-then-match instead of evading (RETEST-4);
+        // normalization resolves them before the sensitivity check.
         while j < bytes.len()
-            && (bytes[j].is_ascii_alphanumeric() || matches!(bytes[j], b'_' | b'-' | b'.'))
+            && (bytes[j].is_ascii_alphanumeric() || matches!(bytes[j], b'_' | b'-' | b'.' | b'\\'))
             && j - i <= 128
         {
             j += 1;
@@ -833,11 +1103,7 @@ fn match_key_at(text: &str, i: usize) -> Option<(usize, usize, bool)> {
     if raw.is_empty() || raw.len() > 128 {
         return None;
     }
-    let clean_key: String = raw
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-        .collect();
-    let match_key = percent_decode_for_match(&clean_key).to_lowercase();
+    let match_key = normalize_key_for_match(raw);
     if match_key.is_empty() || !is_sensitive_key(&match_key) {
         return None;
     }

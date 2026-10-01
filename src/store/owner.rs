@@ -649,7 +649,14 @@ pub fn open_dir_nofollow(path: &Path) -> crate::Result<std::fs::File> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
         .open(path)
         .map_err(|e| {
-            if e.raw_os_error() == Some(libc::ELOOP) {
+            // Linux reports ELOOP for O_NOFOLLOW on a symlink, but macOS
+            // reports ENOTDIR when O_DIRECTORY is also set; classify by
+            // lstat so the refusal names the symlink on both. This runs
+            // only after the open already failed, so a racing swap can
+            // affect just the message, never the fail-closed outcome.
+            let symlink =
+                e.raw_os_error() == Some(libc::ELOOP) || is_symlink_path(path).unwrap_or(false);
+            if symlink {
                 Error::Store(format!("refusing symlinked directory {}", path.display()))
             } else {
                 Error::Io(format!("cannot open directory {}: {e}", path.display()))

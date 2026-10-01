@@ -339,3 +339,39 @@ pub struct GeneratedArtifact {
     pub kind: String,
     pub created_after_status: bool,
 }
+
+impl Scan {
+    /// Return this record with credential-bearing URL fields redacted
+    /// (RETEST-5 public-API boundary): `target_url` and `canonical_url`
+    /// pass through [`crate::identity::redact_remote_url`], exactly as the
+    /// report builder does at emission. Direct model callers that bypass
+    /// the builder must apply this before serializing or displaying a
+    /// `Scan`, so the no-credential-bytes invariant holds however the
+    /// record was constructed. Idempotent: already-redacted values pass
+    /// through unchanged.
+    #[must_use]
+    pub fn sanitized(mut self) -> Self {
+        self.target_url = crate::identity::redact_remote_url(&self.target_url);
+        self.canonical_url = self
+            .canonical_url
+            .map(|url| crate::identity::redact_remote_url(&url));
+        self
+    }
+}
+
+impl Remote {
+    /// Return this record with credential-bearing URL fields redacted
+    /// (RETEST-5 public-API boundary): `url` and `canonical_url` pass
+    /// through [`crate::identity::redact_remote_url`], exactly as the
+    /// report builder does at emission. Direct model callers that bypass
+    /// the builder must apply this before serializing or displaying a
+    /// `Remote`. Idempotent: already-redacted values pass through unchanged.
+    #[must_use]
+    pub fn sanitized(mut self) -> Self {
+        self.url = crate::identity::redact_remote_url(&self.url);
+        self.canonical_url = self
+            .canonical_url
+            .map(|url| crate::identity::redact_remote_url(&url));
+        self
+    }
+}

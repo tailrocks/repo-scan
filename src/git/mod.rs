@@ -633,7 +633,7 @@ impl GixInspector {
                 Ok(url) => {
                     let full = url.to_bstring().to_string();
                     (
-                        Some(crate::identity::redact_credentials(&full)),
+                        Some(crate::identity::redact_remote_url(&full)),
                         crate::identity::normalize_github_url(&full),
                     )
                 }
@@ -908,7 +908,7 @@ impl GitInspect for GixInspector {
                     out.push(RemoteObservation {
                         name: name.as_bytes().to_vec(),
                         role,
-                        url: crate::identity::redact_credentials(&full),
+                        url: crate::identity::redact_remote_url(&full),
                         canonical_url: crate::identity::normalize_github_url(&full),
                     });
                 }

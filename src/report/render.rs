@@ -32,9 +32,7 @@ pub fn render_terminal(report: &Report, out: &mut dyn std::io::Write) -> crate::
     ))?;
     w(&format!(
         "target {} ({})\n",
-        escape_display(&crate::identity::redact_credentials(
-            &report.scan.target_url
-        )),
+        escape_display(&crate::identity::redact_remote_url(&report.scan.target_url)),
         escape_display(&report.scan.state)
     ))?;
     w(&format!(
@@ -64,10 +62,14 @@ pub fn render_terminal(report: &Report, out: &mut dyn std::io::Write) -> crate::
         .iter()
         .map(|p| (p.id.as_str(), p.display.as_str()))
         .collect();
+    // RETEST-7: path bytes are lower-layer filesystem/git material and can
+    // carry credential-shaped components (`token=...`, embedded URLs); the
+    // display channel scrubs them like the cached-query path display does
+    // (lossless bytes stay in the report `value` channel and the catalog).
     let show_path = |id: &str| -> String {
         paths
             .get(id)
-            .map(|d| escape_display(d))
+            .map(|d| show_prose(d))
             .unwrap_or_else(|| format!("<missing path {id}>"))
     };
 
@@ -126,7 +128,7 @@ pub fn render_terminal(report: &Report, out: &mut dyn std::io::Write) -> crate::
             w(&format!(
                 "  [{}] {} {}\n",
                 escape_display(&branch.kind),
-                escape_display(&branch.name.display),
+                show_prose(&branch.name.display),
                 oid
             ))?;
         }
