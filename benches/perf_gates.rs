@@ -17,6 +17,7 @@ mod support;
 
 use repo_scan::config::ResourceLimits;
 use repo_scan::model::{Epoch, GenerationId, TaskState};
+use repo_scan::report::publish::sha256_hex;
 use repo_scan::report::{model::Status, validate::validate_status};
 use repo_scan::scheduler::{
     Admission, DurableScheduler, MemorySchedulerStore, OpClass, Scheduler, SchedulerStore, Task,
@@ -49,19 +50,279 @@ const MAX_ITERS: usize = 60;
 const RSS_CADENCE: Duration = Duration::from_millis(100);
 /// Per-scan wall timeout: a hung scan fails the gate, never the harness.
 const SCAN_TIMEOUT: Duration = Duration::from_secs(600);
+/// Phase wall budgets (RSF-PERF-BLOCKED-TEST-001): an overrun FAILS the
+/// gate (exit 1 with a `phase_timeout` record plus hashed evidence), never
+/// skips. Worst-case wall is bounded (~corpus + warmup + sustained + one
+/// overrun scan). Overridable via `$PERF_GATES_{CORPUS,SUSTAINED,HARNESS}_
+/// BUDGET_S` (seconds) for slow machines and the timeout regression test.
+const CORPUS_BUDGET_SECS: u64 = 600;
+const SUSTAINED_BUDGET_SECS: u64 = 900;
+const HARNESS_BUDGET_SECS: u64 = 1800;
+/// Wall budget for one read-only evidence probe (git/toolchain).
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Outcome of one wall-bounded unit of work.
+enum Bounded<T> {
+    /// Finished in budget with this value.
+    Value(T),
+    /// The worker panicked (message); the gate fails with the reason.
+    Panicked(String),
+    /// Still running when the budget expired; the gate fails.
+    TimedOut,
+}
+
+/// Run `job` on a worker thread, waiting at most `budget`. Panics are
+/// caught (never silent) and reported as [`Bounded::Panicked`]. On
+/// timeout the worker is left detached: every caller fails the gate and
+/// exits, so the process reaps it.
+fn run_bounded<T, F>(budget: Duration, job: F) -> Bounded<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
+            Ok(value) => Bounded::Value(value),
+            Err(payload) => Bounded::Panicked(panic_message(payload)),
+        };
+        let _ = tx.send(outcome);
+    });
+    match rx.recv_timeout(budget) {
+        Ok(outcome) => outcome,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Bounded::TimedOut,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Bounded::Panicked(String::from("worker thread ended without reporting"))
+        }
+    }
+}
+
+/// Best-effort text of a caught panic payload.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else {
+        String::from("non-string panic payload")
+    }
+}
+
+/// True when `elapsed` has reached `budget`. A zero budget is already
+/// over (used by the corpus-timeout regression test).
+fn phase_over(elapsed: Duration, budget: Duration) -> bool {
+    elapsed >= budget
+}
+
+/// Phase budget in seconds: `$PERF_GATES_<KEY>_BUDGET_S` wins, an
+/// unparsable value warns and falls back to `default`.
+fn budget_secs(key: &str, default: u64) -> Duration {
+    let name = format!("PERF_GATES_{key}_BUDGET_S");
+    match std::env::var(&name) {
+        Ok(raw) => match raw.parse::<u64>() {
+            Ok(secs) => {
+                eprintln!("perf_gates: {name}={secs}s (override)");
+                Duration::from_secs(secs)
+            }
+            Err(_) => {
+                eprintln!("perf_gates: {name}={raw:?} unparsable; using default {default}s");
+                Duration::from_secs(default)
+            }
+        },
+        Err(_) => Duration::from_secs(default),
+    }
+}
+
+/// Record a phase-timeout FAIL and exit 1 (RSF-PERF-BLOCKED-TEST-001):
+/// timeouts fail the gate with hashed evidence, never skip. Diverges.
+fn fail_gate(
+    recorder: &mut Recorder,
+    reports: &Path,
+    phase: &str,
+    detail: &str,
+    budget: Duration,
+    elapsed: Duration,
+) -> ! {
+    recorder.record(&serde_json::json!({
+        "record": "phase_timeout",
+        "phase": phase,
+        "detail": detail,
+        "budget_s": budget.as_secs_f64(),
+        "elapsed_s": elapsed.as_secs_f64(),
+        "timeout": true,
+        "verdict": false,
+    }));
+    recorder.record(&serde_json::json!({
+        "record": "verdict",
+        "perf02_pass": false,
+        "queue_pass": false,
+        "perf03_pass": false,
+        "pass": false,
+        "timeout": true,
+        "timeout_phase": phase,
+    }));
+    record_evidence(recorder, reports);
+    eprintln!("perf_gates: FAIL (phase {phase} over budget: {detail})");
+    println!("TEST_EXIT=1");
+    std::process::exit(1);
+}
+
+/// One read-only evidence probe: trimmed stdout, or an explicit
+/// unknown-with-reason. Bounded by [`PROBE_TIMEOUT`]; failures never
+/// panic (the record carries the reason, the test enforces presence).
+fn probe_text(cmd: &str, args: &[&str]) -> Result<String, String> {
+    let cmd_owned = cmd.to_string();
+    let owned: Vec<String> = args.iter().map(ToString::to_string).collect();
+    match run_bounded(PROBE_TIMEOUT, move || {
+        Command::new(&cmd_owned).args(&owned).output()
+    }) {
+        Bounded::Value(Ok(output)) if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
+        Bounded::Value(Ok(output)) => Err(format!("exit {}", output.status.code().unwrap_or(-1))),
+        Bounded::Value(Err(e)) => Err(e.to_string()),
+        Bounded::Panicked(message) => Err(format!("probe panicked: {message}")),
+        Bounded::TimedOut => Err(format!("probe exceeded {}s", PROBE_TIMEOUT.as_secs())),
+    }
+}
+
+/// Record the build/source fingerprint (RSF-PERF-BLOCKED-TEST-001 durable
+/// evidence): git HEAD, SHA-256 of the tracked diff, toolchain versions.
+/// Read-only probes; failures record explicit unknowns with reasons.
+fn record_build_evidence(recorder: &mut Recorder) {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let git_head = probe_text("git", &["-C", manifest, "rev-parse", "HEAD"])
+        .map(|head| {
+            if head.len() == 40 && head.chars().all(|c| c.is_ascii_hexdigit()) {
+                head
+            } else {
+                format!("unknown (unexpected rev-parse output: {head:?})")
+            }
+        })
+        .unwrap_or_else(|reason| format!("unknown ({reason})"));
+    let diff_fp = match probe_text("git", &["-C", manifest, "diff", "--no-ext-diff", "HEAD"]) {
+        Ok(diff) => sha256_hex(diff.as_bytes()),
+        Err(reason) => format!("unknown ({reason})"),
+    };
+    let status_lines = probe_text("git", &["-C", manifest, "status", "--porcelain"])
+        .map(|status| status.lines().count() as u64)
+        .unwrap_or(u64::MAX);
+    let rustc =
+        probe_text("rustc", &["--version"]).unwrap_or_else(|reason| format!("unknown ({reason})"));
+    let cargo =
+        probe_text("cargo", &["--version"]).unwrap_or_else(|reason| format!("unknown ({reason})"));
+    recorder.record(&serde_json::json!({
+        "record": "build_evidence",
+        "git_head": git_head,
+        "git_diff_sha256": diff_fp,
+        "git_status_lines": status_lines,
+        "rustc": rustc,
+        "cargo": cargo,
+    }));
+}
+
+/// SHA-256 (hex) plus byte length of one file; `None` when unreadable.
+fn sha256_file(path: &Path) -> Option<(String, u64)> {
+    let bytes = std::fs::read(path).ok()?;
+    let len = bytes.len() as u64;
+    Some((sha256_hex(&bytes), len))
+}
+
+/// Record the durable-evidence anchor (RSF-PERF-BLOCKED-TEST-001): SHA-256
+/// of the JSONL bytes so far plus every report file, taken BEFORE the
+/// fixture tempdir is cleaned. Then print the post-record `EVIDENCE` lines
+/// (stdout, tee'd by the caller) so the final bytes are anchored too.
+fn record_evidence(recorder: &mut Recorder, reports: &Path) {
+    let jsonl_path = recorder.path().to_path_buf();
+    let (pre_sha, pre_len) =
+        sha256_file(&jsonl_path).unwrap_or_else(|| (String::from("unknown (jsonl unreadable)"), 0));
+    let mut files: Vec<(String, String, u64)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(reports) {
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.ends_with(".json") {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        names.sort();
+        for name in names {
+            if let Some((sha, len)) = sha256_file(&reports.join(&name)) {
+                files.push((name, sha, len));
+            }
+        }
+    }
+    let reports_json: Vec<serde_json::Value> = files
+        .iter()
+        .map(|(name, sha, len)| serde_json::json!({"name": name, "sha256": sha, "bytes": len}))
+        .collect();
+    let reports_bytes: u64 = files.iter().map(|(_, _, len)| *len).sum();
+    recorder.record(&serde_json::json!({
+        "record": "evidence",
+        "jsonl_sha256_pre": pre_sha,
+        "jsonl_bytes_pre": pre_len,
+        "reports": reports_json,
+        "reports_total": files.len(),
+        "reports_bytes_total": reports_bytes,
+        "note": "hashes taken before fixture cleanup; post hash printed on stdout",
+    }));
+    let (post_sha, post_len) =
+        sha256_file(&jsonl_path).unwrap_or_else(|| (String::from("unknown (jsonl unreadable)"), 0));
+    println!(
+        "EVIDENCE jsonl_sha256={post_sha} jsonl_bytes={post_len} path={}",
+        jsonl_path.display()
+    );
+    for (name, sha, len) in &files {
+        println!("EVIDENCE report_sha256={sha} report_bytes={len} report={name}");
+    }
+}
 
 fn main() {
     let mut recorder = Recorder::open(&support::results_dir(), "perf_gates");
+    let harness_start = Instant::now();
+    let corpus_budget = budget_secs("CORPUS", CORPUS_BUDGET_SECS);
+    let sustained_budget = budget_secs("SUSTAINED", SUSTAINED_BUDGET_SECS);
+    let harness_budget = budget_secs("HARNESS", HARNESS_BUDGET_SECS);
     let limits = ResourceLimits::default();
     let binary = resolve_binary();
     eprintln!("perf_gates: binary: {}", binary.display());
+    record_build_evidence(&mut recorder);
 
     // --- Declared corpus (tempdir only). ---
     let holder = tempfile::TempDir::new().expect("perf scratch");
     let corpus = holder.path().join("corpus");
+    let archetypes = holder.path().join("archetypes");
     std::fs::create_dir_all(&corpus).expect("corpus root");
+    let reports = holder.path().join("reports");
+    std::fs::create_dir_all(&reports).expect("reports dir");
     let start = Instant::now();
-    build_corpus(&corpus, &holder.path().join("archetypes"));
+    let corpus_job = corpus.clone();
+    let archetypes_job = archetypes.clone();
+    match run_bounded(corpus_budget, move || {
+        build_corpus(&corpus_job, &archetypes_job);
+    }) {
+        Bounded::Value(()) => {}
+        Bounded::Panicked(message) => fail_gate(
+            &mut recorder,
+            &reports,
+            "corpus",
+            &format!("corpus worker panicked: {message}"),
+            corpus_budget,
+            start.elapsed(),
+        ),
+        Bounded::TimedOut => fail_gate(
+            &mut recorder,
+            &reports,
+            "corpus",
+            "corpus build exceeded budget",
+            corpus_budget,
+            start.elapsed(),
+        ),
+    }
     let build_ms = support::wall_ms(&start);
     let total_builds = REPOS_NORMAL + REPOS_BARE + REPOS_DETACHED + REPOS_WT_MAINS;
     recorder.record(&serde_json::json!({
@@ -78,11 +339,19 @@ fn main() {
         "build_wall_ms": build_ms,
         "method": "one git-built archetype per layout, then filesystem copies; detach and worktree registration run in place",
     }));
+    if phase_over(harness_start.elapsed(), harness_budget) {
+        fail_gate(
+            &mut recorder,
+            &reports,
+            "harness",
+            "harness budget exhausted after corpus build",
+            harness_budget,
+            harness_start.elapsed(),
+        );
+    }
 
     // --- Warmup scan (unmeasured), then the sustained measured window. ---
     let state_dir = holder.path().join("state");
-    let reports = holder.path().join("reports");
-    std::fs::create_dir_all(&reports).expect("reports dir");
     let ctx = ScanCtx {
         binary: &binary,
         state_dir: &state_dir,
@@ -103,10 +372,31 @@ fn main() {
 
     let cpu_before = children_cpu_seconds();
     let window_start = Instant::now();
+    let sustained_start = Instant::now();
     let mut iters = Vec::new();
     for iter in 0..MAX_ITERS {
         if window_start.elapsed().as_secs_f64() >= MEASURED_MIN_SECS {
             break;
+        }
+        if phase_over(sustained_start.elapsed(), sustained_budget) {
+            fail_gate(
+                &mut recorder,
+                &reports,
+                "sustained",
+                "sustained phase exceeded budget before reaching the measured window",
+                sustained_budget,
+                sustained_start.elapsed(),
+            );
+        }
+        if phase_over(harness_start.elapsed(), harness_budget) {
+            fail_gate(
+                &mut recorder,
+                &reports,
+                "harness",
+                "harness budget exhausted during sustained phase",
+                harness_budget,
+                harness_start.elapsed(),
+            );
         }
         let sample = run_scan(&ctx, &reports.join(format!("iter-{iter:03}.json")));
         recorder.record(&serde_json::json!({
@@ -225,19 +515,24 @@ fn main() {
         "queue_pass": queue_pass,
         "perf03_pass": pressure_pass,
         "pass": pass,
+        "timeout": false,
         "measured_wall_s": measured_s,
         "iters": iters.len(),
         "child_peak_rss_bytes": child_peak,
         "mean_cores": mean_cores,
     }));
+    // Durable evidence BEFORE the fixture tempdir drops at scope end.
+    record_evidence(&mut recorder, &reports);
     println!("perf_gates: results at {}", recorder.path().display());
     if pass {
         println!(
             "perf_gates: PASS ({} iters, {measured_s:.1}s measured)",
             iters.len()
         );
+        println!("TEST_EXIT=0");
     } else {
         eprintln!("perf_gates: FAIL (perf02={perf02} queue={queue_pass} perf03={pressure_pass})");
+        println!("TEST_EXIT=1");
         std::process::exit(1);
     }
 }
@@ -268,6 +563,7 @@ fn resolve_binary() -> PathBuf {
         }
     }
     eprintln!("perf_gates: no repo-scan binary found (set CARGO_BIN_EXE_repo-scan)");
+    println!("TEST_EXIT=1");
     std::process::exit(1);
 }
 

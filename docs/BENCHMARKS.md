@@ -16,10 +16,10 @@ cargo bench --bench scan_cycle
 # results: benches/results/scan_cycle.jsonl (override dir with $BENCH_RESULTS)
 ```
 
-Harness: [benches/support.rs](/Users/donbeave/Projects/repo-scan/benches/support.rs) (`Recorder`, traversal driver,
+Harness: [benches/support.rs](../benches/support.rs) (`Recorder`, traversal driver,
 RSS sampler). Scopes are built in tempdirs per run
-([benches/walk_compare.rs](/Users/donbeave/Projects/repo-scan/benches/walk_compare.rs:19),
-[benches/scan_cycle.rs](/Users/donbeave/Projects/repo-scan/benches/scan_cycle.rs:24)):
+([benches/walk_compare.rs](../benches/walk_compare.rs:19),
+[benches/scan_cycle.rs](../benches/scan_cycle.rs:24)):
 hidden/tmp/cache repos, arbitrarily named bare store, linked worktree, nested repo,
 flat (500 files) and deep (32 levels) trees, non-UTF-8 names on Unix.
 
@@ -48,4 +48,4 @@ Verdict record: `adapters`, `equivalent`, `baseline_dirs/entries/errors`.
 | 2026-10-01 | M5 Max / macOS 27.0 / APFS | footprint | — | — | — | — | — | — | — | — | — | — | — | 17711104 |
 
 PERF-02/03 gates (declared corpus, ≥30 s sustained measurement, 512 MiB injection)
-have no harness yet — see [docs/CHECKLIST.md](/Users/donbeave/Projects/repo-scan/docs/CHECKLIST.md).
+have no harness yet — see [docs/CHECKLIST.md](../docs/CHECKLIST.md).

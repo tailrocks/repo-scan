@@ -211,6 +211,46 @@ pub fn redact_credentials(url: &str) -> String {
     format!("{scheme}{redacted_user}@{host}{tail}")
 }
 
+/// True when a scheme URL carries a non-empty `userinfo@` authority prefix
+/// (the credential-bearing shape [`redact_credentials`] redacts). Scp-like
+/// `user@host:path` has no `://` and carries no password field, so it
+/// reports false, matching redaction behavior.
+pub fn has_userinfo(url: &str) -> bool {
+    let scheme_end = match url.find("://") {
+        Some(i) => i + 3,
+        None => return false,
+    };
+    let rest = &url[scheme_end..];
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    match authority.rfind('@') {
+        Some(at) => !authority[..at].is_empty(),
+        None => false,
+    }
+}
+
+/// Strip `userinfo@` from a scheme URL entirely, for internal reuse of a
+/// legacy stored target (resume of a row persisted before the CLI boundary
+/// rejected credentials). Unlike [`redact_credentials`] the result carries
+/// no `@` at all, so it re-enters normalization without tripping the
+/// userinfo reject while resolving to the same canonical target. Scp-like
+/// input is returned unchanged.
+pub fn strip_userinfo(url: &str) -> String {
+    let scheme_end = match url.find("://") {
+        Some(i) => i + 3,
+        None => return url.to_string(),
+    };
+    let (scheme, rest) = url.split_at(scheme_end);
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    match authority.rfind('@') {
+        Some(at) if !authority[..at].is_empty() => {
+            format!("{scheme}{}{tail}", &authority[at + 1..])
+        }
+        _ => url.to_string(),
+    }
+}
+
 /// True when `host` is github.com directly or via an SSH alias.
 ///
 /// Alias resolution is read-only (`~/.ssh/config`, `Host`/`HostName` only;

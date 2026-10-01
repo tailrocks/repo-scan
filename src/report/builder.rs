@@ -19,14 +19,15 @@
 use crate::error::Error;
 use crate::model::StatusMode;
 use crate::report::encode::{
-    encode_bytes, encode_name, guess_oid_algorithm, ms_to_rfc3339, oid_hex_from_bytes,
+    cap_report_field, encode_bytes, encode_name, guess_oid_algorithm, ms_to_rfc3339,
+    oid_hex_from_bytes,
 };
 use crate::report::model::{
     Alias, Branch, Candidate, Checkout, Coverage, ErrorRecord, GeneratedArtifact, Head, ObjectId,
     PathRecord, Remote, Report, Repository, Resources, Root, Scan, Status, StorageLink, Tool,
     Volume,
 };
-use crate::report::publish::{retain_snapshot, PublishReceipt};
+use crate::report::publish::{publish_bound, retain_bound, BoundStaged, PublishReceipt};
 use crate::report::stream::StreamingWriter;
 use crate::report::validate::validate_report;
 use std::collections::{HashMap, HashSet};
@@ -241,12 +242,18 @@ fn opt_blob(row: &turso::Row, idx: usize) -> crate::Result<Option<Vec<u8>>> {
 }
 
 /// Lenient JSON string-array parse for stored evidence/unknown-fields.
-/// Falls back to a single line so observations are never dropped.
+/// Falls back to a single line so observations are never dropped. Every
+/// line is per-field capped (finding 6): one huge stored line must not
+/// blow the streaming memory bound.
 fn parse_string_array(raw: &str) -> Vec<String> {
     if raw.is_empty() {
         return Vec::new();
     }
-    serde_json::from_str::<Vec<String>>(raw).unwrap_or_else(|_| vec![raw.to_string()])
+    serde_json::from_str::<Vec<String>>(raw)
+        .unwrap_or_else(|_| vec![raw.to_string()])
+        .into_iter()
+        .map(|line| cap_report_field(&line))
+        .collect()
 }
 
 fn status_mode_as_str(mode: StatusMode) -> &'static str {
@@ -1068,9 +1075,9 @@ async fn stream_with_pre_pass<W: Write>(
                 checkout_scope_id: scope,
                 name: encode_name(&req_blob(&row, 3)?),
                 role: req_text(&row, 4)?,
-                url: String::from_utf8_lossy(&req_blob(&row, 5)?).into_owned(),
+                url: cap_report_field(&String::from_utf8_lossy(&req_blob(&row, 5)?)),
                 canonical_url: opt_blob(&row, 6)?
-                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+                    .map(|bytes| cap_report_field(&String::from_utf8_lossy(&bytes))),
                 observed_at: ms_to_rfc3339(req_i64(&row, 7)?),
             })?;
             stats.remotes += 1;
@@ -1094,7 +1101,11 @@ async fn stream_with_pre_pass<W: Write>(
             from_repository_id: link.from_repository_id.clone(),
             to_path_id,
             kind: link.kind.clone(),
-            evidence: link.evidence.clone(),
+            evidence: link
+                .evidence
+                .iter()
+                .map(|line| cap_report_field(line))
+                .collect(),
         })?;
         stats.storage_links += 1;
     }
@@ -1139,7 +1150,7 @@ async fn stream_with_pre_pass<W: Write>(
             path_id,
             repository_id: candidate.repository_id.clone(),
             disposition: candidate.disposition.clone(),
-            reason: candidate.reason.clone(),
+            reason: cap_report_field(&candidate.reason),
             retry_after: candidate.retry_after_ms.map(ms_to_rfc3339),
             error_ids: candidate.error_ids.clone(),
         })?;
@@ -1173,7 +1184,7 @@ async fn stream_with_pre_pass<W: Write>(
                 path_id,
                 operation: operation_for_scope(&scope_key).to_string(),
                 category,
-                message: req_text(&row, 3)?,
+                message: cap_report_field(&req_text(&row, 3)?),
                 retryable,
                 attempts: req_i64(&row, 4)?.max(0) as u64,
                 first_seen: ms_to_rfc3339(req_i64(&row, 5)?),
@@ -1233,17 +1244,24 @@ async fn error_path_id(
 }
 
 /// Parse staged bytes back into a validated [`Report`]. Used by the
-/// REPORT-01 gate, the terminal renderer, and publication retries. This
-/// loads the report into memory; production file publication streams
-/// without this step.
+/// REPORT-01 gate, the terminal renderer, and publication retries. The
+/// staging file is opened once (`O_NOFOLLOW`, capped) and the bound bytes
+/// are verified; production file publication reuses the same bound bytes
+/// without re-opening the path.
 pub fn verify_staged_report(staged: &Path) -> crate::Result<Report> {
-    let bytes = std::fs::read(staged)?;
-    let report: Report = serde_json::from_slice(&bytes).map_err(|e| {
+    let bound = BoundStaged::open(staged)?;
+    verify_bound_report(&bound).map_err(|e| {
         Error::Report(format!(
-            "staged report {} is not valid JSON: {e}",
+            "staged report {} is not valid: {e}",
             staged.display()
         ))
-    })?;
+    })
+}
+
+/// Parse already-bound staged bytes into a validated [`Report`].
+pub fn verify_bound_report(bound: &BoundStaged) -> crate::Result<Report> {
+    let report: Report = serde_json::from_slice(bound.bytes())
+        .map_err(|e| Error::Report(format!("staged report bytes are not valid JSON: {e}")))?;
     validate_report(&report)?;
     Ok(report)
 }
@@ -1254,10 +1272,22 @@ pub fn verify_staged_report(staged: &Path) -> crate::Result<Report> {
 pub struct ReportPipeline;
 
 impl ReportPipeline {
-    /// Stream the report into controlled staging, retain the snapshot, and
-    /// publish to `dest`. On publication failure the snapshot is retained,
-    /// its state is marked `failed`, and the error is returned; retry with
-    /// [`ReportPipeline::retry_publication`] without repeating discovery.
+    /// Stream the report into controlled staging, verify it, retain the
+    /// snapshot, and publish to `dest`. On publication failure the snapshot
+    /// is retained, its state is marked `failed`, and the error is returned;
+    /// retry with [`ReportPipeline::retry_publication`] without repeating
+    /// discovery.
+    ///
+    /// Call-graph note (RSF-751/AC46/F06D): production file publication
+    /// does NOT call this function. `run_scan_inner` stages via
+    /// `stream_report_from_store` and publishes via
+    /// `verified_retain_and_publish` (`src/main.rs`), which gates on
+    /// [`verify_staged_report`] before anything is retained or shipped;
+    /// the terminal path uses [`ReportPipeline::emit_to_terminal`] and
+    /// retries use [`ReportPipeline::retry_publication`] (both verify).
+    /// This entry point is exercised only by the REPORT-01/02 suite, but
+    /// it carries the same verify-before-retain gate so any future
+    /// production wiring cannot ship unverified bytes.
     pub async fn emit_to_file(
         store: &crate::store::TursoStore,
         inputs: &ReportInputs,
@@ -1268,9 +1298,23 @@ impl ReportPipeline {
         now_ms: i64,
     ) -> crate::Result<crate::report::Publication> {
         let staged = stage_report(store, inputs, staging_dir).await?;
-        let receipt = retain_snapshot(
+        let bound = BoundStaged::open(&staged).map_err(|e| {
+            quarantine_staging(&staged);
+            crate::error::Error::Report(format!(
+                "refusing invalid staged report {}: {e}",
+                staged.display()
+            ))
+        })?;
+        verify_bound_report(&bound).map_err(|e| {
+            quarantine_staging(&staged);
+            crate::error::Error::Report(format!(
+                "refusing invalid staged report {}: {e}",
+                staged.display()
+            ))
+        })?;
+        let receipt = retain_bound(
             store,
-            &staged,
+            &bound,
             snapshot_dir,
             &inputs.report_id,
             inputs.catalog_revision,
@@ -1278,8 +1322,13 @@ impl ReportPipeline {
             now_ms,
         )
         .await?;
-        let published: crate::Result<PublishReceipt> =
-            crate::report::publish::publish_staged(&receipt.path, dest, state_dir);
+        if receipt.sha256 != bound.sha256() {
+            return Err(Error::Report(format!(
+                "snapshot {} digest does not match staged bytes",
+                receipt.path.display()
+            )));
+        }
+        let published: crate::Result<PublishReceipt> = publish_bound(&bound, dest, state_dir);
         match published {
             Ok(file) => {
                 store
@@ -1301,8 +1350,9 @@ impl ReportPipeline {
         }
     }
 
-    /// Stream the report into controlled staging, retain the snapshot, and
-    /// render a readable summary to `terminal` (normally stdout).
+    /// Stream the report into controlled staging, verify it, retain the
+    /// snapshot, and render a readable summary to `terminal` (normally
+    /// stdout). Invalid staging is quarantined, never retained.
     pub async fn emit_to_terminal(
         store: &crate::store::TursoStore,
         inputs: &ReportInputs,
@@ -1312,9 +1362,23 @@ impl ReportPipeline {
         terminal: &mut dyn std::io::Write,
     ) -> crate::Result<crate::report::Publication> {
         let staged = stage_report(store, inputs, staging_dir).await?;
-        let receipt = retain_snapshot(
+        let bound = BoundStaged::open(&staged).map_err(|e| {
+            quarantine_staging(&staged);
+            crate::error::Error::Report(format!(
+                "refusing invalid staged report {}: {e}",
+                staged.display()
+            ))
+        })?;
+        let report = verify_bound_report(&bound).map_err(|e| {
+            quarantine_staging(&staged);
+            crate::error::Error::Report(format!(
+                "refusing invalid staged report {}: {e}",
+                staged.display()
+            ))
+        })?;
+        let receipt = retain_bound(
             store,
-            &staged,
+            &bound,
             snapshot_dir,
             &inputs.report_id,
             inputs.catalog_revision,
@@ -1322,7 +1386,6 @@ impl ReportPipeline {
             now_ms,
         )
         .await?;
-        let report = verify_staged_report(&receipt.path)?;
         crate::report::render::render_terminal(&report, terminal)?;
         store
             .set_snapshot_publication(&inputs.report_id, "retained")
@@ -1344,7 +1407,8 @@ impl ReportPipeline {
         dest: &Path,
         state_dir: &Path,
     ) -> crate::Result<crate::report::Publication> {
-        let report = verify_staged_report(snapshot_path)?;
+        let bound = BoundStaged::open(snapshot_path)?;
+        let report = verify_bound_report(&bound)?;
         if report.report_id != report_id {
             return Err(Error::Report(format!(
                 "snapshot {} holds report {}, not {report_id}",
@@ -1352,7 +1416,7 @@ impl ReportPipeline {
                 report.report_id
             )));
         }
-        match crate::report::publish::publish_staged(snapshot_path, dest, state_dir) {
+        match publish_bound(&bound, dest, state_dir) {
             Ok(file) => {
                 store
                     .set_snapshot_publication(report_id, "published")
@@ -1369,6 +1433,20 @@ impl ReportPipeline {
             }
         }
     }
+}
+
+/// Quarantine a failed staging file: move it under
+/// `<staging>/quarantine/` for forensics, deleting it when the move fails.
+/// Best-effort; never fails.
+pub fn quarantine_staging(staged: &Path) {
+    if let (Some(parent), Some(name)) = (staged.parent(), staged.file_name()) {
+        let dir = parent.join("quarantine");
+        if std::fs::create_dir_all(&dir).is_ok() && std::fs::rename(staged, dir.join(name)).is_ok()
+        {
+            return;
+        }
+    }
+    let _ = std::fs::remove_file(staged);
 }
 
 /// Stream the report into a fresh staging file and sync it. The database

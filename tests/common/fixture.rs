@@ -2,8 +2,12 @@
 //!
 //! Hermetic: every `git` invocation runs with `GIT_CONFIG_GLOBAL` and
 //! `GIT_CONFIG_SYSTEM` pointed at the null device, a fixed author identity,
-//! `init.defaultBranch=main`, no GPG signing, and `protocol.file.allow=always`
-//! (local `file://` submodule/file transports only — no network).
+//! `init.defaultBranch=main`, no GPG signing, background maintenance off
+//! (`maintenance.auto=false`: commits fork no async job that transiently
+//! creates `.git/objects/maintenance.lock` and races `.git` inventory
+//! snapshots), foreground-only gc (`gc.autoDetach=false`), and
+//! `protocol.file.allow=always` (local `file://` submodule/file transports
+//! only — no network).
 
 use std::ffi::OsString;
 use std::fs;
@@ -52,6 +56,10 @@ pub fn git(dir: &Path, args: &[&str]) -> Vec<u8> {
         .arg("init.defaultBranch=main")
         .arg("-c")
         .arg("commit.gpgsign=false")
+        .arg("-c")
+        .arg("maintenance.auto=false")
+        .arg("-c")
+        .arg("gc.autoDetach=false")
         .arg("-c")
         .arg("protocol.file.allow=always")
         .args(args);

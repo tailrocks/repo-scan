@@ -5,7 +5,7 @@ Checked = a dedicated test maps to the ID (file:line cited). This lane never run
 Residual gaps are noted inline. The REVIEW_WF4 findings called out here
 previously (R1/R2/R3/R5) now have regressions in `tests/review_fix_main.rs` and
 `tests/review_fix_store.rs`; see
-[docs/REVIEW_WF4.md](/Users/donbeave/Projects/repo-scan/docs/REVIEW_WF4.md) for the
+[docs/REVIEW_WF4.md](../docs/REVIEW_WF4.md) for the
 original finding texts.
 
 - [x] CLI-01 — six commands + exit codes. Evidence: `tests/cli_impl.rs:47` (parse),

@@ -270,10 +270,57 @@ pub fn volume_cursor_from_rows(
     })
 }
 
-/// Scheduler scope key for one invalidated subtree path. `{:?}` escaping
-/// keeps non-UTF-8 bytes lossless in the TEXT scope column.
+/// Planner scope key for one invalidated subtree path.
+///
+/// RSF-F940: `path:<volume>:<hex>`, with the path as lowercase hex of
+/// its exact [`OsStr`](std::ffi::OsStr) bytes (see
+/// [`crate::config::path_as_bytes`]). The volume stays in the key
+/// (planner keys are per-volume; the run loop fences them to the scan's
+/// roots). The scheduler/run loop never executes planner keys directly:
+/// [`dir_scope_for_subtree_key`] is the single canonical translation to
+/// the `dir:<hex>` scheduler scope, and the owner invalidates exactly
+/// that scope. A planner key with no scheduler mapping would schedule
+/// work the run loop can never execute, so the mapping is total over
+/// keys this constructor emits.
+///
+/// Byte-exact for every path, UTF-8 or not: distinct siblings always
+/// produce distinct keys, so a literal-U+FFFD path never collides with
+/// a non-UTF8 sibling (no fan-out, no dropped invalidation).
 pub fn subtree_scope_key(volume: &str, path: &Path) -> String {
-    format!("path:{volume}:{path:?}")
+    format!(
+        "path:{volume}:{}",
+        crate::config::encode_hex(&crate::config::path_as_bytes(path))
+    )
+}
+
+/// Parse a planner subtree key back into its volume and path: split at
+/// the first `:` after the prefix, hex-decode the path bytes. `None`
+/// on any malformed input (wrong prefix, empty volume, empty or
+/// non-hex path). Volume keys must not contain `:`. Byte-exact: every
+/// key this module's constructor emits round-trips to the identical
+/// path bytes.
+pub fn parse_subtree_scope_key(key: &str) -> Option<(String, PathBuf)> {
+    let rest = key.strip_prefix("path:")?;
+    let (volume, hex) = rest.split_once(':')?;
+    if volume.is_empty() || hex.is_empty() {
+        return None;
+    }
+    let bytes = crate::config::decode_hex(hex)?;
+    if bytes.is_empty() {
+        return None;
+    }
+    Some((volume.to_string(), crate::config::path_from_bytes(bytes)))
+}
+
+/// Canonical scheduler scope for a planner subtree key: the
+/// `dir:<hex>` scope the owner invalidates for the planned path. `None`
+/// when `key` is not a well-formed planner key. Planner keys and
+/// scheduler keys agree through this function, never by string
+/// equality: every planner key denotes exactly one scheduler scope,
+/// byte-identical to [`crate::config::scope_key_for_dir`] of the real
+/// path (planner keys carry exact path bytes, so no re-derivation).
+pub fn dir_scope_for_subtree_key(key: &str) -> Option<String> {
+    parse_subtree_scope_key(key).map(|(_, path)| crate::config::scope_key_for_dir(&path))
 }
 
 /// Scheduler scope key for a whole volume (continuity loss, overflow).
@@ -284,6 +331,66 @@ pub fn volume_scope_key(volume: &str) -> String {
 /// Scheduler scope key for mount-table refresh work.
 pub fn mounts_scope_key() -> &'static str {
     "mounts"
+}
+
+/// What a bounded-channel `try_recv` failure means (RSF-F940).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TryRecvAction {
+    /// Channel momentarily empty: caught up with the producer. Return the
+    /// pending batch, or `None` when nothing was observed.
+    CaughtUp,
+    /// Callback sender gone: the event stream is lost. Surface an event
+    /// error so the owner invalidates the volume scope and reconciles;
+    /// never treat it as silent end-of-stream.
+    StreamLost,
+}
+
+/// Classify a `try_recv` failure. `Empty` and `Disconnected` must never be
+/// conflated: the first is routine backpressure, the second is lost
+/// history. Pure and portable so every platform backend shares it.
+pub fn classify_try_recv(error: std::sync::mpsc::TryRecvError) -> TryRecvAction {
+    match error {
+        std::sync::mpsc::TryRecvError::Empty => TryRecvAction::CaughtUp,
+        std::sync::mpsc::TryRecvError::Disconnected => TryRecvAction::StreamLost,
+    }
+}
+
+/// Stable gap category for failed event-batch reads (RSF-F940).
+pub const BATCH_ERROR_CATEGORY: &str = "event-batch-error";
+
+/// Durable action for one failed event-batch read (RSF-F940): never
+/// log-and-drop. The owner records (`gap_id`, `scope_key`,
+/// [`BATCH_ERROR_CATEGORY`], `detail`) via `store.record_error` and
+/// invalidates `scope_key` via `store.invalidate_scope`, so the failure
+/// schedules a volume rescan with retry instead of losing the unknown
+/// paths the failed batch covered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchErrorAction {
+    /// Volume whose batch read failed.
+    pub volume_key: String,
+    /// Volume-wide rescan scope to invalidate (the failed batch's paths
+    /// are unknown, so per-path retry is unsound).
+    pub scope_key: String,
+    /// Stable gap id for `store.record_error`.
+    pub gap_id: String,
+    /// Human-readable detail (report evidence).
+    pub detail: String,
+}
+
+/// Plan the durable retry/park action for one batch-read error. Pure: the
+/// owner applies it through the store. Retrying the read alone is wrong —
+/// the missed events are already gone from the bounded channel — so the
+/// action schedules reconciling work, not a re-read.
+pub fn plan_batch_error(volume: &str, error: impl std::fmt::Display) -> BatchErrorAction {
+    BatchErrorAction {
+        volume_key: volume.to_string(),
+        scope_key: volume_scope_key(volume),
+        gap_id: format!("gap:event-batch:{volume}"),
+        detail: format!(
+            "event batch read failed on volume {volume}: {error}; \
+             volume rescan scheduled with retry"
+        ),
+    }
 }
 
 /// Collapse invalidations: sorted, deduplicated, and any path below an
@@ -410,6 +517,52 @@ impl MemoryCursorJournal {
     /// Empty fixture journal.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Restore one volume's durable cursor record (RSF-F940): seeds
+    /// UUID/ingested/reconciled from the store so the reconciler never
+    /// starts empty when cursors exist (empty start would lose resume
+    /// position and duplicate suppression).
+    ///
+    /// When the durable record shows ingested ahead of reconciled — a kill
+    /// between cursor append and scope invalidation, or any unreconciled
+    /// batch — a pending boundary is synthesized at the ingested cursor
+    /// with the volume-wide scope. The original per-path scopes are not
+    /// persisted alongside the cursor, so volume-wide is the conservative
+    /// cover: restart rescans before any completeness claim. Fully
+    /// reconciled records restore with no pending work. Idempotent:
+    /// existing live pending entries are preserved, never overwritten.
+    pub fn restore_volume(&mut self, volume: &str, cursor: &VolumeCursor) {
+        let state = self.volumes.entry(volume.to_string()).or_default();
+        state.uuid = cursor.uuid.clone();
+        state.ingested = cursor.ingested;
+        state.reconciled = cursor.reconciled;
+        for flag in &cursor.flags_seen {
+            if !state.flags_seen.iter().any(|f| f == flag) {
+                state.flags_seen.push(flag.clone());
+            }
+        }
+        let gap = match (cursor.ingested, cursor.reconciled) {
+            (Some(ing), None) => Some(ing),
+            (Some(ing), Some(rec)) if ing > rec => Some(ing),
+            _ => None,
+        };
+        if let Some(ing) = gap {
+            if ing.0 != 0 {
+                state
+                    .pending
+                    .entry(ing.0)
+                    .or_insert_with(|| vec![volume_scope_key(volume)]);
+            }
+        }
+    }
+
+    /// Restore every durable cursor record (RSF-F940). Call before
+    /// `note_stream_opened`/`begin_traversal` when stored cursors exist.
+    pub fn restore_from_durable(&mut self, stored: &HashMap<String, VolumeCursor>) {
+        for (volume, cursor) in stored {
+            self.restore_volume(volume, cursor);
+        }
     }
 }
 
@@ -1129,6 +1282,10 @@ pub struct IngestOutcome {
     pub suppressed_own: usize,
     /// Scheduler invalidations derived from the batch.
     pub plans: Vec<SubtreePlan>,
+    /// True once the volume's historical phase ended (RSF-F940): the
+    /// `history_done` sentinel has been consumed by the reconcile path for
+    /// the current baseline. Cumulative, not per-batch.
+    pub history_done: bool,
 }
 
 /// Result of reconciling one volume's pending boundaries.
@@ -1140,6 +1297,11 @@ pub struct ReconcileOutcome {
     pub invalidated_scopes: Vec<String>,
     /// Reconciled cursor after the call.
     pub reconciled_through: Option<EventCursorId>,
+    /// True once the volume's historical phase ended (RSF-F940): the
+    /// reconcile path has consumed `history_done` for the current
+    /// baseline. A completeness claim on a live-monitored volume requires
+    /// this (see `claim_volume_complete_requiring_history`).
+    pub history_done: bool,
 }
 
 /// Per-volume incremental reconciler over any [`CursorJournal`].
@@ -1153,6 +1315,11 @@ pub struct Reconciler<J> {
     boundaries: HashMap<String, EventCursorId>,
     own: OwnBookkeeping,
     gate: ScanGate,
+    /// Volumes whose historical phase ended under the current baseline
+    /// (RSF-F940): the `history_done` sentinel was consumed by `ingest`.
+    /// Cleared on history invalidation; never persisted (a restarted
+    /// stream replays history and re-emits the sentinel).
+    history_done_seen: HashSet<String>,
 }
 
 impl<J: CursorJournal> Reconciler<J> {
@@ -1163,6 +1330,7 @@ impl<J: CursorJournal> Reconciler<J> {
             boundaries: HashMap::new(),
             own: OwnBookkeeping::new(),
             gate: ScanGate::new(),
+            history_done_seen: HashSet::new(),
         }
     }
 
@@ -1191,6 +1359,21 @@ impl<J: CursorJournal> Reconciler<J> {
         self.boundaries.get(volume).copied()
     }
 
+    /// True once the reconcile path consumed `history_done` for this
+    /// volume under the current baseline (RSF-F940).
+    pub fn history_done(&self, volume: &str) -> bool {
+        self.history_done_seen.contains(volume)
+    }
+
+    /// Record the end of the historical phase explicitly (RSF-F940).
+    /// `ingest` calls this for every batch carrying the sentinel; the
+    /// owner calls it when it observes the sentinel out-of-band (e.g. a
+    /// platform signal delivered alongside a batch error, where no batch
+    /// was ingested).
+    pub fn note_history_done(&mut self, volume: &str) {
+        self.history_done_seen.insert(volume.to_string());
+    }
+
     /// Durable side of stream open: apply the open rule, record the
     /// validated UUID, start monitoring, and pin the per-volume observation
     /// boundary. `boundary` is the live ID observed at open, before any
@@ -1214,6 +1397,8 @@ impl<J: CursorJournal> Reconciler<J> {
             } => {
                 if history_invalid {
                     let _ = self.journal.invalidate_history(volume, "open-rule");
+                    // A discarded baseline's history_done is meaningless.
+                    self.history_done_seen.remove(volume);
                 }
                 self.journal.record_open(
                     volume,
@@ -1233,13 +1418,16 @@ impl<J: CursorJournal> Reconciler<J> {
     }
 
     /// Ingest one batch: suppress own-bookkeeping paths by exact identity,
-    /// derive invalidation plans, and durably record the batch (ingested
-    /// advances only with this write). `HistoryInvalid` batches discard
-    /// cursors instead of recording.
+    /// derive invalidation plans, consume the `history_done` sentinel into
+    /// the reconcile path, and durably record the batch (ingested advances
+    /// only with this write). `HistoryInvalid` batches discard cursors
+    /// instead of recording; a sentinel on such a batch belongs to the
+    /// discarded baseline and is not consumed.
     pub fn ingest(&mut self, batch: &EventBatch) -> crate::Result<IngestOutcome> {
         let volume = batch.volume_key.clone();
         if batch.signals.contains(&ContinuitySignal::HistoryInvalid) {
             let _ = self.journal.invalidate_history(&volume, "signal");
+            self.history_done_seen.remove(&volume);
             return Ok(IngestOutcome {
                 volume_key: volume.clone(),
                 advanced_to: None,
@@ -1247,7 +1435,14 @@ impl<J: CursorJournal> Reconciler<J> {
                 history_invalid: true,
                 suppressed_own: 0,
                 plans: continuity_plan(&volume, &batch.signals, &batch.invalidations),
+                history_done: false,
             });
+        }
+        // RSF-F940: the historical-phase sentinel is reconcile state, not
+        // batch trivia. Consume it here so every downstream decision
+        // (reconcile outcomes, checked completeness claims) observes it.
+        if batch.history_done {
+            self.note_history_done(&volume);
         }
         let mut kept = Vec::with_capacity(batch.invalidations.len());
         let mut suppressed_own = 0usize;
@@ -1272,6 +1467,7 @@ impl<J: CursorJournal> Reconciler<J> {
             &scopes,
             &batch.signals,
         )?;
+        let history_done = self.history_done_seen.contains(&volume);
         Ok(IngestOutcome {
             volume_key: volume,
             advanced_to: record.advanced_to,
@@ -1279,6 +1475,7 @@ impl<J: CursorJournal> Reconciler<J> {
             history_invalid: false,
             suppressed_own,
             plans,
+            history_done,
         })
     }
 
@@ -1302,10 +1499,12 @@ impl<J: CursorJournal> Reconciler<J> {
         invalidated.sort();
         invalidated.dedup();
         let reconciled_through = self.try_advance_reconciled(volume, &*io)?;
+        let history_done = self.history_done_seen.contains(volume);
         Ok(ReconcileOutcome {
             volume_key: volume.to_string(),
             invalidated_scopes: invalidated,
             reconciled_through,
+            history_done,
         })
     }
 
@@ -1344,6 +1543,36 @@ impl<J: CursorJournal> Reconciler<J> {
         let reconciled = loaded.and_then(|c| c.reconciled);
         self.gate
             .claim_volume_complete(volume, reconciled, boundary, history_valid)
+    }
+
+    /// Claim completeness for one live-monitored volume relative to its
+    /// own boundary, requiring the consumed `history_done` sentinel
+    /// (RSF-F940). Claiming event completeness while the historical phase
+    /// may still be replaying would treat an open-ended prefix as the
+    /// whole history; the owner uses this checked claim on every volume
+    /// with live history and the unchecked claim only where no history
+    /// exists (where it already fails and forces traversal-only honesty).
+    pub fn claim_volume_complete_requiring_history(&self, volume: &str) -> crate::Result<()> {
+        if !self.history_done_seen.contains(volume) {
+            return Err(crate::Error::Events(format!(
+                "reconcile-before-claim: volume {volume} historical phase not done \
+                 (no history_done consumed); end-of-history sentinel required \
+                 before completeness"
+            )));
+        }
+        self.claim_volume_complete(volume)
+    }
+}
+
+impl Reconciler<MemoryCursorJournal> {
+    /// Seed the journal from durable cursor records (RSF-F940). The owner
+    /// calls this with the store's cursors before `note_stream_opened` /
+    /// `begin_traversal` whenever stored cursors exist; starting empty
+    /// with durable state present loses resume position, duplicate
+    /// suppression, and unreconciled-gap rescan. See
+    /// [`MemoryCursorJournal::restore_from_durable`].
+    pub fn restore_durable_cursors(&mut self, stored: &HashMap<String, VolumeCursor>) {
+        self.journal_mut().restore_from_durable(stored);
     }
 }
 

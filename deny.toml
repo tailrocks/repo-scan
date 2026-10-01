@@ -1,0 +1,41 @@
+# RSF-SEC-AUDIT-GATE: dependency policy enforced by .github/workflows/audit.yml.
+# Scopes: advisories + licenses + sources. Matches the current Cargo.lock:
+# every locked package resolves from registry+https://github.com/rust-lang/crates.io-index.
+
+[advisories]
+vulnerability = "deny"
+unmaintained = "deny"
+unsound = "deny"
+yanked = "deny"
+notice = "warn"
+
+[licenses]
+unlicensed = "deny"
+copyleft = "warn"
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT-0",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-DFS-2016",
+    "Unlicense",
+    "Zlib",
+]
+exceptions = []
+
+# The workspace root crate carries no distribution license header; the
+# policy above governs third-party dependencies, not the unpublished root.
+[licenses.private]
+ignore = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -19,17 +19,22 @@ use repo_scan::identity;
 use repo_scan::model::{ExitCode, Scope, StatusMode, TaskState};
 use repo_scan::platform::MountTable;
 use repo_scan::report::builder::{
-    AliasInput, ArtifactInput, CandidateInput, ReportInputs as LibReportInputs, ReportPipeline,
-    RootInput, StorageLinkInput,
+    verify_staged_report, AliasInput, ArtifactInput, CandidateInput,
+    ReportInputs as LibReportInputs, ReportPipeline, RootInput, StorageLinkInput,
 };
 use repo_scan::scheduler::{backoff_for_attempt, Admission, CircuitBreaker, OpClass};
 use repo_scan::store::{
-    self, ClaimedTask, EventRow, NewCheckout, NewGitInstance, NewRef, NewRemote, NewScan,
-    NewStatus, NewTask, NewVolume, OwnerGuard, Store, TaskOutcome, TursoStore,
+    self, CheckpointCoordinator, CheckpointPolicy, ClaimedTask, NewCheckout, NewGitInstance,
+    NewRef, NewRemote, NewScan, NewStatus, NewTask, NewVolume, OwnerGuard, Store, TaskOutcome,
+    TursoStore, WriterBatch,
 };
+use repo_scan::telemetry::{live_helper_rss_bytes, FootprintSampler, SamplerInputs};
 use repo_scan::walk::roots::{plan_machine_roots, PlannedRoot, RootPriority};
-use repo_scan::walk::topology::{resolve_symlink, PhysicalDirId, ResolveError, Topology};
-use repo_scan::walk::{ChildKind, ListOptions};
+use repo_scan::walk::topology::{
+    resolve_symlink, DirStat, FenceError, FenceOpen, PhysicalDirId, PinnedDir, ResolveError,
+    ScopeFence, Topology,
+};
+use repo_scan::walk::{ChildKind, ListOptions, WalkItem};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,11 +58,12 @@ const LEASE_TTL_MS: i64 = 60_000;
 const MAX_ATTEMPTS: u64 = 5;
 /// Per-task soft watchdog: slower tasks emit a stderr diagnostic.
 const SLOW_TASK_SECS: u64 = 30;
-/// Per-operation no-progress watchdog grace (R9): an admitted operation that
-/// makes no progress for this long is contained (enumeration aborts its
-/// admitted portion with a preserved gap; other operations trip the volume
-/// breaker after they return). Bounded: at most one grace period of stall
-/// per operation before containment engages.
+/// Per-operation no-progress watchdog grace (R9): evaluated once per task
+/// after it returns via [`watchdog_verdict`]. An over-grace task with no
+/// observed progress is contained (volume breaker + preserved gap +
+/// stderr); an over-grace task that produced entries or completed
+/// directories is advancing and is never contained. Bounded: at most one
+/// grace period of stall per operation before containment engages.
 const WATCHDOG_GRACE_SECS: u64 = 120;
 /// Circuit-breaker threshold and cooldown per volume (spec §14).
 const BREAKER_THRESHOLD: u32 = 3;
@@ -76,6 +82,19 @@ const PENDING_EXIT: i32 = -1;
 const MAX_REPORT_ATTEMPTS: u32 = 1_000;
 /// Bytes of the engine file scanned for catalog schema markers (R15).
 const DB_IDENTITY_SCAN_BYTES: u64 = 64 * 1024;
+/// Rows per catalog page for bounded report-derivation scans
+/// (RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1): errors, instances, and
+/// reclassification reads never hold more than one page from the database
+/// cursor at a time; only report-required derived records accumulate.
+const LOAD_CHUNK_ROWS: i64 = 512;
+/// Cap on distinct pathname aliases held per run (A-F5), mirroring
+/// [`note_applied_scopes`]: past the cap new aliases drop and one
+/// `alias-overflow` gap row documents the loss.
+const MAX_ALIASES: usize = 4096;
+/// Cap on distinct probed Git identities held per run (A-F5), mirroring
+/// [`note_applied_scopes`]: past the cap new identities persist without
+/// dedupe and one `probe-index-overflow` gap row documents the loss.
+const MAX_PROBED_GIT_IDS: usize = 4096;
 
 fn main() {
     std::process::exit(dispatch().code());
@@ -212,9 +231,42 @@ async fn write_owner_marker(store: &TursoStore, state_dir: &Path) -> repo_scan::
     );
     let path = owner_marker_path(state_dir);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        store::owner::ensure_private_dir_all(parent)?;
     }
-    std::fs::write(&path, contents)?;
+    if is_symlink_path(&path)? {
+        return Err(repo_scan::Error::Store(format!(
+            "refusing to write through a symlinked ownership marker: {}",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(store::owner::STATE_FILE_MODE)
+            .open(&path)?
+    };
+    #[cfg(not(unix))]
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &path,
+            std::fs::Permissions::from_mode(store::owner::STATE_FILE_MODE),
+        )?;
+    }
+    {
+        use std::io::Write as _;
+        file.write_all(contents.as_bytes())?;
+    }
     Ok(())
 }
 
@@ -305,51 +357,72 @@ async fn reclassify_for_target(
     canonical: &str,
     counters: &mut RunCounters,
 ) -> repo_scan::Result<()> {
-    let mut rows = store
-        .connection()
-        .query("SELECT id, evidence FROM git_instances", ())
-        .await
-        .map_err(store_err)?;
-    let mut instances: Vec<(String, String)> = Vec::new();
-    while let Some(row) = rows.next().await.map_err(store_err)? {
-        instances.push((cell_text(&row, 0)?, cell_text(&row, 1)?));
-    }
-    for (id, evidence_json) in &instances {
-        let remotes = store.list_remotes(id).await?;
-        let pairs: Vec<(String, String)> = remotes
-            .iter()
-            .map(|r| (String::from_utf8_lossy(&r.url).into_owned(), r.role.clone()))
-            .collect();
-        let borrowed: Vec<(&str, &str)> = pairs
-            .iter()
-            .map(|(url, role)| (url.as_str(), role.as_str()))
-            .collect();
-        let (disposition, mut fresh) = identity::classify_remotes(canonical, borrowed);
-        let mut evidence: Vec<String> = serde_json::from_str(evidence_json).unwrap_or_default();
-        evidence.retain(|line| {
-            !(line.starts_with("Effective ")
-                || line.starts_with("No effective remotes")
-                || line.starts_with("reclassified for target "))
-        });
-        evidence.push(format!(
-            "reclassified for target {canonical} at report time"
-        ));
-        evidence.append(&mut fresh);
-        let evidence_json = serde_json::to_string(&evidence)
-            .map_err(|e| repo_scan::Error::Report(e.to_string()))?;
-        store
+    // RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1: chunked pages, one
+    // in flight at a time; per-row work is unchanged.
+    let mut offset: i64 = 0;
+    loop {
+        let sql = format!(
+            "SELECT id, evidence FROM git_instances ORDER BY id ASC \
+             LIMIT {LOAD_CHUNK_ROWS} OFFSET {offset}"
+        );
+        let mut rows = store
             .connection()
-            .execute(
-                "UPDATE git_instances SET disposition = ?1, evidence = ?2 WHERE id = ?3",
-                vec![
-                    turso::Value::Text(disposition_str(disposition).to_string()),
-                    turso::Value::Text(evidence_json),
-                    turso::Value::Text(id.clone()),
-                ],
-            )
+            .query(sql.as_str(), ())
             .await
             .map_err(store_err)?;
-        counters.db_transactions += 1;
+        let mut page: Vec<(String, String)> = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            page.push((cell_text(&row, 0)?, cell_text(&row, 1)?));
+            if page.len() as i64 >= LOAD_CHUNK_ROWS {
+                break;
+            }
+        }
+        if page.is_empty() {
+            break;
+        }
+        let full_page = page.len() as i64 >= LOAD_CHUNK_ROWS;
+        for (id, evidence_json) in &page {
+            let remotes = store.list_remotes(id).await?;
+            let pairs: Vec<(String, String)> = remotes
+                .iter()
+                .map(|r| (String::from_utf8_lossy(&r.url).into_owned(), r.role.clone()))
+                .collect();
+            let borrowed: Vec<(&str, &str)> = pairs
+                .iter()
+                .map(|(url, role)| (url.as_str(), role.as_str()))
+                .collect();
+            let (disposition, mut fresh) = identity::classify_remotes(canonical, borrowed);
+            let mut evidence: Vec<String> = serde_json::from_str(evidence_json).unwrap_or_default();
+            evidence.retain(|line| {
+                !(line.starts_with("Effective ")
+                    || line.starts_with("No effective remotes")
+                    || line.starts_with("reclassified for target "))
+            });
+            evidence.push(format!(
+                "reclassified for target {canonical} at report time"
+            ));
+            evidence.append(&mut fresh);
+            let evidence_json = serde_json::to_string(&evidence)
+                .map_err(|e| repo_scan::Error::Report(e.to_string()))?;
+            store
+                .connection()
+                .execute(
+                    "UPDATE git_instances SET disposition = ?1, evidence = ?2 WHERE id = ?3",
+                    vec![
+                        turso::Value::Text(disposition_str(disposition).to_string()),
+                        turso::Value::Text(evidence_json),
+                        turso::Value::Text(id.clone()),
+                    ],
+                )
+                .await
+                .map_err(store_err)?;
+            counters.db_transactions += 1;
+        }
+        if full_page {
+            offset += page.len() as i64;
+        } else {
+            break;
+        }
     }
     Ok(())
 }
@@ -373,6 +446,15 @@ async fn run_scan_inner(
     args: &repo_scan::cli::ScanArgs,
     resumed: Option<ResumedRequest>,
 ) -> repo_scan::Result<ExitCode> {
+    // CLI boundary (RSF-SEC-TARGET-URL): credential-bearing targets are
+    // rejected before any persistence or reporting; the error echoes only
+    // the redacted shape.
+    if identity::has_userinfo(&args.url) {
+        return Err(repo_scan::Error::InvalidArgs(format!(
+            "target URL must not embed credentials; remove userinfo and retry: {}",
+            identity::redact_credentials(&args.url),
+        )));
+    }
     let canonical = match identity::normalize_github_url(&args.url) {
         Some(canonical) => canonical,
         None => {
@@ -392,6 +474,15 @@ async fn run_scan_inner(
     let (_guard, store) = open_owned_with_wait(&cfg.state_dir).await?;
     let epoch = store.epoch();
     let mut runner = Runner::new(&cfg.resources);
+    // Finding 12: the traversal fence is built once from the planned
+    // roots; every enum task re-verifies its directory against it through
+    // a pinned descriptor-relative open before listing.
+    runner.fence = Some(ScopeFence::build(
+        &roots
+            .iter()
+            .map(|root| root.path.clone())
+            .collect::<Vec<_>>(),
+    ));
     // Event monitoring opens before any traversal decision (R5).
     let mut events = open_event_session(&store, &cfg.state_dir, &policy, &roots).await?;
     // One fresh catalog revision per run: status observations keyed by it
@@ -506,7 +597,7 @@ async fn run_scan_inner(
     // Per-target dispositions before traversal and staging (R1): status
     // refresh, probes, and the report all classify this scan's target.
     reclassify_for_target(&store, &canonical, &mut runner.counters).await?;
-    enqueue_status_refresh(&store, generation, run_rev, now, &mut runner.counters).await?;
+    enqueue_status_refresh(&store, &mut runner, generation, run_rev, now).await?;
 
     let outcome = run_until_boundary(
         &mut runner,
@@ -536,8 +627,9 @@ async fn run_scan_inner(
         )
         .await?;
     }
-    // Advance reconciled cursors over satisfied work (R5).
-    let cursors = reconcile_event_cursors(&mut events, &store).await?;
+    // Advance reconciled cursors over satisfied work (R5). Claim
+    // verdicts are logged inside; only cursors feed the report.
+    let (cursors, _) = reconcile_event_cursors(&mut events, &store).await?;
 
     let finished_ms = store::now_ms();
     let gen_state = if outcome.interrupted {
@@ -825,6 +917,14 @@ async fn mint_scan_id(
     report_dest: &Option<PathBuf>,
     counters: &mut RunCounters,
 ) -> repo_scan::Result<String> {
+    // Defense-in-depth: the CLI boundary already rejected userinfo; never
+    // persist a credential-bearing target even on a direct call path.
+    if identity::has_userinfo(raw_url) {
+        return Err(repo_scan::Error::InvalidArgs(format!(
+            "target URL must not embed credentials: {}",
+            identity::redact_credentials(raw_url),
+        )));
+    }
     let now = store::now_ms();
     let dest_bytes = report_dest.as_ref().map(|p| config::path_as_bytes(p));
     for _ in 0..3 {
@@ -957,36 +1057,30 @@ async fn seed_root_tasks(
         let id = enum_task_id_for_path(generation, &root.path);
         let expected_rev = store.scope_rev(&scope_key).await?;
         let idempotency = format!("idem:{id}");
-        let inserted = store
-            .enqueue_task(
-                &NewTask {
-                    id: &id,
-                    kind: KIND_ENUM,
-                    generation,
-                    dir_id: None,
-                    scope_key: &scope_key,
-                    expected_rev,
-                    idempotency_key: &idempotency,
-                },
-                now_ms,
-            )
-            .await?;
-        runner.counters.db_transactions += 1;
-        if !inserted {
-            // Two requested roots name the same object: shared results
-            // plus a preserved alias (R7).
-            note_enum_alias(
-                store,
-                runner,
-                &id,
-                &scope_key,
-                &root.path,
-                "same_object",
-                now_ms,
-            )
-            .await?;
-        }
+        // RSF-AC461500-609D-4D55-991E-09C60D382D67: buffered enqueue.
+        // Two requested roots naming the same object share results plus
+        // a preserved alias (R7); the check is deferred to the flush.
+        let task = NewTask {
+            id: &id,
+            kind: KIND_ENUM,
+            generation,
+            dir_id: None,
+            scope_key: &scope_key,
+            expected_rev,
+            idempotency_key: &idempotency,
+        };
+        let due = TursoStore::buffer_enqueue_task(&mut runner.batch, &task, now_ms);
+        runner.pending_alias_checks.push(PendingAliasCheck {
+            task_id: id,
+            scope_key,
+            path: root.path.clone(),
+            kind: "same_object",
+            at_ms: now_ms,
+        });
+        flush_if_due(runner, store, due).await?;
     }
+    // Seeded roots must be claimable before traversal starts.
+    flush_runner_batch(runner, store).await?;
     Ok(())
 }
 
@@ -1025,10 +1119,10 @@ fn dir_identity(_md: &std::fs::Metadata) -> (u64, u64) {
 /// Task IDs carry the run revision: one refresh per run, idempotent within it.
 async fn enqueue_status_refresh(
     store: &TursoStore,
+    runner: &mut Runner,
     generation: u64,
     run_rev: u64,
     now_ms: i64,
-    counters: &mut RunCounters,
 ) -> repo_scan::Result<()> {
     let mut rows = store
         .connection()
@@ -1045,38 +1139,36 @@ async fn enqueue_status_refresh(
         .map_err(|e| repo_scan::Error::Store(e.to_string()))?
     {
         let checkout_id = cell_text(&row, 0)?;
-        enqueue_status_task(store, generation, run_rev, &checkout_id, now_ms, counters).await?;
+        enqueue_status_task(store, runner, generation, run_rev, &checkout_id, now_ms).await?;
     }
+    flush_runner_batch(runner, store).await?;
     Ok(())
 }
 
 async fn enqueue_status_task(
     store: &TursoStore,
+    runner: &mut Runner,
     generation: u64,
     run_rev: u64,
     checkout_id: &str,
     now_ms: i64,
-    counters: &mut RunCounters,
 ) -> repo_scan::Result<()> {
     let scope_key = config::scope_key_for_status(checkout_id);
     let id = format!("status:{checkout_id}:{run_rev}");
     let idempotency = format!("idem:{id}");
     let expected_rev = store.scope_rev(&scope_key).await?;
-    store
-        .enqueue_task(
-            &NewTask {
-                id: &id,
-                kind: KIND_STATUS,
-                generation,
-                dir_id: None,
-                scope_key: &scope_key,
-                expected_rev,
-                idempotency_key: &idempotency,
-            },
-            now_ms,
-        )
-        .await?;
-    counters.db_transactions += 1;
+    // RSF-AC461500-609D-4D55-991E-09C60D382D67: buffered enqueue.
+    let task = NewTask {
+        id: &id,
+        kind: KIND_STATUS,
+        generation,
+        dir_id: None,
+        scope_key: &scope_key,
+        expected_rev,
+        idempotency_key: &idempotency,
+    };
+    let due = TursoStore::buffer_enqueue_task(&mut runner.batch, &task, now_ms);
+    flush_if_due(runner, store, due).await?;
     Ok(())
 }
 
@@ -1101,7 +1193,12 @@ struct EventSession {
     /// Mount path per monitored volume key (root mapping + UUID lookup).
     mounts: HashMap<String, PathBuf>,
     /// Dir scopes applied per volume this run (reconcile satisfaction).
-    applied_scopes: HashMap<String, Vec<String>>,
+    /// Deduped and capped (see [`note_applied_scopes`]); a volume past the
+    /// cap lands in `applied_overflow` instead of growing without bound.
+    applied_scopes: HashMap<String, HashSet<String>>,
+    /// Volumes whose applied-scope set overflowed: reconciliation holds
+    /// their cursors rather than advancing over unknown work.
+    applied_overflow: HashSet<String>,
     /// True when a history loss forced a fresh traversal generation.
     history_invalid: bool,
     /// Volumes that degraded (no live history): named in the report note.
@@ -1150,42 +1247,118 @@ fn scan_volumes(policy: &str, roots: &[PlannedRoot]) -> repo_scan::Result<Vec<Sc
         .collect())
 }
 
-/// Durable per-volume cursors from every journal row, grouped by volume.
+/// Durable per-volume cursors, read one volume at a time
+/// (RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1): the journal is never
+/// materialized whole; each volume's cursor derives from bounded pages
+/// (RSF-751/AC46/F06D), holding one page at a time.
 async fn load_stored_cursors(
     store: &TursoStore,
 ) -> repo_scan::Result<HashMap<String, events::VolumeCursor>> {
-    let mut rows = store
+    let mut id_rows = store
         .connection()
         .query(
-            "SELECT id, volume_id, history_uuid, cursor, received_ms, invalidated, \
-             ingested, reconciled FROM event_journal ORDER BY id ASC",
+            "SELECT DISTINCT volume_id FROM event_journal ORDER BY volume_id ASC",
             (),
         )
         .await
         .map_err(store_err)?;
-    let mut all: Vec<EventRow> = Vec::new();
-    while let Some(row) = rows.next().await.map_err(store_err)? {
-        all.push(EventRow {
-            id: cell_int(&row, 0)?,
-            volume_id: cell_text(&row, 1)?,
-            history_uuid: cell_text(&row, 2)?,
-            cursor: cell_text(&row, 3)?,
-            received_ms: cell_int(&row, 4)?,
-            invalidated: cell_int(&row, 5)? != 0,
-            ingested: cell_int(&row, 6)? != 0,
-            reconciled: cell_int(&row, 7)? != 0,
-        });
+    let mut keys = Vec::new();
+    while let Some(row) = id_rows.next().await.map_err(store_err)? {
+        keys.push(cell_text(&row, 0)?);
     }
-    let mut keys: Vec<String> = all.iter().map(|r| r.volume_id.clone()).collect();
-    keys.sort();
-    keys.dedup();
     let mut out = HashMap::new();
     for key in keys {
-        if let Some(cursor) = events::volume_cursor_from_rows(&key, &all) {
+        let scan = stored_cursor_for_volume(store, &key).await?;
+        if let Some(cursor) = scan.cursor {
             out.insert(key, cursor);
         }
     }
     Ok(out)
+}
+
+/// One volume's stored cursor plus paging accounting. The cursor equals
+/// [`events::volume_cursor_from_rows`] over the volume's whole history
+/// (UUID = newest row's; ingested/reconciled = flagged maxima, cursor 0
+/// excluded); only one page is ever held.
+#[allow(dead_code)]
+struct StoredCursorScan {
+    cursor: Option<events::VolumeCursor>,
+    pages: u64,
+    peak_page: usize,
+}
+
+/// Derive one volume's stored cursor page by page
+/// (RSF-751/AC46/F06D): id-ascending pages with the same
+/// interpolated-bounds contract as [`load_open_errors_page`]; running
+/// maxima plus the newest UUID accumulate, so completeness never depends
+/// on fitting the volume's history in memory.
+async fn stored_cursor_for_volume(
+    store: &TursoStore,
+    volume: &str,
+) -> repo_scan::Result<StoredCursorScan> {
+    let mut scan = StoredCursorScan {
+        cursor: None,
+        pages: 0,
+        peak_page: 0,
+    };
+    let mut uuid: Option<String> = None;
+    let mut ingested: Option<events::EventCursorId> = None;
+    let mut reconciled: Option<events::EventCursorId> = None;
+    let mut last_id: i64 = 0;
+    loop {
+        let sql = format!(
+            "SELECT id, history_uuid, cursor, ingested, reconciled FROM event_journal \
+             WHERE volume_id = ?1 AND id > {last_id} ORDER BY id ASC LIMIT {LOAD_CHUNK_ROWS}"
+        );
+        let mut rows = store
+            .connection()
+            .query(sql.as_str(), vec![turso::Value::Text(volume.to_string())])
+            .await
+            .map_err(store_err)?;
+        let mut page: Vec<(i64, String, String, bool, bool)> = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            page.push((
+                cell_int(&row, 0)?,
+                cell_text(&row, 1)?,
+                cell_text(&row, 2)?,
+                cell_int(&row, 3)? != 0,
+                cell_int(&row, 4)? != 0,
+            ));
+            if page.len() as i64 >= LOAD_CHUNK_ROWS {
+                break;
+            }
+        }
+        if page.is_empty() {
+            break;
+        }
+        scan.pages += 1;
+        scan.peak_page = scan.peak_page.max(page.len());
+        let full_page = page.len() as i64 >= LOAD_CHUNK_ROWS;
+        for (id, row_uuid, cursor, row_ingested, row_reconciled) in &page {
+            uuid = Some(row_uuid.clone());
+            if let Some(parsed) = events::parse_journal_cursor(cursor).filter(|c| c.0 != 0) {
+                if *row_ingested {
+                    ingested = Some(ingested.map_or(parsed, |max| max.max(parsed)));
+                }
+                if *row_reconciled {
+                    reconciled = Some(reconciled.map_or(parsed, |max| max.max(parsed)));
+                }
+            }
+            last_id = last_id.max(*id);
+        }
+        if !full_page {
+            break;
+        }
+    }
+    if uuid.is_some() {
+        scan.cursor = Some(events::VolumeCursor {
+            uuid: uuid.map(events::HistoryUuid),
+            ingested,
+            reconciled,
+            flags_seen: Vec::new(),
+        });
+    }
+    Ok(scan)
 }
 
 #[cfg(target_os = "macos")]
@@ -1209,10 +1382,16 @@ async fn open_event_session(
         monitored: Vec::new(),
         mounts: HashMap::new(),
         applied_scopes: HashMap::new(),
+        applied_overflow: HashSet::new(),
         history_invalid: false,
         degraded: Vec::new(),
         live: false,
     };
+    // RSF-F940: seed from durable cursors BEFORE note_stream_opened /
+    // begin_traversal. Starting empty with stored state present loses
+    // resume position, duplicate suppression, and unreconciled-gap
+    // rescan.
+    session.reconciler.restore_durable_cursors(&stored);
     // Tool-owned writes must never come back as foreign invalidations.
     let _ = session.reconciler.own_bookkeeping_mut().register(state_dir);
     #[cfg(target_os = "macos")]
@@ -1314,31 +1493,37 @@ async fn ingest_available_events(
 ) -> repo_scan::Result<IngestApplied> {
     let mut applied = IngestApplied::default();
     let mut batches: Vec<events::EventBatch> = Vec::new();
+    // Batch-read failures are collected, never dropped: each one
+    // schedules a durable volume rescan with retry below (RSF-F940).
+    let mut failures: Vec<(String, String)> = Vec::new();
     for m in session.monitored.iter_mut() {
         for _ in 0..16 {
             match m.batches.next_batch() {
                 Ok(Some(batch)) => batches.push(batch),
                 Ok(None) => break,
                 Err(e) => {
-                    eprintln!("repo-scan: events: batch error on {}: {e}", m.volume_key,);
+                    failures.push((m.volume_key.clone(), e.to_string()));
                     break;
                 }
             }
         }
     }
+    for (volume_key, error) in &failures {
+        apply_batch_error(
+            session,
+            store,
+            generation,
+            volume_key,
+            error,
+            counters,
+            &mut applied,
+        )
+        .await?;
+    }
     // Scope fence in both spellings: event paths are physical while
     // roots may carry an unclean spelling (`/var` vs `/private/var`).
-    let fence: Vec<PathBuf> = roots
-        .iter()
-        .flat_map(|r| {
-            let canon = r.path.canonicalize().unwrap_or_else(|_| r.path.clone());
-            if canon == r.path {
-                vec![canon]
-            } else {
-                vec![r.path.clone(), canon]
-            }
-        })
-        .collect();
+    // Membership is `..`-normalized, never a raw `starts_with` (finding 12).
+    let fence = ScopeFence::build(&roots.iter().map(|r| r.path.clone()).collect::<Vec<_>>());
     for batch in &batches {
         apply_event_batch(
             session,
@@ -1355,9 +1540,46 @@ async fn ingest_available_events(
     Ok(applied)
 }
 
-/// True when `path` sits inside the scan's planned roots (canonical fence).
-fn in_scan_scope(fence: &[PathBuf], path: &Path) -> bool {
-    fence.iter().any(|root| path.starts_with(root))
+/// Durable retry for one failed event-batch read (RSF-F940): never
+/// log-and-drop. The failed batch covered unknown paths, so per-path
+/// retry is unsound; instead the stable gap row plus a volume-scope
+/// invalidation schedule a volume rescan with retry. The rescan scope
+/// joins the session's applied scopes so reconciled cursors wait for it.
+#[allow(clippy::too_many_arguments)]
+async fn apply_batch_error(
+    session: &mut EventSession,
+    store: &TursoStore,
+    generation: u64,
+    volume_key: &str,
+    error: &str,
+    counters: &mut RunCounters,
+    applied: &mut IngestApplied,
+) -> repo_scan::Result<()> {
+    let action = events::plan_batch_error(volume_key, error);
+    let now = store::now_ms();
+    let retry_ms = now.saturating_add(backoff_for_attempt(1).as_millis() as i64);
+    store
+        .record_error(
+            &action.gap_id,
+            &action.scope_key,
+            events::BATCH_ERROR_CATEGORY,
+            &action.detail,
+            Some(retry_ms),
+            now,
+        )
+        .await?;
+    counters.db_transactions += 1;
+    store
+        .invalidate_scope(&action.scope_key, generation, now)
+        .await?;
+    counters.db_transactions += 1;
+    applied.scopes += 1;
+    note_applied_scopes(session, volume_key, std::slice::from_ref(&action.scope_key));
+    eprintln!(
+        "repo-scan: events: batch error on {volume_key}: {error}; \
+         volume rescan scheduled with retry",
+    );
+    Ok(())
 }
 
 /// Apply one batch: durable ingest (cursor persisted with its
@@ -1373,7 +1595,7 @@ async fn apply_event_batch(
     store: &TursoStore,
     generation: u64,
     roots: &[PlannedRoot],
-    fence: &[PathBuf],
+    fence: &ScopeFence,
     counters: &mut RunCounters,
     batch: &events::EventBatch,
     applied: &mut IngestApplied,
@@ -1393,25 +1615,22 @@ async fn apply_event_batch(
         );
         return Ok(());
     }
-    if !outcome.duplicate && batch.high_water.0 != 0 {
-        let uuid = session
-            .reconciler
-            .journal()
-            .load(&outcome.volume_key)
-            .and_then(|c| c.uuid);
-        if let Some(uuid) = uuid {
-            store
-                .append_event(
-                    &outcome.volume_key,
-                    &uuid.0,
-                    &events::journal_cursor_string(batch.high_water),
-                    !outcome.plans.is_empty(),
-                    now,
-                )
-                .await?;
-            counters.db_transactions += 1;
-        }
+    if outcome.duplicate {
+        // Restart/overlap replay (RSF-F940): the cursor and its
+        // invalidations are already recorded durably. Safe to drop,
+        // never double-scheduled.
+        return Ok(());
     }
+    // The cursor row commits atomically with the scope invalidations
+    // below (RSF-F940): no separate append here, so a kill can never
+    // persist a cursor with lost invalidations.
+    // Dir-key plans (RSF-F940): planner keys carry exact path bytes,
+    // so every planner subtree key denotes exactly one scheduler scope
+    // through `dir_scope_for_subtree_key` — no fan-out, no collision:
+    // distinct siblings always hold distinct keys. Volume and mount
+    // plans pass through. Out-of-scope paths are dropped: the journal
+    // still records the cursor, but no work is scheduled outside the
+    // requested roots.
     let mut scopes: Vec<String> = Vec::new();
     for plan in &outcome.plans {
         if plan.scope_key.starts_with("volume:") || plan.scope_key == events::mounts_scope_key() {
@@ -1419,24 +1638,17 @@ async fn apply_event_batch(
             if plan.scope_key == events::mounts_scope_key() {
                 applied.mount_changed = true;
             }
-        }
-    }
-    // Path plans become dir-scope invalidations (path + parent, mirroring
-    // the continuity plan): the scheduler re-enumerates exactly those dirs.
-    // Recursive (MustScanSubDirs) subtrees re-enumerate one level here;
-    // deeper changes carry their own events. Out-of-scope paths are
-    // dropped: the journal still records the cursor, but no work is
-    // scheduled outside the requested roots.
-    for path in &batch.invalidations {
-        if !in_scan_scope(fence, path) {
             continue;
         }
-        scopes.push(config::scope_key_for_dir(path));
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() && in_scan_scope(fence, parent) {
-                scopes.push(config::scope_key_for_dir(parent));
-            }
+        let mapped = events::dir_scope_for_subtree_key(&plan.scope_key);
+        let parsed = events::parse_subtree_scope_key(&plan.scope_key).map(|(_, path)| path);
+        let (Some(dir), Some(planned)) = (mapped, parsed) else {
+            continue;
+        };
+        if !fence.allows_path(&planned) {
+            continue;
         }
+        scopes.push(dir);
     }
     scopes.sort();
     scopes.dedup();
@@ -1452,15 +1664,41 @@ async fn apply_event_batch(
             scopes.len(),
         );
     }
-    session
-        .applied_scopes
-        .entry(outcome.volume_key.clone())
-        .or_default()
-        .extend(scopes.iter().cloned());
-    for scope in &scopes {
-        store.invalidate_scope(scope, generation, now).await?;
-        counters.db_transactions += 1;
-        applied.scopes += 1;
+    note_applied_scopes(session, &outcome.volume_key, &scopes);
+    let uuid = session
+        .reconciler
+        .journal()
+        .load(&outcome.volume_key)
+        .and_then(|c| c.uuid);
+    match uuid {
+        Some(uuid) if batch.high_water.0 != 0 => {
+            // Atomic ingest (RSF-F940): the cursor row plus every scope
+            // invalidation commits in ONE transaction — never a persisted
+            // cursor with lost invalidations.
+            let cursor = events::journal_cursor_string(batch.high_water);
+            let ingested = store
+                .ingest_event_batch(
+                    &outcome.volume_key,
+                    &uuid.0,
+                    &cursor,
+                    !scopes.is_empty(),
+                    &scopes,
+                    generation,
+                    now,
+                )
+                .await?;
+            counters.db_transactions += 1;
+            applied.scopes += ingested.revs.len();
+        }
+        _ => {
+            // No durable history identity (eventless volume) or a zero
+            // cursor (RootChanged): invalidate scopes without a cursor row.
+            for scope in &scopes {
+                store.invalidate_scope(scope, generation, now).await?;
+                counters.db_transactions += 1;
+                applied.scopes += 1;
+            }
+        }
     }
     Ok(())
 }
@@ -1476,18 +1714,69 @@ async fn scope_pending_work(store: &TursoStore, scope_key: &str) -> repo_scan::R
     .await
 }
 
+/// Record invalidation scopes applied for one volume
+/// (RSF-751/AC46/F06D): deduped and capped per volume at
+/// [`events::MAX_PENDING_INVALIDATIONS`]. Past the cap the volume is
+/// flagged in `applied_overflow` and reconciliation holds its cursor
+/// (see [`reconcile_event_cursors`]) instead of advancing over work the
+/// capped set no longer proves satisfied. Invalidation itself is
+/// unaffected: every scope is still invalidated and traversed.
+fn note_applied_scopes(session: &mut EventSession, volume: &str, scopes: &[String]) {
+    if session.applied_overflow.contains(volume) {
+        return;
+    }
+    let mut overflowed = false;
+    {
+        let applied = session
+            .applied_scopes
+            .entry(volume.to_string())
+            .or_default();
+        for scope in scopes {
+            if applied.len() >= events::MAX_PENDING_INVALIDATIONS {
+                overflowed = true;
+                break;
+            }
+            applied.insert(scope.clone());
+        }
+    }
+    if overflowed {
+        session.applied_overflow.insert(volume.to_string());
+        eprintln!(
+            "repo-scan: events: applied-scope overflow on {volume}; \
+             holding reconciled cursor (work still traversed)"
+        );
+    }
+}
+
+/// Checked completeness-claim verdict for one monitored volume (RSF-F940).
+struct VolumeClaim {
+    volume: String,
+    /// True when the history_done-gated claim held.
+    complete: bool,
+    /// Claim failure detail (empty when complete).
+    detail: String,
+}
+
 /// Advance reconciled cursors post-traversal, only over satisfied work,
-/// and report per-volume cursors from durable rows (current UUID only).
+/// attempt the history_done-gated completeness claim per monitored
+/// volume, and report per-volume cursors from durable rows (current UUID
+/// only).
 async fn reconcile_event_cursors(
     session: &mut EventSession,
     store: &TursoStore,
-) -> repo_scan::Result<HashMap<String, RootCursors>> {
+) -> repo_scan::Result<(HashMap<String, RootCursors>, Vec<VolumeClaim>)> {
     let keys: Vec<String> = session
         .monitored
         .iter()
         .map(|m| m.volume_key.clone())
         .collect();
     for key in &keys {
+        if session.applied_overflow.contains(key) {
+            // Scope set incomplete for this volume: hold the reconciled
+            // cursor rather than advancing over unknown work. The work
+            // itself is done; only the cursor claim stays conservative.
+            continue;
+        }
         let pending = session.reconciler.journal().pending(key);
         for boundary in pending {
             let mut scopes = boundary.scopes.clone();
@@ -1513,44 +1802,105 @@ async fn reconcile_event_cursors(
             mark_events_reconciled_through(store, key, boundary.cursor).await?;
         }
     }
-    report_cursors_from_store(store, session).await
+    // Checked completeness claims (RSF-F940): a live volume's claim
+    // requires the consumed `history_done` sentinel, so a volume whose
+    // historical phase may still be replaying is never treated as
+    // event-complete. Failures degrade to stderr: the traversal is the
+    // source of truth and events only accelerate it.
+    let mut claims = Vec::with_capacity(keys.len());
+    for key in &keys {
+        let claim = match session
+            .reconciler
+            .claim_volume_complete_requiring_history(key)
+        {
+            Ok(()) => VolumeClaim {
+                volume: key.clone(),
+                complete: true,
+                detail: String::new(),
+            },
+            Err(e) => VolumeClaim {
+                volume: key.clone(),
+                complete: false,
+                detail: e.to_string(),
+            },
+        };
+        if !claim.complete {
+            eprintln!(
+                "repo-scan: events: volume {} event completeness not claimed: {}",
+                claim.volume, claim.detail,
+            );
+        }
+        claims.push(claim);
+    }
+    let cursors = report_cursors_from_store(store, session).await?;
+    Ok((cursors, claims))
 }
 
-/// Mark journal rows at or below `through` reconciled (current UUID only).
+/// Mark journal rows at or below `through` reconciled (current UUID
+/// only), paged by row id (RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1):
+/// the current UUID resolves from the newest row first, then marking
+/// pages forward holding one page at a time.
 async fn mark_events_reconciled_through(
     store: &TursoStore,
     volume: &str,
     through: events::EventCursorId,
 ) -> repo_scan::Result<()> {
-    let mut rows = store
+    let mut tip = store
         .connection()
         .query(
-            "SELECT id, history_uuid, cursor FROM event_journal WHERE volume_id = ?1 ORDER BY id ASC",
+            "SELECT history_uuid FROM event_journal WHERE volume_id = ?1 ORDER BY id DESC LIMIT 1",
             vec![turso::Value::Text(volume.to_string())],
         )
         .await
         .map_err(store_err)?;
-    let mut pending: Vec<(i64, String, String)> = Vec::new();
-    while let Some(row) = rows.next().await.map_err(store_err)? {
-        pending.push((cell_int(&row, 0)?, cell_text(&row, 1)?, cell_text(&row, 2)?));
-    }
-    let Some(current) = pending.last().map(|(_, uuid, _)| uuid.clone()) else {
+    let Some(tip_row) = tip.next().await.map_err(store_err)? else {
         return Ok(());
     };
-    for (id, uuid, cursor) in pending {
-        if uuid != current {
-            continue;
+    let current = cell_text(&tip_row, 0)?;
+    let mut last_id: i64 = 0;
+    loop {
+        let sql = format!(
+            "SELECT id, history_uuid, cursor FROM event_journal \
+             WHERE volume_id = ?1 AND id > {last_id} ORDER BY id ASC LIMIT {LOAD_CHUNK_ROWS}"
+        );
+        let mut rows = store
+            .connection()
+            .query(sql.as_str(), vec![turso::Value::Text(volume.to_string())])
+            .await
+            .map_err(store_err)?;
+        let mut page: Vec<(i64, String, String)> = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            page.push((cell_int(&row, 0)?, cell_text(&row, 1)?, cell_text(&row, 2)?));
+            if page.len() as i64 >= LOAD_CHUNK_ROWS {
+                break;
+            }
         }
-        let covered = events::parse_journal_cursor(&cursor).is_some_and(|c| c.0 <= through.0);
-        if covered {
-            store.mark_event_reconciled(id).await?;
+        if page.is_empty() {
+            break;
+        }
+        let full_page = page.len() as i64 >= LOAD_CHUNK_ROWS;
+        for (id, uuid, cursor) in &page {
+            if *uuid != current {
+                continue;
+            }
+            let covered = events::parse_journal_cursor(cursor).is_some_and(|c| c.0 <= through.0);
+            if covered {
+                store.mark_event_reconciled(*id).await?;
+            }
+        }
+        if full_page {
+            last_id = page.last().map(|(id, _, _)| *id).unwrap_or(last_id);
+        } else {
+            break;
         }
     }
     Ok(())
 }
 
 /// Per-volume report cursors from durable rows (current UUID only):
-/// monitored volumes plus any volume with persisted history.
+/// monitored volumes plus any volume with persisted history. Each
+/// volume's rows stream in bounded pages (RSF-751/AC46/F06D); only one
+/// page is ever held.
 async fn report_cursors_from_store(
     store: &TursoStore,
     session: &EventSession,
@@ -1573,47 +1923,108 @@ async fn report_cursors_from_store(
         }
     }
     for key in keys {
-        let mut rows = store
-            .connection()
-            .query(
-                "SELECT id, volume_id, history_uuid, cursor, received_ms, invalidated, \
-                 ingested, reconciled FROM event_journal WHERE volume_id = ?1 ORDER BY id ASC",
-                vec![turso::Value::Text(key.clone())],
-            )
-            .await
-            .map_err(store_err)?;
-        let mut all: Vec<EventRow> = Vec::new();
-        while let Some(row) = rows.next().await.map_err(store_err)? {
-            all.push(EventRow {
-                id: cell_int(&row, 0)?,
-                volume_id: cell_text(&row, 1)?,
-                history_uuid: cell_text(&row, 2)?,
-                cursor: cell_text(&row, 3)?,
-                received_ms: cell_int(&row, 4)?,
-                invalidated: cell_int(&row, 5)? != 0,
-                ingested: cell_int(&row, 6)? != 0,
-                reconciled: cell_int(&row, 7)? != 0,
-            });
-        }
-        let Some(current) = all.last().map(|r| r.history_uuid.clone()) else {
-            continue;
-        };
-        let current_rows: Vec<EventRow> = all
-            .into_iter()
-            .filter(|r| r.history_uuid == current)
-            .collect();
-        if let Some(cursor) = events::volume_cursor_from_rows(&key, &current_rows) {
-            out.insert(
-                key,
-                RootCursors {
-                    history_uuid: cursor.uuid.map(|u| u.0),
-                    ingested: cursor.ingested.map(|c| c.0.to_string()),
-                    reconciled: cursor.reconciled.map(|c| c.0.to_string()),
-                },
-            );
+        let scan = report_cursor_for_volume(store, &key).await?;
+        if let Some(cursors) = scan.cursors {
+            out.insert(key, cursors);
         }
     }
     Ok(out)
+}
+
+/// One volume's report cursors plus paging accounting.
+#[allow(dead_code)]
+struct ReportCursorScan {
+    cursors: Option<RootCursors>,
+    pages: u64,
+    peak_page: usize,
+}
+
+/// Derive one volume's report cursors page by page (RSF-751/AC46/F06D):
+/// the current UUID resolves from the newest row first (as in
+/// [`mark_events_reconciled_through`]), then current-UUID rows page
+/// forward accumulating flagged cursor maxima (cursor 0 excluded) — the
+/// same values [`events::volume_cursor_from_rows`] yields over the
+/// filtered history, without materializing it.
+async fn report_cursor_for_volume(
+    store: &TursoStore,
+    volume: &str,
+) -> repo_scan::Result<ReportCursorScan> {
+    let mut scan = ReportCursorScan {
+        cursors: None,
+        pages: 0,
+        peak_page: 0,
+    };
+    let mut tip = store
+        .connection()
+        .query(
+            "SELECT history_uuid FROM event_journal WHERE volume_id = ?1 ORDER BY id DESC LIMIT 1",
+            vec![turso::Value::Text(volume.to_string())],
+        )
+        .await
+        .map_err(store_err)?;
+    let Some(tip_row) = tip.next().await.map_err(store_err)? else {
+        return Ok(scan);
+    };
+    let current = cell_text(&tip_row, 0)?;
+    let mut ingested: Option<events::EventCursorId> = None;
+    let mut reconciled: Option<events::EventCursorId> = None;
+    let mut last_id: i64 = 0;
+    loop {
+        let sql = format!(
+            "SELECT id, cursor, ingested, reconciled FROM event_journal \
+             WHERE volume_id = ?1 AND history_uuid = ?2 AND id > {last_id} \
+             ORDER BY id ASC LIMIT {LOAD_CHUNK_ROWS}"
+        );
+        let mut rows = store
+            .connection()
+            .query(
+                sql.as_str(),
+                vec![
+                    turso::Value::Text(volume.to_string()),
+                    turso::Value::Text(current.clone()),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut page: Vec<(i64, String, bool, bool)> = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            page.push((
+                cell_int(&row, 0)?,
+                cell_text(&row, 1)?,
+                cell_int(&row, 2)? != 0,
+                cell_int(&row, 3)? != 0,
+            ));
+            if page.len() as i64 >= LOAD_CHUNK_ROWS {
+                break;
+            }
+        }
+        if page.is_empty() {
+            break;
+        }
+        scan.pages += 1;
+        scan.peak_page = scan.peak_page.max(page.len());
+        let full_page = page.len() as i64 >= LOAD_CHUNK_ROWS;
+        for (id, cursor, row_ingested, row_reconciled) in &page {
+            if let Some(parsed) = events::parse_journal_cursor(cursor).filter(|c| c.0 != 0) {
+                if *row_ingested {
+                    ingested = Some(ingested.map_or(parsed, |max| max.max(parsed)));
+                }
+                if *row_reconciled {
+                    reconciled = Some(reconciled.map_or(parsed, |max| max.max(parsed)));
+                }
+            }
+            last_id = last_id.max(*id);
+        }
+        if !full_page {
+            break;
+        }
+    }
+    scan.cursors = Some(RootCursors {
+        history_uuid: Some(current),
+        ingested: ingested.map(|c| c.0.to_string()),
+        reconciled: reconciled.map(|c| c.0.to_string()),
+    });
+    Ok(scan)
 }
 
 /// Per-root cursors aligned with `roots`, via the root's mount volume.
@@ -1653,10 +2064,18 @@ struct RunCounters {
     dirs_complete: u64,
     entries: u64,
     /// Real store transactions (R13): incremented once per mutating store
-    /// call (one autocommit statement or one `with_tx` each), never per
-    /// logical row. This is what the report's `db_transactions` carries.
+    /// call (one autocommit statement, one `with_tx`, or one writer-batch
+    /// flush each), never per logical row. This is what the report's
+    /// `db_transactions` carries.
     db_transactions: u64,
     stale_requeued: u64,
+    /// Measured peak aggregate RSS bytes for the run
+    /// (RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1).
+    peak_rss_bytes: u64,
+    /// Measured cumulative CPU seconds at run end (RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1).
+    cpu_seconds: f64,
+    /// Measured database sync calls for the run (RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1).
+    db_sync_calls: u64,
 }
 
 /// One observed pathname alias (R7): `path` names the same filesystem object
@@ -1684,25 +2103,86 @@ impl RunOutcome {
     }
 }
 
+/// One alias check deferred until the writer batch flushes
+/// (RSF-AC461500-609D-4D55-991E-09C60D382D67): buffered enqueues cannot
+/// report whether they won the `INSERT OR IGNORE`, so the
+/// same-object/scope comparison runs post-commit via [`note_enum_alias`],
+/// which no-ops unless the committed row carries another scope.
+struct PendingAliasCheck {
+    task_id: String,
+    scope_key: String,
+    path: PathBuf,
+    kind: &'static str,
+    at_ms: i64,
+}
+
 /// Owner-side run state: admission gates, per-volume breakers, topology
 /// guard, and one lazily discovered installed-git fallback.
 struct Runner {
     admission: Admission,
     breakers: HashMap<String, CircuitBreaker>,
     topology: Topology,
+    /// Descriptor-relative traversal fence (finding 12): `Some` on every
+    /// production scan (built from the planned roots in `run_scan_inner`);
+    /// `None` only on unit-test runners, which keep the legacy open.
+    fence: Option<ScopeFence>,
     inspector: git::GixInspector,
     fallback: Option<git::fallback::FallbackGit>,
     fallback_probed: bool,
     counters: RunCounters,
     /// Pathname aliases observed this run (R7), emitted as `Alias` records.
+    /// Insert-deduped via `alias_seen` (RSF-751/AC46/F06D): memory holds
+    /// distinct aliases only, exactly what the report emits.
     aliases: Vec<ObservedAlias>,
+    /// Distinct `(path, target, kind)` triples already recorded in
+    /// `aliases` (RSF-751/AC46/F06D). The report's `alias_inputs`
+    /// dedupes identically, so insert-time dedupe drops nothing the
+    /// report would keep.
+    alias_seen: HashSet<(Vec<u8>, Vec<u8>, &'static str)>,
+    /// Set once `aliases`/`alias_seen` hit [`MAX_ALIASES`] (A-F5,
+    /// mirroring [`note_applied_scopes`]): further aliases drop and one
+    /// `alias-overflow` gap row documents the loss.
+    alias_overflow: bool,
     /// Git-directory identities already persisted this run (R7):
     /// `(dev, ino)` of `instance.git_dir` to the first spelling's bytes.
     /// A second spelling of the same object records an alias instead of a
-    /// duplicate instance.
+    /// duplicate instance. One small entry per distinct identity; eviction
+    /// would duplicate instances, so the map lives for the run.
     probed_git_ids: HashMap<(u64, u64), Vec<u8>>,
+    /// Set once `probed_git_ids` hits [`MAX_PROBED_GIT_IDS`] (A-F5,
+    /// mirroring [`note_applied_scopes`]): further identities persist
+    /// without dedupe and one `probe-index-overflow` gap documents it.
+    probed_overflow: bool,
     /// Per-operation no-progress watchdog (R9).
     watchdog: Watchdog,
+    /// Buffered writer batch (RSF-AC461500-609D-4D55-991E-09C60D382D67):
+    /// scan writes buffer here and commit at the spec §5 limits.
+    batch: WriterBatch,
+    /// Checkpoint cadence (RSF-AC461500-609D-4D55-991E-09C60D382D67).
+    checkpoints: CheckpointCoordinator,
+    /// Footprint sampler (RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1).
+    sampler: FootprintSampler,
+    /// Peak aggregate RSS bytes observed this run (RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1).
+    peak_rss_bytes: u64,
+    /// Last sampled cumulative CPU seconds (RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1).
+    cpu_seconds: f64,
+    /// Memory-pressure threshold bytes from the effective limits (spec §5).
+    pressure_threshold_bytes: u64,
+    /// Run-loop start for progress elapsed time (RSF-CHAINARGOS-PROGRESS-001).
+    run_started: Instant,
+    /// Scope key of the task currently executing (progress position).
+    current_scope: String,
+    /// Breaker key of the task currently executing (progress volume).
+    current_volume: String,
+    /// Frontier denominator at the previous progress tick, for
+    /// RSF-CHAINARGOS-PROGRESS-002 growth detection: `None` until the
+    /// first tick, then the last tick's `total_tasks`.
+    progress_last_total: Option<u64>,
+    /// Alias checks awaiting the next batch flush (RSF-AC461500-609D-4D55-991E-09C60D382D67).
+    /// Bounded by the writer-batch flush contract: every enqueue that
+    /// pushes a check also pushes a batch op, and the batch flushes
+    /// (draining the checks) at the spec §5 limits.
+    pending_alias_checks: Vec<PendingAliasCheck>,
 }
 
 impl Runner {
@@ -1711,13 +2191,28 @@ impl Runner {
             admission: Admission::new(limits.clone()),
             breakers: HashMap::new(),
             topology: Topology::new(),
+            fence: None,
             inspector: git::GixInspector::new(),
             fallback: None,
             fallback_probed: false,
             counters: RunCounters::default(),
             aliases: Vec::new(),
+            alias_seen: HashSet::new(),
+            alias_overflow: false,
             probed_git_ids: HashMap::new(),
+            probed_overflow: false,
             watchdog: Watchdog::new(Duration::from_secs(WATCHDOG_GRACE_SECS)),
+            batch: WriterBatch::new(),
+            checkpoints: CheckpointCoordinator::new(CheckpointPolicy::default()),
+            sampler: FootprintSampler::new(),
+            peak_rss_bytes: 0,
+            cpu_seconds: 0.0,
+            pressure_threshold_bytes: limits.pressure_threshold_bytes,
+            run_started: Instant::now(),
+            current_scope: String::new(),
+            current_volume: String::new(),
+            progress_last_total: None,
+            pending_alias_checks: Vec::new(),
         }
     }
 
@@ -1741,18 +2236,18 @@ impl Runner {
 /// Per-operation no-progress watchdog (R9) with bounded grace.
 ///
 /// Attributed to the specific admitted operation: grace runs from admission,
-/// and only that operation's own completion counts as progress. On expiry
-/// the operation is contained (enumeration aborts its admitted portion with
-/// a preserved gap; other operations trip the volume breaker once they
-/// return), so one stalled scope cannot silently stall the run.
+/// and only that operation's own entries or completed directories count as
+/// progress. The verdict runs once per task after it returns
+/// ([`watchdog_verdict`]), so one stalled scope cannot silently stall the
+/// run, and advancing work is never reported as stalled.
 ///
 /// Honest single-owner limits: this process is the only worker and executes
 /// operations synchronously, so a hard-hung `stat`/list/Git syscall cannot
 /// be preempted — there is no helper to kill and no thread to cancel. The
-/// watchdog therefore bounds *detected* stalls: chunk-interruptible work
-/// (enumeration) is aborted in place, and every other over-grace operation
-/// is contained after the fact (breaker + preserved gap + stderr). It never
-/// claims cancellation it cannot perform.
+/// in-loop abort ([`watchdog_inloop_abort`]) only fires between items when
+/// no entry completed within grace, preserving the partial enumeration as
+/// a `watchdog-no-progress` gap; it never claims cancellation it cannot
+/// perform.
 struct Watchdog {
     grace: Duration,
     tripped: u64,
@@ -1768,6 +2263,41 @@ impl Watchdog {
     fn exceeded(&self, admitted: Instant, now: Instant) -> bool {
         now.duration_since(admitted) > self.grace
     }
+}
+
+/// Blocked-vs-advancing verdict for an admitted operation
+/// (RSF-AD9D4AF7-3CC3-4B37-8168-E78DD6375C5B): an over-grace operation
+/// that produced entries or completed directories is slow but advancing
+/// and is never contained; only an over-grace operation with no observed
+/// progress is contained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchdogVerdict {
+    WithinGrace,
+    Advancing,
+    Contained,
+}
+
+fn watchdog_verdict(timed_out: bool, advanced: bool) -> WatchdogVerdict {
+    match (timed_out, advanced) {
+        (false, _) => WatchdogVerdict::WithinGrace,
+        (true, true) => WatchdogVerdict::Advancing,
+        (true, false) => WatchdogVerdict::Contained,
+    }
+}
+
+/// In-loop no-progress gate for enumeration (RSF-SEC-WATCHDOG-ABORT):
+/// abort only when no entry completed since the last progress mark and
+/// the stall exceeds grace. A zero grace disables pre-emption: any
+/// nonzero stall would otherwise exceed it before the first entry is
+/// attempted, so judgment stays post-hoc via [`watchdog_verdict`]
+/// (RSF-AD9D4AF7-3CC3-4B37-8168-E78DD6375C5B). Pure and unit-testable.
+fn watchdog_inloop_abort(
+    entries_seen: u64,
+    progress_mark: u64,
+    stalled: Duration,
+    grace: Duration,
+) -> bool {
+    !grace.is_zero() && entries_seen == progress_mark && stalled > grace
 }
 
 /// Claim and execute tasks until the boundary: no claimable work remains
@@ -1790,8 +2320,12 @@ async fn run_until_boundary(
             break;
         }
         let now = store::now_ms();
+        // RSF-3E2FDCF3-78C5-401A-84DD-A799688ED84F: claims are scoped to
+        // this run's traversal generation, so a resumed or force-rescan
+        // run never drains another generation's work and claimed tasks
+        // stay visible to that generation's `pending_count` boundary.
         let claimed = store
-            .claim_tasks(epoch, CLAIM_BATCH, LEASE_TTL_MS, now)
+            .claim_tasks_in_generation(generation, epoch, CLAIM_BATCH, LEASE_TTL_MS, now)
             .await?;
         runner.counters.db_transactions += 1;
         if claimed.is_empty() {
@@ -1826,7 +2360,13 @@ async fn run_until_boundary(
                 continue;
             };
             progressed = true;
+            // RSF-CHAINARGOS-PROGRESS-001: progress position follows the
+            // task actually executing.
+            runner.current_scope = item.task.scope_key.clone();
+            runner.current_volume = volume.clone();
             let started = Instant::now();
+            let entries_before = runner.counters.entries;
+            let dirs_before = runner.counters.dirs_complete;
             let result = execute_task(
                 runner,
                 store,
@@ -1839,6 +2379,11 @@ async fn run_until_boundary(
             )
             .await;
             runner.admission.release(&permit);
+            // RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1: at-most-1 Hz
+            // footprint sample with pressure response.
+            if runner.admission.telemetry_due() {
+                sample_footprint(runner);
+            }
             let elapsed = started.elapsed();
             if elapsed > Duration::from_secs(SLOW_TASK_SECS) {
                 eprintln!(
@@ -1847,24 +2392,47 @@ async fn run_until_boundary(
                     elapsed.as_secs()
                 );
             }
-            if runner.watchdog.exceeded(started, Instant::now()) {
-                // No-progress grace exhausted: contain the scope (R9). The
-                // operation already returned, so containment isolates the
-                // volume for the rest of the run instead of pretending to
-                // cancel in flight.
-                runner.watchdog.tripped += 1;
-                runner.breaker_failure(&volume);
-                runner.breaker_failure(&volume);
-                runner.breaker_failure(&volume);
-                eprintln!(
-                    "repo-scan: watchdog: {} made no progress within {}s; \
-                     volume {volume} contained (breaker opened)",
-                    item.task.id, WATCHDOG_GRACE_SECS,
-                );
+            // RSF-AD9D4AF7-3CC3-4B37-8168-E78DD6375C5B: the watchdog
+            // distinguishes blocked from advancing. Entries or completed
+            // directories observed during the task are progress even past
+            // grace; only a past-grace task with no observed progress is
+            // contained. The operation already returned, so containment
+            // isolates the volume instead of pretending to cancel in flight.
+            let advanced = runner.counters.entries > entries_before
+                || runner.counters.dirs_complete > dirs_before;
+            let timed_out = runner.watchdog.exceeded(started, Instant::now());
+            match watchdog_verdict(timed_out, advanced) {
+                WatchdogVerdict::WithinGrace => {}
+                WatchdogVerdict::Advancing => {
+                    runner.watchdog.tripped += 1;
+                    eprintln!(
+                        "repo-scan: watchdog: {} slow ({}s) but advancing; not contained",
+                        item.task.id,
+                        elapsed.as_secs(),
+                    );
+                }
+                WatchdogVerdict::Contained => {
+                    runner.watchdog.tripped += 1;
+                    runner.breaker_failure(&volume);
+                    runner.breaker_failure(&volume);
+                    runner.breaker_failure(&volume);
+                    eprintln!(
+                        "repo-scan: watchdog: {} made no progress within {}s; \
+                         volume {volume} contained (breaker opened)",
+                        item.task.id,
+                        runner.watchdog.grace.as_secs(),
+                    );
+                }
             }
+            let contained = timed_out && !advanced;
             match result {
                 Ok(()) => {
-                    runner.breaker_success(&volume);
+                    // RSF-AD9D4AF7-3CC3-4B37-8168-E78DD6375C5B: a
+                    // contained (timed-out, non-advancing) task must never
+                    // clear its containment via success-after-timeout.
+                    if !contained {
+                        runner.breaker_success(&volume);
+                    }
                 }
                 Err(e) => {
                     // Lease/unknown-task failures are scheduler bugs, not
@@ -1874,15 +2442,10 @@ async fn run_until_boundary(
                 }
             }
             runner.counters.claimed += 1;
+            // At-most-2 Hz token-timer gate (RSF-CHAINARGOS-PROGRESS-001):
+            // progress lines carry position, pending, and elapsed.
             if runner.admission.progress_due() {
-                eprintln!(
-                    "repo-scan: scan {scan_id} gen {generation}: {} claimed, \
-                     {} dirs, {} entries, {} stale-requeued",
-                    runner.counters.claimed,
-                    runner.counters.dirs_complete,
-                    runner.counters.entries,
-                    runner.counters.stale_requeued,
-                );
+                emit_progress(runner, store, scan_id, generation).await?;
             }
         }
         if !progressed {
@@ -1890,6 +2453,20 @@ async fn run_until_boundary(
             break;
         }
     }
+    // RSF-AC461500-609D-4D55-991E-09C60D382D67: buffered rows must be
+    // committed before boundary accounting reads them.
+    flush_runner_batch(runner, store).await?;
+    // RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1: forced final sample so the
+    // report carries measured resources, never None-after-run. Under
+    // `synchronous = FULL` every counted transaction syncs at least once;
+    // explicit checkpoints add their own syncs.
+    sample_footprint(runner);
+    runner.counters.peak_rss_bytes = runner.peak_rss_bytes;
+    runner.counters.cpu_seconds = runner.cpu_seconds;
+    let store_stats = store.stats();
+    runner.counters.db_sync_calls = store_stats
+        .transactions
+        .saturating_add(store_stats.checkpoints);
     let pending = store.pending_count(generation).await?;
     let open_gaps = count_open_errors(store).await?;
     let unresolvable = count_unresolvable(store).await?;
@@ -1934,6 +2511,424 @@ async fn release_claim(
     Ok(())
 }
 
+/// One footprint sample into run state with pressure response
+/// (RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1). The owner folds its live
+/// admission snapshot into the sampler. Reaped-subprocess CPU
+/// (`RUSAGE_CHILDREN`, e.g. installed-git fallback probes) is measured
+/// automatically inside the sampler, so the owner passes 0.0 retained CPU
+/// unless it tracks CPU the kernel cannot see. Live-helper RSS is
+/// `Some(0)` (measured zero) while this sequential design spawns no helpers
+/// and `None` (honest unknown, aggregate is owner-only) if helpers ever go
+/// live without instrumentation — never a hardcoded fake zero. Pressure
+/// trips on the aggregate reading against the 512 MiB threshold; when helper
+/// RSS is unknown that reading is an owner-only lower bound and the pressure
+/// line says so.
+fn sample_footprint(runner: &mut Runner) {
+    let admitted = runner.admission.snapshot();
+    let sample = runner.sampler.sample_with(&SamplerInputs {
+        helpers_rss_bytes: live_helper_rss_bytes(admitted.helpers_live),
+        helpers_cpu_seconds: 0.0,
+        app_fds: admitted.app_fds,
+        admitted_enum_ops: admitted.enum_in_use,
+        admitted_git_probes: admitted.git_in_use,
+        helpers: admitted.helpers_live,
+    });
+    runner.peak_rss_bytes = runner.peak_rss_bytes.max(sample.aggregate_rss_bytes);
+    runner.cpu_seconds = sample.cpu_seconds;
+    let pressured = sample.aggregate_rss_bytes > runner.pressure_threshold_bytes;
+    let rising = pressured && !runner.admission.under_pressure();
+    runner.admission.set_pressure(pressured);
+    if rising {
+        let helper_note = match sample.helpers_rss_bytes {
+            Some(_) => "measured",
+            None => "owner-only lower bound; live-helper RSS unknown (not instrumented)",
+        };
+        eprintln!(
+            "repo-scan: memory pressure: RSS {} bytes over threshold {} bytes \
+             (helpers: {helper_note}); admission stopped",
+            sample.aggregate_rss_bytes, runner.pressure_threshold_bytes,
+        );
+    }
+}
+
+/// Cumulative progress context for one generation
+/// (RSF-F2865989-7199-472B-A9D8-9C54C88656EB, RSF-CHAINARGOS-RESUME-002,
+/// RSF-CHAINARGOS-SPEED-003): frontier denominator plus cumulative totals
+/// across resumes. The frontier denominator grows as discovery enqueues
+/// children, so it is a lower bound, not a fixed scope total.
+#[derive(Debug, Clone, Copy, Default)]
+struct ProgressTotals {
+    /// Frontier tasks still needing scheduler action (this generation).
+    pending: u64,
+    /// All frontier tasks enqueued so far (this generation; grows).
+    total_tasks: u64,
+    /// Cumulative completed directories (all runs, this generation).
+    cum_dirs: u64,
+    /// Cumulative entries seen (all runs, this generation).
+    cum_entries: u64,
+}
+
+impl ProgressTotals {
+    /// Frontier tasks finished so far (total minus pending).
+    fn done_tasks(&self) -> u64 {
+        self.total_tasks.saturating_sub(self.pending)
+    }
+}
+
+/// Load the cumulative progress context for one progress tick (at most 2 Hz).
+/// Four cheap indexed counts; failures propagate instead of printing stale
+/// totals.
+async fn load_progress_totals(
+    store: &TursoStore,
+    generation: u64,
+) -> repo_scan::Result<ProgressTotals> {
+    let pending = store.pending_count(generation).await?;
+    let total_tasks = count_query(
+        store,
+        "SELECT COUNT(*) FROM frontier_tasks WHERE generation = ?1",
+        vec![turso::Value::Integer(i64::try_from(generation).map_err(
+            |_| repo_scan::Error::Store(format!("task generation {generation} exceeds i64 range")),
+        )?)],
+    )
+    .await?;
+    let cum_dirs = count_dirs_complete(store, generation).await?;
+    let cum_entries = count_query(
+        store,
+        "SELECT COALESCE(SUM(entries_seen), 0) FROM dir_observations WHERE generation = ?1",
+        vec![turso::Value::Integer(i64::try_from(generation).map_err(
+            |_| repo_scan::Error::Store(format!("task generation {generation} exceeds i64 range")),
+        )?)],
+    )
+    .await?;
+    Ok(ProgressTotals {
+        pending,
+        total_tasks,
+        cum_dirs,
+        cum_entries,
+    })
+}
+
+/// Session throughput for one progress tick (tasks/s), or an explicit
+/// unknown with reason when the rate is not yet meaningful.
+fn format_progress_rate(session_claimed: u64, elapsed: Duration) -> String {
+    let secs = elapsed.as_secs_f64();
+    if secs < 0.5 {
+        return String::from("unknown (warming-up: <0.5s elapsed)");
+    }
+    format!("{:.1} tasks/s", session_claimed as f64 / secs)
+}
+
+/// ETA for one progress tick (RSF-F2865989-7199-472B-A9D8-9C54C88656EB,
+/// RSF-CHAINARGOS-SPEED-003): `0s` when nothing is pending, a `~Ns` lower
+/// bound from this session's claimed-task rate otherwise, or an explicit
+/// `unknown (<reason>)` when no defensible rate exists yet. A known ETA is a
+/// lower bound because the frontier denominator grows as discovery enqueues
+/// children; the full machine dir count is unknowable until traversal
+/// completes (see `scope_total` in the progress line).
+fn format_progress_eta(session_claimed: u64, pending: u64, elapsed: Duration) -> String {
+    if pending == 0 {
+        return String::from("0s");
+    }
+    let secs = elapsed.as_secs_f64();
+    if secs < 2.0 {
+        return String::from("unknown (warming-up: <2s elapsed, rate unstable)");
+    }
+    if session_claimed == 0 {
+        return String::from("unknown (no session progress yet, rate undefined)");
+    }
+    let rate = session_claimed as f64 / secs;
+    if !rate.is_finite() || rate <= 0.0 {
+        return String::from("unknown (session rate non-positive)");
+    }
+    let eta = (pending as f64 / rate).ceil().max(0.0) as u64;
+    format!("~{eta}s (lower bound; denominator grows with discovery)")
+}
+
+/// Growth-aware ETA (RSF-CHAINARGOS-PROGRESS-002): when the frontier
+/// denominator grew since the previous tick there is no stable total, so
+/// the ETA is an explicit unknown naming the growth — never a `~Ns`
+/// estimate over a moving denominator. `0s` still short-circuits when
+/// nothing is pending; a stable denominator delegates to
+/// [`format_progress_eta`].
+fn format_progress_eta_growth(
+    session_claimed: u64,
+    pending: u64,
+    elapsed: Duration,
+    denominator_grew: bool,
+    new_since_tick: u64,
+) -> String {
+    if pending == 0 {
+        return String::from("0s");
+    }
+    if denominator_grew {
+        return format!(
+            "unknown (frontier denominator still growing: +{new_since_tick} tasks since last \
+             tick; no stable total until discovery completes)"
+        );
+    }
+    format_progress_eta(session_claimed, pending, elapsed)
+}
+
+/// Emit one 2 Hz progress line with scan position and completion context
+/// (RSF-CHAINARGOS-PROGRESS-001): current scope/volume, session counters,
+/// cumulative scan totals, frontier denominator, throughput, ETA, and elapsed
+/// run time. Session counters are per-invocation run totals
+/// (RSF-CHAINARGOS-RESUME-002): a resume starts a new run at 1/1/1 and the
+/// `session(this run)` vs `cumulative(scan total)` labels keep that
+/// unambiguous. Still gated at most 2 Hz by the caller.
+async fn emit_progress(
+    runner: &mut Runner,
+    store: &TursoStore,
+    scan_id: &str,
+    generation: u64,
+) -> repo_scan::Result<()> {
+    let totals = load_progress_totals(store, generation).await?;
+    // RSF-CHAINARGOS-PROGRESS-002: compare the frontier denominator
+    // against the previous tick; growth forces an explicit-unknown ETA.
+    let (denominator_grew, new_since_tick) = match runner.progress_last_total {
+        Some(last) => (
+            totals.total_tasks > last,
+            totals.total_tasks.saturating_sub(last),
+        ),
+        None => (false, 0),
+    };
+    runner.progress_last_total = Some(totals.total_tasks);
+    let line = format_progress_line_full_with_growth(
+        scan_id,
+        generation,
+        &runner.counters,
+        &totals,
+        runner.run_started.elapsed(),
+        &runner.current_scope,
+        &runner.current_volume,
+        denominator_grew,
+        new_since_tick,
+    );
+    eprintln!("{line}");
+    Ok(())
+}
+
+/// Full progress line with store totals: session counters plus cumulative
+/// scan totals, frontier denominator, rate, and ETA.
+/// Test-only: production `emit_progress` uses the `_with_growth` variant.
+#[cfg(test)]
+fn format_progress_line_full(
+    scan_id: &str,
+    generation: u64,
+    counters: &RunCounters,
+    totals: &ProgressTotals,
+    elapsed: Duration,
+    scope: &str,
+    volume: &str,
+) -> String {
+    let rate = format_progress_rate(counters.claimed, elapsed);
+    let eta = format_progress_eta(counters.claimed, totals.pending, elapsed);
+    format_progress_line_full_inner(
+        scan_id, generation, counters, totals, elapsed, scope, volume, &rate, &eta, "",
+    )
+}
+
+/// Full progress line with RSF-CHAINARGOS-PROGRESS-002 growth context:
+/// growth-aware ETA plus a `denominator=` stability token. Production
+/// `emit_progress` uses this; [`format_progress_line_full`] keeps the
+/// growth-agnostic shape.
+#[allow(clippy::too_many_arguments)]
+fn format_progress_line_full_with_growth(
+    scan_id: &str,
+    generation: u64,
+    counters: &RunCounters,
+    totals: &ProgressTotals,
+    elapsed: Duration,
+    scope: &str,
+    volume: &str,
+    denominator_grew: bool,
+    new_since_tick: u64,
+) -> String {
+    let rate = format_progress_rate(counters.claimed, elapsed);
+    let eta = format_progress_eta_growth(
+        counters.claimed,
+        totals.pending,
+        elapsed,
+        denominator_grew,
+        new_since_tick,
+    );
+    let growth = if denominator_grew {
+        format!(" denominator=growing(+{new_since_tick} since last tick)")
+    } else {
+        String::from(" denominator=stable(since last tick)")
+    };
+    format_progress_line_full_inner(
+        scan_id, generation, counters, totals, elapsed, scope, volume, &rate, &eta, &growth,
+    )
+}
+
+/// Shared full-line renderer: `growth_note` is empty for the
+/// growth-agnostic entry and a `denominator=` token otherwise.
+#[allow(clippy::too_many_arguments)]
+fn format_progress_line_full_inner(
+    scan_id: &str,
+    generation: u64,
+    counters: &RunCounters,
+    totals: &ProgressTotals,
+    elapsed: Duration,
+    scope: &str,
+    volume: &str,
+    rate: &str,
+    eta: &str,
+    growth_note: &str,
+) -> String {
+    format!(
+        "repo-scan: scan {scan_id} gen {generation} session(this run): claimed={} dirs={} \
+         entries={} stale-requeued={} | cumulative(scan total): tasks_done={}/{} dirs={} \
+         entries={} pending={} | elapsed={}s rate={} eta={} scope={} volume={} \
+         scope_total=unknown (full machine dir count unknowable until traversal completes)\
+         {growth_note}",
+        counters.claimed,
+        counters.dirs_complete,
+        counters.entries,
+        counters.stale_requeued,
+        totals.done_tasks(),
+        totals.total_tasks,
+        totals.cum_dirs,
+        totals.cum_entries,
+        totals.pending,
+        elapsed.as_secs(),
+        rate,
+        eta,
+        if scope.is_empty() { "-" } else { scope },
+        if volume.is_empty() { "-" } else { volume },
+    )
+}
+
+#[cfg(test)]
+fn format_progress_line(
+    scan_id: &str,
+    generation: u64,
+    counters: &RunCounters,
+    pending: u64,
+    elapsed: Duration,
+    scope: &str,
+    volume: &str,
+) -> String {
+    // Backward-compatible entry without store totals: session-labeled
+    // counters plus explicit unknowns with reasons. Production
+    // `emit_progress` prefers `format_progress_line_full` with the frontier
+    // denominator and cumulative totals.
+    let rate = format_progress_rate(counters.claimed, elapsed);
+    let eta = format_progress_eta(counters.claimed, pending, elapsed);
+    format!(
+        "repo-scan: scan {scan_id} gen {generation} session(this run): claimed={} dirs={} \
+         entries={} stale-requeued={} | cumulative(scan total)=unknown (store totals not \
+         loaded in this context) tasks_total=unknown (frontier denominator not loaded) \
+         pending={pending} | elapsed={}s rate={} eta={} scope={} volume={} scope_total=unknown \
+         (full machine dir count unknowable until traversal completes)",
+        counters.claimed,
+        counters.dirs_complete,
+        counters.entries,
+        counters.stale_requeued,
+        elapsed.as_secs(),
+        rate,
+        eta,
+        if scope.is_empty() { "-" } else { scope },
+        if volume.is_empty() { "-" } else { volume },
+    )
+}
+
+/// Flush buffered writer ops in one transaction
+/// (RSF-AC461500-609D-4D55-991E-09C60D382D67). Applied ops feed the
+/// checkpoint cadence ([`CheckpointCoordinator::note_ops`] /
+/// [`CheckpointCoordinator::maybe_checkpoint`], which calls `wal_status`
+/// and, over budget, `checkpoint_truncate`); deferred alias checks then
+/// run against committed rows. Returns applied ops. One transaction,
+/// counted as such.
+async fn flush_runner_batch(runner: &mut Runner, store: &TursoStore) -> repo_scan::Result<u64> {
+    if runner.batch.is_empty() {
+        return Ok(0);
+    }
+    let applied = store.flush(&mut runner.batch).await? as u64;
+    if applied == 0 {
+        return Ok(0);
+    }
+    runner.counters.db_transactions += 1;
+    if runner.checkpoints.note_ops(applied) {
+        let _ = runner.checkpoints.maybe_checkpoint(store).await?;
+    }
+    let checks = std::mem::take(&mut runner.pending_alias_checks);
+    for check in &checks {
+        note_enum_alias(
+            store,
+            runner,
+            &check.task_id,
+            &check.scope_key,
+            &check.path,
+            check.kind,
+            check.at_ms,
+        )
+        .await?;
+    }
+    Ok(applied)
+}
+
+/// Flush when a `buffer_*` call reports a spec §5 limit
+/// (RSF-AC461500-609D-4D55-991E-09C60D382D67).
+async fn flush_if_due(runner: &mut Runner, store: &TursoStore, due: bool) -> repo_scan::Result<()> {
+    if due {
+        flush_runner_batch(runner, store).await?;
+    }
+    Ok(())
+}
+
+/// Buffer the error upsert as its two statements (RSF-AC461500-609D-4D55-991E-09C60D382D67):
+/// the unconditional `UPDATE` plus `INSERT OR IGNORE`, mirroring
+/// `record_error`'s update-then-insert outcome without a read. Returns
+/// `WriterBatch::should_flush`.
+fn buffer_record_error(
+    batch: &mut WriterBatch,
+    id: &str,
+    scope_key: &str,
+    category: &str,
+    detail: &str,
+    next_retry_ms: Option<i64>,
+    now_ms: i64,
+) -> bool {
+    batch.push(
+        "UPDATE errors SET attempts = attempts + 1, detail = ?1, last_seen_ms = ?2, \
+         next_retry_ms = ?3, open = 1 WHERE id = ?4",
+        vec![
+            turso::Value::Text(detail.to_string()),
+            turso::Value::Integer(now_ms),
+            next_retry_ms.map_or(turso::Value::Null, turso::Value::Integer),
+            turso::Value::Text(id.to_string()),
+        ],
+    );
+    batch.push(
+        "INSERT OR IGNORE INTO errors (id, scope_key, category, detail, attempts, \
+         first_seen_ms, last_seen_ms, next_retry_ms, open) \
+         VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5, ?6, 1)",
+        vec![
+            turso::Value::Text(id.to_string()),
+            turso::Value::Text(scope_key.to_string()),
+            turso::Value::Text(category.to_string()),
+            turso::Value::Text(detail.to_string()),
+            turso::Value::Integer(now_ms),
+            next_retry_ms.map_or(turso::Value::Null, turso::Value::Integer),
+        ],
+    );
+    batch.should_flush()
+}
+
+/// Buffer a gap close (RSF-AC461500-609D-4D55-991E-09C60D382D67), mirroring
+/// `resolve_error`. Returns `WriterBatch::should_flush`.
+fn buffer_resolve_error(batch: &mut WriterBatch, id: &str, now_ms: i64) -> bool {
+    batch.push(
+        "UPDATE errors SET open = 0, last_seen_ms = ?1 WHERE id = ?2",
+        vec![
+            turso::Value::Integer(now_ms),
+            turso::Value::Text(id.to_string()),
+        ],
+    )
+}
+
 impl Runner {
     fn breaker_success(&mut self, volume: &str) {
         if let Some(breaker) = self.breakers.get_mut(volume) {
@@ -1948,6 +2943,86 @@ impl Runner {
             .or_insert_with(|| CircuitBreaker::new(BREAKER_THRESHOLD, BREAKER_COOLDOWN));
         breaker.on_failure(SystemTime::now());
     }
+
+    /// Record an observed pathname alias once (RSF-751/AC46/F06D).
+    /// Repeat observations of one `(path, target, kind)` triple are
+    /// dropped at insert: the run holds distinct aliases only, exactly
+    /// what the report emits (see `alias_inputs`). Capped at
+    /// [`MAX_ALIASES`] (A-F5, mirroring [`note_applied_scopes`]): past
+    /// the cap new triples drop and one `alias-overflow` gap row
+    /// documents the loss. Returns `WriterBatch::should_flush`.
+    fn note_alias(
+        &mut self,
+        path: Vec<u8>,
+        target: Vec<u8>,
+        kind: &'static str,
+        at_ms: i64,
+    ) -> bool {
+        if self.alias_overflow {
+            return false;
+        }
+        let key = (path, target, kind);
+        if self.alias_seen.contains(&key) {
+            return false;
+        }
+        if self.alias_seen.len() >= MAX_ALIASES {
+            self.alias_overflow = true;
+            eprintln!("repo-scan: alias overflow; further aliases dropped (gap recorded)");
+            return buffer_record_error(
+                &mut self.batch,
+                "alias-overflow",
+                events::mounts_scope_key(),
+                "alias-overflow",
+                &format!("alias table past {MAX_ALIASES}; further aliases dropped"),
+                None,
+                at_ms,
+            );
+        }
+        self.alias_seen.insert(key.clone());
+        self.aliases.push(ObservedAlias {
+            path: key.0,
+            target: key.1,
+            kind: key.2,
+            verified_at_ms: at_ms,
+        });
+        false
+    }
+}
+
+/// Record one probed Git identity, capped at [`MAX_PROBED_GIT_IDS`]
+/// (A-F5, mirroring [`note_applied_scopes`]): past the cap the identity
+/// is not recorded (later spellings persist without dedupe) and one
+/// `probe-index-overflow` gap row documents the loss. Returns
+/// `WriterBatch::should_flush`.
+fn note_probed_git_id(
+    runner: &mut Runner,
+    key: (u64, u64),
+    git_bytes: Vec<u8>,
+    now_ms: i64,
+) -> bool {
+    if runner.probed_overflow {
+        return false;
+    }
+    if runner.probed_git_ids.len() >= MAX_PROBED_GIT_IDS {
+        runner.probed_overflow = true;
+        eprintln!(
+            "repo-scan: probe-index overflow; further identities persist without dedupe \
+             (gap recorded)"
+        );
+        return buffer_record_error(
+            &mut runner.batch,
+            "probe-index-overflow",
+            events::mounts_scope_key(),
+            "probe-index-overflow",
+            &format!(
+                "probe index past {MAX_PROBED_GIT_IDS}; further identities persist without dedupe"
+            ),
+            None,
+            now_ms,
+        );
+    }
+    runner.probed_git_ids.insert(key, git_bytes);
+    false
 }
 
 /// Per-volume breaker key for a scope key (paths stat their volume;
@@ -1997,6 +3072,9 @@ async fn execute_task(
             Some(config::ScopeRef::Dir(_))
         )
     {
+        // RSF-AC461500-609D-4D55-991E-09C60D382D67: buffered rows commit
+        // before verified completion.
+        flush_runner_batch(runner, store).await?;
         match complete_claimed(store, runner, claimed, epoch, &TaskOutcome::Complete).await? {
             CompletionApplied::Applied => {}
             CompletionApplied::StaleRequeued => {
@@ -2011,23 +3089,25 @@ async fn execute_task(
         KIND_STATUS => exec_status(runner, store, status_mode, claimed).await?,
         other => {
             let detail = format!("unknown task kind: {other}");
-            store
-                .record_error(
-                    &format!("kind:{}", claimed.task.id),
-                    &claimed.task.scope_key,
-                    "unsupported-task-kind",
-                    &detail,
-                    None,
-                    store::now_ms(),
-                )
-                .await?;
-            runner.counters.db_transactions += 1;
+            let due = buffer_record_error(
+                &mut runner.batch,
+                &format!("kind:{}", claimed.task.id),
+                &claimed.task.scope_key,
+                "unsupported-task-kind",
+                &detail,
+                None,
+                store::now_ms(),
+            );
+            flush_if_due(runner, store, due).await?;
             TaskOutcome::Parked {
                 state: TaskState::Unsupported,
                 reason: detail,
             }
         }
     };
+    // RSF-AC461500-609D-4D55-991E-09C60D382D67: children commit in
+    // earlier batches; completion verifies against committed rows.
+    flush_runner_batch(runner, store).await?;
     match complete_claimed(store, runner, claimed, epoch, &outcome).await? {
         CompletionApplied::Applied => {}
         CompletionApplied::StaleRequeued => {
@@ -2116,6 +3196,133 @@ fn classify_io_error(e: &std::io::Error) -> Option<TaskState> {
     }
 }
 
+/// Outcome of the fenced open attempt for one enum task (finding 12).
+enum FencedDir {
+    /// No fence configured (unit-test runners): legacy pathname open.
+    Unfenced,
+    /// Pinned, verified directory: enumerate through the descriptor.
+    Pinned(PinnedDir),
+    /// The task path itself is a symlink: route to link handling.
+    Link,
+    /// Refused without filesystem writes (out of scope, cycle, ...).
+    Refused { state: TaskState, reason: String },
+    /// Open failed like the legacy stat: park or retry, no observation.
+    StatFailed(std::io::Error),
+}
+
+/// Directory identity source for one enum task: pinned `fstat` parts or
+/// legacy `symlink_metadata`.
+enum OpenDirMeta {
+    Pinned(DirStat),
+    Legacy(std::fs::Metadata),
+}
+
+/// Fenced open of one enum task's directory: descriptor-relative
+/// resolution plus the `(dev, ino)`-anchored scope check. Every refusal
+/// fails closed (parked gap or retryable error), never an enumeration
+/// outside the declared roots.
+fn open_dir_fenced(fence: Option<&ScopeFence>, path: &Path) -> FencedDir {
+    let Some(fence) = fence else {
+        return FencedDir::Unfenced;
+    };
+    match fence.open_pinned(path) {
+        Ok(FenceOpen::Dir(pinned)) => FencedDir::Pinned(pinned),
+        Ok(FenceOpen::Symlink) => FencedDir::Link,
+        Err(FenceError::OutOfScope(p)) => FencedDir::Refused {
+            state: TaskState::Unavailable,
+            reason: format!("directory {} is outside the scan scope", p.display()),
+        },
+        Err(FenceError::TooDeep(p)) => FencedDir::Refused {
+            state: TaskState::Unavailable,
+            reason: format!("symlink chain too deep at {}", p.display()),
+        },
+        Err(FenceError::NotAbsolute(p)) => FencedDir::Refused {
+            state: TaskState::Unavailable,
+            reason: format!("scope path is not absolute: {}", p.display()),
+        },
+        // Non-unix targets cannot pin descriptors: fall back to the
+        // legacy pathname open there (documented weaker posture).
+        Err(FenceError::Unsupported(_)) => FencedDir::Unfenced,
+        Err(FenceError::NotDirectory(p)) => FencedDir::StatFailed(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            format!("not a directory: {}", p.display()),
+        )),
+        Err(FenceError::Io(e)) => FencedDir::StatFailed(e),
+    }
+}
+
+/// Translate a directory-stat failure: permission loss and disappearance
+/// park immediately as coverage gaps; anything else retries.
+async fn fail_stat_open(
+    runner: &mut Runner,
+    store: &TursoStore,
+    claimed: &ClaimedTask,
+    path: &Path,
+    e: &std::io::Error,
+) -> repo_scan::Result<TaskOutcome> {
+    let detail = format!("cannot stat {}: {e}", path.display());
+    if let Some(state) = classify_io_error(e) {
+        return Ok(TaskOutcome::Parked {
+            state,
+            reason: detail,
+        });
+    }
+    fail_task(
+        runner,
+        store,
+        claimed,
+        ExecFail {
+            category: String::from("stat-error"),
+            detail,
+        },
+    )
+    .await
+}
+
+/// Record a directory-open failure as the directory's enumeration error:
+/// permission loss and disappearance park immediately as coverage gaps;
+/// anything else retries.
+#[allow(clippy::too_many_arguments)]
+async fn fail_list_open(
+    runner: &mut Runner,
+    store: &TursoStore,
+    claimed: &ClaimedTask,
+    dir_id: i64,
+    generation: u64,
+    path: &Path,
+    now: i64,
+    e: &std::io::Error,
+) -> repo_scan::Result<TaskOutcome> {
+    let detail = format!("cannot list {}: {e}", path.display());
+    let due = TursoStore::buffer_record_dir_observation(
+        &mut runner.batch,
+        dir_id,
+        generation,
+        false,
+        1,
+        0,
+        Some(&detail),
+        now,
+    );
+    flush_if_due(runner, store, due).await?;
+    if let Some(state) = classify_io_error(e) {
+        return Ok(TaskOutcome::Parked {
+            state,
+            reason: detail,
+        });
+    }
+    fail_task(
+        runner,
+        store,
+        claimed,
+        ExecFail {
+            category: String::from("enumerate-error"),
+            detail,
+        },
+    )
+    .await
+}
+
 /// Enumerate one directory's immediate children: upsert the directory row,
 /// enqueue unseen child directories (identity-deduped), resolve symlinks
 /// through the topology layer, detect Git candidates by marker evidence
@@ -2133,29 +3340,55 @@ async fn exec_enumerate(
             reason: format!("malformed dir scope key: {}", claimed.task.scope_key),
         });
     };
-    let md = match std::fs::symlink_metadata(&path) {
-        Ok(md) => md,
-        Err(e) => {
-            let detail = format!("cannot stat {}: {e}", path.display());
-            if let Some(state) = classify_io_error(&e) {
-                return Ok(TaskOutcome::Parked {
-                    state,
-                    reason: detail,
-                });
-            }
-            return fail_task(
-                runner,
-                store,
-                claimed,
-                ExecFail {
-                    category: String::from("stat-error"),
-                    detail,
-                },
-            )
-            .await;
+    // Finding 12: fenced runners open the task directory through
+    // pinned descriptors and verify scope before touching it; unfenced
+    // runners (unit tests) keep the legacy pathname stat.
+    let pinned: Option<PinnedDir> = match open_dir_fenced(runner.fence.as_ref(), &path) {
+        FencedDir::Unfenced => None,
+        FencedDir::Pinned(pinned) => Some(pinned),
+        FencedDir::Link => {
+            // The task path resolves to a symlink (swapped since
+            // scheduling): resolve it through the topology layer like any
+            // symlink child instead of following it blindly. The link
+            // itself needs no enumeration.
+            enqueue_symlink_target(store, runner, generation, &path, store::now_ms()).await?;
+            return Ok(TaskOutcome::Complete);
+        }
+        FencedDir::Refused { state, reason } => {
+            return Ok(TaskOutcome::Parked { state, reason });
+        }
+        FencedDir::StatFailed(e) => {
+            return fail_stat_open(runner, store, claimed, &path, &e).await;
         }
     };
-    let (dev, ino) = dir_identity(&md);
+    let opened_meta: OpenDirMeta = match &pinned {
+        Some(pinned) => OpenDirMeta::Pinned(pinned.stat()),
+        None => match std::fs::symlink_metadata(&path) {
+            Ok(md) => OpenDirMeta::Legacy(md),
+            Err(e) => return fail_stat_open(runner, store, claimed, &path, &e).await,
+        },
+    };
+    let dir_path: &Path = if let Some(pinned) = &pinned {
+        pinned.true_path()
+    } else {
+        &path
+    };
+    let (dev, ino, incarnation) = match &opened_meta {
+        OpenDirMeta::Pinned(stat) => {
+            // Pre-1970 mtimes stay `None` ("unknown"), matching the
+            // `SystemTime`-based legacy spelling exactly.
+            let mtime = (stat.mtime_secs >= 0).then_some((stat.mtime_secs, stat.mtime_nanos));
+            (
+                stat.meta.dev,
+                stat.meta.ino,
+                incarnation_from_parts(stat.meta.nlink, mtime, stat.meta.len),
+            )
+        }
+        OpenDirMeta::Legacy(md) => {
+            let (dev, ino) = dir_identity(md);
+            (dev, ino, incarnation_of(md))
+        }
+    };
     let volume_tag = format!("dev:{dev}");
     runner.topology.observe(PhysicalDirId {
         dev,
@@ -2163,55 +3396,60 @@ async fn exec_enumerate(
         namespace: volume_tag.clone(),
     });
     let now = store::now_ms();
-    let admitted = Instant::now();
-    let component = path
+    let component = dir_path
         .file_name()
         .map(|n| config::path_as_bytes(Path::new(n)))
-        .unwrap_or_else(|| config::path_as_bytes(&path));
-    let dir_id = store
-        .upsert_dir(
-            None,
-            &component,
-            &escape_display(&config::path_as_bytes(&path)),
-            &volume_tag,
-            &ino.to_string(),
-            &incarnation_of(&md),
-            now,
-        )
+        .unwrap_or_else(|| config::path_as_bytes(dir_path));
+    // RSF-751/AC46/F06D: batch the upsert through the writer batch and
+    // flush only when a spec §5 limit is due or the row id is not yet
+    // knowable (a new identity still buffered), instead of an immediate
+    // flush per directory. Repeats (resume, rediscovery) commit with
+    // neighboring work; the observation below needs no read, so no other
+    // buffered row must be visible here.
+    let due = TursoStore::buffer_dir_upsert(
+        &mut runner.batch,
+        None,
+        &component,
+        &escape_display(&config::path_as_bytes(dir_path)),
+        &volume_tag,
+        &ino.to_string(),
+        &incarnation,
+        now,
+    );
+    let mut dir_id = store
+        .lookup_dir_id(&volume_tag, &ino.to_string(), &incarnation)
         .await?;
-    runner.counters.db_transactions += 1;
+    if dir_id.is_none() {
+        flush_runner_batch(runner, store).await?;
+        dir_id = store
+            .lookup_dir_id(&volume_tag, &ino.to_string(), &incarnation)
+            .await?;
+    }
+    let dir_id = dir_id
+        .ok_or_else(|| repo_scan::Error::Store(String::from("directory upsert left no row")))?;
+    flush_if_due(runner, store, due).await?;
 
     let adapter = repo_scan::walk::primary_adapter();
-    let listing = match adapter.list_dir(
-        &path,
-        ListOptions {
-            skip_metadata: false,
-        },
-    ) {
-        Ok(listing) => listing,
-        Err(e) => {
-            let detail = format!("cannot list {}: {e}", path.display());
-            store
-                .record_dir_observation(dir_id, generation, false, 1, 0, Some(&detail), now)
-                .await?;
-            runner.counters.db_transactions += 1;
-            if let Some(state) = classify_io_error(&e) {
-                return Ok(TaskOutcome::Parked {
-                    state,
-                    reason: detail,
-                });
+    let listing: Box<dyn Iterator<Item = WalkItem> + '_> = match pinned {
+        Some(pinned) => match pinned.into_children(false) {
+            Ok(children) => Box::new(children),
+            Err(e) => {
+                return fail_list_open(runner, store, claimed, dir_id, generation, &path, now, &e)
+                    .await;
             }
-            return fail_task(
-                runner,
-                store,
-                claimed,
-                ExecFail {
-                    category: String::from("enumerate-error"),
-                    detail,
-                },
-            )
-            .await;
-        }
+        },
+        None => match adapter.list_dir(
+            &path,
+            ListOptions {
+                skip_metadata: false,
+            },
+        ) {
+            Ok(listing) => listing,
+            Err(e) => {
+                return fail_list_open(runner, store, claimed, dir_id, generation, &path, now, &e)
+                    .await;
+            }
+        },
     };
     let mut entries_seen = 0u64;
     let mut mid_error: Option<String> = None;
@@ -2219,26 +3457,28 @@ async fn exec_enumerate(
     let mut saw_objects = false;
     let mut saw_refs = false;
     let mut probed_self_for_dot_git = false;
+    let watchdog_grace = runner.watchdog.grace;
+    let mut last_progress = Instant::now();
+    let mut progress_mark = 0u64;
     for item in listing {
-        if interrupted() {
-            mid_error = Some(String::from("interrupted; partial enumeration"));
+        // Progress-aware in-loop abort (RSF-SEC-WATCHDOG-ABORT): only a
+        // stall with no completed entry inside grace aborts; the partial
+        // enumeration below is preserved as a `watchdog-no-progress` gap.
+        if watchdog_inloop_abort(
+            entries_seen,
+            progress_mark,
+            last_progress.elapsed(),
+            watchdog_grace,
+        ) {
+            mid_error = Some(format!(
+                "watchdog: no progress within {}s after {entries_seen} entries; \
+                 partial enumeration",
+                watchdog_grace.as_secs(),
+            ));
             break;
         }
-        // No-progress watchdog (R9): chunk-interruptible work aborts its
-        // admitted portion in place once grace expires. The partial
-        // observation is recorded below and the task retries with backoff,
-        // so the stall is bounded instead of open-ended.
-        if runner.watchdog.exceeded(admitted, Instant::now()) {
-            runner.watchdog.tripped += 1;
-            runner.breaker_failure(&volume_tag);
-            mid_error = Some(format!(
-                "watchdog: no progress within {WATCHDOG_GRACE_SECS}s; \
-                 partial enumeration contained",
-            ));
-            eprintln!(
-                "repo-scan: watchdog: enumeration of {} exceeded grace; contained",
-                path.display(),
-            );
+        if interrupted() {
+            mid_error = Some(String::from("interrupted; partial enumeration"));
             break;
         }
         let child = match item {
@@ -2249,6 +3489,8 @@ async fn exec_enumerate(
             }
         };
         entries_seen += 1;
+        progress_mark = entries_seen;
+        last_progress = Instant::now();
         let name = child.name.clone();
         let is_dot_git = name.as_os_str() == std::ffi::OsStr::new(".git");
         if is_dot_git && !probed_self_for_dot_git {
@@ -2278,24 +3520,19 @@ async fn exec_enumerate(
         // Bare-store marker evidence: exact-path validation decides.
         enqueue_probe_task(store, runner, generation, claimed, &path, now).await?;
     }
-    let entry_generation = store
-        .get_dir_observation(dir_id, generation)
-        .await?
-        .map(|o| o.entry_generation + 1)
-        .unwrap_or(1);
     let completed = mid_error.is_none();
-    store
-        .record_dir_observation(
-            dir_id,
-            generation,
-            completed,
-            entry_generation,
-            entries_seen,
-            mid_error.as_deref(),
-            store::now_ms(),
-        )
-        .await?;
-    runner.counters.db_transactions += 1;
+    // RSF-751/AC46/F06D: read-free observation; the attempt counts in SQL,
+    // so this write never needs a flush to observe buffered rows first.
+    let due = TursoStore::buffer_record_dir_observation_bumped(
+        &mut runner.batch,
+        dir_id,
+        generation,
+        completed,
+        entries_seen,
+        mid_error.as_deref(),
+        store::now_ms(),
+    );
+    flush_if_due(runner, store, due).await?;
     if completed {
         runner.counters.dirs_complete += 1;
         Ok(TaskOutcome::Complete)
@@ -2319,6 +3556,16 @@ async fn exec_enumerate(
     }
 }
 
+/// Incarnation guard from explicit parts (link count + mtime + size).
+/// [`incarnation_of`] delegates here; the fenced open supplies pinned
+/// `fstat` parts directly.
+fn incarnation_from_parts(nlink: u64, mtime: Option<(i64, i64)>, len: u64) -> String {
+    let mtime = mtime
+        .map(|(secs, nanos)| format!("{secs}.{nanos}"))
+        .unwrap_or_else(|| String::from("unknown"));
+    format!("n{nlink}:m{mtime}:s{len}")
+}
+
 /// Incarnation guard against identifier reuse (link count + mtime + size).
 #[cfg(unix)]
 fn incarnation_of(md: &std::fs::Metadata) -> String {
@@ -2327,9 +3574,12 @@ fn incarnation_of(md: &std::fs::Metadata) -> String {
         .modified()
         .ok()
         .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .map(|d| format!("{}.{}", d.as_secs(), d.subsec_nanos()))
-        .unwrap_or_else(|| String::from("unknown"));
-    format!("n{}:m{mtime}:s{}", md.nlink(), md.len())
+        .and_then(|d| {
+            i64::try_from(d.as_secs())
+                .ok()
+                .map(|secs| (secs, i64::from(d.subsec_nanos())))
+        });
+    incarnation_from_parts(md.nlink(), mtime, md.len())
 }
 
 #[cfg(not(unix))]
@@ -2366,36 +3616,29 @@ async fn enqueue_enum_child(
     let scope_key = config::scope_key_for_dir(child_path);
     let expected_rev = store.scope_rev(&scope_key).await?;
     let idempotency = format!("idem:{id}");
-    let inserted = store
-        .enqueue_task(
-            &NewTask {
-                id: &id,
-                kind: KIND_ENUM,
-                generation,
-                dir_id: None,
-                scope_key: &scope_key,
-                expected_rev,
-                idempotency_key: &idempotency,
-            },
-            now_ms,
-        )
-        .await?;
-    runner.counters.db_transactions += 1;
-    if !inserted {
-        // Identity-deduped: the same object is already scheduled under
-        // another spelling. Results are shared (not dropped), and the
-        // alternate pathname is preserved as an alias (R7).
-        note_enum_alias(
-            store,
-            runner,
-            &id,
-            &scope_key,
-            child_path,
-            "same_object",
-            now_ms,
-        )
-        .await?;
-    }
+    // RSF-AC461500-609D-4D55-991E-09C60D382D67: buffered enqueue. The
+    // identity-dedupe alias check is deferred to the flush: when the
+    // same object is already scheduled under another spelling, results
+    // are shared (not dropped) and the alternate pathname is preserved
+    // as an alias (R7); `note_enum_alias` no-ops on same-scope rows.
+    let task = NewTask {
+        id: &id,
+        kind: KIND_ENUM,
+        generation,
+        dir_id: None,
+        scope_key: &scope_key,
+        expected_rev,
+        idempotency_key: &idempotency,
+    };
+    let due = TursoStore::buffer_enqueue_task(&mut runner.batch, &task, now_ms);
+    runner.pending_alias_checks.push(PendingAliasCheck {
+        task_id: id,
+        scope_key,
+        path: child_path.to_path_buf(),
+        kind: "same_object",
+        at_ms: now_ms,
+    });
+    flush_if_due(runner, store, due).await?;
     Ok(())
 }
 
@@ -2418,12 +3661,15 @@ async fn note_enum_alias(
     let Some(config::ScopeRef::Dir(first)) = config::parse_scope_key(&existing.scope_key) else {
         return Ok(());
     };
-    runner.aliases.push(ObservedAlias {
-        path: config::path_as_bytes(path),
-        target: config::path_as_bytes(&first),
+    let due = runner.note_alias(
+        config::path_as_bytes(path),
+        config::path_as_bytes(&first),
         kind,
-        verified_at_ms: now_ms,
-    });
+        now_ms,
+    );
+    // Boxed: flush_runner_batch -> note_enum_alias -> flush_if_due ->
+    // flush_runner_batch is a future-type cycle (E0733).
+    Box::pin(flush_if_due(runner, store, due)).await?;
     Ok(())
 }
 
@@ -2442,6 +3688,21 @@ async fn enqueue_symlink_target(
             if !matches!(target.kind, ChildKind::Directory) {
                 return Ok(());
             }
+            // Finding 12: never schedule work outside the declared
+            // roots. The link alias is preserved; the out-of-scope
+            // target simply schedules no work (execution re-verifies).
+            if let Some(fence) = runner.fence.as_ref() {
+                if !fence.allows_path(&target.path) {
+                    let alias_due = runner.note_alias(
+                        config::path_as_bytes(link_path),
+                        config::path_as_bytes(&target.path),
+                        "symlink",
+                        now_ms,
+                    );
+                    flush_if_due(runner, store, alias_due).await?;
+                    return Ok(());
+                }
+            }
             let id = format!(
                 "enum:{generation}:d{}:i{}",
                 target.metadata.dev, target.metadata.ino
@@ -2449,77 +3710,68 @@ async fn enqueue_symlink_target(
             let scope_key = config::scope_key_for_dir(&target.path);
             let expected_rev = store.scope_rev(&scope_key).await?;
             let idempotency = format!("idem:{id}");
-            let inserted = store
-                .enqueue_task(
-                    &NewTask {
-                        id: &id,
-                        kind: KIND_ENUM,
-                        generation,
-                        dir_id: None,
-                        scope_key: &scope_key,
-                        expected_rev,
-                        idempotency_key: &idempotency,
-                    },
-                    now_ms,
-                )
-                .await?;
-            runner.counters.db_transactions += 1;
+            // RSF-AC461500-609D-4D55-991E-09C60D382D67: buffered enqueue;
+            // the target's same-object check is deferred to the flush.
+            let task = NewTask {
+                id: &id,
+                kind: KIND_ENUM,
+                generation,
+                dir_id: None,
+                scope_key: &scope_key,
+                expected_rev,
+                idempotency_key: &idempotency,
+            };
+            let due = TursoStore::buffer_enqueue_task(&mut runner.batch, &task, now_ms);
             // The link pathname is an alias of its target pathname (R7),
             // whether or not this enqueue won the shared task.
-            runner.aliases.push(ObservedAlias {
-                path: config::path_as_bytes(link_path),
-                target: config::path_as_bytes(&target.path),
-                kind: "symlink",
-                verified_at_ms: now_ms,
+            let alias_due = runner.note_alias(
+                config::path_as_bytes(link_path),
+                config::path_as_bytes(&target.path),
+                "symlink",
+                now_ms,
+            );
+            // The target itself may be scheduled under another spelling:
+            // preserve that pair too (deferred; no-ops on same scope).
+            runner.pending_alias_checks.push(PendingAliasCheck {
+                task_id: id,
+                scope_key,
+                path: target.path.clone(),
+                kind: "same_object",
+                at_ms: now_ms,
             });
-            if !inserted {
-                // The target itself is scheduled under another spelling:
-                // preserve that pair too.
-                note_enum_alias(
-                    store,
-                    runner,
-                    &id,
-                    &scope_key,
-                    &target.path,
-                    "same_object",
-                    now_ms,
-                )
-                .await?;
-            }
+            flush_if_due(runner, store, due || alias_due).await?;
             Ok(())
         }
         Err(ResolveError::Cycle(p) | ResolveError::TooDeep(p)) => {
-            store
-                .record_error(
-                    &format!(
-                        "symlink:{}",
-                        config::encode_hex(&config::path_as_bytes(link_path))
-                    ),
-                    &config::scope_key_for_dir(link_path),
-                    "symlink-cycle",
-                    &format!("symlink cycle or excessive chain at {}", p.display()),
-                    None,
-                    now_ms,
-                )
-                .await?;
-            runner.counters.db_transactions += 1;
+            let due = buffer_record_error(
+                &mut runner.batch,
+                &format!(
+                    "symlink:{}",
+                    config::encode_hex(&config::path_as_bytes(link_path))
+                ),
+                &config::scope_key_for_dir(link_path),
+                "symlink-cycle",
+                &format!("symlink cycle or excessive chain at {}", p.display()),
+                None,
+                now_ms,
+            );
+            flush_if_due(runner, store, due).await?;
             Ok(())
         }
         Err(ResolveError::Io(e)) => {
-            store
-                .record_error(
-                    &format!(
-                        "symlink:{}",
-                        config::encode_hex(&config::path_as_bytes(link_path))
-                    ),
-                    &config::scope_key_for_dir(link_path),
-                    "symlink-unresolvable",
-                    &format!("cannot resolve {}: {e}", link_path.display()),
-                    None,
-                    now_ms,
-                )
-                .await?;
-            runner.counters.db_transactions += 1;
+            let due = buffer_record_error(
+                &mut runner.batch,
+                &format!(
+                    "symlink:{}",
+                    config::encode_hex(&config::path_as_bytes(link_path))
+                ),
+                &config::scope_key_for_dir(link_path),
+                "symlink-unresolvable",
+                &format!("cannot resolve {}: {e}", link_path.display()),
+                None,
+                now_ms,
+            );
+            flush_if_due(runner, store, due).await?;
             Ok(())
         }
     }
@@ -2545,22 +3797,105 @@ async fn enqueue_probe_task(
     let scope_key = config::scope_key_for_git(path);
     let expected_rev = store.scope_rev(&scope_key).await?;
     let idempotency = format!("idem:{id}");
-    store
-        .enqueue_task(
-            &NewTask {
-                id: &id,
-                kind: KIND_PROBE,
-                generation,
-                dir_id: None,
-                scope_key: &scope_key,
-                expected_rev,
-                idempotency_key: &idempotency,
-            },
-            now_ms,
-        )
-        .await?;
-    runner.counters.db_transactions += 1;
+    // RSF-AC461500-609D-4D55-991E-09C60D382D67: buffered enqueue.
+    let task = NewTask {
+        id: &id,
+        kind: KIND_PROBE,
+        generation,
+        dir_id: None,
+        scope_key: &scope_key,
+        expected_rev,
+        idempotency_key: &idempotency,
+    };
+    let due = TursoStore::buffer_enqueue_task(&mut runner.batch, &task, now_ms);
+    flush_if_due(runner, store, due).await?;
     Ok(())
+}
+
+/// Outcome of the pre-run fence verification for one probe/status path.
+enum ProbeFence {
+    /// No fence configured (unit-test runners): legacy unverified run.
+    Unfenced,
+    /// Pinned, in-scope execution: run Git, then re-verify identity.
+    Pinned(PinnedDir),
+    /// Scheduled out-of-scope (explicit Git-relationship path, spec §8):
+    /// the scope fence cannot cover it; run without a pin.
+    Relationship,
+    /// Refused without spawning Git: park with the reason, persist nothing.
+    Refused { state: TaskState, reason: String },
+    /// Open failed like the legacy stat: park or retry, no observation.
+    StatFailed(std::io::Error),
+}
+
+/// Pre-run fence verification for one probe/status path (`what` names the
+/// task kind for gap reasons): resolve through the pinned fence and refuse
+/// scope ESCAPE — a scheduled in-scope spelling whose execution-time
+/// resolution lands outside the declared roots (a swap between scheduling
+/// and execution). A spelling the scheduler itself placed out-of-scope
+/// (explicit Git-relationship path: registered worktree base, external
+/// common dir — spec §8) proceeds as [`ProbeFence::Relationship`]; the
+/// fence cannot distinguish its swaps, so nothing is pinned. A task path
+/// that is itself a link never proceeds: probes follow registry/pointer
+/// relationships, never a swapped-in link.
+fn verify_probe_path(fence: Option<&ScopeFence>, what: &str, path: &Path) -> ProbeFence {
+    let Some(fence) = fence else {
+        return ProbeFence::Unfenced;
+    };
+    match fence.open_pinned(path) {
+        Ok(FenceOpen::Dir(pinned)) => ProbeFence::Pinned(pinned),
+        Ok(FenceOpen::Symlink) => ProbeFence::Refused {
+            state: TaskState::Unavailable,
+            reason: format!(
+                "{what} path {} is a symlink; {what} never follows a swapped-in link",
+                path.display()
+            ),
+        },
+        Err(FenceError::OutOfScope(_)) if !fence.allows_path(path) => ProbeFence::Relationship,
+        Err(FenceError::OutOfScope(p)) => ProbeFence::Refused {
+            state: TaskState::Unavailable,
+            reason: format!("{what} path {} escaped the scan scope", p.display()),
+        },
+        Err(FenceError::TooDeep(p)) => ProbeFence::Refused {
+            state: TaskState::Unavailable,
+            reason: format!("symlink chain too deep at {}", p.display()),
+        },
+        Err(FenceError::NotAbsolute(p)) => ProbeFence::Refused {
+            state: TaskState::Unavailable,
+            reason: format!("scope path is not absolute: {}", p.display()),
+        },
+        // Non-unix targets cannot pin descriptors: fall back to the
+        // legacy pathname run there (documented weaker posture).
+        Err(FenceError::Unsupported(_)) => ProbeFence::Unfenced,
+        Err(FenceError::NotDirectory(p)) => ProbeFence::StatFailed(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            format!("not a directory: {}", p.display()),
+        )),
+        Err(FenceError::Io(e)) => ProbeFence::StatFailed(e),
+    }
+}
+
+/// Post-run fence re-verification for one probe/status path: re-resolve
+/// `path` through the fence and require the same true path plus `(dev,
+/// ino)` identity the pre-run pin observed. `false` means the path was
+/// swapped mid-run (or left the scope): the caller must discard every
+/// observation and park the scope, never persist. Unfenced runners (unit
+/// tests) always pass; on non-unix targets the pinned open refuses with
+/// `Unsupported`, which also passes through the legacy path before this
+/// helper is ever reached.
+pub fn reverify_probe_path(fence: Option<&ScopeFence>, path: &Path, before: &PinnedDir) -> bool {
+    let Some(fence) = fence else {
+        return true;
+    };
+    match fence.open_pinned(path) {
+        Ok(FenceOpen::Dir(after)) => {
+            let before_stat = before.stat();
+            let after_stat = after.stat();
+            after.true_path() == before.true_path()
+                && after_stat.meta.dev == before_stat.meta.dev
+                && after_stat.meta.ino == before_stat.meta.ino
+        }
+        _ => false,
+    }
 }
 
 /// Validate one Git candidate at its exact path and persist the instance,
@@ -2587,6 +3922,21 @@ async fn exec_probe(
         "probe:{}",
         config::encode_hex(&config::path_as_bytes(&path))
     );
+    // Probe fence (pre-run): verify the scheduled path through the pinned
+    // fence immediately before Git runs, refusing scope escape (a path
+    // swapped between scheduling and execution). Explicitly scheduled
+    // out-of-scope relationship paths proceed unpinned (spec §8);
+    // refusals park with a preserved gap and persist nothing.
+    let pinned: Option<PinnedDir> = match verify_probe_path(runner.fence.as_ref(), "probe", &path) {
+        ProbeFence::Unfenced | ProbeFence::Relationship => None,
+        ProbeFence::Pinned(pinned) => Some(pinned),
+        ProbeFence::Refused { state, reason } => {
+            return Ok(TaskOutcome::Parked { state, reason });
+        }
+        ProbeFence::StatFailed(e) => {
+            return fail_stat_open(runner, store, claimed, &path, &e).await;
+        }
+    };
     let validated = match runner.inspector.validate(&path) {
         Ok(validated) => validated,
         Err(e) => {
@@ -2595,28 +3945,41 @@ async fn exec_probe(
             } else {
                 "probe-failed"
             };
-            store
-                .record_error(
-                    &gap_id,
-                    &claimed.task.scope_key,
-                    category,
-                    &e.to_string(),
-                    None,
-                    now,
-                )
-                .await?;
-            runner.counters.db_transactions += 1;
+            let due = buffer_record_error(
+                &mut runner.batch,
+                &gap_id,
+                &claimed.task.scope_key,
+                category,
+                &e.to_string(),
+                None,
+                now,
+            );
+            flush_if_due(runner, store, due).await?;
             return Ok(TaskOutcome::Complete);
         }
     };
+    // Probe fence (post-run): re-verify identity after Git ran. A path
+    // swapped mid-run discards every observation — nothing reaches the
+    // batch — and parks the scope instead of persisting foreign rows.
+    if let Some(pinned) = &pinned {
+        if !reverify_probe_path(runner.fence.as_ref(), &path, pinned) {
+            return Ok(TaskOutcome::Parked {
+                state: TaskState::Unavailable,
+                reason: format!(
+                    "probe path {} changed during inspection; observations discarded",
+                    path.display()
+                ),
+            });
+        }
+    }
     match persist_probe(
         runner, store, generation, run_rev, canonical, &path, &validated, now,
     )
     .await
     {
         Ok(()) => {
-            store.resolve_error(&gap_id, store::now_ms()).await?;
-            runner.counters.db_transactions += 1;
+            let due = buffer_resolve_error(&mut runner.batch, &gap_id, store::now_ms());
+            flush_if_due(runner, store, due).await?;
             Ok(TaskOutcome::Complete)
         }
         // Operational Git failures retry with backoff, then park with the
@@ -2635,6 +3998,56 @@ async fn exec_probe(
         }
         Err(e) => Err(e),
     }
+}
+
+/// Execute one probe task under a fenced runner (probe-fence wiring
+/// proof): the fence is built from `fence_roots` exactly like the scan
+/// path builds it from the planned roots, then the production
+/// `exec_probe` runs against `scope_path`. `before_exec` runs between
+/// claim and execution so the test can swap the scheduled path first —
+/// the production schedule/execute race in miniature. Returns the
+/// production outcome for the caller to match on.
+#[cfg(test)]
+pub async fn test_probe_fenced_outcome(
+    store: &TursoStore,
+    fence_roots: &[PathBuf],
+    generation: u64,
+    run_rev: u64,
+    canonical: &str,
+    scope_path: &Path,
+    before_exec: Option<Box<dyn FnOnce() + Send>>,
+) -> repo_scan::Result<TaskOutcome> {
+    let mut runner = Runner::new(&config::ResourceLimits::default());
+    runner.fence = Some(ScopeFence::build(fence_roots));
+    let scope_key = config::scope_key_for_git(scope_path);
+    let hex = config::encode_hex(&config::path_as_bytes(scope_path));
+    let id = format!("probe:{generation}:{hex}");
+    let expected_rev = store.scope_rev(&scope_key).await?;
+    let idempotency = format!("idem:{id}");
+    let task = NewTask {
+        id: &id,
+        kind: KIND_PROBE,
+        generation,
+        dir_id: None,
+        scope_key: &scope_key,
+        expected_rev,
+        idempotency_key: &idempotency,
+    };
+    store.enqueue_task(&task, store::now_ms()).await?;
+    let claimed = store
+        .claim_tasks(store.epoch(), 16, LEASE_TTL_MS, store::now_ms())
+        .await?;
+    let claimed = claimed.into_iter().next().ok_or_else(|| {
+        repo_scan::Error::Store(String::from("fenced probe hook: claim returned no task"))
+    })?;
+    if let Some(swap) = before_exec {
+        swap();
+    }
+    let outcome = exec_probe(&mut runner, store, generation, run_rev, canonical, &claimed).await?;
+    // Production flushes the writer batch before completing the task; the
+    // hook does the same so "persists nothing" assertions are airtight.
+    flush_runner_batch(&mut runner, store).await?;
+    Ok(outcome)
 }
 
 /// Persist every observation from a validated probe. Remotes, refs, and HEAD
@@ -2672,17 +4085,14 @@ async fn persist_probe(
     if let Some(key) = git_identity {
         match runner.probed_git_ids.get(&key).cloned() {
             Some(first) if first != git_bytes => {
-                runner.aliases.push(ObservedAlias {
-                    path: git_bytes.clone(),
-                    target: first,
-                    kind: "same_object",
-                    verified_at_ms: now_ms,
-                });
+                let due = runner.note_alias(git_bytes.clone(), first, "same_object", now_ms);
+                flush_if_due(runner, store, due).await?;
                 return Ok(());
             }
             Some(_) => {}
             None => {
-                runner.probed_git_ids.insert(key, git_bytes.clone());
+                let due = note_probed_git_id(runner, key, git_bytes.clone(), now_ms);
+                flush_if_due(runner, store, due).await?;
             }
         }
     }
@@ -2723,23 +4133,21 @@ async fn persist_probe(
     evidence.append(&mut match_evidence);
     let evidence_json =
         serde_json::to_string(&evidence).map_err(|e| repo_scan::Error::Report(e.to_string()))?;
-    store
-        .upsert_git_instance(
-            &NewGitInstance {
-                id: &instance_id,
-                git_path: &git_bytes,
-                common_path: &common_bytes,
-                incarnation: &incarnation,
-                format: "git-files",
-                bare: Some(instance.is_bare),
-                object_format: &instance.object_format,
-                disposition: disposition_str(disposition),
-                evidence_json: &evidence_json,
-            },
-            now_ms,
-        )
-        .await?;
-    runner.counters.db_transactions += 1;
+    // RSF-AC461500-609D-4D55-991E-09C60D382D67: every probe write
+    // buffers; the task-end flush commits them before completion.
+    let new_instance = NewGitInstance {
+        id: &instance_id,
+        git_path: &git_bytes,
+        common_path: &common_bytes,
+        incarnation: &incarnation,
+        format: "git-files",
+        bare: Some(instance.is_bare),
+        object_format: &instance.object_format,
+        disposition: disposition_str(disposition),
+        evidence_json: &evidence_json,
+    };
+    let due = TursoStore::buffer_upsert_git_instance(&mut runner.batch, &new_instance, now_ms);
+    flush_if_due(runner, store, due).await?;
     for remote in &remotes {
         let role = match remote.role {
             git::RemoteRole::Fetch => "fetch",
@@ -2751,21 +4159,17 @@ async fn persist_probe(
             config::encode_hex(&remote.name),
         );
         let canonical_bytes = remote.canonical_url.as_ref().map(|c| c.as_bytes());
-        store
-            .upsert_remote(
-                &NewRemote {
-                    id: &remote_id,
-                    instance_id: &instance_id,
-                    checkout_scope_id: None,
-                    name: &remote.name,
-                    role,
-                    url: remote.url.as_bytes(),
-                    canonical_url: canonical_bytes,
-                },
-                now_ms,
-            )
-            .await?;
-        runner.counters.db_transactions += 1;
+        let new_remote = NewRemote {
+            id: &remote_id,
+            instance_id: &instance_id,
+            checkout_scope_id: None,
+            name: &remote.name,
+            role,
+            url: remote.url.as_bytes(),
+            canonical_url: canonical_bytes,
+        };
+        let due = TursoStore::buffer_upsert_remote(&mut runner.batch, &new_remote, now_ms);
+        flush_if_due(runner, store, due).await?;
     }
 
     let head = observed_head(runner, instance)?;
@@ -2799,14 +4203,12 @@ async fn persist_probe(
     // A worktree-less angle on an instance (bare-dir probe of a git dir
     // that a pointer probe links to a worktree) must not erase the rooted
     // row: insert only when absent, independent of probe order.
-    if root_bytes.is_none() {
-        store
-            .insert_checkout_if_absent(&main_checkout, now_ms)
-            .await?;
+    let due = if root_bytes.is_none() {
+        TursoStore::buffer_insert_checkout_if_absent(&mut runner.batch, &main_checkout, now_ms)
     } else {
-        store.upsert_checkout(&main_checkout, now_ms).await?;
-    }
-    runner.counters.db_transactions += 1;
+        TursoStore::buffer_upsert_checkout(&mut runner.batch, &main_checkout, now_ms)
+    };
+    flush_if_due(runner, store, due).await?;
 
     // Registered linked worktrees: own checkout rows plus explicit probes
     // for bases outside already discovered paths.
@@ -2836,24 +4238,21 @@ async fn persist_probe(
             let wt_git = config::path_as_bytes(&instance.common_dir.join("worktrees").join(&wt.id));
             let wt_root = config::path_as_bytes(&wt.base);
             if placeholder {
-                store
-                    .upsert_checkout(
-                        &NewCheckout {
-                            id: &wt_id,
-                            instance_id: &instance_id,
-                            root_path: Some(&wt_root),
-                            git_path: &wt_git,
-                            relationship: "linked",
-                            availability: wt_availability,
-                            head_state: "unknown",
-                            head_ref: None,
-                            head_oid: None,
-                            head_algo: None,
-                        },
-                        now_ms,
-                    )
-                    .await?;
-                runner.counters.db_transactions += 1;
+                let wt_checkout = NewCheckout {
+                    id: &wt_id,
+                    instance_id: &instance_id,
+                    root_path: Some(&wt_root),
+                    git_path: &wt_git,
+                    relationship: "linked",
+                    availability: wt_availability,
+                    head_state: "unknown",
+                    head_ref: None,
+                    head_oid: None,
+                    head_algo: None,
+                };
+                let due =
+                    TursoStore::buffer_upsert_checkout(&mut runner.batch, &wt_checkout, now_ms);
+                flush_if_due(runner, store, due).await?;
                 checkout_ids.push(wt_id);
             }
             enqueue_probe_task_for_path(store, runner, generation, &wt.base, now_ms).await?;
@@ -2890,37 +4289,33 @@ async fn persist_probe(
                 (peeled_oid, peeled_algo, Some(target.as_slice()))
             }
         };
-        store
-            .upsert_ref(
-                &NewRef {
-                    id: &ref_id,
-                    instance_id: &instance_id,
-                    checkout_scope_id: None,
-                    kind,
-                    name: &reference.name,
-                    oid,
-                    algo,
-                    symbolic_target: symbolic,
-                    upstream: upstream_for_ref(&branch_upstreams, &reference.name).as_deref(),
-                    state: ref_state_for(reference, &known),
-                },
-                now_ms,
-            )
-            .await?;
-        runner.counters.db_transactions += 1;
+        let upstream = upstream_for_ref(&branch_upstreams, &reference.name);
+        let new_ref = NewRef {
+            id: &ref_id,
+            instance_id: &instance_id,
+            checkout_scope_id: None,
+            kind,
+            name: &reference.name,
+            oid,
+            algo,
+            symbolic_target: symbolic,
+            upstream: upstream.as_deref(),
+            state: ref_state_for(reference, &known),
+        };
+        let due = TursoStore::buffer_upsert_ref(&mut runner.batch, &new_ref, now_ms);
+        flush_if_due(runner, store, due).await?;
     }
     for broken in runner.inspector.reference_errors(instance) {
-        store
-            .record_error(
-                &format!("ref-err:{instance_id}:{}", fnv1a_hex(broken.as_bytes())),
-                &config::scope_key_for_git(path),
-                "invalid-ref",
-                &broken,
-                None,
-                now_ms,
-            )
-            .await?;
-        runner.counters.db_transactions += 1;
+        let due = buffer_record_error(
+            &mut runner.batch,
+            &format!("ref-err:{instance_id}:{}", fnv1a_hex(broken.as_bytes())),
+            &config::scope_key_for_git(path),
+            "invalid-ref",
+            &broken,
+            None,
+            now_ms,
+        );
+        flush_if_due(runner, store, due).await?;
     }
 
     // Detailed working state only for matching candidates (spec §9).
@@ -2931,15 +4326,7 @@ async fn persist_probe(
             | identity::MatchDisposition::Probable
     ) {
         for checkout_id in &checkout_ids {
-            enqueue_status_task(
-                store,
-                generation,
-                run_rev,
-                checkout_id,
-                now_ms,
-                &mut runner.counters,
-            )
-            .await?;
+            enqueue_status_task(store, runner, generation, run_rev, checkout_id, now_ms).await?;
         }
     }
     Ok(())
@@ -3055,21 +4442,18 @@ async fn enqueue_probe_task_for_path(
     let scope_key = config::scope_key_for_git(path);
     let expected_rev = store.scope_rev(&scope_key).await?;
     let idempotency = format!("idem:{id}");
-    store
-        .enqueue_task(
-            &NewTask {
-                id: &id,
-                kind: KIND_PROBE,
-                generation,
-                dir_id: None,
-                scope_key: &scope_key,
-                expected_rev,
-                idempotency_key: &idempotency,
-            },
-            now_ms,
-        )
-        .await?;
-    runner.counters.db_transactions += 1;
+    // RSF-AC461500-609D-4D55-991E-09C60D382D67: buffered enqueue.
+    let task = NewTask {
+        id: &id,
+        kind: KIND_PROBE,
+        generation,
+        dir_id: None,
+        scope_key: &scope_key,
+        expected_rev,
+        idempotency_key: &idempotency,
+    };
+    let due = TursoStore::buffer_enqueue_task(&mut runner.batch, &task, now_ms);
+    flush_if_due(runner, store, due).await?;
     Ok(())
 }
 
@@ -3174,17 +4558,16 @@ async fn exec_status(
     };
     let now = store::now_ms();
     let Some(checkout) = store.get_checkout(&checkout_id).await? else {
-        store
-            .record_error(
-                &format!("status:{checkout_id}"),
-                &claimed.task.scope_key,
-                "unknown-checkout",
-                &format!("status task names unknown checkout {checkout_id}; dropping"),
-                None,
-                now,
-            )
-            .await?;
-        runner.counters.db_transactions += 1;
+        let due = buffer_record_error(
+            &mut runner.batch,
+            &format!("status:{checkout_id}"),
+            &claimed.task.scope_key,
+            "unknown-checkout",
+            &format!("status task names unknown checkout {checkout_id}; dropping"),
+            None,
+            now,
+        );
+        flush_if_due(runner, store, due).await?;
         return Ok(TaskOutcome::Complete);
     };
     // Observation revision: the run revision would need threading through;
@@ -3211,6 +4594,19 @@ async fn exec_status(
         return Ok(TaskOutcome::Complete);
     }
     let git_path = config::path_from_bytes(checkout.git_path.clone());
+    // Status fence (pre-run): same verify-run-reverify envelope as probes.
+    // Refusals park with a preserved gap; nothing is persisted.
+    let pinned: Option<PinnedDir> =
+        match verify_probe_path(runner.fence.as_ref(), "status", &git_path) {
+            ProbeFence::Unfenced | ProbeFence::Relationship => None,
+            ProbeFence::Pinned(pinned) => Some(pinned),
+            ProbeFence::Refused { state, reason } => {
+                return Ok(TaskOutcome::Parked { state, reason });
+            }
+            ProbeFence::StatFailed(e) => {
+                return fail_stat_open(runner, store, claimed, &git_path, &e).await;
+            }
+        };
     let instance = match runner.inspector.open_exact(&git_path) {
         Ok(instance) => instance,
         Err(e) if git::is_unsupported_error(&e) => {
@@ -3273,6 +4669,20 @@ async fn exec_status(
         Ok(_) => "checked",
         Err(_) => "unknown",
     };
+    // Status fence (post-run): every Git read above is done; re-verify
+    // identity before any status row is recorded. On mismatch the
+    // observation is discarded and the scope parks.
+    if let Some(pinned) = &pinned {
+        if !reverify_probe_path(runner.fence.as_ref(), &git_path, pinned) {
+            return Ok(TaskOutcome::Parked {
+                state: TaskState::Unavailable,
+                reason: format!(
+                    "status path {} changed during inspection; observations discarded",
+                    git_path.display()
+                ),
+            });
+        }
+    }
     match observation {
         None => {
             record_status_row(
@@ -3383,27 +4793,25 @@ async fn record_status_row(
 ) -> repo_scan::Result<()> {
     let unknown_json = serde_json::to_string(unknown_fields)
         .map_err(|e| repo_scan::Error::Report(e.to_string()))?;
-    store
-        .record_status(
-            &NewStatus {
-                checkout_id,
-                mode: status_mode_str(mode),
-                state,
-                started_ms: Some(started_ms),
-                finished_ms: Some(finished_ms),
-                staged,
-                unstaged,
-                untracked,
-                untracked_units: units,
-                submodules,
-                unknown_fields: &unknown_json,
-                input_fingerprint: None,
-                observed_rev,
-            },
-            finished_ms,
-        )
-        .await?;
-    runner.counters.db_transactions += 1;
+    // RSF-AC461500-609D-4D55-991E-09C60D382D67: buffered observation;
+    // the task-end flush commits it before completion.
+    let status = NewStatus {
+        checkout_id,
+        mode: status_mode_str(mode),
+        state,
+        started_ms: Some(started_ms),
+        finished_ms: Some(finished_ms),
+        staged,
+        unstaged,
+        untracked,
+        untracked_units: units,
+        submodules,
+        unknown_fields: &unknown_json,
+        input_fingerprint: None,
+        observed_rev,
+    };
+    let due = TursoStore::buffer_record_status(&mut runner.batch, &status, finished_ms);
+    flush_if_due(runner, store, due).await?;
     Ok(())
 }
 
@@ -3425,7 +4833,9 @@ async fn count_status_pending(store: &TursoStore, generation: u64) -> repo_scan:
         store,
         "SELECT COUNT(*) FROM frontier_tasks WHERE generation = ?1 AND kind = 'status' \
          AND state NOT IN ('complete', 'unsupported', 'cancelled', 'superseded')",
-        vec![turso::Value::Integer(generation as i64)],
+        vec![turso::Value::Integer(i64::try_from(generation).map_err(
+            |_| repo_scan::Error::Store(format!("task generation {generation} exceeds i64 range")),
+        )?)],
     )
     .await
 }
@@ -3446,7 +4856,12 @@ async fn count_query(
         .map_err(|e| repo_scan::Error::Store(e.to_string()))?
     {
         None => Ok(0),
-        Some(row) => Ok(cell_int(&row, 0)? as u64),
+        Some(row) => {
+            let value = cell_int(&row, 0)?;
+            u64::try_from(value).map_err(|_| {
+                repo_scan::Error::Store(format!("count {value} in catalog is not a valid u64"))
+            })
+        }
     }
 }
 
@@ -3499,7 +4914,9 @@ async fn count_dirs_complete(store: &TursoStore, generation: u64) -> repo_scan::
     count_query(
         store,
         "SELECT COUNT(*) FROM dir_observations WHERE generation = ?1 AND completed = 1",
-        vec![turso::Value::Integer(generation as i64)],
+        vec![turso::Value::Integer(i64::try_from(generation).map_err(
+            |_| repo_scan::Error::Store(format!("task generation {generation} exceeds i64 range")),
+        )?)],
     )
     .await
 }
@@ -3568,16 +4985,25 @@ struct OpenError {
     next_retry_ms: Option<i64>,
 }
 
-/// All open gaps, oldest first. The lib path streams every gap into the
-/// report (no cap), so `coverage.gaps` agrees with the emitted records.
-async fn load_open_errors(store: &TursoStore) -> repo_scan::Result<Vec<OpenError>> {
+/// One page of open gaps, oldest first
+/// (RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1). Page bounds are
+/// interpolated numerics (owner-controlled), never bound parameters:
+/// the pinned engine needs no bound-`LIMIT` support. The defensive
+/// length cap holds even if the engine ignored `LIMIT`.
+async fn load_open_errors_page(
+    store: &TursoStore,
+    limit: i64,
+    offset: i64,
+) -> repo_scan::Result<Vec<OpenError>> {
+    let limit = limit.max(1);
+    let offset = offset.max(0);
+    let sql = format!(
+        "SELECT id, scope_key, category, detail, next_retry_ms FROM errors \
+         WHERE open = 1 ORDER BY id ASC LIMIT {limit} OFFSET {offset}"
+    );
     let mut rows = store
         .connection()
-        .query(
-            "SELECT id, scope_key, category, detail, next_retry_ms FROM errors \
-             WHERE open = 1 ORDER BY id ASC",
-            (),
-        )
+        .query(sql.as_str(), ())
         .await
         .map_err(store_err)?;
     let mut out = Vec::new();
@@ -3589,8 +5015,89 @@ async fn load_open_errors(store: &TursoStore) -> repo_scan::Result<Vec<OpenError
             detail: cell_text(&row, 3)?,
             next_retry_ms: cell_opt_int(&row, 4)?,
         });
+        if out.len() as i64 >= limit {
+            break;
+        }
     }
     Ok(out)
+}
+
+/// Report derivations over every open gap
+/// (RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1): the scan holds one page
+/// from the database cursor at a time and retains only report-required
+/// derived records (probe candidates, per-root error ids). The lib path
+/// still streams every gap into the report (no cap), so `coverage.gaps`
+/// agrees with the emitted records; nothing is dropped to fit memory.
+/// Scan accounting (`scanned`/`chunks`/`peak_chunk`) is surfaced to the
+/// regression hooks; production consumes only the derived records.
+#[allow(dead_code)]
+struct ErrorDerivations {
+    candidates: Vec<CandidateInput>,
+    /// Per-root error ids, aligned with the requested `root_scopes`.
+    root_error_ids: Vec<Vec<String>>,
+    scanned: u64,
+    chunks: u64,
+    peak_chunk: usize,
+}
+
+async fn scan_error_derivations(
+    store: &TursoStore,
+    root_scopes: &[String],
+) -> repo_scan::Result<ErrorDerivations> {
+    let mut out = ErrorDerivations {
+        candidates: Vec::new(),
+        root_error_ids: vec![Vec::new(); root_scopes.len()],
+        scanned: 0,
+        chunks: 0,
+        peak_chunk: 0,
+    };
+    let mut offset: i64 = 0;
+    loop {
+        let chunk = load_open_errors_page(store, LOAD_CHUNK_ROWS, offset).await?;
+        if chunk.is_empty() {
+            break;
+        }
+        out.chunks += 1;
+        out.peak_chunk = out.peak_chunk.max(chunk.len());
+        out.scanned += chunk.len() as u64;
+        for error in &chunk {
+            push_error_candidate(&mut out.candidates, error);
+            for (n, scope) in root_scopes.iter().enumerate() {
+                if error.scope_key == *scope {
+                    out.root_error_ids[n].push(error.id.clone());
+                }
+            }
+        }
+        if chunk.len() as i64 >= LOAD_CHUNK_ROWS {
+            offset += chunk.len() as i64;
+        } else {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// One gap's candidate contribution, if it is a failed/unsupported probe.
+/// Pure coverage gaps (permission, symlink, status) are errors, not
+/// candidates.
+fn push_error_candidate(out: &mut Vec<CandidateInput>, error: &OpenError) {
+    let disposition = match error.category.as_str() {
+        "probe-failed" => "probe_failed",
+        "unsupported-git-format" => "unsupported",
+        _ => return,
+    };
+    let Some(path) = scope_path(&error.scope_key) else {
+        return;
+    };
+    out.push(CandidateInput {
+        id: format!("cand-err:{}", error.id),
+        path_bytes: config::path_as_bytes(&path),
+        repository_id: None,
+        disposition: disposition.to_string(),
+        reason: truncate_str(&error.detail, 512),
+        retry_after_ms: error.next_retry_ms,
+        error_ids: vec![error.id.clone()],
+    });
 }
 
 /// One report-subject instance (matches the lib builder's own subject
@@ -3602,14 +5109,24 @@ struct EmittedInstance {
     disposition: String,
 }
 
-async fn load_emitted_instances(store: &TursoStore) -> repo_scan::Result<Vec<EmittedInstance>> {
+/// One page of report-subject instances
+/// (RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1): everything but
+/// `nonmatch`, id-ascending, with the same interpolated-bounds contract
+/// as [`load_open_errors_page`].
+async fn load_emitted_instances_page(
+    store: &TursoStore,
+    limit: i64,
+    offset: i64,
+) -> repo_scan::Result<Vec<EmittedInstance>> {
+    let limit = limit.max(1);
+    let offset = offset.max(0);
+    let sql = format!(
+        "SELECT id, git_path, common_path, disposition FROM git_instances \
+         WHERE disposition != 'nonmatch' ORDER BY id ASC LIMIT {limit} OFFSET {offset}"
+    );
     let mut rows = store
         .connection()
-        .query(
-            "SELECT id, git_path, common_path, disposition FROM git_instances \
-             WHERE disposition != 'nonmatch' ORDER BY id ASC",
-            (),
-        )
+        .query(sql.as_str(), ())
         .await
         .map_err(store_err)?;
     let mut out = Vec::new();
@@ -3620,8 +5137,129 @@ async fn load_emitted_instances(store: &TursoStore) -> repo_scan::Result<Vec<Emi
             common_path: cell_blob(&row, 2)?,
             disposition: cell_text(&row, 3)?,
         });
+        if out.len() as i64 >= limit {
+            break;
+        }
     }
     Ok(out)
+}
+
+/// Report derivations over every emitted instance
+/// (RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1): one page in flight at a
+/// time; only report-required derived records (unresolvable candidates,
+/// storage edges) accumulate. Scan accounting is hook-surfaced (see
+/// [`ErrorDerivations`]).
+#[allow(dead_code)]
+struct InstanceDerivations {
+    candidates: Vec<CandidateInput>,
+    storage_links: Vec<StorageLinkInput>,
+    scanned: u64,
+    chunks: u64,
+    peak_chunk: usize,
+}
+
+async fn scan_instance_derivations(store: &TursoStore) -> repo_scan::Result<InstanceDerivations> {
+    let mut out = InstanceDerivations {
+        candidates: Vec::new(),
+        storage_links: Vec::new(),
+        scanned: 0,
+        chunks: 0,
+        peak_chunk: 0,
+    };
+    // First instance id per common path (the shared-store hub). Chunk
+    // order is id-ascending, so the hub is the same lowest id the old
+    // whole-load group-and-sort produced.
+    let mut first_common: HashMap<Vec<u8>, String> = HashMap::new();
+    let mut offset: i64 = 0;
+    loop {
+        let chunk = load_emitted_instances_page(store, LOAD_CHUNK_ROWS, offset).await?;
+        if chunk.is_empty() {
+            break;
+        }
+        out.chunks += 1;
+        out.peak_chunk = out.peak_chunk.max(chunk.len());
+        out.scanned += chunk.len() as u64;
+        for instance in &chunk {
+            if instance.disposition == "unresolvable_identity" {
+                out.candidates.push(CandidateInput {
+                    id: format!("cand:{}", instance.id),
+                    path_bytes: instance.git_path.clone(),
+                    repository_id: Some(instance.id.clone()),
+                    disposition: String::from("unresolvable_identity"),
+                    reason: String::from(
+                        "identifying remotes removed or uninterpretable under the matching policy; \
+                         see repository evidence",
+                    ),
+                    retry_after_ms: None,
+                    error_ids: Vec::new(),
+                });
+            }
+            push_instance_links(&mut out.storage_links, &mut first_common, instance);
+        }
+        if chunk.len() as i64 >= LOAD_CHUNK_ROWS {
+            offset += chunk.len() as i64;
+        } else {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// One instance's storage-edge contributions: common-directory
+/// relationships, borrowed object stores (alternates), shared common
+/// storage, and observed hard-link sharing (R16).
+fn push_instance_links(
+    out: &mut Vec<StorageLinkInput>,
+    first_common: &mut HashMap<Vec<u8>, String>,
+    instance: &EmittedInstance,
+) {
+    if instance.common_path != instance.git_path {
+        out.push(StorageLinkInput {
+            id: format!("link:{}:common", instance.id),
+            from_repository_id: instance.id.clone(),
+            to_path_bytes: instance.common_path.clone(),
+            kind: String::from("common_directory"),
+            evidence: vec![String::from("common directory differs from git directory")],
+        });
+    }
+    for (n, target) in alternates_targets(&instance.git_path).iter().enumerate() {
+        out.push(StorageLinkInput {
+            id: format!("link:{}:alt:{n}", instance.id),
+            from_repository_id: instance.id.clone(),
+            to_path_bytes: target.clone(),
+            kind: String::from("alternate_objects"),
+            evidence: vec![format!(
+                "borrows object store: {}",
+                String::from_utf8_lossy(target)
+            )],
+        });
+    }
+    match first_common.entry(instance.common_path.clone()) {
+        std::collections::hash_map::Entry::Vacant(hub) => {
+            hub.insert(instance.id.clone());
+        }
+        std::collections::hash_map::Entry::Occupied(hub) => {
+            let first = hub.get().clone();
+            out.push(StorageLinkInput {
+                id: format!("link:{}:shared", instance.id),
+                from_repository_id: instance.id.clone(),
+                to_path_bytes: instance.common_path.clone(),
+                kind: String::from("shared_object_store"),
+                evidence: vec![format!("shares common storage with {first}")],
+            });
+        }
+    }
+    if let Some(object) = first_hardlinked_object(&instance.git_path) {
+        out.push(StorageLinkInput {
+            id: format!("link:{}:hardlink", instance.id),
+            from_repository_id: instance.id.clone(),
+            to_path_bytes: object,
+            kind: String::from("observed_hardlink"),
+            evidence: vec![String::from(
+                "object file has multiple hard links; store shared, not copied",
+            )],
+        });
+    }
 }
 
 async fn load_volume_ids(store: &TursoStore) -> repo_scan::Result<HashSet<String>> {
@@ -3647,8 +5285,15 @@ async fn build_lib_inputs(
     dirs_complete: u64,
     snapshot_path: &Path,
 ) -> repo_scan::Result<LibReportInputs> {
-    let errors = load_open_errors(store).await?;
-    let instances = load_emitted_instances(store).await?;
+    // RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1: bounded chunked
+    // derivation scans — one page in flight, report-required records only.
+    let root_scopes: Vec<String> = inputs
+        .roots
+        .iter()
+        .map(|root| config::scope_key_for_dir(&root.path))
+        .collect();
+    let errors = scan_error_derivations(store, &root_scopes).await?;
+    let instances = scan_instance_derivations(store).await?;
     let volumes = load_volume_ids(store).await?;
     let mut boundaries = Vec::new();
     if inputs.scope_policy == "roots" {
@@ -3697,7 +5342,9 @@ async fn build_lib_inputs(
         generation: inputs.generation,
         epoch: inputs.epoch,
         catalog_revision: catalog_rev,
-        target_url: inputs.target_raw.clone(),
+        // Defense-in-depth (RSF-SEC-TARGET-URL): the report's `Scan.target_url`
+        // never carries credentials even if a legacy stored target did.
+        target_url: identity::redact_credentials(&inputs.target_raw),
         canonical_url: Some(inputs.canonical.clone()),
         scope: inputs.scope_policy.clone(),
         scan_state: inputs.scan_state.clone(),
@@ -3712,27 +5359,33 @@ async fn build_lib_inputs(
         profile: String::from("conservative"),
         cpu_target_cores: 1.0,
         rss_target_bytes: 268435456,
-        peak_rss_bytes: None,
-        cpu_seconds: None,
+        // RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1: measured run-loop
+        // telemetry — never None-after-run.
+        peak_rss_bytes: Some(inputs.counters.peak_rss_bytes),
+        cpu_seconds: Some(inputs.counters.cpu_seconds),
         enumerated_entries: inputs.counters.entries,
         db_transactions: inputs.counters.db_transactions,
-        db_sync_calls: None,
+        db_sync_calls: Some(inputs.counters.db_sync_calls),
         source_commit: None,
         include_nonmatching: false,
         coverage_filesystem: None,
         coverage_identity: None,
         coverage_status: Some(coverage_status.to_string()),
-        roots: root_inputs(inputs, &errors, &volumes),
-        storage_links: storage_link_inputs(&instances),
+        roots: root_inputs_chunked(inputs, &errors.root_error_ids, &volumes),
+        storage_links: instances.storage_links,
         aliases: alias_inputs(&inputs.aliases),
-        candidates: candidate_inputs(&errors, &instances),
+        candidates: {
+            let mut candidates = instances.candidates;
+            candidates.extend(errors.candidates);
+            candidates
+        },
         generated_artifacts: artifacts,
     })
 }
 
-fn root_inputs(
+fn root_inputs_chunked(
     inputs: &ScanReportInputs,
-    errors: &[OpenError],
+    root_error_ids: &[Vec<String>],
     volumes: &HashSet<String>,
 ) -> Vec<RootInput> {
     inputs
@@ -3747,12 +5400,7 @@ fn root_inputs(
                 }
                 _ => None,
             };
-            let root_scope = config::scope_key_for_dir(&root.path);
-            let error_ids: Vec<String> = errors
-                .iter()
-                .filter(|e| e.scope_key == root_scope)
-                .map(|e| e.id.clone())
-                .collect();
+            let error_ids: Vec<String> = root_error_ids.get(n).cloned().unwrap_or_default();
             let state = if !error_ids.is_empty() {
                 "error"
             } else if inputs.pending > 0 {
@@ -3777,124 +5425,11 @@ fn root_inputs(
         .collect()
 }
 
-/// Caller-owned candidates: unresolvable-identity subjects plus
-/// failed/unsupported probes. Pure coverage gaps (permission, symlink,
-/// status) are errors, not candidates.
-fn candidate_inputs(errors: &[OpenError], instances: &[EmittedInstance]) -> Vec<CandidateInput> {
-    let mut out = Vec::new();
-    for instance in instances {
-        if instance.disposition != "unresolvable_identity" {
-            continue;
-        }
-        out.push(CandidateInput {
-            id: format!("cand:{}", instance.id),
-            path_bytes: instance.git_path.clone(),
-            repository_id: Some(instance.id.clone()),
-            disposition: String::from("unresolvable_identity"),
-            reason: String::from(
-                "identifying remotes removed or uninterpretable under the matching policy; \
-                 see repository evidence",
-            ),
-            retry_after_ms: None,
-            error_ids: Vec::new(),
-        });
-    }
-    for error in errors {
-        let disposition = match error.category.as_str() {
-            "probe-failed" => "probe_failed",
-            "unsupported-git-format" => "unsupported",
-            _ => continue,
-        };
-        let Some(path) = scope_path(&error.scope_key) else {
-            continue;
-        };
-        out.push(CandidateInput {
-            id: format!("cand-err:{}", error.id),
-            path_bytes: config::path_as_bytes(&path),
-            repository_id: None,
-            disposition: disposition.to_string(),
-            reason: truncate_str(&error.detail, 512),
-            retry_after_ms: error.next_retry_ms,
-            error_ids: vec![error.id.clone()],
-        });
-    }
-    out
-}
-
 fn scope_path(scope_key: &str) -> Option<PathBuf> {
     match config::parse_scope_key(scope_key) {
         Some(config::ScopeRef::Dir(p) | config::ScopeRef::Git(p)) => Some(p),
         _ => None,
     }
-}
-
-/// Caller-owned storage edges: common-directory relationships, borrowed
-/// object stores (alternates), shared common storage, and observed
-/// hard-link sharing (R16).
-fn storage_link_inputs(instances: &[EmittedInstance]) -> Vec<StorageLinkInput> {
-    let mut out = Vec::new();
-    for instance in instances {
-        if instance.common_path != instance.git_path {
-            out.push(StorageLinkInput {
-                id: format!("link:{}:common", instance.id),
-                from_repository_id: instance.id.clone(),
-                to_path_bytes: instance.common_path.clone(),
-                kind: String::from("common_directory"),
-                evidence: vec![String::from("common directory differs from git directory")],
-            });
-        }
-    }
-    for instance in instances {
-        for (n, target) in alternates_targets(&instance.git_path).iter().enumerate() {
-            out.push(StorageLinkInput {
-                id: format!("link:{}:alt:{n}", instance.id),
-                from_repository_id: instance.id.clone(),
-                to_path_bytes: target.clone(),
-                kind: String::from("alternate_objects"),
-                evidence: vec![format!(
-                    "borrows object store: {}",
-                    String::from_utf8_lossy(target)
-                )],
-            });
-        }
-    }
-    let mut by_common: HashMap<&Vec<u8>, Vec<&EmittedInstance>> = HashMap::new();
-    for instance in instances {
-        by_common
-            .entry(&instance.common_path)
-            .or_default()
-            .push(instance);
-    }
-    for (_, mut group) in by_common {
-        if group.len() < 2 {
-            continue;
-        }
-        group.sort_by(|a, b| a.id.cmp(&b.id));
-        let first = group[0].id.clone();
-        for instance in group.into_iter().skip(1) {
-            out.push(StorageLinkInput {
-                id: format!("link:{}:shared", instance.id),
-                from_repository_id: instance.id.clone(),
-                to_path_bytes: instance.common_path.clone(),
-                kind: String::from("shared_object_store"),
-                evidence: vec![format!("shares common storage with {first}")],
-            });
-        }
-    }
-    for instance in instances {
-        if let Some(object) = first_hardlinked_object(&instance.git_path) {
-            out.push(StorageLinkInput {
-                id: format!("link:{}:hardlink", instance.id),
-                from_repository_id: instance.id.clone(),
-                to_path_bytes: object,
-                kind: String::from("observed_hardlink"),
-                evidence: vec![String::from(
-                    "object file has multiple hard links; store shared, not copied",
-                )],
-            });
-        }
-    }
-    out
 }
 
 /// Borrowed object-store targets from `objects/info/alternates` (R16),
@@ -4025,13 +5560,12 @@ async fn emit_file_report(
     now_ms: i64,
 ) -> repo_scan::Result<PathBuf> {
     use repo_scan::report::builder::stream_report_from_store;
-    use repo_scan::report::publish;
     use std::io::Write;
 
     let staging = staging_dir(state_dir);
-    let snapshots = snapshots_dir(state_dir);
-    std::fs::create_dir_all(&staging)?;
-    std::fs::create_dir_all(&snapshots)?;
+    // Owner-only report dirs; symlinked components are refused inside.
+    store::owner::ensure_private_dir_all(&staging)?;
+    store::owner::ensure_private_dir_all(&snapshots_dir(state_dir))?;
     let staged_name = format!(
         ".staging-{}-{}-{}.json",
         std::process::id(),
@@ -4039,6 +5573,16 @@ async fn emit_file_report(
         inputs.report_id,
     );
     let staged = staging.join(staged_name);
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(store::owner::STATE_FILE_MODE)
+            .open(&staged)?
+    };
+    #[cfg(not(unix))]
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -4050,13 +5594,50 @@ async fn emit_file_report(
     if let Ok(dir) = std::fs::File::open(&staging) {
         let _ = dir.sync_all();
     }
-    let receipt = publish::retain_snapshot(
+    verified_retain_and_publish(
         store,
         &staged,
-        &snapshots,
         &inputs.report_id,
         inputs.catalog_revision,
         inputs.generation,
+        dest,
+        state_dir,
+        now_ms,
+    )
+    .await
+}
+
+/// Verify staged bytes, retain the immutable snapshot, then publish
+/// (RSF-7511725D-DC03-471A-9635-4F8173986489): production publication
+/// calls [`verify_staged_report`] (schema + cross-field rules) and
+/// refuses invalid output before it can be retained or shipped. Returns
+/// the snapshot path.
+#[allow(clippy::too_many_arguments)]
+async fn verified_retain_and_publish(
+    store: &TursoStore,
+    staged: &Path,
+    report_id: &str,
+    catalog_rev: u64,
+    generation: u64,
+    dest: &Path,
+    state_dir: &Path,
+    now_ms: i64,
+) -> repo_scan::Result<PathBuf> {
+    use repo_scan::report::publish;
+
+    verify_staged_report(staged).map_err(|e| {
+        repo_scan::Error::Report(format!(
+            "refusing invalid staged report {}: {e}",
+            staged.display()
+        ))
+    })?;
+    let receipt = publish::retain_snapshot(
+        store,
+        staged,
+        &snapshots_dir(state_dir),
+        report_id,
+        catalog_rev,
+        generation,
         now_ms,
     )
     .await?;
@@ -4067,22 +5648,18 @@ async fn emit_file_report(
     let checked =
         reject_state_dir_dest(dest, state_dir).and(publish::check_destination(dest, state_dir));
     if let Err(e) = checked {
-        store
-            .set_snapshot_publication(&inputs.report_id, "failed")
-            .await?;
+        store.set_snapshot_publication(report_id, "failed").await?;
         return Err(e);
     }
     match publish::publish_staged(&snapshot, dest, state_dir) {
         Ok(_) => {
             store
-                .set_snapshot_publication(&inputs.report_id, "published")
+                .set_snapshot_publication(report_id, "published")
                 .await?;
             Ok(snapshot)
         }
         Err(e) => {
-            store
-                .set_snapshot_publication(&inputs.report_id, "failed")
-                .await?;
+            store.set_snapshot_publication(report_id, "failed").await?;
             Err(e)
         }
     }
@@ -4130,7 +5707,11 @@ async fn run_query_inner(
         );
         return Ok(ExitCode::Incomplete);
     }
-    let (_guard, store) = open_owned_with_wait(&cfg.state_dir).await?;
+    // RSF-02C3154D-7D7A-420E-A0C5-EA763B8B327D: the cached query opens
+    // the catalog read-only — no owner lock, no epoch claim, no recovery
+    // writes, no migrations — so it is servable while a scan owner holds
+    // the write lock and can never mutate catalog state.
+    let store = TursoStore::open_read_only(&db_path).await?;
     let mut rows = store
         .connection()
         .query(
@@ -4420,7 +6001,20 @@ async fn continue_saved_scan(
     row: &store::ScanRow,
     saved_roots: Option<Vec<PathBuf>>,
 ) -> repo_scan::Result<ExitCode> {
-    let url = String::from_utf8_lossy(&row.url_raw).into_owned();
+    // Redact-on-read (RSF-SEC-TARGET-URL): rows persisted before the CLI
+    // boundary reject may hold credential-bearing targets. Reuse the stored
+    // canonical target (never credential-bearing) or a stripped raw URL so
+    // the resumed scan resolves the same repository without carrying the
+    // secret forward into state or reports.
+    let stored_url = String::from_utf8_lossy(&row.url_raw).into_owned();
+    let url = if identity::has_userinfo(&stored_url) {
+        match &row.url_canonical {
+            Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+            None => identity::strip_userinfo(&stored_url),
+        }
+    } else {
+        stored_url
+    };
     let status = status_mode_from_str(&row.status_mode).ok_or_else(|| {
         repo_scan::Error::Config(format!("saved status mode is invalid: {}", row.status_mode))
     })?;
@@ -4925,12 +6519,16 @@ pub async fn test_apply_event_batch(
         monitored: Vec::new(),
         mounts: HashMap::new(),
         applied_scopes: HashMap::new(),
+        applied_overflow: HashSet::new(),
         history_invalid: false,
         degraded: Vec::new(),
         live: false,
     };
     // Open rule for the batch's volume so ingest pins a history identity.
     let stored = load_stored_cursors(store).await?;
+    // Same open order as `open_event_session` (RSF-F940): restore durable
+    // cursors before the open rule so replays dedupe.
+    session.reconciler.restore_durable_cursors(&stored);
     let live = events::HistoryUuid(history_uuid.to_string());
     session.reconciler.note_stream_opened(
         &batch.volume_key,
@@ -4941,20 +6539,16 @@ pub async fn test_apply_event_batch(
     );
     let mut counters = RunCounters::default();
     let mut applied = IngestApplied::default();
-    // Hook fence: the batch's own paths (raw + canonical) plus parents.
-    let mut fence: Vec<PathBuf> = Vec::new();
+    // Hook fence: the batch's own paths plus parents (`ScopeFence`
+    // keeps each raw spelling alongside its canonicalization).
+    let mut fence_paths: Vec<PathBuf> = Vec::new();
     for path in &batch.invalidations {
-        fence.push(path.clone());
-        fence.push(path.canonicalize().unwrap_or_else(|_| path.clone()));
+        fence_paths.push(path.clone());
         if let Some(parent) = path.parent() {
-            fence.push(parent.to_path_buf());
-            fence.push(
-                parent
-                    .canonicalize()
-                    .unwrap_or_else(|_| parent.to_path_buf()),
-            );
+            fence_paths.push(parent.to_path_buf());
         }
     }
+    let fence = ScopeFence::build(&fence_paths);
     apply_event_batch(
         &mut session,
         store,
@@ -4982,4 +6576,960 @@ pub async fn test_mark_reconciled(
     through: u64,
 ) -> repo_scan::Result<()> {
     mark_events_reconciled_through(store, volume, events::EventCursorId(through)).await
+}
+
+// ---------------------------------------------------------------------------
+// RSF-F940 production-wiring hooks (`tests/rsf_f940.rs` includes this file
+// as a module). Each hook drives the same production code the command
+// paths use: the scripted drain runs `ingest_available_events`, the
+// scripted reconcile runs it plus `reconcile_event_cursors`.
+// ---------------------------------------------------------------------------
+
+/// One scripted drain item (RSF-F940): a delivered batch or a failed
+/// batch read.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub enum TestDrainItem {
+    /// A delivered event batch.
+    Batch(events::EventBatch),
+    /// A failed batch read (`next_batch` returns this error).
+    Fail(String),
+}
+
+#[cfg(test)]
+struct TestDrainIter {
+    script: std::collections::VecDeque<TestDrainItem>,
+}
+
+#[cfg(test)]
+impl repo_scan::platform::EventBatchIter for TestDrainIter {
+    fn next_batch(&mut self) -> repo_scan::Result<Option<events::EventBatch>> {
+        match self.script.pop_front() {
+            None => Ok(None),
+            Some(TestDrainItem::Batch(batch)) => Ok(Some(batch)),
+            Some(TestDrainItem::Fail(error)) => Err(repo_scan::Error::Events(error)),
+        }
+    }
+}
+
+/// What one hook-driven scripted drain applied (RSF-F940).
+#[cfg(test)]
+pub struct TestDrainOutcome {
+    pub history_invalid: bool,
+    pub batches: usize,
+    pub scopes: usize,
+    pub mount_changed: bool,
+    pub tx: u64,
+}
+
+/// Per-volume report cursors observed through the reconcile hook (RSF-F940).
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+pub struct TestCursors {
+    pub history_uuid: Option<String>,
+    pub ingested: Option<String>,
+    pub reconciled: Option<String>,
+}
+
+/// One checked-claim verdict observed through the reconcile hook (RSF-F940).
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct TestClaimOutcome {
+    pub volume: String,
+    pub complete: bool,
+    pub detail: String,
+}
+
+/// What one hook-driven scripted reconcile produced (RSF-F940).
+#[cfg(test)]
+pub struct TestReconcileOutcome {
+    pub cursors: HashMap<String, TestCursors>,
+    pub claims: Vec<TestClaimOutcome>,
+    pub tx: u64,
+}
+
+/// Scripted live session for one volume (RSF-F940): the same open order
+/// as `open_event_session` — restore durable cursors, open the stream
+/// against stored state, begin traversal — with a scripted batch stream.
+#[cfg(test)]
+async fn test_drain_session(
+    store: &TursoStore,
+    volume_key: &str,
+    history_uuid: &str,
+    fence_roots: &[PathBuf],
+    script: Vec<TestDrainItem>,
+) -> repo_scan::Result<(EventSession, Vec<PlannedRoot>)> {
+    let stored = load_stored_cursors(store).await?;
+    let mut session = EventSession {
+        reconciler: events::Reconciler::new(events::MemoryCursorJournal::new()),
+        monitored: Vec::new(),
+        mounts: HashMap::new(),
+        applied_scopes: HashMap::new(),
+        applied_overflow: HashSet::new(),
+        history_invalid: false,
+        degraded: Vec::new(),
+        live: true,
+    };
+    session.reconciler.restore_durable_cursors(&stored);
+    let boundary = script
+        .iter()
+        .filter_map(|item| match item {
+            TestDrainItem::Batch(batch) => Some(batch.high_water.0),
+            TestDrainItem::Fail(_) => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let live = events::HistoryUuid(history_uuid.to_string());
+    session.reconciler.note_stream_opened(
+        volume_key,
+        stored.get(volume_key),
+        Some(&live),
+        boundary,
+        events::EventCursorId(boundary),
+    );
+    session.reconciler.begin_traversal()?;
+    session.monitored.push(events::MonitoredVolume {
+        volume_key: volume_key.to_string(),
+        boundary: events::EventCursorId(boundary),
+        batches: Box::new(TestDrainIter {
+            script: script.into(),
+        }),
+    });
+    let roots: Vec<PlannedRoot> = fence_roots
+        .iter()
+        .map(|path| PlannedRoot {
+            path: path.clone(),
+            priority: RootPriority::Normal,
+            namespace: String::from("test"),
+            volume: None,
+        })
+        .collect();
+    Ok((session, roots))
+}
+
+/// Drive scripted batches and batch failures through the production
+/// drain (RSF-F940): the same `ingest_available_events` the scan and
+/// invalidate paths execute.
+#[cfg(test)]
+pub async fn test_drain_scripted(
+    store: &TursoStore,
+    generation: u64,
+    volume_key: &str,
+    history_uuid: &str,
+    fence_roots: &[PathBuf],
+    script: Vec<TestDrainItem>,
+) -> repo_scan::Result<TestDrainOutcome> {
+    let (mut session, roots) =
+        test_drain_session(store, volume_key, history_uuid, fence_roots, script).await?;
+    let mut counters = RunCounters::default();
+    let applied =
+        ingest_available_events(&mut session, store, generation, &roots, &mut counters).await?;
+    Ok(TestDrainOutcome {
+        history_invalid: session.history_invalid,
+        batches: applied.batches,
+        scopes: applied.scopes,
+        mount_changed: applied.mount_changed,
+        tx: counters.db_transactions,
+    })
+}
+
+/// Drive scripted batches through the production drain, satisfy the
+/// scheduled work through the production claim/complete path, then run
+/// the production reconcile (RSF-F940): the same
+/// `ingest_available_events` + `reconcile_event_cursors` the scan path
+/// executes.
+#[cfg(test)]
+pub async fn test_reconcile_scripted(
+    store: &TursoStore,
+    generation: u64,
+    volume_key: &str,
+    history_uuid: &str,
+    fence_roots: &[PathBuf],
+    batches: Vec<events::EventBatch>,
+) -> repo_scan::Result<TestReconcileOutcome> {
+    let script: Vec<TestDrainItem> = batches.into_iter().map(TestDrainItem::Batch).collect();
+    let (mut session, roots) =
+        test_drain_session(store, volume_key, history_uuid, fence_roots, script).await?;
+    let mut counters = RunCounters::default();
+    ingest_available_events(&mut session, store, generation, &roots, &mut counters).await?;
+    let epoch = store.epoch();
+    loop {
+        let now = store::now_ms();
+        let claimed = store.claim_tasks(epoch, 64, 60_000, now).await?;
+        if claimed.is_empty() {
+            break;
+        }
+        for task in &claimed {
+            // Production completion semantics (`complete_claimed`):
+            // stale completions are routine — the store already requeued
+            // the task with a fresh expected rev, and this loop reclaims
+            // it. Only non-stale errors abort.
+            match store
+                .complete_task(
+                    &task.task.id,
+                    task.token,
+                    epoch,
+                    &TaskOutcome::Complete,
+                    now,
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(repo_scan::Error::Scheduler(message))
+                    if message.starts_with("stale-completion:") => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    let (cursors, claims) = reconcile_event_cursors(&mut session, store).await?;
+    let mut observed = HashMap::with_capacity(cursors.len());
+    for (volume, cursor) in cursors {
+        observed.insert(
+            volume,
+            TestCursors {
+                history_uuid: cursor.history_uuid,
+                ingested: cursor.ingested,
+                reconciled: cursor.reconciled,
+            },
+        );
+    }
+    Ok(TestReconcileOutcome {
+        cursors: observed,
+        claims: claims
+            .into_iter()
+            .map(|claim| TestClaimOutcome {
+                volume: claim.volume,
+                complete: claim.complete,
+                detail: claim.detail,
+            })
+            .collect(),
+        tx: counters.db_transactions,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// RSF consumer-findings hooks (`tests/rsf_main.rs` includes this file as a
+// module). Each hook drives the same production code the command paths use.
+// ---------------------------------------------------------------------------
+
+/// Run-loop outcome plus measured run state (RSF-3E2/AC46/23D/AD9D).
+#[cfg(test)]
+#[derive(Debug)]
+pub struct TestRunStats {
+    pub interrupted: bool,
+    pub pending: u64,
+    pub open_gaps: u64,
+    pub unresolvable: u64,
+    pub status_pending: u64,
+    pub claimed: u64,
+    pub dirs_complete: u64,
+    pub entries: u64,
+    pub db_transactions: u64,
+    pub peak_rss_bytes: u64,
+    pub cpu_seconds: f64,
+    pub db_sync_calls: u64,
+    pub batch_commits: u64,
+    pub batch_ops: u64,
+    pub wal_probes: u64,
+    pub checkpoints: u64,
+    pub checkpoint_ops_pending: u64,
+    pub watchdog_trips: u64,
+    pub pressure: bool,
+    /// Breaker keys currently open (contained), sorted.
+    pub breakers_open: Vec<String>,
+}
+
+/// Drive the production run loop to its boundary (RSF-3E2FDCF3-78C5-401A-84DD-A799688ED84F):
+/// the same `run_until_boundary` the scan path executes.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub async fn test_run_boundary(
+    store: &TursoStore,
+    epoch: u64,
+    generation: u64,
+    run_rev: u64,
+    canonical: &str,
+    status_mode: StatusMode,
+    scan_id: &str,
+) -> repo_scan::Result<TestRunStats> {
+    let mut runner = Runner::new(&config::ResourceLimits::default());
+    test_run_boundary_with(
+        &mut runner,
+        store,
+        epoch,
+        generation,
+        run_rev,
+        canonical,
+        status_mode,
+        scan_id,
+    )
+    .await
+}
+
+/// Run-loop with an overridden watchdog grace
+/// (RSF-AD9D4AF7-3CC3-4B37-8168-E78DD6375C5B).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub async fn test_run_boundary_with_grace(
+    store: &TursoStore,
+    epoch: u64,
+    generation: u64,
+    run_rev: u64,
+    canonical: &str,
+    status_mode: StatusMode,
+    scan_id: &str,
+    grace_secs: u64,
+) -> repo_scan::Result<TestRunStats> {
+    let mut runner = Runner::new(&config::ResourceLimits::default());
+    runner.watchdog = Watchdog::new(Duration::from_secs(grace_secs));
+    test_run_boundary_with(
+        &mut runner,
+        store,
+        epoch,
+        generation,
+        run_rev,
+        canonical,
+        status_mode,
+        scan_id,
+    )
+    .await
+}
+
+/// Run-loop with an eager checkpoint policy
+/// (RSF-AC461500-609D-4D55-991E-09C60D382D67): a probe is due after
+/// `ops_between_probes` applied ops with no time rate-limit.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub async fn test_run_boundary_with_checkpoint(
+    store: &TursoStore,
+    epoch: u64,
+    generation: u64,
+    run_rev: u64,
+    canonical: &str,
+    status_mode: StatusMode,
+    scan_id: &str,
+    ops_between_probes: u64,
+) -> repo_scan::Result<TestRunStats> {
+    let mut runner = Runner::new(&config::ResourceLimits::default());
+    runner.checkpoints = CheckpointCoordinator::new(CheckpointPolicy {
+        ops_between_probes,
+        max_wal_frames: u64::MAX,
+        min_probe_interval: Duration::ZERO,
+    });
+    test_run_boundary_with(
+        &mut runner,
+        store,
+        epoch,
+        generation,
+        run_rev,
+        canonical,
+        status_mode,
+        scan_id,
+    )
+    .await
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn test_run_boundary_with(
+    runner: &mut Runner,
+    store: &TursoStore,
+    epoch: u64,
+    generation: u64,
+    run_rev: u64,
+    canonical: &str,
+    status_mode: StatusMode,
+    scan_id: &str,
+) -> repo_scan::Result<TestRunStats> {
+    let outcome = run_until_boundary(
+        runner,
+        store,
+        epoch,
+        generation,
+        run_rev,
+        canonical,
+        status_mode,
+        scan_id,
+    )
+    .await?;
+    let stats = store.stats();
+    let now_sys = SystemTime::now();
+    let mut breakers_open: Vec<String> = runner
+        .breakers
+        .iter()
+        .filter(|(_, breaker)| !breaker.allow(now_sys))
+        .map(|(key, _)| key.clone())
+        .collect();
+    breakers_open.sort();
+    Ok(TestRunStats {
+        interrupted: outcome.interrupted,
+        pending: outcome.pending,
+        open_gaps: outcome.open_gaps,
+        unresolvable: outcome.unresolvable,
+        status_pending: outcome.status_pending,
+        claimed: runner.counters.claimed,
+        dirs_complete: runner.counters.dirs_complete,
+        entries: runner.counters.entries,
+        db_transactions: runner.counters.db_transactions,
+        peak_rss_bytes: runner.counters.peak_rss_bytes,
+        cpu_seconds: runner.counters.cpu_seconds,
+        db_sync_calls: runner.counters.db_sync_calls,
+        batch_commits: stats.batch_commits,
+        batch_ops: stats.batch_ops,
+        wal_probes: stats.wal_probes,
+        checkpoints: stats.checkpoints,
+        checkpoint_ops_pending: runner.checkpoints.ops_since_probe(),
+        watchdog_trips: runner.watchdog.tripped,
+        pressure: runner.admission.under_pressure(),
+        breakers_open,
+    })
+}
+
+/// Drive crafted staged bytes through the real verified publish path
+/// (RSF-7511725D-DC03-471A-9635-4F8173986489): the same
+/// `verified_retain_and_publish` production file emission uses.
+#[cfg(test)]
+pub async fn test_verified_publish_bytes(
+    store: &TursoStore,
+    state_dir: &Path,
+    report_id: &str,
+    staged_bytes: &[u8],
+    dest: &Path,
+    now_ms: i64,
+) -> repo_scan::Result<PathBuf> {
+    let staging = staging_dir(state_dir);
+    store::owner::ensure_private_dir_all(&staging)?;
+    let staged = staging.join(format!(
+        ".staging-test-{}-{report_id}.json",
+        std::process::id()
+    ));
+    std::fs::write(&staged, staged_bytes)?;
+    let catalog_rev = store.current_revision().await?;
+    verified_retain_and_publish(
+        store,
+        &staged,
+        report_id,
+        catalog_rev,
+        1,
+        dest,
+        state_dir,
+        now_ms,
+    )
+    .await
+}
+
+/// Bounded-scan accounting (RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1).
+#[cfg(test)]
+#[derive(Debug)]
+pub struct TestDerivationScan {
+    pub scanned: u64,
+    pub chunks: u64,
+    pub peak_chunk: usize,
+    pub candidates: usize,
+    pub storage_links: usize,
+}
+
+/// Production error-derivation scan over every open gap.
+#[cfg(test)]
+pub async fn test_scan_error_derivations(
+    store: &TursoStore,
+    root_scopes: &[String],
+) -> repo_scan::Result<TestDerivationScan> {
+    let derived = scan_error_derivations(store, root_scopes).await?;
+    Ok(TestDerivationScan {
+        scanned: derived.scanned,
+        chunks: derived.chunks,
+        peak_chunk: derived.peak_chunk,
+        candidates: derived.candidates.len(),
+        storage_links: 0,
+    })
+}
+
+/// Production instance-derivation scan over every emitted instance.
+#[cfg(test)]
+pub async fn test_scan_instance_derivations(
+    store: &TursoStore,
+) -> repo_scan::Result<TestDerivationScan> {
+    let derived = scan_instance_derivations(store).await?;
+    Ok(TestDerivationScan {
+        scanned: derived.scanned,
+        chunks: derived.chunks,
+        peak_chunk: derived.peak_chunk,
+        candidates: derived.candidates.len(),
+        storage_links: derived.storage_links.len(),
+    })
+}
+
+/// Burst verdicts through the real 2 Hz progress gate
+/// (RSF-CHAINARGOS-PROGRESS-001): the first call passes, immediate
+/// followers are coalesced.
+#[cfg(test)]
+pub fn test_progress_burst(n: usize) -> Vec<bool> {
+    let mut runner = Runner::new(&config::ResourceLimits::default());
+    (0..n).map(|_| runner.admission.progress_due()).collect()
+}
+
+/// Timed gate sample (RSF-CHAINARGOS-PROGRESS-001): `(first, immediate,
+/// after_interval)` where the third sample follows a 600 ms sleep past
+/// the 500 ms (2 Hz) interval.
+#[cfg(test)]
+pub fn test_progress_timed() -> (bool, bool, bool) {
+    let mut runner = Runner::new(&config::ResourceLimits::default());
+    let first = runner.admission.progress_due();
+    let immediate = runner.admission.progress_due();
+    std::thread::sleep(Duration::from_millis(600));
+    let after_interval = runner.admission.progress_due();
+    (first, immediate, after_interval)
+}
+
+/// Progress line content through the real formatter
+/// (RSF-CHAINARGOS-PROGRESS-001).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub fn test_format_progress(
+    claimed: u64,
+    dirs: u64,
+    entries: u64,
+    stale: u64,
+    pending: u64,
+    elapsed_secs: u64,
+    scope: &str,
+    volume: &str,
+) -> String {
+    let counters = RunCounters {
+        claimed,
+        dirs_complete: dirs,
+        entries,
+        db_transactions: 0,
+        stale_requeued: stale,
+        peak_rss_bytes: 0,
+        cpu_seconds: 0.0,
+        db_sync_calls: 0,
+    };
+    format_progress_line(
+        "scan-test",
+        7,
+        &counters,
+        pending,
+        Duration::from_secs(elapsed_secs),
+        scope,
+        volume,
+    )
+}
+
+/// Production watchdog verdict (RSF-AD9D4AF7-3CC3-4B37-8168-E78DD6375C5B).
+#[cfg(test)]
+pub fn test_watchdog_verdict(timed_out: bool, advanced: bool) -> &'static str {
+    match watchdog_verdict(timed_out, advanced) {
+        WatchdogVerdict::WithinGrace => "within_grace",
+        WatchdogVerdict::Advancing => "advancing",
+        WatchdogVerdict::Contained => "contained",
+    }
+}
+
+/// Full progress line through the real store-totals formatter
+/// (RSF-F2865989-7199-472B-A9D8-9C54C88656EB, RSF-CHAINARGOS-RESUME-002,
+/// RSF-CHAINARGOS-SPEED-003): session counters plus cumulative scan totals,
+/// frontier denominator, rate, and ETA.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub fn test_format_progress_full(
+    claimed: u64,
+    dirs: u64,
+    entries: u64,
+    stale: u64,
+    pending: u64,
+    total_tasks: u64,
+    cum_dirs: u64,
+    cum_entries: u64,
+    elapsed_secs: u64,
+    scope: &str,
+    volume: &str,
+) -> String {
+    let counters = RunCounters {
+        claimed,
+        dirs_complete: dirs,
+        entries,
+        db_transactions: 0,
+        stale_requeued: stale,
+        peak_rss_bytes: 0,
+        cpu_seconds: 0.0,
+        db_sync_calls: 0,
+    };
+    let totals = ProgressTotals {
+        pending,
+        total_tasks,
+        cum_dirs,
+        cum_entries,
+    };
+    format_progress_line_full(
+        "scan-test",
+        7,
+        &counters,
+        &totals,
+        Duration::from_secs(elapsed_secs),
+        scope,
+        volume,
+    )
+}
+
+/// Production ETA formatting (RSF-F2865989-7199-472B-A9D8-9C54C88656EB).
+#[cfg(test)]
+pub fn test_format_eta(session_claimed: u64, pending: u64, elapsed_secs: u64) -> String {
+    format_progress_eta(session_claimed, pending, Duration::from_secs(elapsed_secs))
+}
+
+/// Production growth-aware ETA (RSF-CHAINARGOS-PROGRESS-002).
+#[cfg(test)]
+pub fn test_format_eta_growth(
+    session_claimed: u64,
+    pending: u64,
+    elapsed_secs: u64,
+    denominator_grew: bool,
+    new_since_tick: u64,
+) -> String {
+    format_progress_eta_growth(
+        session_claimed,
+        pending,
+        Duration::from_secs(elapsed_secs),
+        denominator_grew,
+        new_since_tick,
+    )
+}
+
+/// Full progress line through the growth-aware production formatter
+/// (RSF-CHAINARGOS-PROGRESS-002).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub fn test_format_progress_full_growth(
+    claimed: u64,
+    dirs: u64,
+    entries: u64,
+    stale: u64,
+    pending: u64,
+    total_tasks: u64,
+    cum_dirs: u64,
+    cum_entries: u64,
+    elapsed_secs: u64,
+    scope: &str,
+    volume: &str,
+    denominator_grew: bool,
+    new_since_tick: u64,
+) -> String {
+    let counters = RunCounters {
+        claimed,
+        dirs_complete: dirs,
+        entries,
+        db_transactions: 0,
+        stale_requeued: stale,
+        peak_rss_bytes: 0,
+        cpu_seconds: 0.0,
+        db_sync_calls: 0,
+    };
+    let totals = ProgressTotals {
+        pending,
+        total_tasks,
+        cum_dirs,
+        cum_entries,
+    };
+    format_progress_line_full_with_growth(
+        "scan-test",
+        7,
+        &counters,
+        &totals,
+        Duration::from_secs(elapsed_secs),
+        scope,
+        volume,
+        denominator_grew,
+        new_since_tick,
+    )
+}
+
+/// Production rate formatting.
+#[cfg(test)]
+pub fn test_format_rate(session_claimed: u64, elapsed_secs: u64) -> String {
+    format_progress_rate(session_claimed, Duration::from_secs(elapsed_secs))
+}
+
+/// Production progress-totals load: `(pending, total_tasks, cum_dirs,
+/// cum_entries)` for one generation.
+#[cfg(test)]
+pub async fn test_load_progress_totals(
+    store: &TursoStore,
+    generation: u64,
+) -> repo_scan::Result<(u64, u64, u64, u64)> {
+    let totals = load_progress_totals(store, generation).await?;
+    Ok((
+        totals.pending,
+        totals.total_tasks,
+        totals.cum_dirs,
+        totals.cum_entries,
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// RSF-751/AC46/F06D hooks (`tests/rsf_publish.rs` includes this file as a
+// module). Each hook drives the same production code the command paths use.
+// ---------------------------------------------------------------------------
+
+/// Paging width the bounded scans hold in flight (one page at most).
+#[cfg(test)]
+pub fn test_load_chunk_rows() -> i64 {
+    LOAD_CHUNK_ROWS
+}
+
+/// One stored cursor in test-comparable form.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestVolumeCursor {
+    pub uuid: Option<String>,
+    pub ingested: Option<u64>,
+    pub reconciled: Option<u64>,
+}
+
+/// Production stored-cursor scan over every volume with journal history,
+/// with paging accounting.
+#[cfg(test)]
+#[derive(Debug)]
+pub struct TestStoredCursorScan {
+    pub cursors: HashMap<String, TestVolumeCursor>,
+    pub pages: u64,
+    pub peak_page: usize,
+}
+
+/// Production stored cursors through the real per-volume paged scan.
+#[cfg(test)]
+pub async fn test_stored_cursors(store: &TursoStore) -> repo_scan::Result<TestStoredCursorScan> {
+    let mut id_rows = store
+        .connection()
+        .query(
+            "SELECT DISTINCT volume_id FROM event_journal ORDER BY volume_id ASC",
+            (),
+        )
+        .await
+        .map_err(store_err)?;
+    let mut keys = Vec::new();
+    while let Some(row) = id_rows.next().await.map_err(store_err)? {
+        keys.push(cell_text(&row, 0)?);
+    }
+    let mut scan = TestStoredCursorScan {
+        cursors: HashMap::new(),
+        pages: 0,
+        peak_page: 0,
+    };
+    for key in keys {
+        let one = stored_cursor_for_volume(store, &key).await?;
+        scan.pages += one.pages;
+        scan.peak_page = scan.peak_page.max(one.peak_page);
+        if let Some(cursor) = one.cursor {
+            scan.cursors.insert(
+                key,
+                TestVolumeCursor {
+                    uuid: cursor.uuid.map(|u| u.0),
+                    ingested: cursor.ingested.map(|c| c.0),
+                    reconciled: cursor.reconciled.map(|c| c.0),
+                },
+            );
+        }
+    }
+    Ok(scan)
+}
+
+/// One volume's report cursors in test-comparable form.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestRootCursors {
+    pub history_uuid: Option<String>,
+    pub ingested: Option<String>,
+    pub reconciled: Option<String>,
+}
+
+/// Production report cursors with paging accounting.
+#[cfg(test)]
+#[derive(Debug)]
+pub struct TestReportCursorScan {
+    pub cursors: HashMap<String, TestRootCursors>,
+    pub pages: u64,
+    pub peak_page: usize,
+}
+
+/// Production `report_cursors_from_store` over an unmonitored session
+/// (keys come from persisted history alone), with paging totals through
+/// the same per-volume production scan.
+#[cfg(test)]
+pub async fn test_report_cursors(store: &TursoStore) -> repo_scan::Result<TestReportCursorScan> {
+    let session = EventSession {
+        reconciler: events::Reconciler::new(events::MemoryCursorJournal::new()),
+        monitored: Vec::new(),
+        mounts: HashMap::new(),
+        applied_scopes: HashMap::new(),
+        applied_overflow: HashSet::new(),
+        history_invalid: false,
+        degraded: Vec::new(),
+        live: false,
+    };
+    let cursors = report_cursors_from_store(store, &session).await?;
+    let mut scan = TestReportCursorScan {
+        cursors: HashMap::new(),
+        pages: 0,
+        peak_page: 0,
+    };
+    for (key, value) in &cursors {
+        let one = report_cursor_for_volume(store, key).await?;
+        scan.pages += one.pages;
+        scan.peak_page = scan.peak_page.max(one.peak_page);
+        scan.cursors.insert(
+            key.clone(),
+            TestRootCursors {
+                history_uuid: value.history_uuid.clone(),
+                ingested: value.ingested.clone(),
+                reconciled: value.reconciled.clone(),
+            },
+        );
+    }
+    Ok(scan)
+}
+
+/// Production alias insert-dedupe: records one triple twice plus a
+/// distinct triple; returns `(aliases, distinct)`.
+#[cfg(test)]
+pub fn test_alias_dedupe() -> (usize, usize) {
+    let mut runner = Runner::new(&config::ResourceLimits::default());
+    runner.note_alias(b"/a".to_vec(), b"/b".to_vec(), "same_object", 1);
+    runner.note_alias(b"/a".to_vec(), b"/b".to_vec(), "same_object", 2);
+    runner.note_alias(b"/a".to_vec(), b"/c".to_vec(), "symlink", 3);
+    (runner.aliases.len(), runner.alias_seen.len())
+}
+
+/// Production applied-scope cap: notes 5,000 scopes for one volume;
+/// returns `(recorded, overflowed)`.
+#[cfg(test)]
+pub fn test_applied_scopes_cap() -> (usize, bool) {
+    let mut session = EventSession {
+        reconciler: events::Reconciler::new(events::MemoryCursorJournal::new()),
+        monitored: Vec::new(),
+        mounts: HashMap::new(),
+        applied_scopes: HashMap::new(),
+        applied_overflow: HashSet::new(),
+        history_invalid: false,
+        degraded: Vec::new(),
+        live: false,
+    };
+    let scopes: Vec<String> = (0..5000).map(|n| format!("dir:{n:08x}")).collect();
+    note_applied_scopes(&mut session, "vol-cap", &scopes);
+    let recorded = session
+        .applied_scopes
+        .get("vol-cap")
+        .map_or(0, HashSet::len);
+    (recorded, session.applied_overflow.contains("vol-cap"))
+}
+
+/// Production alias cap (A-F5): notes `MAX_ALIASES + 10` distinct aliases
+/// plus a repeat of the first; returns `(held, overflowed, gap_buffered)`.
+#[cfg(test)]
+pub fn test_alias_cap() -> (usize, bool, bool) {
+    let mut runner = Runner::new(&config::ResourceLimits::default());
+    for n in 0..(MAX_ALIASES + 10) {
+        let path = format!("/a/{n}").into_bytes();
+        let target = format!("/b/{n}").into_bytes();
+        let _ = runner.note_alias(path, target, "symlink", 1);
+    }
+    let _ = runner.note_alias(b"/a/0".to_vec(), b"/b/0".to_vec(), "symlink", 2);
+    (
+        runner.aliases.len(),
+        runner.alias_overflow,
+        !runner.batch.is_empty(),
+    )
+}
+
+/// Production probe-index cap (A-F5): notes `MAX_PROBED_GIT_IDS + 10`
+/// distinct identities; returns `(held, overflowed, gap_buffered)`.
+#[cfg(test)]
+pub fn test_probed_git_ids_cap() -> (usize, bool, bool) {
+    let mut runner = Runner::new(&config::ResourceLimits::default());
+    for n in 0..(MAX_PROBED_GIT_IDS + 10) {
+        let _ = note_probed_git_id(
+            &mut runner,
+            (1, n as u64),
+            format!("/g/{n}").into_bytes(),
+            1,
+        );
+    }
+    (
+        runner.probed_git_ids.len(),
+        runner.probed_overflow,
+        !runner.batch.is_empty(),
+    )
+}
+
+/// Production in-loop watchdog gate (RSF-SEC-WATCHDOG-ABORT): returns
+/// `(fires_on_stall, quiet_on_progress, quiet_in_grace)`.
+#[cfg(test)]
+pub fn test_watchdog_inloop_abort() -> (bool, bool, bool) {
+    let grace = Duration::from_secs(WATCHDOG_GRACE_SECS);
+    let fires = watchdog_inloop_abort(10, 10, Duration::from_secs(WATCHDOG_GRACE_SECS + 1), grace);
+    let quiet_progress = watchdog_inloop_abort(11, 10, Duration::from_secs(3600), grace);
+    let quiet_grace = watchdog_inloop_abort(10, 10, Duration::from_secs(1), grace);
+    (fires, quiet_progress, quiet_grace)
+}
+
+/// Production planner-key losslessness (A-F1, fix4): two distinct byte
+/// paths with identical lossy display hold distinct planner keys, each
+/// parsing byte-exact and denoting its own scheduler scope; returns the
+/// distinct scope count (2: no sibling dropped, no fan-out needed).
+#[cfg(all(test, unix))]
+pub fn test_subtree_fanout() -> usize {
+    use std::os::unix::ffi::OsStringExt;
+    let a = PathBuf::from(std::ffi::OsString::from_vec(b"/fan/\xff".to_vec()));
+    let b = PathBuf::from(std::ffi::OsString::from_vec(b"/fan/\xfe".to_vec()));
+    let key_a = events::subtree_scope_key("vol-fanout", &a);
+    let key_b = events::subtree_scope_key("vol-fanout", &b);
+    assert_ne!(key_a, key_b, "lossless keys never collide");
+    let mut scopes = std::collections::HashSet::new();
+    for (key, path) in [(&key_a, &a), (&key_b, &b)] {
+        let (volume, planned) = events::parse_subtree_scope_key(key).expect("planner key parses");
+        assert_eq!(volume, "vol-fanout");
+        assert_eq!(&planned, path, "byte-exact round-trip");
+        let dir = events::dir_scope_for_subtree_key(key).expect("mapped scope");
+        assert_eq!(dir, config::scope_key_for_dir(path), "scheduler agreement");
+        scopes.insert(dir);
+    }
+    scopes.len()
+}
+
+/// Execute one enum task under a fenced runner (finding-12 wiring
+/// proof): the fence is built from `fence_roots` exactly like the scan
+/// path builds it from the planned roots, then the production
+/// `exec_enumerate` runs against `scope_path`. Returns the production
+/// outcome for the caller to match on.
+#[cfg(test)]
+pub async fn test_enum_fenced_outcome(
+    store: &TursoStore,
+    fence_roots: &[PathBuf],
+    generation: u64,
+    scope_path: &Path,
+) -> repo_scan::Result<TaskOutcome> {
+    let mut runner = Runner::new(&config::ResourceLimits::default());
+    runner.fence = Some(ScopeFence::build(fence_roots));
+    let scope_key = config::scope_key_for_dir(scope_path);
+    let id = enum_task_id_for_path(generation, scope_path);
+    let expected_rev = store.scope_rev(&scope_key).await?;
+    let idempotency = format!("idem:{id}");
+    let task = NewTask {
+        id: &id,
+        kind: KIND_ENUM,
+        generation,
+        dir_id: None,
+        scope_key: &scope_key,
+        expected_rev,
+        idempotency_key: &idempotency,
+    };
+    store.enqueue_task(&task, store::now_ms()).await?;
+    let claimed = store
+        .claim_tasks(store.epoch(), 16, LEASE_TTL_MS, store::now_ms())
+        .await?;
+    let claimed = claimed.into_iter().next().ok_or_else(|| {
+        repo_scan::Error::Store(String::from("fenced enum hook: claim returned no task"))
+    })?;
+    exec_enumerate(&mut runner, store, generation, &claimed).await
 }

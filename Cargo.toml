@@ -51,6 +51,9 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 tempfile = "3"
 # MACOS_QUAL §1.3: direct libc for getfsstat/getattrlist/getattrlistbulk.
 libc = "0.2"
+# SEC-REPORT: SHA-256 receipts for staged/snapshot/published bytes. Exact
+# pin; already in Cargo.lock via the gix closure (no new packages).
+sha2 = "=0.11.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # MACOS_QUAL §1.1: full FSEvents history surface (UUID + dispatch queue +

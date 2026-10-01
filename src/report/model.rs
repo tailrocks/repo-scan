@@ -60,7 +60,8 @@ pub struct Scan {
     pub generation: u64,
     pub epoch: u64,
     pub catalog_revision: u64,
-    /// Target URL exactly as supplied.
+    /// Target URL as supplied, with embedded credentials redacted (never a
+    /// password or token; see `identity::redact_credentials`).
     pub target_url: String,
     /// Normalized canonical form, when the shape is supported.
     pub canonical_url: Option<String>,

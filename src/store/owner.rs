@@ -26,6 +26,12 @@ pub const LOCK_FILE_NAME: &str = "instance.lock";
 pub const PAYLOAD_DIR_NAME: &str = "payload";
 /// Catalog database filename inside the payload namespace.
 pub const CATALOG_DB_NAME: &str = "catalog.db";
+/// Owner-only directory mode for state/payload/staging/snapshot dirs (unix).
+#[cfg(unix)]
+pub const STATE_DIR_MODE: u32 = 0o700;
+/// Owner-only file mode for the lock, marker, and staged/snapshot files (unix).
+#[cfg(unix)]
+pub const STATE_FILE_MODE: u32 = 0o600;
 
 /// `<state_dir>/payload`.
 pub fn payload_dir(state_dir: &Path) -> PathBuf {
@@ -56,15 +62,34 @@ pub struct OwnerGuard {
 
 impl OwnerGuard {
     /// Create the layout, acquire an exclusive non-blocking lock, and record
-    /// an occupancy note. Fails when another owner holds the lock.
+    /// an occupancy note. Fails when another owner holds the lock. State and
+    /// payload dirs are owner-only (`0o700`); the lock file is `0o600`.
+    /// Symlinked state components are refused (fail closed).
     pub fn acquire(state_dir: &Path) -> crate::Result<Self> {
-        std::fs::create_dir_all(payload_dir(state_dir))?;
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(lock_path(state_dir))?;
+        if is_symlink_path(state_dir)? {
+            return Err(symlink_refusal("state dir is a symlink"));
+        }
+        ensure_private_dir_all(state_dir)?;
+        let payload = payload_dir(state_dir);
+        ensure_private_dir_all(&payload)?;
+        let lock = lock_path(state_dir);
+        if is_symlink_path(&lock)? {
+            return Err(symlink_refusal("coordination lock is a symlink"));
+        }
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(STATE_FILE_MODE);
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = opts.open(&lock)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(STATE_FILE_MODE))?;
+        }
         lock_exclusive(&file)?;
         let note = format!(
             "pid={} time_ms={}\n",
@@ -132,4 +157,54 @@ fn lock_exclusive(_file: &std::fs::File) -> crate::Result<()> {
     Err(Error::Config(
         "owner lock requires a unix platform (flock)".to_string(),
     ))
+}
+
+/// True when `path` itself is a symlink (lstat semantics). Missing paths
+/// report false; other inspection failures are errors (fail closed).
+pub fn is_symlink_path(path: &Path) -> crate::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(md) => Ok(md.file_type().is_symlink()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(Error::Io(format!("cannot inspect {}: {e}", path.display()))),
+    }
+}
+
+fn symlink_refusal(detail: &str) -> Error {
+    Error::Store(format!("refusing symlinked state component: {detail}"))
+}
+
+/// Create `path` (parents as needed) as an owner-only directory (`0o700` on
+/// unix, applied to the target itself whether newly created or pre-existing).
+/// A symlinked target is refused before and after creation (fail closed).
+#[cfg(unix)]
+pub fn ensure_private_dir_all(path: &Path) -> crate::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if is_symlink_path(path)? {
+        return Err(symlink_refusal(&format!(
+            "directory is a symlink: {}",
+            path.display()
+        )));
+    }
+    std::fs::create_dir_all(path)?;
+    if is_symlink_path(path)? {
+        return Err(symlink_refusal(&format!(
+            "directory is a symlink: {}",
+            path.display()
+        )));
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(STATE_DIR_MODE))?;
+    Ok(())
+}
+
+/// Portable fallback: create the directory; modes are unix-only.
+#[cfg(not(unix))]
+pub fn ensure_private_dir_all(path: &Path) -> crate::Result<()> {
+    if is_symlink_path(path)? {
+        return Err(symlink_refusal(&format!(
+            "directory is a symlink: {}",
+            path.display()
+        )));
+    }
+    std::fs::create_dir_all(path)?;
+    Ok(())
 }

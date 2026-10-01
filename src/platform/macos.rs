@@ -90,6 +90,17 @@ fn volume_uuid_of(mount_path: &Path) -> Option<String> {
     Some(format_uuid_bytes(&buf))
 }
 
+/// Device-anchored fallback volume identity (Item 11): colon-free and
+/// byte-exact. The mount path hex-encodes raw bytes instead of the lossy
+/// display rendering (which could collide), and carries no `:` that would
+/// corrupt planner-key parsing, which splits the volume at the first `:`.
+pub fn dev_fallback_volume_id(anchor: &str, mount_path: &Path) -> VolumeId {
+    VolumeId(format!(
+        "dev-{anchor}-{}",
+        crate::config::encode_hex(&crate::config::path_as_bytes(mount_path))
+    ))
+}
+
 /// Native macOS mount table (`getfsstat`).
 #[derive(Debug, Default)]
 pub struct MacOsMountTable;
@@ -161,7 +172,7 @@ impl MountTable for MacOsMountTable {
                     let anchor = device_of(&mount_path)
                         .map(|d| d.to_string())
                         .unwrap_or_else(|_| String::from("unknown"));
-                    VolumeId(format!("dev:{anchor}@{}", mount_path.display()))
+                    dev_fallback_volume_id(&anchor, &mount_path)
                 }
             };
             mounts.push(MountPoint {
@@ -504,7 +515,23 @@ impl EventBatchIter for FsEventStreamIter {
                 break;
             }
             match self.rx.try_recv() {
-                Err(_) => break,
+                // RSF-F940: Empty (caught up) and Disconnected (stream
+                // lost) must never be conflated. A dead callback channel
+                // is lost history: surface it so the owner invalidates
+                // the volume scope instead of silently ending the stream.
+                Err(error) => match crate::events::classify_try_recv(error) {
+                    crate::events::TryRecvAction::CaughtUp => break,
+                    crate::events::TryRecvAction::StreamLost => {
+                        if count == 0 && signals.is_empty() && !history_done {
+                            return Err(crate::Error::Events(format!(
+                                "FSEvents callback channel disconnected for volume {}; \
+                                 stream lost, volume scope must be invalidated",
+                                self.volume_key
+                            )));
+                        }
+                        break;
+                    }
+                },
                 Ok(event) => {
                     count += 1;
                     bytes += event.path.len();

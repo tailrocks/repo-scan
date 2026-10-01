@@ -4,10 +4,14 @@
 //!
 //! Two pieces: [`Counters`] (monotonic owner-side event counters, cheap
 //! atomic increments) and [`FootprintSampler`] (periodic RSS/CPU/descriptor
-//! footprint implementing [`Telemetry`]). Helper CPU/RSS contributions are
-//! folded in through [`SamplerInputs`] supplied by the owner, which tracks
-//! helper processes; exited-helper CPU is retained in
-//! [`SamplerInputs::helpers_cpu_seconds`] so respawning cannot reset it.
+//! footprint implementing [`Telemetry`]). Reaped-subprocess CPU is measured
+//! automatically via `getrusage(RUSAGE_CHILDREN)`; additional retained helper
+//! CPU beyond what the kernel sees arrives through [`SamplerInputs`]. Live
+//! helper RSS is `Some(n)` when measured (including `Some(0)` when no helpers
+//! exist) and `None` when live helpers exist but are not instrumented — an
+//! honest unknown, never a fake zero. On macOS the owner RSS reading is a
+//! `ru_maxrss` peak stand-in and stays labeled peak (see
+//! [`ResourceSample::rss_is_peak`] and [`Telemetry::accounting_method`]).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime};
@@ -17,12 +21,29 @@ use std::time::{Instant, SystemTime};
 pub struct ResourceSample {
     /// When the sample was taken.
     pub at: SystemTime,
-    /// Aggregate RSS bytes (owner + live helpers).
+    /// Aggregate RSS bytes: owner plus known live-helper RSS. When helper
+    /// RSS is unknown (`helpers_rss_bytes == None`) this is owner-only and
+    /// understates the family; check `helpers_rss_bytes` before treating it
+    /// as a family total.
     pub aggregate_rss_bytes: u64,
+    /// Owner RSS bytes alone.
+    pub owner_rss_bytes: u64,
+    /// Live-helper RSS bytes when known. `Some(0)` means measured zero (no
+    /// helpers exist); `None` means honest unknown (live helpers exist but
+    /// per-helper RSS is not instrumented) — never a fake zero.
+    pub helpers_rss_bytes: Option<u64>,
+    /// True when RSS readings on this target are `ru_maxrss` peak stand-ins
+    /// (macOS), not current RSS. Peak stays labeled peak.
+    pub rss_is_peak: bool,
     /// Rolling mean logical cores over the 10 s window.
     pub rolling_cores: f64,
-    /// Cumulative CPU seconds incl. exited children.
+    /// Cumulative CPU seconds: owner plus measured reaped-children CPU plus
+    /// owner-retained helper CPU.
     pub cpu_seconds: f64,
+    /// Owner CPU seconds alone (`RUSAGE_SELF`).
+    pub owner_cpu_seconds: f64,
+    /// Measured reaped-children CPU seconds (`RUSAGE_CHILDREN`; 0 on non-unix).
+    pub children_cpu_seconds: f64,
     /// Application-controlled descriptors in use (cap: 64).
     pub app_fds: usize,
     /// Currently admitted operations by class.
@@ -111,14 +132,21 @@ impl Counters {
     }
 }
 
-/// Owner-supplied helper contributions folded into each sample. The owner
-/// updates these as helpers report or exit; exited-helper CPU seconds are
-/// retained here forever so respawning cannot reset the measurement.
-#[derive(Debug, Clone, Default)]
+/// Owner-supplied helper contributions folded into each sample.
+/// Reaped local subprocess CPU is measured automatically via
+/// `RUSAGE_CHILDREN` inside [`FootprintSampler::sample_with`]; the owner
+/// passes 0.0 unless it tracks CPU the kernel cannot see (e.g. remote
+/// helpers). Retained values persist forever so respawning cannot reset the
+/// measurement.
+#[derive(Debug, Clone)]
 pub struct SamplerInputs {
-    /// Sum of live-helper RSS bytes (owner adds its own).
-    pub helpers_rss_bytes: u64,
-    /// Cumulative helper CPU seconds, including exited helpers.
+    /// Live-helper RSS bytes when known: `Some(0)` when `helpers == 0`
+    /// (measured zero, no helpers exist); `None` when live helpers exist
+    /// but their RSS is not instrumented (honest unknown, never fake 0).
+    /// Build with [`live_helper_rss_bytes`] unless the owner measures helpers.
+    pub helpers_rss_bytes: Option<u64>,
+    /// Additional retained helper CPU seconds beyond measured reaped-children
+    /// CPU. Never negative (clamped at sampling time).
     pub helpers_cpu_seconds: f64,
     /// Application-controlled descriptors in use (cap: 64).
     pub app_fds: usize,
@@ -128,6 +156,38 @@ pub struct SamplerInputs {
     pub admitted_git_probes: usize,
     /// Live helper processes incl. still-stuck.
     pub helpers: usize,
+}
+
+impl Default for SamplerInputs {
+    fn default() -> Self {
+        Self {
+            // No helpers tracked: measured zero, not unknown.
+            helpers_rss_bytes: Some(0),
+            helpers_cpu_seconds: 0.0,
+            app_fds: 0,
+            admitted_enum_ops: 0,
+            admitted_git_probes: 0,
+            helpers: 0,
+        }
+    }
+}
+
+/// Live-helper RSS honesty helper (RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1):
+/// `Some(0)` when no helpers exist (measured zero); `None` when live helpers
+/// exist but per-helper RSS is not instrumented (honest unknown, never a
+/// hardcoded fake zero).
+pub fn live_helper_rss_bytes(helpers_live: usize) -> Option<u64> {
+    if helpers_live == 0 {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+/// True when RSS readings on this target are `ru_maxrss` peak stand-ins
+/// (macOS), not current RSS. Peak stays labeled peak.
+pub fn rss_is_peak() -> bool {
+    cfg!(target_os = "macos")
 }
 
 /// Rolling CPU window: keeps (instant, cumulative CPU seconds) samples and
@@ -207,9 +267,7 @@ fn owner_cpu_seconds() -> f64 {
     if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
         return 0.0;
     }
-    let secs = usage.ru_utime.tv_sec as f64 + usage.ru_stime.tv_sec as f64;
-    let micros = usage.ru_utime.tv_usec as f64 + usage.ru_stime.tv_usec as f64;
-    secs + micros / 1_000_000.0
+    rusage_cpu_seconds(&usage)
 }
 
 /// Owner CPU fallback for non-unix targets.
@@ -218,16 +276,47 @@ fn owner_cpu_seconds() -> f64 {
     0.0
 }
 
+#[cfg(unix)]
+fn rusage_cpu_seconds(usage: &libc::rusage) -> f64 {
+    let secs = usage.ru_utime.tv_sec as f64 + usage.ru_stime.tv_sec as f64;
+    let micros = usage.ru_utime.tv_usec as f64 + usage.ru_stime.tv_usec as f64;
+    secs + micros / 1_000_000.0
+}
+
+/// Measured reaped-children CPU seconds (user + system) via
+/// `getrusage(RUSAGE_CHILDREN)` (RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1).
+/// This captures short-lived subprocess CPU (e.g. installed-git fallback
+/// probes) so respawning cannot reset the measurement. Returns 0.0 when the
+/// call fails.
+#[cfg(unix)]
+pub fn reaped_children_cpu_seconds() -> f64 {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: usage is writable for the call.
+    if unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut usage) } != 0 {
+        return 0.0;
+    }
+    rusage_cpu_seconds(&usage).max(0.0)
+}
+
+/// Reaped-children CPU fallback for non-unix targets.
+#[cfg(not(unix))]
+pub fn reaped_children_cpu_seconds() -> f64 {
+    0.0
+}
+
 /// How this target measures RSS/CPU (reported with results, spec §18).
+/// Helper CPU is measured via `RUSAGE_CHILDREN` plus owner-retained input;
+/// helper RSS is `Some(n)` when measured and `None` (honest unknown, aggregate
+/// is owner-only) when live helpers exist but are not instrumented.
 #[cfg(target_os = "linux")]
 const ACCOUNTING_METHOD: &str =
-    "linux: owner RSS from /proc/self/statm resident pages; owner CPU from getrusage(RUSAGE_SELF); helper RSS/CPU folded in via SamplerInputs (exited-helper CPU retained)";
+    "linux: owner RSS (current) from /proc/self/statm resident pages; CPU = getrusage(RUSAGE_SELF) + measured getrusage(RUSAGE_CHILDREN) + owner-retained SamplerInputs.helpers_cpu_seconds; live-helper RSS is Some(n) when measured (Some(0)=measured zero, no helpers) and None=honest unknown when live helpers exist but are not instrumented (aggregate is owner-only then)";
 #[cfg(target_os = "macos")]
 const ACCOUNTING_METHOD: &str =
-    "macos: owner RSS approximated by getrusage ru_maxrss peak (task_info current-RSS wiring pending); owner CPU from getrusage(RUSAGE_SELF); helper RSS/CPU folded in via SamplerInputs (exited-helper CPU retained)";
+    "macos: owner RSS is getrusage ru_maxrss PEAK bytes, not current RSS (task_info current-RSS wiring pending; peak stays labeled peak); CPU = getrusage(RUSAGE_SELF) + measured getrusage(RUSAGE_CHILDREN) + owner-retained SamplerInputs.helpers_cpu_seconds; live-helper RSS is Some(n) when measured (Some(0)=measured zero, no helpers) and None=honest unknown when live helpers exist but are not instrumented (aggregate is owner-peak-only then)";
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 const ACCOUNTING_METHOD: &str =
-    "fallback: owner RSS/CPU unsupported on this target (reported 0); helper contributions via SamplerInputs only";
+    "fallback: owner RSS/CPU unsupported on this target (reported 0); reaped-children CPU unsupported (0); live-helper RSS via SamplerInputs only (Some(n)=measured, None=honest unknown)";
 
 /// Periodic footprint sampler implementing [`Telemetry`]. Interior
 /// mutability is confined to the rolling CPU window; inputs are supplied
@@ -245,20 +334,37 @@ impl FootprintSampler {
     }
 
     /// Take one sample with these owner-supplied helper/admission inputs.
+    /// Reaped-subprocess CPU (`RUSAGE_CHILDREN`) is measured automatically on
+    /// top of the owner-retained input so short-lived subprocess CPU (e.g.
+    /// installed-git fallback probes) cannot be reset by respawning. When
+    /// helper RSS is unknown (`None`), the aggregate is owner-only.
     pub fn sample_with(&self, inputs: &SamplerInputs) -> ResourceSample {
         let now = Instant::now();
-        let cpu = owner_cpu_seconds() + inputs.helpers_cpu_seconds.max(0.0);
+        let owner_cpu = owner_cpu_seconds();
+        let children_cpu = reaped_children_cpu_seconds();
+        let retained = inputs.helpers_cpu_seconds.max(0.0);
+        let cpu = owner_cpu + children_cpu + retained;
         let rolling_cores = self
             .rolling
             .lock()
             .map(|mut r| r.observe(now, cpu))
             .unwrap_or(0.0);
         *self.last_sample.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
+        let owner_rss = owner_rss_bytes();
+        let aggregate_rss_bytes = match inputs.helpers_rss_bytes {
+            Some(helper_rss) => owner_rss.saturating_add(helper_rss),
+            None => owner_rss,
+        };
         ResourceSample {
             at: SystemTime::now(),
-            aggregate_rss_bytes: owner_rss_bytes().saturating_add(inputs.helpers_rss_bytes),
+            aggregate_rss_bytes,
+            owner_rss_bytes: owner_rss,
+            helpers_rss_bytes: inputs.helpers_rss_bytes,
+            rss_is_peak: rss_is_peak(),
             rolling_cores,
             cpu_seconds: cpu,
+            owner_cpu_seconds: owner_cpu,
+            children_cpu_seconds: children_cpu,
             app_fds: inputs.app_fds,
             admitted_enum_ops: inputs.admitted_enum_ops,
             admitted_git_probes: inputs.admitted_git_probes,

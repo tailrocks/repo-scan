@@ -26,7 +26,7 @@ must NOT be `COMPLETE`. This file is the preserved incompatibility record.
 
 ## Implementation destination
 
-- Project directory: `/Users/donbeave/Projects/repo-scan` (in place; the
+- Project directory: this checkout (repo root; in place; the
   directory is already named `repo-scan` and contains only spec/goal docs, so
   it is the designated implementation checkout — no nested `repo-scan/`
   created, no unrelated repo overwritten).

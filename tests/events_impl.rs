@@ -12,16 +12,18 @@
 //! macOS adds `live_*` tests asserting real history-UUID round-trips and
 //! stream open against the native `objc2-core-services` stack.
 
+use repo_scan::config::scope_key_for_dir;
 use repo_scan::events::{
-    coalesce_invalidations, continuity_plan, decide_open, journal_cursor_string, monitor_volumes,
-    parse_journal_cursor, portable, validate_live_progress, volume_cursor_from_rows,
-    BatchCoalescer, BookkeepingClass, ContinuitySignal, CursorJournal, EventBatch, EventCursorId,
-    HistoryUuid, MemoryCursorJournal, MemorySink, OpenDecision, RawFlags, Reconciler, VolumeCursor,
-    WorkChecker, MAX_BATCH_BYTES, MAX_BATCH_EVENTS,
+    coalesce_invalidations, continuity_plan, decide_open, dir_scope_for_subtree_key,
+    journal_cursor_string, monitor_volumes, parse_journal_cursor, portable, subtree_scope_key,
+    validate_live_progress, volume_cursor_from_rows, BatchCoalescer, BookkeepingClass,
+    ContinuitySignal, CursorJournal, EventBatch, EventCursorId, HistoryUuid, MemoryCursorJournal,
+    MemorySink, OpenDecision, RawFlags, Reconciler, VolumeCursor, WorkChecker, MAX_BATCH_BYTES,
+    MAX_BATCH_EVENTS,
 };
 use repo_scan::platform::{EventBatchIter, EventSource, VolumeId};
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn batch(volume: &str, high_water: u64, paths: &[&str]) -> EventBatch {
     EventBatch {
@@ -431,7 +433,15 @@ fn subtree_invalidation_plans() {
     );
     assert_eq!(plans.len(), 1);
     assert!(plans[0].recursive);
-    assert!(plans[0].scope_key.contains("vol-a"));
+    // Exact planner key plus planner-to-scheduler `dir:` agreement.
+    let moved_in = Path::new("/moved/in");
+    assert_eq!(plans[0].scope_key, subtree_scope_key("vol-a", moved_in));
+    assert_eq!(
+        dir_scope_for_subtree_key(&plans[0].scope_key),
+        Some(scope_key_for_dir(moved_in)),
+        "{}",
+        plans[0].scope_key
+    );
 
     // Overflow form: MustScanSubDirs with no paths means the watched roots.
     let plans = continuity_plan("vol-a", &[ContinuitySignal::MustScanSubDirs], &[]);
@@ -675,10 +685,20 @@ fn scripted_source_end_to_end() {
 
     let mut sink = MemorySink::new();
     let outcome = r.reconcile_volume("vol-a", &mut sink).expect("reconcile");
-    assert!(outcome
-        .invalidated_scopes
-        .iter()
-        .any(|s| s.contains("moved-in")));
+    // Exact planner key for the moved-in subtree, plus planner-to-scheduler
+    // `dir:` agreement through the total mapping.
+    let moved_in = Path::new("/a/moved-in");
+    let planner_key = subtree_scope_key("vol-a", moved_in);
+    assert!(
+        outcome.invalidated_scopes.contains(&planner_key),
+        "{:?}",
+        outcome.invalidated_scopes
+    );
+    assert_eq!(
+        dir_scope_for_subtree_key(&planner_key),
+        Some(scope_key_for_dir(moved_in)),
+        "{planner_key}"
+    );
     for scope in sink.pending_scopes() {
         sink.complete_scope(&scope);
     }

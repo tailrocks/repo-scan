@@ -268,7 +268,10 @@ fn r5_events_ingest_reconcile() {
         assert!(!outcome.history_invalid);
         assert_eq!(outcome.batches, 1);
         assert!(outcome.scopes >= 2, "path + parent: {:?}", outcome.scopes);
-        assert!(outcome.tx >= 2, "append + invalidations: {}", outcome.tx);
+        assert_eq!(
+            outcome.tx, 1,
+            "atomic ingest (RSF-F940): cursor + invalidations in one commit"
+        );
         let dir_scope = repo_scan::config::scope_key_for_dir(&changed);
         assert_eq!(store.scope_rev(&dir_scope).await.expect("rev"), 1);
         let mut rows = store

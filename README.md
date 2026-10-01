@@ -4,8 +4,8 @@ Deterministic, resource-conscious discovery of local copies of a GitHub reposito
 Given a repository URL, `repo-scan` finds matching clones, worktrees, and bare stores,
 inspects branches and working state, and writes a JSON report a recovery agent can consume.
 
-Spec: [repo-scan-spec.md](/Users/donbeave/Projects/repo-scan/repo-scan-spec.md).
-Adversarial command-path review: [docs/REVIEW_WF4.md](/Users/donbeave/Projects/repo-scan/docs/REVIEW_WF4.md).
+Spec: [repo-scan-spec.md](repo-scan-spec.md).
+Adversarial command-path review: [docs/REVIEW_WF4.md](docs/REVIEW_WF4.md).
 
 ## Install / build
 
@@ -18,7 +18,7 @@ cargo build --release
 
 No runtime dependencies: no LLM, cloud service, daemon, GUI, or TUI. Installed Git is
 an optional compatibility backend only. Locked deps: `turso =0.8.1`, `dua-core =4.1.0`,
-`gix =0.88.0` ([Cargo.toml](/Users/donbeave/Projects/repo-scan/Cargo.toml:19)).
+`gix =0.88.0` ([Cargo.toml](Cargo.toml:19)).
 
 ## Test
 
@@ -28,7 +28,7 @@ cargo bench --bench walk_compare   # adapter equivalence (fails on mismatch)
 cargo bench --bench scan_cycle     # traversal / cached-query / invalidate / resume
 ```
 
-Details and results discipline: [docs/BENCHMARKS.md](/Users/donbeave/Projects/repo-scan/docs/BENCHMARKS.md).
+Details and results discipline: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Usage: the six commands
 
@@ -64,7 +64,7 @@ superseded resume, `130` interrupted after bounded progress save.
 - `--state-dir PATH` (global): tool state location. Default on macOS is
   `~/Library/Application Support/repo-scan`; elsewhere `$XDG_STATE_HOME/repo-scan`
   or `~/.local/state/repo-scan`. Resolved to an absolute path once
-  ([src/config.rs](/Users/donbeave/Projects/repo-scan/src/config.rs:148)). Layout:
+  ([src/config.rs](src/config.rs:148)). Layout:
   `instance.lock` (coordination, never deleted) + `payload/` (database, snapshots).
 - `--status metadata|summary|full` (scan only, default `summary`): working-state
   depth. `metadata` skips status probes; `summary` collapses each untracked directory
@@ -78,7 +78,7 @@ superseded resume, `130` interrupted after bounded progress save.
 
 ## Docs
 
-- [docs/BENCHMARKS.md](/Users/donbeave/Projects/repo-scan/docs/BENCHMARKS.md) — reproducible bench commands + results tables.
-- [docs/TROUBLESHOOTING.md](/Users/donbeave/Projects/repo-scan/docs/TROUBLESHOOTING.md) — lock contention, empty catalog, unsafe state dir, interrupted scans.
-- [docs/CHECKLIST.md](/Users/donbeave/Projects/repo-scan/docs/CHECKLIST.md) — acceptance-ID traceability with test evidence.
-- [docs/ARCHITECTURE.md](/Users/donbeave/Projects/repo-scan/docs/ARCHITECTURE.md), `docs/*_QUAL.md` — design and dependency qualification.
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — reproducible bench commands + results tables.
+- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — lock contention, empty catalog, unsafe state dir, interrupted scans.
+- [docs/CHECKLIST.md](docs/CHECKLIST.md) — acceptance-ID traceability with test evidence.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), `docs/*_QUAL.md` — design and dependency qualification.

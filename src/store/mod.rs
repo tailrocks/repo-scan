@@ -26,10 +26,10 @@ pub mod writer;
 
 pub use catalog::{
     task_state_as_str, task_state_from_str, CheckoutRow, ClaimedTask, DirObservation, DirRecord,
-    ErrorRow, EventRow, FrontierTask, GenerationRow, GitInstanceRow, NewCheckout, NewGitInstance,
-    NewRef, NewRemote, NewScan, NewStatus, NewTask, NewVolume, RecoveryReport, RefRow, RemoteRow,
-    ReportSnapshotRow, ScanRow, StatusRow, StoreStats, TaskOutcome, TursoStore, VolumeRow,
-    WalStatus,
+    ErrorRow, EventRow, FrontierTask, GenerationRow, GitInstanceRow, IngestedBatch, NewCheckout,
+    NewGitInstance, NewRef, NewRemote, NewScan, NewStatus, NewTask, NewVolume, RecoveryReport,
+    RefRow, RemoteRow, ReportSnapshotRow, ScanRow, StatusRow, StoreStats, TaskOutcome, TursoStore,
+    VolumeRow, WalStatus,
 };
 pub use checkpoint::{CheckpointCoordinator, CheckpointPolicy, CheckpointStats};
 pub use owner::{catalog_db_path, lock_path, payload_dir, OwnerGuard};

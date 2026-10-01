@@ -73,7 +73,8 @@ pub struct StoreStats {
 static LEASE_TOKENS: AtomicI64 = AtomicI64::new(1);
 
 fn fresh_token() -> i64 {
-    let base = (std::process::id() as i64) << 48;
+    // fix10: pid is `u32`, statically lossless into `i64`.
+    let base = i64::from(std::process::id()) << 48;
     let token = base ^ LEASE_TOKENS.fetch_add(1, Ordering::Relaxed);
     if token == 0 {
         1
@@ -127,6 +128,27 @@ fn opt_i64(row: &turso::Row, idx: usize) -> crate::Result<Option<i64>> {
             "column {idx} expected INTEGER or NULL, got {other:?}"
         ))),
     }
+}
+
+/// `u64` → `INTEGER` for catalog writes: values past `i64::MAX` are a
+/// caller defect, never silently wrapped (fix10).
+fn u64_to_i64(value: u64, what: &str) -> crate::Result<i64> {
+    i64::try_from(value).map_err(|_| Error::Store(format!("{what} {value} exceeds i64 range")))
+}
+
+/// `u64` → `INTEGER` for the `buffer_*` family, which returns
+/// `WriterBatch::should_flush` (`bool`) and cannot propagate `Error`.
+/// Same fail-loud contract as [`u64_to_i64`]: out-of-range input is a
+/// caller defect and panics instead of wrapping (fix10).
+fn u64_to_i64_buf(value: u64, what: &str) -> i64 {
+    u64_to_i64(value, what).unwrap_or_else(|err| panic!("{err}"))
+}
+
+/// `INTEGER` → `u64` for catalog reads: negative stored values are
+/// catalog corruption, never silently wrapped (fix10).
+fn i64_to_u64(value: i64, what: &str) -> crate::Result<u64> {
+    u64::try_from(value)
+        .map_err(|_| Error::Store(format!("{what} {value} in catalog is not a valid u64")))
 }
 
 fn req_text(row: &turso::Row, idx: usize) -> crate::Result<String> {
@@ -233,17 +255,19 @@ impl FrontierTask {
         Ok(Self {
             id: req_text(row, 0)?,
             kind: req_text(row, 1)?,
-            generation: req_i64(row, 2)? as u64,
+            generation: i64_to_u64(req_i64(row, 2)?, "task generation")?,
             dir_id: opt_i64(row, 3)?,
             scope_key: req_text(row, 4)?,
-            expected_rev: req_i64(row, 5)? as u64,
+            expected_rev: i64_to_u64(req_i64(row, 5)?, "task expected_rev")?,
             state: task_state_from_str(&req_text(row, 6)?)?,
             lease_token: opt_i64(row, 7)?,
-            lease_epoch: opt_i64(row, 8)?.map(|epoch| epoch as u64),
+            lease_epoch: opt_i64(row, 8)?
+                .map(|epoch| i64_to_u64(epoch, "task lease_epoch"))
+                .transpose()?,
             lease_expires_ms: opt_i64(row, 9)?,
             idempotency_key: req_text(row, 10)?,
             retry_after_ms: opt_i64(row, 11)?,
-            attempts: req_i64(row, 12)? as u64,
+            attempts: i64_to_u64(req_i64(row, 12)?, "task attempts")?,
         })
     }
 }
@@ -379,6 +403,11 @@ impl TursoStore {
     /// Owner-only writer connection. Report streaming uses `prepare` plus
     /// `Rows::next()` on this or a dedicated reader; never buffering batch
     /// APIs. The owner serializes writer use.
+    ///
+    /// On a read-only handle the underlying database is engine-enforced
+    /// read-only (`TursoStore::open_read_only`), so even raw `execute`
+    /// calls through this handle fail in the engine; every writer entry
+    /// point additionally refuses up front via `forbid_write`.
     pub fn connection(&self) -> &turso::Connection {
         &self.conn
     }
@@ -402,13 +431,18 @@ impl TursoStore {
         let conn = db.connect().map_err(store_err)?;
         Self::apply_pragmas(&conn).await?;
         let schema_version = Self::migrate(&conn).await?;
-        let epoch = Self::with_tx_on(&conn, |tx| async move {
-            let current = Self::read_meta_i64(tx, "epoch").await?.unwrap_or(0);
-            let next = current + 1;
-            Self::write_meta_i64(tx, "epoch", next).await?;
-            Ok::<i64, Error>(next)
-        })
-        .await? as u64;
+        let epoch = i64_to_u64(
+            Self::with_tx_on(&conn, |tx| async move {
+                let current = Self::read_meta_i64(tx, "epoch").await?.unwrap_or(0);
+                let next = current
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Store("catalog epoch overflow".to_string()))?;
+                Self::write_meta_i64(tx, "epoch", next).await?;
+                Ok::<i64, Error>(next)
+            })
+            .await?,
+            "catalog epoch",
+        )?;
         let now = crate::store::now_ms();
         Self::with_tx_on(&conn, |tx| async move {
             Self::recover_on(tx, epoch, now).await?;
@@ -429,8 +463,11 @@ impl TursoStore {
 
     /// Open an existing catalog read-only for cached queries (spec §3):
     /// no epoch claim, no crash-recovery writes, no migrations, no PRAGMA
-    /// assignments — only reads. The handle reports the stored epoch
-    /// unbumped, and every writer entry point refuses. Recovery runs only
+    /// assignments — only reads. The database itself opens engine-enforced
+    /// read-only (`Builder::read_only`, Item 10), so mutations fail in the
+    /// engine even through the raw `connection()` handle. The handle
+    /// reports the stored epoch unbumped, and every writer entry point
+    /// refuses. Recovery runs only
     /// when leases actually block, via
     /// [`TursoStore::recover_if_blocked`] on a read-write handle.
     /// Returns a store error (not a catalog) when the database file is
@@ -445,7 +482,14 @@ impl TursoStore {
         let path_str = db_path.to_str().ok_or_else(|| {
             Error::Store(format!("database path is not UTF-8: {}", db_path.display()))
         })?;
+        // Engine-enforced read-only (Item 10): the `read_only` builder
+        // flag opens with `OpenFlags::ReadOnly`
+        // (turso-0.8.1 lib.rs:284-285,341-344), so writes fail in the
+        // engine even through the raw `connection()` handle. The
+        // `read_only` flag plus `forbid_write` remain as the first
+        // refusal layer for writer entry points.
         let db = turso::Builder::new_local(path_str)
+            .read_only(true)
             .build()
             .await
             .map_err(store_err)?;
@@ -483,7 +527,10 @@ impl TursoStore {
                 crate::store::CURRENT_SCHEMA_VERSION
             )));
         }
-        let epoch = Self::read_meta_i64(&conn, "epoch").await?.unwrap_or(0) as u64;
+        let epoch = i64_to_u64(
+            Self::read_meta_i64(&conn, "epoch").await?.unwrap_or(0),
+            "catalog epoch",
+        )?;
         Self::assert_autocommit(&conn)?;
         Ok(Self {
             db,
@@ -768,7 +815,7 @@ impl TursoStore {
                     lease_epoch = NULL, lease_expires_ms = NULL, updated_at_ms = ?1 \
                     WHERE state = 'leased' AND (lease_epoch IS NULL OR lease_epoch != ?2 \
                     OR (lease_expires_ms IS NOT NULL AND lease_expires_ms <= ?1))",
-                vec![v_int(now_ms), v_int(epoch as i64)],
+                vec![v_int(now_ms), v_int(u64_to_i64(epoch, "recovery epoch")?)],
             )
             .await
             .map_err(store_err)?;
@@ -778,7 +825,7 @@ impl TursoStore {
             .map_err(store_err)?;
         let uncertain = match rows.next().await.map_err(store_err)? {
             None => 0,
-            Some(row) => req_i64(&row, 0)? as u64,
+            Some(row) => i64_to_u64(req_i64(&row, 0)?, "uncertain batch count")?,
         };
         conn.execute("DELETE FROM batches WHERE state = 'uncertain'", ())
             .await
@@ -806,13 +853,13 @@ impl TursoStore {
                 "SELECT COUNT(*) FROM frontier_tasks WHERE state = 'leased' \
                     AND (lease_epoch IS NULL OR lease_epoch != ?1 \
                     OR (lease_expires_ms IS NOT NULL AND lease_expires_ms <= ?2))",
-                vec![v_int(self.epoch as i64), v_int(now_ms)],
+                vec![v_int(u64_to_i64(self.epoch, "store epoch")?), v_int(now_ms)],
             )
             .await
             .map_err(store_err)?;
         match rows.next().await.map_err(store_err)? {
             None => Ok(0),
-            Some(row) => Ok(req_i64(&row, 0)? as u64),
+            Some(row) => Ok(i64_to_u64(req_i64(&row, 0)?, "blocking lease count")?),
         }
     }
 
@@ -850,10 +897,10 @@ impl TursoStore {
                 vec![
                     v_text(task.id),
                     v_text(task.kind),
-                    v_int(task.generation as i64),
+                    v_int(u64_to_i64(task.generation, "task generation")?),
                     v_opt_int(task.dir_id),
                     v_text(task.scope_key),
-                    v_int(task.expected_rev as i64),
+                    v_int(u64_to_i64(task.expected_rev, "task expected_rev")?),
                     v_text(task.idempotency_key),
                     v_int(now_ms),
                 ],
@@ -919,7 +966,12 @@ impl TursoStore {
             let mut claimed = Vec::with_capacity(tasks.len());
             for task in &tasks {
                 let token = fresh_token();
-                let expires = now_ms + ttl_ms;
+                // fix10: checked — an overflowing expiry would silently
+                // shorten the lease; near-`i64::MAX` clocks are a caller
+                // defect and fail the claim loudly.
+                let expires = now_ms.checked_add(ttl_ms).ok_or_else(|| {
+                    Error::Store(format!("lease expiry {now_ms} + {ttl_ms} overflows i64"))
+                })?;
                 let rows = conn
                     .execute(
                         "UPDATE frontier_tasks SET state = 'leased', lease_token = ?1, \
@@ -928,7 +980,7 @@ impl TursoStore {
                             AND (state = 'pending' OR state = 'retry_wait')",
                         vec![
                             v_int(token),
-                            v_int(epoch as i64),
+                            v_int(u64_to_i64(epoch, "lease epoch")?),
                             v_int(expires),
                             v_int(now_ms),
                             v_text(task.id.clone()),
@@ -942,7 +994,12 @@ impl TursoStore {
                     leased.lease_token = Some(token);
                     leased.lease_epoch = Some(epoch);
                     leased.lease_expires_ms = Some(expires);
-                    leased.attempts += 1;
+                    // fix10: saturating — `attempts` is a monotonic
+                    // telemetry counter, not a boundary; reaching
+                    // `u64::MAX` needs 2^64 claims, and saturating keeps
+                    // the "retried many times" signal without failing a
+                    // lease claim that already committed in SQL above.
+                    leased.attempts = leased.attempts.saturating_add(1);
                     claimed.push(ClaimedTask {
                         task: leased,
                         token,
@@ -982,8 +1039,9 @@ impl TursoStore {
                     AND retry_after_ms IS NOT NULL AND retry_after_ms <= ?2)) \
                     ORDER BY id ASC LIMIT {limit}"
             );
+            let generation_i64 = u64_to_i64(generation, "task generation")?;
             let mut rows = conn
-                .query(sql.as_str(), vec![v_int(generation as i64), v_int(now_ms)])
+                .query(sql.as_str(), vec![v_int(generation_i64), v_int(now_ms)])
                 .await
                 .map_err(store_err)?;
             let mut tasks = Vec::new();
@@ -993,7 +1051,11 @@ impl TursoStore {
             let mut claimed = Vec::with_capacity(tasks.len());
             for task in &tasks {
                 let token = fresh_token();
-                let expires = now_ms + ttl_ms;
+                // fix10: checked — see `claim_tasks`; an overflowing expiry
+                // must fail the claim, never silently shorten the lease.
+                let expires = now_ms.checked_add(ttl_ms).ok_or_else(|| {
+                    Error::Store(format!("lease expiry {now_ms} + {ttl_ms} overflows i64"))
+                })?;
                 let rows = conn
                     .execute(
                         "UPDATE frontier_tasks SET state = 'leased', lease_token = ?1, \
@@ -1002,7 +1064,7 @@ impl TursoStore {
                             AND (state = 'pending' OR state = 'retry_wait')",
                         vec![
                             v_int(token),
-                            v_int(epoch as i64),
+                            v_int(u64_to_i64(epoch, "lease epoch")?),
                             v_int(expires),
                             v_int(now_ms),
                             v_text(task.id.clone()),
@@ -1016,7 +1078,10 @@ impl TursoStore {
                     leased.lease_token = Some(token);
                     leased.lease_epoch = Some(epoch);
                     leased.lease_expires_ms = Some(expires);
-                    leased.attempts += 1;
+                    // fix10: saturating — see `claim_tasks`; `attempts` is
+                    // monotonic telemetry, and the SQL increment above
+                    // already committed.
+                    leased.attempts = leased.attempts.saturating_add(1);
                     claimed.push(ClaimedTask {
                         task: leased,
                         token,
@@ -1040,6 +1105,11 @@ impl TursoStore {
         now_ms: i64,
     ) -> crate::Result<bool> {
         self.forbid_write("renew_lease")?;
+        // fix10: checked — see `claim_tasks`; an overflowing expiry must
+        // fail the renew, never silently shorten the lease.
+        let expires = now_ms.checked_add(ttl_ms).ok_or_else(|| {
+            Error::Store(format!("lease expiry {now_ms} + {ttl_ms} overflows i64"))
+        })?;
         let rows = self
             .conn
             .execute(
@@ -1047,11 +1117,11 @@ impl TursoStore {
                     WHERE id = ?3 AND state = 'leased' AND lease_token = ?4 \
                     AND lease_epoch = ?5",
                 vec![
-                    v_int(now_ms + ttl_ms),
+                    v_int(expires),
                     v_int(now_ms),
                     v_text(task_id),
                     v_int(token),
-                    v_int(epoch as i64),
+                    v_int(u64_to_i64(epoch, "lease epoch")?),
                 ],
             )
             .await
@@ -1193,7 +1263,7 @@ impl TursoStore {
                     lease_epoch = NULL, lease_expires_ms = NULL, expected_rev = ?1, \
                     updated_at_ms = ?2 WHERE id = ?3",
                 vec![
-                    v_int(current_rev as i64),
+                    v_int(u64_to_i64(current_rev, "scope revision")?),
                     v_int(now_ms),
                     v_text(task.id.as_str()),
                 ],
@@ -1341,39 +1411,60 @@ impl TursoStore {
         now_ms: i64,
     ) -> crate::Result<u64> {
         self.with_tx(|conn| async move {
-            let next = Self::scope_rev_on(conn, scope_key).await? + 1;
-            conn.execute(
-                "INSERT OR REPLACE INTO scope_revisions (scope_key, rev, updated_at_ms) \
-                    VALUES (?1, ?2, ?3)",
-                vec![v_text(scope_key), v_int(next as i64), v_int(now_ms)],
-            )
-            .await
-            .map_err(store_err)?;
-            // Mirror directory scopes into `directories.invalidation_rev`
-            // (§11): `dir:` keys carry hex-encoded path bytes, never row ids,
-            // so the directory rows are looked up by path, not parsed.
-            Self::mirror_dir_invalidation(conn, scope_key, next).await?;
-            let task_id = format!("reconcile:{scope_key}:{next}");
-            let idempotency = format!("idem:{task_id}");
-            conn.execute(
-                "INSERT OR IGNORE INTO frontier_tasks (id, kind, generation, dir_id, \
-                    scope_key, expected_rev, state, idempotency_key, attempts, \
-                    updated_at_ms) VALUES (?1, 'reconcile', ?2, NULL, ?3, ?4, \
-                    'pending', ?5, 0, ?6)",
-                vec![
-                    v_text(task_id),
-                    v_int(generation as i64),
-                    v_text(scope_key),
-                    v_int(next as i64),
-                    v_text(idempotency),
-                    v_int(now_ms),
-                ],
-            )
-            .await
-            .map_err(store_err)?;
-            Ok::<u64, Error>(next)
+            Self::invalidate_scope_on(conn, scope_key, generation, now_ms).await
         })
         .await
+    }
+
+    /// One scope invalidation inside the caller's transaction: revision
+    /// bump, directory mirror, and reconcile-task enqueue. Shared by
+    /// [`TursoStore::invalidate_scope`] and the atomic event ingest
+    /// [`TursoStore::ingest_event_batch`] so both paths schedule identical
+    /// work. Returns the new revision.
+    async fn invalidate_scope_on(
+        conn: &turso::Connection,
+        scope_key: &str,
+        generation: u64,
+        now_ms: i64,
+    ) -> crate::Result<u64> {
+        let next = Self::scope_rev_on(conn, scope_key)
+            .await?
+            .checked_add(1)
+            .ok_or_else(|| Error::Store("scope revision overflow".to_string()))?;
+        let next_i64 = i64::try_from(next)
+            .map_err(|_| Error::Store(format!("scope revision {next} exceeds i64 range")))?;
+        let generation_i64 = i64::try_from(generation)
+            .map_err(|_| Error::Store(format!("generation {generation} exceeds i64 range")))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO scope_revisions (scope_key, rev, updated_at_ms) \
+                VALUES (?1, ?2, ?3)",
+            vec![v_text(scope_key), v_int(next_i64), v_int(now_ms)],
+        )
+        .await
+        .map_err(store_err)?;
+        // Mirror directory scopes into `directories.invalidation_rev`
+        // (§11): `dir:` keys carry hex-encoded path bytes, never row ids,
+        // so the directory rows are looked up by path, not parsed.
+        Self::mirror_dir_invalidation(conn, scope_key, next).await?;
+        let task_id = format!("reconcile:{scope_key}:{next}");
+        let idempotency = format!("idem:{task_id}");
+        conn.execute(
+            "INSERT OR IGNORE INTO frontier_tasks (id, kind, generation, dir_id, \
+                scope_key, expected_rev, state, idempotency_key, attempts, \
+                updated_at_ms) VALUES (?1, 'reconcile', ?2, NULL, ?3, ?4, \
+                'pending', ?5, 0, ?6)",
+            vec![
+                v_text(task_id),
+                v_int(generation_i64),
+                v_text(scope_key),
+                v_int(next_i64),
+                v_text(idempotency),
+                v_int(now_ms),
+            ],
+        )
+        .await
+        .map_err(store_err)?;
+        Ok(next)
     }
 
     /// Mirror a `dir:` scope invalidation into every matching
@@ -1420,10 +1511,12 @@ impl TursoStore {
                 ids.push(req_i64(&row, 0)?);
             }
         }
+        let rev_i64 = i64::try_from(rev)
+            .map_err(|_| Error::Store(format!("invalidation revision {rev} exceeds i64 range")))?;
         for id in ids {
             conn.execute(
                 "UPDATE directories SET invalidation_rev = ?1 WHERE id = ?2",
-                vec![v_int(rev as i64), v_int(id)],
+                vec![v_int(rev_i64), v_int(id)],
             )
             .await
             .map_err(store_err)?;
@@ -1446,7 +1539,14 @@ impl TursoStore {
             .map_err(store_err)?;
         match rows.next().await.map_err(store_err)? {
             None => Ok(0),
-            Some(row) => Ok(req_i64(&row, 0)? as u64),
+            Some(row) => {
+                let rev = req_i64(&row, 0)?;
+                u64::try_from(rev).map_err(|_| {
+                    Error::Store(format!(
+                        "scope revision {rev} in catalog is not a valid u64"
+                    ))
+                })
+            }
         }
     }
 
@@ -1458,13 +1558,13 @@ impl TursoStore {
             .query(
                 "SELECT COUNT(*) FROM frontier_tasks WHERE generation = ?1 \
                     AND state NOT IN ('complete', 'unsupported', 'cancelled', 'superseded')",
-                vec![v_int(generation as i64)],
+                vec![v_int(u64_to_i64(generation, "task generation")?)],
             )
             .await
             .map_err(store_err)?;
         match rows.next().await.map_err(store_err)? {
             None => Ok(0),
-            Some(row) => Ok(req_i64(&row, 0)? as u64),
+            Some(row) => Ok(i64_to_u64(req_i64(&row, 0)?, "pending task count")?),
         }
     }
 }
@@ -1503,7 +1603,7 @@ impl DirRecord {
             object_id: req_text(row, 5)?,
             incarnation: req_text(row, 6)?,
             last_observed_ms: opt_i64(row, 7)?,
-            invalidation_rev: req_i64(row, 8)? as u64,
+            invalidation_rev: i64_to_u64(req_i64(row, 8)?, "dir invalidation_rev")?,
         })
     }
 }
@@ -1531,10 +1631,10 @@ impl DirObservation {
     fn from_row(row: &turso::Row) -> crate::Result<Self> {
         Ok(Self {
             dir_id: req_i64(row, 0)?,
-            generation: req_i64(row, 1)? as u64,
+            generation: i64_to_u64(req_i64(row, 1)?, "dir observation generation")?,
             completed: req_i64(row, 2)? != 0,
-            entry_generation: req_i64(row, 3)? as u64,
-            entries_seen: req_i64(row, 4)? as u64,
+            entry_generation: i64_to_u64(req_i64(row, 3)?, "dir entry_generation")?,
+            entries_seen: i64_to_u64(req_i64(row, 4)?, "dir entries_seen")?,
             error: opt_text(row, 5)?,
             observed_at_ms: req_i64(row, 6)?,
         })
@@ -1852,7 +1952,7 @@ impl StatusRow {
             submodules: req_text(row, 10)?,
             unknown_fields: req_text(row, 11)?,
             input_fingerprint: opt_blob(row, 12)?,
-            observed_rev: req_i64(row, 13)? as u64,
+            observed_rev: i64_to_u64(req_i64(row, 13)?, "status observed_rev")?,
             observed_at_ms: req_i64(row, 14)?,
         })
     }
@@ -1975,8 +2075,8 @@ impl ReportSnapshotRow {
         Ok(Self {
             id: req_text(row, 0)?,
             schema_version: req_text(row, 1)?,
-            catalog_rev: req_i64(row, 2)? as u64,
-            generation: req_i64(row, 3)? as u64,
+            catalog_rev: i64_to_u64(req_i64(row, 2)?, "snapshot catalog_rev")?,
+            generation: i64_to_u64(req_i64(row, 3)?, "snapshot generation")?,
             publication_state: req_text(row, 4)?,
             checksum: opt_blob(row, 5)?,
             created_at_ms: req_i64(row, 6)?,
@@ -2014,7 +2114,7 @@ impl ErrorRow {
             scope_key: req_text(row, 1)?,
             category: req_text(row, 2)?,
             detail: req_text(row, 3)?,
-            attempts: req_i64(row, 4)? as u64,
+            attempts: i64_to_u64(req_i64(row, 4)?, "error attempts")?,
             first_seen_ms: req_i64(row, 5)?,
             last_seen_ms: req_i64(row, 6)?,
             next_retry_ms: opt_i64(row, 7)?,
@@ -2057,6 +2157,18 @@ impl EventRow {
             reconciled: req_i64(row, 7)? != 0,
         })
     }
+}
+
+/// Outcome of one atomic event-batch ingest
+/// ([`TursoStore::ingest_event_batch`], RSF-F940).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestedBatch {
+    /// True when the journal row was newly inserted. False on duplicate
+    /// `(volume, history UUID, cursor)` replays, which bump nothing.
+    pub inserted: bool,
+    /// New scope revision per requested scope, in order. Empty on
+    /// duplicates (nothing was bumped) and when no scopes were requested.
+    pub revs: Vec<u64>,
 }
 
 /// One durable volume record.
@@ -2127,10 +2239,12 @@ pub struct GenerationRow {
 impl GenerationRow {
     fn from_row(row: &turso::Row) -> crate::Result<Self> {
         Ok(Self {
-            id: req_i64(row, 0)? as u64,
+            id: i64_to_u64(req_i64(row, 0)?, "generation id")?,
             scope_policy: req_text(row, 1)?,
             state: req_text(row, 2)?,
-            prior_generation: opt_i64(row, 3)?.map(|prior| prior as u64),
+            prior_generation: opt_i64(row, 3)?
+                .map(|prior| i64_to_u64(prior, "prior generation"))
+                .transpose()?,
             created_at_ms: req_i64(row, 4)?,
         })
     }
@@ -2265,10 +2379,10 @@ impl TursoStore {
                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 vec![
                     v_int(dir_id),
-                    v_int(generation as i64),
+                    v_int(u64_to_i64(generation, "dir observation generation")?),
                     v_int(i64::from(completed)),
-                    v_int(entry_generation as i64),
-                    v_int(entries_seen as i64),
+                    v_int(u64_to_i64(entry_generation, "dir entry_generation")?),
+                    v_int(u64_to_i64(entries_seen, "dir entries_seen")?),
                     v_opt_text(error.map(str::to_string)),
                     v_int(observed_ms),
                 ],
@@ -2290,7 +2404,10 @@ impl TursoStore {
                 "SELECT dir_id, generation, completed, entry_generation, entries_seen, \
                     error, observed_at_ms FROM dir_observations \
                     WHERE dir_id = ?1 AND generation = ?2",
-                vec![v_int(dir_id), v_int(generation as i64)],
+                vec![
+                    v_int(dir_id),
+                    v_int(u64_to_i64(generation, "dir observation generation")?),
+                ],
             )
             .await
             .map_err(store_err)?;
@@ -2556,7 +2673,7 @@ impl TursoStore {
                     v_text(status.submodules),
                     v_text(status.unknown_fields),
                     v_opt_blob(status.input_fingerprint.map(<[u8]>::to_vec)),
-                    v_int(status.observed_rev as i64),
+                    v_int(u64_to_i64(status.observed_rev, "status observed_rev")?),
                     v_int(observed_ms),
                 ],
             )
@@ -2683,8 +2800,8 @@ impl TursoStore {
                 vec![
                     v_text(id),
                     v_text(schema_version),
-                    v_int(catalog_rev as i64),
-                    v_int(generation as i64),
+                    v_int(u64_to_i64(catalog_rev, "snapshot catalog_rev")?),
+                    v_int(u64_to_i64(generation, "snapshot generation")?),
                     v_text(publication_state),
                     v_opt_blob(checksum.map(<[u8]>::to_vec)),
                     v_int(now_ms),
@@ -2887,6 +3004,70 @@ impl TursoStore {
         Ok(out)
     }
 
+    /// Atomically ingest one event batch: the cursor row plus every scope
+    /// invalidation (revision bump, directory mirror, reconcile-task
+    /// enqueue) commit in ONE transaction (RSF-F940). A kill leaves the
+    /// cursor and its invalidations jointly present or jointly absent —
+    /// never a persisted cursor with lost invalidations, the torn state
+    /// the old separate `append_event` + `invalidate_scope` writes
+    /// allowed. The owner ingests every batch through this method.
+    ///
+    /// Duplicate `(volume, history UUID, cursor)` replays (FullHistory
+    /// overlap, restart replay) are idempotent no-ops: `inserted` is
+    /// false, no revision is bumped, and no task is enqueued, so replays
+    /// never schedule double work. An empty `scopes` slice still records
+    /// the cursor (out-of-scope batches advance the boundary with no
+    /// scheduled work).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn ingest_event_batch(
+        &self,
+        volume_id: &str,
+        history_uuid: &str,
+        cursor: &str,
+        invalidated: bool,
+        scopes: &[String],
+        generation: u64,
+        now_ms: i64,
+    ) -> crate::Result<IngestedBatch> {
+        let volume = volume_id.to_string();
+        let uuid = history_uuid.to_string();
+        let cursor = cursor.to_string();
+        let scopes = scopes.to_vec();
+        self.with_tx(move |conn| async move {
+            let inserted = conn
+                .execute(
+                    "INSERT OR IGNORE INTO event_journal (volume_id, history_uuid, cursor, \
+                        received_ms, invalidated, ingested, reconciled) \
+                        VALUES (?1, ?2, ?3, ?4, ?5, 1, 0)",
+                    vec![
+                        v_text(volume),
+                        v_text(uuid),
+                        v_text(cursor),
+                        v_int(now_ms),
+                        v_int(i64::from(invalidated)),
+                    ],
+                )
+                .await
+                .map_err(store_err)?
+                == 1;
+            if !inserted {
+                return Ok::<IngestedBatch, Error>(IngestedBatch {
+                    inserted: false,
+                    revs: Vec::new(),
+                });
+            }
+            let mut revs = Vec::with_capacity(scopes.len());
+            for scope in &scopes {
+                revs.push(Self::invalidate_scope_on(conn, scope, generation, now_ms).await?);
+            }
+            Ok::<IngestedBatch, Error>(IngestedBatch {
+                inserted: true,
+                revs,
+            })
+        })
+        .await
+    }
+
     /// Idempotent volume upsert keyed by stable id.
     pub async fn upsert_volume(
         &self,
@@ -2947,13 +3128,17 @@ impl TursoStore {
                 vec![
                     v_text(scope_policy),
                     v_text(state),
-                    v_opt_int(prior_generation.map(|prior| prior as i64)),
+                    v_opt_int(
+                        prior_generation
+                            .map(|prior| u64_to_i64(prior, "prior generation"))
+                            .transpose()?,
+                    ),
                     v_int(now_ms),
                 ],
             )
             .await
             .map_err(store_err)?;
-        Ok(self.conn.last_insert_rowid() as u64)
+        i64_to_u64(self.conn.last_insert_rowid(), "generation id")
     }
 
     /// Update a generation's completion state.
@@ -2962,7 +3147,7 @@ impl TursoStore {
         self.conn
             .execute(
                 "UPDATE generations SET state = ?1 WHERE id = ?2",
-                vec![v_text(state), v_int(id as i64)],
+                vec![v_text(state), v_int(u64_to_i64(id, "generation id")?)],
             )
             .await
             .map_err(store_err)?;
@@ -2976,7 +3161,7 @@ impl TursoStore {
             .query(
                 "SELECT id, scope_policy, state, prior_generation, created_at_ms \
                     FROM generations WHERE id = ?1",
-                vec![v_int(id as i64)],
+                vec![v_int(u64_to_i64(id, "generation id")?)],
             )
             .await
             .map_err(store_err)?;
@@ -2990,9 +3175,12 @@ impl TursoStore {
 impl TursoStore {
     /// Current committed catalog revision (for report envelopes).
     pub async fn current_revision(&self) -> crate::Result<u64> {
-        Ok(Self::read_meta_i64(&self.conn, "committed_revision")
-            .await?
-            .unwrap_or(0) as u64)
+        i64_to_u64(
+            Self::read_meta_i64(&self.conn, "committed_revision")
+                .await?
+                .unwrap_or(0),
+            "committed catalog revision",
+        )
     }
 
     /// Advance the committed catalog revision; returns the new revision.
@@ -3001,9 +3189,10 @@ impl TursoStore {
             let next = Self::read_meta_i64(conn, "committed_revision")
                 .await?
                 .unwrap_or(0)
-                + 1;
+                .checked_add(1)
+                .ok_or_else(|| Error::Store("committed catalog revision overflow".to_string()))?;
             Self::write_meta_i64(conn, "committed_revision", next).await?;
-            Ok::<u64, Error>(next as u64)
+            i64_to_u64(next, "committed catalog revision")
         })
         .await
     }
@@ -3076,9 +3265,12 @@ impl TursoStore {
         })
         .await?;
         self.counters.batch_commits.fetch_add(1, Ordering::Relaxed);
+        // fix10: op counts are `usize`; loud on 32-bit overflow, infallible on 64-bit.
+        let count_u64 = u64::try_from(count)
+            .map_err(|_| Error::Store(format!("batch op count {count} exceeds u64 range")))?;
         self.counters
             .batch_ops
-            .fetch_add(count as u64, Ordering::Relaxed);
+            .fetch_add(count_u64, Ordering::Relaxed);
         Ok(count)
     }
 
@@ -3100,9 +3292,12 @@ impl TursoStore {
         })
         .await?;
         self.counters.batch_commits.fetch_add(1, Ordering::Relaxed);
+        // fix10: op counts are `usize`; loud on 32-bit overflow, infallible on 64-bit.
+        let count_u64 = u64::try_from(count)
+            .map_err(|_| Error::Store(format!("batch op count {count} exceeds u64 range")))?;
         self.counters
             .batch_ops
-            .fetch_add(count as u64, Ordering::Relaxed);
+            .fetch_add(count_u64, Ordering::Relaxed);
         Ok(count)
     }
 
@@ -3115,6 +3310,12 @@ impl TursoStore {
     /// verified parent completion. Buffered rows are invisible until the
     /// flush commits. Returns `WriterBatch::should_flush`.
     pub fn buffer_enqueue_task(batch: &mut WriterBatch, task: &NewTask<'_>, now_ms: i64) -> bool {
+        // fix10: `generation`/`expected_rev` round-trip from range-checked
+        // `INTEGER` reads, so they always fit `i64` here; out-of-range
+        // input is a caller defect and panics loudly (release builds must
+        // fail too, so a `debug_assert`-only guard is not enough).
+        let generation_i64 = u64_to_i64_buf(task.generation, "task generation");
+        let expected_rev_i64 = u64_to_i64_buf(task.expected_rev, "task expected_rev");
         batch.push(
             "INSERT OR IGNORE INTO frontier_tasks (id, kind, generation, dir_id, \
                 scope_key, expected_rev, state, idempotency_key, attempts, \
@@ -3122,10 +3323,10 @@ impl TursoStore {
             vec![
                 v_text(task.id),
                 v_text(task.kind),
-                v_int(task.generation as i64),
+                v_int(generation_i64),
                 v_opt_int(task.dir_id),
                 v_text(task.scope_key),
-                v_int(task.expected_rev as i64),
+                v_int(expected_rev_i64),
                 v_text(task.idempotency_key),
                 v_int(now_ms),
             ],
@@ -3190,20 +3391,74 @@ impl TursoStore {
         error: Option<&str>,
         observed_ms: i64,
     ) -> bool {
+        let generation_i64 = u64_to_i64_buf(generation, "dir observation generation");
+        let entry_generation_i64 = u64_to_i64_buf(entry_generation, "dir entry_generation");
+        let entries_seen_i64 = u64_to_i64_buf(entries_seen, "dir entries_seen");
         batch.push(
             "INSERT OR REPLACE INTO dir_observations (dir_id, generation, completed, \
                 entry_generation, entries_seen, error, observed_at_ms) \
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             vec![
                 v_int(dir_id),
-                v_int(generation as i64),
+                v_int(generation_i64),
                 v_int(i64::from(completed)),
-                v_int(entry_generation as i64),
-                v_int(entries_seen as i64),
+                v_int(entry_generation_i64),
+                v_int(entries_seen_i64),
                 v_opt_text(error.map(str::to_string)),
                 v_int(observed_ms),
             ],
         )
+    }
+
+    /// Buffer an enumeration observation with the attempt counted in SQL
+    /// (RSF-751/AC46/F06D): the unconditional `UPDATE` bumps
+    /// `entry_generation` and refreshes the outcome columns, mirroring the
+    /// `record_error` update-then-insert shape, while `INSERT OR IGNORE`
+    /// seeds a first observation at generation 1. No read is needed, so
+    /// callers never flush just to observe a buffered row before writing
+    /// the next observation; two observations for one (`dir_id`,
+    /// `generation`) in a single batch count 1 then 2 in op order. See
+    /// [`TursoStore::buffer_enqueue_task`] for the flush contract. Returns
+    /// `WriterBatch::should_flush`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn buffer_record_dir_observation_bumped(
+        batch: &mut WriterBatch,
+        dir_id: i64,
+        generation: u64,
+        completed: bool,
+        entries_seen: u64,
+        error: Option<&str>,
+        observed_ms: i64,
+    ) -> bool {
+        let generation_i64 = u64_to_i64_buf(generation, "dir observation generation");
+        let entries_seen_i64 = u64_to_i64_buf(entries_seen, "dir entries_seen");
+        batch.push(
+            "UPDATE dir_observations SET entry_generation = entry_generation + 1, \
+                completed = ?1, entries_seen = ?2, error = ?3, observed_at_ms = ?4 \
+                WHERE dir_id = ?5 AND generation = ?6",
+            vec![
+                v_int(i64::from(completed)),
+                v_int(entries_seen_i64),
+                v_opt_text(error.map(str::to_string)),
+                v_int(observed_ms),
+                v_int(dir_id),
+                v_int(generation_i64),
+            ],
+        );
+        batch.push(
+            "INSERT OR IGNORE INTO dir_observations (dir_id, generation, completed, \
+                entry_generation, entries_seen, error, observed_at_ms) \
+                VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6)",
+            vec![
+                v_int(dir_id),
+                v_int(generation_i64),
+                v_int(i64::from(completed)),
+                v_int(entries_seen_i64),
+                v_opt_text(error.map(str::to_string)),
+                v_int(observed_ms),
+            ],
+        );
+        batch.should_flush()
     }
 
     /// Buffer a Git-instance upsert; see [`TursoStore::buffer_enqueue_task`]
@@ -3349,6 +3604,7 @@ impl TursoStore {
         status: &NewStatus<'_>,
         observed_ms: i64,
     ) -> bool {
+        let observed_rev_i64 = u64_to_i64_buf(status.observed_rev, "status observed_rev");
         batch.push(
             "INSERT OR IGNORE INTO status_observations (checkout_id, mode, state, \
                 started_ms, finished_ms, staged, unstaged, untracked, \
@@ -3368,7 +3624,7 @@ impl TursoStore {
                 v_text(status.submodules),
                 v_text(status.unknown_fields),
                 v_opt_blob(status.input_fingerprint.map(<[u8]>::to_vec)),
-                v_int(status.observed_rev as i64),
+                v_int(observed_rev_i64),
                 v_int(observed_ms),
             ],
         )
@@ -3414,9 +3670,12 @@ impl TursoStore {
         // (busy=1, NULL counters), unlike SQLite which reports counts. The
         // counters surface as 0 there; callers key off `busy`.
         Ok((
-            req_i64(&row, 0)? as u64,
-            opt_i64(&row, 1)?.unwrap_or(0) as u64,
-            opt_i64(&row, 2)?.unwrap_or(0) as u64,
+            i64_to_u64(req_i64(&row, 0)?, "wal_checkpoint busy")?,
+            i64_to_u64(opt_i64(&row, 1)?.unwrap_or(0), "wal_checkpoint log frames")?,
+            i64_to_u64(
+                opt_i64(&row, 2)?.unwrap_or(0),
+                "wal_checkpoint checkpointed frames",
+            )?,
         ))
     }
 

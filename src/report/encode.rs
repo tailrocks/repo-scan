@@ -99,6 +99,29 @@ pub fn escape_display(text: &str) -> String {
     out
 }
 
+/// Maximum bytes for one free-text report field (finding 6): error
+/// messages, candidate reasons, and evidence/unknown-field lines stream
+/// row by row, so one huge field would otherwise blow the streaming
+/// memory bound. Lossless path/name channels (`value`) are NOT capped —
+/// lossy replacement there is forbidden — only diagnostic prose.
+pub const MAX_REPORT_FIELD_BYTES: usize = 64 * 1024;
+
+/// Cap one free-text report field at [`MAX_REPORT_FIELD_BYTES`]: short
+/// fields pass through untouched; longer ones are cut at a character
+/// boundary with an explicit `…[+N bytes truncated]` marker, so the cut
+/// is always visible and never silent.
+pub fn cap_report_field(text: &str) -> String {
+    if text.len() <= MAX_REPORT_FIELD_BYTES {
+        return text.to_string();
+    }
+    let mut end = MAX_REPORT_FIELD_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let dropped = text.len() - end;
+    format!("{}…[+{dropped} bytes truncated]", &text[..end])
+}
+
 /// Encode raw bytes as (`encoding`, `value`, `display`): exact Unicode when
 /// the bytes are valid UTF-8, otherwise standard Base64 of the original
 /// bytes. Lossy replacement is forbidden on `value`; `display` is escaped

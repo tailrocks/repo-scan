@@ -17,11 +17,12 @@
 mod common;
 
 use common::fixture;
-use repo_scan::config::ResourceLimits;
+use repo_scan::config::{scope_key_for_dir, ResourceLimits};
 use repo_scan::events::{
-    continuity_plan, decide_open, subtree_scope_key, volume_scope_key, ContinuitySignal,
-    CursorJournal, EventBatch, EventCursorId, HistoryUuid, MemoryCursorJournal, MemorySink,
-    Reconciler, MAX_PENDING_INVALIDATIONS,
+    continuity_plan, decide_open, dir_scope_for_subtree_key, parse_subtree_scope_key,
+    subtree_scope_key, volume_scope_key, ContinuitySignal, CursorJournal, EventBatch,
+    EventCursorId, HistoryUuid, MemoryCursorJournal, MemorySink, Reconciler,
+    MAX_PENDING_INVALIDATIONS,
 };
 use repo_scan::scheduler::admission::{Admission, OpClass};
 use std::path::{Path, PathBuf};
@@ -259,19 +260,27 @@ fn event_01_history_loss_invalidates_scope() {
 fn event_01_moved_in_subtree_inspected_recursively() {
     // MustScanSubDirs plans name exactly the moved-in subtrees (recursive),
     // so reconciliation inspects them instead of trusting parent state.
-    let plans = continuity_plan(
-        "vol-a",
-        &[ContinuitySignal::MustScanSubDirs],
-        &[
-            PathBuf::from("/root/moved-in"),
-            PathBuf::from("/root/other"),
-        ],
-    );
+    let paths = [
+        PathBuf::from("/root/moved-in"),
+        PathBuf::from("/root/other"),
+    ];
+    let plans = continuity_plan("vol-a", &[ContinuitySignal::MustScanSubDirs], &paths);
     assert_eq!(plans.len(), 2);
     for plan in &plans {
         assert!(plan.recursive, "{}", plan.scope_key);
         assert!(
             plan.scope_key.starts_with("path:vol-a:"),
+            "{}",
+            plan.scope_key
+        );
+        // Planner-to-scheduler agreement: every planner key denotes exactly
+        // one `dir:` scheduler scope for its planned path.
+        let (volume, path) = parse_subtree_scope_key(&plan.scope_key).expect("planner key parses");
+        assert_eq!(volume, "vol-a");
+        assert!(paths.contains(&path), "{}", plan.scope_key);
+        assert_eq!(
+            dir_scope_for_subtree_key(&plan.scope_key),
+            Some(scope_key_for_dir(&path)),
             "{}",
             plan.scope_key
         );

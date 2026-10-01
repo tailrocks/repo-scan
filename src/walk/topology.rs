@@ -9,7 +9,11 @@
 
 use super::{ChildKind, EntryMetadata};
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::ffi::{c_char, CString, OsString};
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::path::{Component, Path, PathBuf};
 
 /// Maximum symlink hops before reporting [`ResolveError::TooDeep`].
 /// Mirrors the OS `ELOOP` convention (Linux `MAXSYMLINKS` = 40).
@@ -183,4 +187,664 @@ pub fn resolve_symlink(path: &Path) -> Result<LinkTarget, ResolveError> {
     }
 
     Err(ResolveError::TooDeep(current))
+}
+
+// ---------------------------------------------------------------------------
+// Scan-scope fence + descriptor-relative traversal (finding 12)
+// ---------------------------------------------------------------------------
+
+/// Lexically normalize an absolute path: collapse `.`, resolve `..`
+/// against the preceding components (absorbed at the filesystem root),
+/// and reject non-absolute inputs. Pure string handling — no I/O, so it
+/// cannot be raced; symlinks are NOT resolved here (that is the pinned
+/// traversal's job).
+fn normalize_absolute(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut out = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) => return None,
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    Some(out)
+}
+
+/// One declared scan root: its canonical spelling (symlinks resolved),
+/// the raw spelling when it differs (roots may carry an unclean spelling
+/// such as `/var` vs `/private/var`), and the canonical directory's
+/// `(dev, ino)` identity for root-swap detection.
+#[derive(Debug, Clone)]
+struct FenceRoot {
+    canonical: PathBuf,
+    raw: Option<PathBuf>,
+    identity: Option<(u64, u64)>,
+}
+
+/// Scan-scope fence built once from the planned roots.
+///
+/// Scheduling-time checks ([`ScopeFence::allows_path`]) are lexical over
+/// a `..`-normalized path: they close `..` escapes without filesystem
+/// I/O. Execution-time checks ([`ScopeFence::open_pinned`]) resolve the
+/// task path component by component through pinned directory descriptors
+/// (`openat`, never following symlinks silently) and fence the resulting
+/// true path plus its `fstat` identity — so a symlink swapped between
+/// scheduling and execution still cannot leave the declared roots.
+#[derive(Debug, Clone, Default)]
+pub struct ScopeFence {
+    roots: Vec<FenceRoot>,
+}
+
+impl ScopeFence {
+    /// Build the fence from declared roots. Each root is canonicalized
+    /// (resolving root-level symlinks such as `/var` → `/private/var`);
+    /// when canonicalization fails the raw spelling is kept, mirroring
+    /// the legacy fence fallback. Root identities come from the
+    /// canonical spelling for root-swap detection.
+    pub fn build(roots: &[PathBuf]) -> Self {
+        let mut fenced = Vec::with_capacity(roots.len());
+        for root in roots {
+            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+            let raw = (canonical != *root).then(|| root.clone());
+            let identity = std::fs::symlink_metadata(&canonical).ok().map(|md| {
+                let meta = super::fs_entry_metadata(&md);
+                (meta.dev, meta.ino)
+            });
+            fenced.push(FenceRoot {
+                canonical,
+                raw,
+                identity,
+            });
+        }
+        Self { roots: fenced }
+    }
+
+    /// True when no roots were declared (deny-all: every path is refused).
+    pub fn is_empty(&self) -> bool {
+        self.roots.is_empty()
+    }
+
+    /// Scheduling-time membership: `..`-normalize `path` and prefix-match
+    /// against every root spelling. No I/O: symlink escapes through a
+    /// lexically in-scope spelling are closed at execution time by
+    /// [`ScopeFence::open_pinned`], which re-verifies every task.
+    pub fn allows_path(&self, path: &Path) -> bool {
+        let Some(normalized) = normalize_absolute(path) else {
+            return false;
+        };
+        self.roots.iter().any(|root| {
+            normalized.starts_with(&root.canonical)
+                || root
+                    .raw
+                    .as_ref()
+                    .is_some_and(|raw| normalized.starts_with(raw))
+        })
+    }
+
+    /// True when a pinned true path plus its `fstat` identity sit inside
+    /// the declared roots. A true path equal to a canonical root must
+    /// also match the root's recorded identity, so a swapped-in impostor
+    /// directory at the root spelling is refused.
+    fn allows_verified(&self, true_path: &Path, dev: u64, ino: u64) -> bool {
+        self.roots.iter().any(|root| {
+            if *true_path == root.canonical {
+                root.identity
+                    .is_some_and(|(root_dev, root_ino)| root_dev == dev && root_ino == ino)
+            } else {
+                true_path.starts_with(&root.canonical)
+            }
+        })
+    }
+
+    /// Execution-time open of one task directory: resolve `path`
+    /// component by component from the filesystem root through pinned
+    /// directory descriptors, restarting from the root past each
+    /// intermediate symlink (bounded by [`MAX_SYMLINK_HOPS`]), and fence
+    /// the resulting true path plus its `fstat` identity against the
+    /// declared roots. The returned [`PinnedDir`] lists through its own
+    /// descriptor, so a path swapped after this call cannot redirect the
+    /// enumeration.
+    #[cfg(unix)]
+    pub fn open_pinned(&self, path: &Path) -> Result<FenceOpen, FenceError> {
+        use std::collections::VecDeque;
+        use std::os::unix::ffi::OsStrExt;
+
+        let normalized =
+            normalize_absolute(path).ok_or_else(|| FenceError::NotAbsolute(path.to_path_buf()))?;
+        let mut pending: VecDeque<OsString> = normalized
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(part) => Some(part.to_os_string()),
+                _ => None,
+            })
+            .collect();
+        let mut stack: Vec<OsString> = Vec::new();
+        let mut fd = open_root_dir().map_err(FenceError::Io)?;
+        let mut hops = 0u32;
+        while let Some(name) = pending.pop_front() {
+            let last = pending.is_empty();
+            let c_name = CString::new(name.as_os_str().as_bytes()).map_err(|_| {
+                FenceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("path component holds NUL: {}", path.display()),
+                ))
+            })?;
+            let st = fstatat_no_follow(fd.as_raw_fd(), &c_name).map_err(FenceError::Io)?;
+            let kind = kind_from_mode(st.st_mode as u32);
+            if kind == ChildKind::Symlink {
+                if last {
+                    // The task path itself is a link: never follow it
+                    // here — the caller routes it to link handling.
+                    return Ok(FenceOpen::Symlink);
+                }
+                hops += 1;
+                if hops > MAX_SYMLINK_HOPS {
+                    return Err(FenceError::TooDeep(path.to_path_buf()));
+                }
+                let target = readlinkat_all(fd.as_raw_fd(), &c_name).map_err(FenceError::Io)?;
+                // Restart from the root past the link: an absolute
+                // target replaces the stack, a relative one extends it
+                // (`PathBuf::push` semantics), and `..` inside the
+                // target collapses lexically before we descend again.
+                let mut rejoined = PathBuf::from("/");
+                for part in &stack {
+                    rejoined.push(part);
+                }
+                rejoined.push(&target);
+                for rest in &pending {
+                    rejoined.push(rest);
+                }
+                let renormalized = normalize_absolute(&rejoined).ok_or_else(|| {
+                    FenceError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "symlink target escapes to a non-absolute path: {}",
+                            path.display()
+                        ),
+                    ))
+                })?;
+                pending = renormalized
+                    .components()
+                    .filter_map(|component| match component {
+                        Component::Normal(part) => Some(part.to_os_string()),
+                        _ => None,
+                    })
+                    .collect();
+                stack.clear();
+                fd = open_root_dir().map_err(FenceError::Io)?;
+                continue;
+            }
+            if kind != ChildKind::Directory {
+                return Err(FenceError::NotDirectory(path.to_path_buf()));
+            }
+            // `O_NOFOLLOW` closes the fstatat→open race: a component
+            // swapped to a symlink here fails the open instead of
+            // redirecting the descriptor.
+            let child = openat_dir(fd.as_raw_fd(), &c_name).map_err(FenceError::Io)?;
+            stack.push(name);
+            fd = child;
+        }
+        let mut true_path = PathBuf::from("/");
+        for part in &stack {
+            true_path.push(part);
+        }
+        let final_stat = fstat_self(fd.as_raw_fd()).map_err(FenceError::Io)?;
+        let stat = stat_to_dir_stat(&final_stat);
+        if !self.allows_verified(&true_path, stat.meta.dev, stat.meta.ino) {
+            return Err(FenceError::OutOfScope(true_path));
+        }
+        Ok(FenceOpen::Dir(PinnedDir {
+            fd,
+            stat,
+            true_path,
+        }))
+    }
+
+    /// Non-unix targets cannot pin descriptors: always refuse so the
+    /// caller falls back to the legacy pathname open.
+    #[cfg(not(unix))]
+    pub fn open_pinned(&self, path: &Path) -> Result<FenceOpen, FenceError> {
+        let _ = path;
+        Err(FenceError::Unsupported(
+            "descriptor-relative traversal requires unix".to_string(),
+        ))
+    }
+}
+
+/// Outcome of [`ScopeFence::open_pinned`].
+#[derive(Debug)]
+pub enum FenceOpen {
+    /// Pinned, in-scope directory: enumerate through the descriptor.
+    Dir(PinnedDir),
+    /// The task path itself is a symlink: the caller must route it to
+    /// link handling, never follow it as a directory.
+    Symlink,
+}
+
+/// Why a fenced open failed. Every variant fails closed: the caller
+/// records a coverage gap or parks the task, never enumerates outside
+/// the declared roots.
+#[derive(Debug)]
+pub enum FenceError {
+    /// The pinned true path sits outside every declared root.
+    OutOfScope(PathBuf),
+    /// More than [`MAX_SYMLINK_HOPS`] intermediate symlinks.
+    TooDeep(PathBuf),
+    /// The task path is not absolute (declared roots always are).
+    NotAbsolute(PathBuf),
+    /// The task path resolves to a non-directory, non-symlink object.
+    NotDirectory(PathBuf),
+    /// Descriptor-relative traversal is unavailable on this target.
+    Unsupported(String),
+    /// Underlying I/O failure (dangling target, permission, race).
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for FenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FenceError::OutOfScope(p) => {
+                write!(f, "path is outside the scan scope: {}", p.display())
+            }
+            FenceError::TooDeep(p) => {
+                write!(f, "symlink chain too deep at {}", p.display())
+            }
+            FenceError::NotAbsolute(p) => {
+                write!(f, "scope path is not absolute: {}", p.display())
+            }
+            FenceError::NotDirectory(p) => {
+                write!(f, "not a directory: {}", p.display())
+            }
+            FenceError::Unsupported(detail) => write!(f, "{detail}"),
+            FenceError::Io(e) => write!(f, "fenced open I/O error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for FenceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            FenceError::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// Identity + incarnation parts for one pinned directory, from a single
+/// `fstat` on the open descriptor (no pathname re-stat, no race).
+#[derive(Debug, Clone, Copy)]
+pub struct DirStat {
+    /// Device/inode/link-count/size identity.
+    pub meta: EntryMetadata,
+    /// Modification time seconds (unix epoch, negative before 1970).
+    pub mtime_secs: i64,
+    /// Modification time sub-second nanoseconds.
+    pub mtime_nanos: i64,
+}
+
+/// One pinned open directory: the descriptor, its `fstat` identity, and
+/// the true path derived from the resolution (never from string reuse).
+#[derive(Debug)]
+pub struct PinnedDir {
+    #[cfg(unix)]
+    fd: OwnedFd,
+    stat: DirStat,
+    true_path: PathBuf,
+}
+
+impl PinnedDir {
+    /// True path of the pinned directory (symlinks resolved, `..` collapsed).
+    pub fn true_path(&self) -> &Path {
+        &self.true_path
+    }
+
+    /// `fstat` identity + incarnation parts from the open descriptor.
+    pub fn stat(&self) -> DirStat {
+        self.stat
+    }
+
+    /// Stream immediate children through the pinned descriptor
+    /// (`fdopendir` semantics): names plus lstat identity per child,
+    /// `.`/`..` skipped, per-child failures preserved like the
+    /// [`StdEscape`](super::StdEscape) adapter. Consumes the pin: the
+    /// stream owns the description until exhaustion or drop.
+    #[cfg(unix)]
+    pub fn into_children(self, skip_metadata: bool) -> std::io::Result<PinnedChildren> {
+        use std::os::unix::io::IntoRawFd;
+        // `fdopendir` takes the description: on failure close it here,
+        // on success the stream owns it (closed by `closedir` on drop).
+        let raw = self.fd.into_raw_fd();
+        let dir = unsafe { libc::fdopendir(raw) };
+        if dir.is_null() {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(raw);
+            }
+            return Err(error);
+        }
+        let dirfd = unsafe { libc::dirfd(dir) };
+        Ok(PinnedChildren {
+            dir,
+            dirfd,
+            skip_metadata,
+            done: false,
+        })
+    }
+
+    /// Non-unix targets cannot pin: [`ScopeFence::open_pinned`] already
+    /// refuses there, so this is unreachable — loud, never empty.
+    #[cfg(not(unix))]
+    pub fn into_children(self, _skip_metadata: bool) -> std::io::Result<PinnedChildren> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "pinned traversal requires unix",
+        ))
+    }
+}
+
+/// Streaming children of a [`PinnedDir`]: owns the `DIR*` opened from the
+/// pinned descriptor (closed on drop) and yields [`super::WalkItem`]s —
+/// one [`super::ChildEntry`] per child with lstat identity, or a
+/// preserved error that ends reliable enumeration.
+#[cfg(unix)]
+pub struct PinnedChildren {
+    dir: *mut libc::DIR,
+    dirfd: RawFd,
+    skip_metadata: bool,
+    done: bool,
+}
+
+#[cfg(unix)]
+impl Drop for PinnedChildren {
+    fn drop(&mut self) {
+        unsafe {
+            libc::closedir(self.dir);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Iterator for PinnedChildren {
+    type Item = super::WalkItem;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        if self.done {
+            return None;
+        }
+        loop {
+            // `readdir` signals errors only via `errno`: clear it first
+            // so a stale value cannot end the stream spuriously.
+            clear_errno();
+            let entry = unsafe { libc::readdir(self.dir) };
+            if entry.is_null() {
+                self.done = true;
+                let errno = last_errno();
+                if errno != 0 {
+                    return Some(Err(std::io::Error::from_raw_os_error(errno)));
+                }
+                return None;
+            }
+            let raw_name = dirent_name_bytes(unsafe { &*entry });
+            if raw_name == b"." || raw_name == b".." {
+                continue;
+            }
+            let name = OsString::from_vec(raw_name);
+            let c_name = match CString::new(name.as_os_str().as_bytes()) {
+                Ok(c) => c,
+                Err(_) => {
+                    // Impossible: the name came from a NUL-terminated
+                    // `d_name`. End the stream loudly rather than skip.
+                    self.done = true;
+                    return Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "directory entry name holds NUL",
+                    )));
+                }
+            };
+            let dtype = unsafe { (*entry).d_type } as u32;
+            let (kind, stored) = match dtype_to_kind(dtype) {
+                Some(kind) if self.skip_metadata => (kind, None),
+                Some(kind) => match fstatat_no_follow(self.dirfd, &c_name) {
+                    Ok(st) => (kind, Some(Ok(st))),
+                    Err(e) => (kind, Some(Err(e))),
+                },
+                None => match fstatat_no_follow(self.dirfd, &c_name) {
+                    Ok(st) => {
+                        let kind = kind_from_mode(st.st_mode as u32);
+                        let stored = (!self.skip_metadata).then_some(Ok(st));
+                        (kind, stored)
+                    }
+                    Err(e) => return Some(Err(e)),
+                },
+            };
+            let metadata = stored.map(|result| result.map(|st| stat_to_entry(&st)));
+            return Some(Ok(super::ChildEntry {
+                name,
+                kind,
+                metadata,
+            }));
+        }
+    }
+}
+
+/// Non-unix placeholder: [`PinnedDir::into_children`] already refuses
+/// there, so this stream is never constructed.
+#[cfg(not(unix))]
+pub struct PinnedChildren {
+    _private: (),
+}
+
+#[cfg(not(unix))]
+impl Iterator for PinnedChildren {
+    type Item = super::WalkItem;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        None
+    }
+}
+
+/// Map a `dirent` type to [`ChildKind`]; `None` on `DT_UNKNOWN`, which
+/// needs an `fstatat` for the kind.
+#[cfg(unix)]
+fn dtype_to_kind(dtype: u32) -> Option<ChildKind> {
+    if dtype == libc::DT_DIR as u32 {
+        Some(ChildKind::Directory)
+    } else if dtype == libc::DT_REG as u32 {
+        Some(ChildKind::File)
+    } else if dtype == libc::DT_LNK as u32 {
+        Some(ChildKind::Symlink)
+    } else if dtype == libc::DT_UNKNOWN as u32 {
+        None
+    } else {
+        Some(ChildKind::Other)
+    }
+}
+
+/// Map a `st_mode` file-type mask to [`ChildKind`] (never follows links:
+/// the mode always comes from a no-follow stat).
+#[cfg(unix)]
+fn kind_from_mode(mode: u32) -> ChildKind {
+    let file_type = mode & libc::S_IFMT as u32;
+    if file_type == libc::S_IFDIR as u32 {
+        ChildKind::Directory
+    } else if file_type == libc::S_IFREG as u32 {
+        ChildKind::File
+    } else if file_type == libc::S_IFLNK as u32 {
+        ChildKind::Symlink
+    } else {
+        ChildKind::Other
+    }
+}
+
+/// Copy a `d_name` up to its NUL terminator.
+#[cfg(unix)]
+fn dirent_name_bytes(entry: &libc::dirent) -> Vec<u8> {
+    entry
+        .d_name
+        .iter()
+        .map(|c| *c as u8)
+        .take_while(|byte| *byte != 0)
+        .collect()
+}
+
+/// [`EntryMetadata`] from a no-follow stat result.
+#[cfg(unix)]
+// Field widths (`ino_t`, `dev_t`, `off_t`) vary by unix target; the `as`
+// casts below keep this portable and mirror `std::os::unix::fs::MetadataExt`.
+#[allow(clippy::unnecessary_cast)]
+fn stat_to_entry(st: &libc::stat) -> EntryMetadata {
+    // `dev_t`/`off_t` are definitionally non-negative; `as` mirrors
+    // `std::os::unix::fs::MetadataExt`.
+    EntryMetadata {
+        dev: st.st_dev as u64,
+        ino: st.st_ino as u64,
+        nlink: st.st_nlink as u64,
+        len: st.st_size as u64,
+    }
+}
+
+/// [`DirStat`] from a no-follow stat result.
+#[cfg(unix)]
+fn stat_to_dir_stat(st: &libc::stat) -> DirStat {
+    let (mtime_secs, mtime_nanos) = stat_mtime(st);
+    DirStat {
+        meta: stat_to_entry(st),
+        mtime_secs,
+        mtime_nanos,
+    }
+}
+
+/// mtime from a no-follow stat result. libc 0.2 exposes split
+/// `st_mtime`/`st_mtime_nsec` seconds/nanos on every unix target this crate
+/// supports (macOS, Linux, BSDs); only exotic targets outside our support
+/// keep a `st_mtim` timespec, so no per-OS split is needed.
+#[cfg(unix)]
+// `time_t`/`c_long` are 64-bit on our targets but narrower on some 32-bit
+// unix; the `as` casts keep this portable.
+#[allow(clippy::unnecessary_cast)]
+fn stat_mtime(st: &libc::stat) -> (i64, i64) {
+    (st.st_mtime as i64, st.st_mtime_nsec as i64)
+}
+
+/// Open the filesystem root for a pinned descent.
+#[cfg(unix)]
+fn open_root_dir() -> std::io::Result<OwnedFd> {
+    let fd = unsafe {
+        libc::open(
+            c"/".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Open one descent step: a directory, never a symlink.
+#[cfg(unix)]
+fn openat_dir(parent: RawFd, name: &CString) -> std::io::Result<OwnedFd> {
+    let fd = unsafe {
+        libc::openat(
+            parent,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Classify one descent step without following a trailing symlink.
+#[cfg(unix)]
+fn fstatat_no_follow(parent: RawFd, name: &CString) -> std::io::Result<libc::stat> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstatat(parent, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(st)
+}
+
+/// `fstat` the pinned descriptor itself (fd-bound: no pathname, no race).
+#[cfg(unix)]
+fn fstat_self(fd: RawFd) -> std::io::Result<libc::stat> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(st)
+}
+
+/// Read one link target, growing past truncation (a full buffer may hide
+/// a longer target). Absurd targets fail loudly instead of resolving
+/// half a path.
+#[cfg(unix)]
+fn readlinkat_all(parent: RawFd, name: &CString) -> std::io::Result<OsString> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut cap = 256usize;
+    loop {
+        let mut buf = vec![0u8; cap];
+        let read = unsafe {
+            libc::readlinkat(parent, name.as_ptr(), buf.as_mut_ptr() as *mut c_char, cap)
+        };
+        if read < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let read = read as usize;
+        if read < cap {
+            buf.truncate(read);
+            return Ok(OsString::from_vec(buf));
+        }
+        cap *= 2;
+        if cap > 65_536 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "symlink target exceeds 64 KiB",
+            ));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn clear_errno() {
+    unsafe {
+        *libc::__error() = 0;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn clear_errno() {
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn clear_errno() {}
+
+#[cfg(target_os = "macos")]
+fn last_errno() -> i32 {
+    unsafe { *libc::__error() }
+}
+
+#[cfg(target_os = "linux")]
+fn last_errno() -> i32 {
+    unsafe { *libc::__errno_location() }
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn last_errno() -> i32 {
+    0
 }
