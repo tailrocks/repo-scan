@@ -1,0 +1,324 @@
+# Hand-written velnor-shaped workflow (NOT velnor-generated: no official
+# velnor-actions release exists yet, so `velnor-actions plan`/`generate` fail
+# closed with consumer_requires_release_install; see docs/CI.md).
+# Every pin/version below is velnor's qualified pin, not a fresh choice:
+# actions/checkout v7.0.1, jdx/mise-action v5.0.0, Swatinem/rust-cache v2.9.2,
+# mise 2026.9.18, rust 1.98.1, actionlint 1.7.12, shellcheck 0.11.0,
+# zizmor 1.30.1. Cargo/cargo_test runners (NO mbx/nextest): this repo has no
+# mise cargo wrapper or nextest config, and velnor V1 forbids imposing them
+# on consumers. Dropped velnor-runtime parts (Acquire Velnor, Plan, Merge
+# reports, velnor-* artifacts, covered_tasks gates): all obligations run
+# unconditionally. The macos job is deliberately non-velnor (see below).
+name: CI
+"on":
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  push:
+    branches:
+      - main
+  merge_group:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: velnor-CI-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  actionlint:
+    name: Actionlint
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: "false"
+      - name: Setup Mise
+        uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          env: "false"
+          install: "false"
+          sha256: d24fe0bf7e613824ad99f7b8dac3f2b381a37b9f75f84dd250855217095a8de4
+          version: 2026.9.18
+      - name: Run actionlint
+        run: mise --no-config --no-env --no-hooks exec actionlint@1.7.12 shellcheck@0.11.0 -- actionlint -color
+  rust:
+    name: Rust / repo-scan
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: "false"
+      - name: Setup Mise
+        uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          env: "false"
+          install: "false"
+          sha256: d24fe0bf7e613824ad99f7b8dac3f2b381a37b9f75f84dd250855217095a8de4
+          version: 2026.9.18
+      - name: Prepare pinned tools
+        env:
+          MISE_CARGO_HOME: ${{ runner.temp }}/velnor/cargo
+          MISE_LOCKFILE: "0"
+          MISE_NO_CONFIG: "1"
+          MISE_NO_ENV: "1"
+          MISE_NO_HOOKS: "1"
+          MISE_RUSTUP_HOME: ${{ runner.temp }}/velnor/rustup
+          RUSTUP_TOOLCHAIN: 1.98.1
+        run: mise --no-config --no-env --no-hooks install rust@1.98.1 actionlint@1.7.12 shellcheck@0.11.0 zizmor@1.30.1
+      - name: Prepare Rust components
+        env:
+          MISE_AUTO_INSTALL: "false"
+          MISE_CARGO_HOME: ${{ runner.temp }}/velnor/cargo
+          MISE_EXEC_AUTO_INSTALL: "false"
+          MISE_LOCKFILE: "0"
+          MISE_NO_CONFIG: "1"
+          MISE_NO_ENV: "1"
+          MISE_NO_HOOKS: "1"
+          MISE_RUSTUP_HOME: ${{ runner.temp }}/velnor/rustup
+          RUSTUP_TOOLCHAIN: 1.98.1
+        run: mise --no-config --no-env --no-hooks exec rust@1.98.1 -- rustup component add --toolchain 1.98.1-x86_64-unknown-linux-gnu clippy rustfmt
+      # Deviation noted: velnor's crate reader uses save-if "false" because its
+      # plan job owns the shared-key save. This hand workflow has no plan job,
+      # so this step saves on success; otherwise the cache could never populate.
+      - name: Restore Cargo registry
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          add-job-id-key: "false"
+          cache-on-failure: "false"
+          cache-targets: "false"
+          prefix-key: velnor-v1-cargo
+          save-if: "true"
+          shared-key: velnor-cargo-x86_64-unknown-linux-gnu-1.98.1
+      - name: Fetch Cargo sources
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          CARGO_REGISTRY_TOKEN: ""
+          GH_CONFIG_DIR: ""
+          GH_HOST: ""
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          MISE_AUTO_INSTALL: "false"
+          MISE_CARGO_HOME: ${{ runner.temp }}/velnor/cargo
+          MISE_EXEC_AUTO_INSTALL: "false"
+          MISE_GITHUB_TOKEN: ""
+          MISE_LOCKFILE: "0"
+          MISE_NO_CONFIG: "1"
+          MISE_NO_ENV: "1"
+          MISE_NO_HOOKS: "1"
+          MISE_RUSTUP_HOME: ${{ runner.temp }}/velnor/rustup
+          NODE_AUTH_TOKEN: ""
+          NPM_TOKEN: ""
+          RUSTUP_TOOLCHAIN: 1.98.1
+        run: |
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN GITHUB_TOKEN MISE_GITHUB_TOKEN GH_TOKEN GH_HOST GH_CONFIG_DIR
+          mkdir -p "$RUNNER_TEMP/velnor/cargo-clean" && cd "$RUNNER_TEMP/velnor/cargo-clean" && if mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo metadata --locked --offline --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" >/dev/null 2>&1; then echo "velnor: sources hit, skipping fetch"; else echo "velnor: sources miss (source_missing), fetching"; mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo fetch --locked --manifest-path "$GITHUB_WORKSPACE/Cargo.toml"; fi
+      - name: Format
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          CARGO_REGISTRY_TOKEN: ""
+          GH_CONFIG_DIR: ""
+          GH_HOST: ""
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          MISE_AUTO_INSTALL: "false"
+          MISE_CARGO_HOME: ${{ runner.temp }}/velnor/cargo
+          MISE_EXEC_AUTO_INSTALL: "false"
+          MISE_GITHUB_TOKEN: ""
+          MISE_LOCKFILE: "0"
+          MISE_NO_CONFIG: "1"
+          MISE_NO_ENV: "1"
+          MISE_NO_HOOKS: "1"
+          MISE_RUSTUP_HOME: ${{ runner.temp }}/velnor/rustup
+          NODE_AUTH_TOKEN: ""
+          NPM_TOKEN: ""
+          RUSTUP_TOOLCHAIN: 1.98.1
+        run: |
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN GITHUB_TOKEN MISE_GITHUB_TOKEN GH_TOKEN GH_HOST GH_CONFIG_DIR
+          mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo fmt --check --manifest-path Cargo.toml
+      - name: Clippy
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          CARGO_REGISTRY_TOKEN: ""
+          GH_CONFIG_DIR: ""
+          GH_HOST: ""
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          MISE_AUTO_INSTALL: "false"
+          MISE_CARGO_HOME: ${{ runner.temp }}/velnor/cargo
+          MISE_EXEC_AUTO_INSTALL: "false"
+          MISE_GITHUB_TOKEN: ""
+          MISE_LOCKFILE: "0"
+          MISE_NO_CONFIG: "1"
+          MISE_NO_ENV: "1"
+          MISE_NO_HOOKS: "1"
+          MISE_RUSTUP_HOME: ${{ runner.temp }}/velnor/rustup
+          NODE_AUTH_TOKEN: ""
+          NPM_TOKEN: ""
+          RUSTUP_TOOLCHAIN: 1.98.1
+        run: |
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN GITHUB_TOKEN MISE_GITHUB_TOKEN GH_TOKEN GH_HOST GH_CONFIG_DIR
+          mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo clippy --locked --offline --manifest-path Cargo.toml --package repo-scan --all-targets -- -D warnings
+      - name: Build test executables
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          CARGO_REGISTRY_TOKEN: ""
+          GH_CONFIG_DIR: ""
+          GH_HOST: ""
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          MISE_AUTO_INSTALL: "false"
+          MISE_CARGO_HOME: ${{ runner.temp }}/velnor/cargo
+          MISE_EXEC_AUTO_INSTALL: "false"
+          MISE_GITHUB_TOKEN: ""
+          MISE_LOCKFILE: "0"
+          MISE_NO_CONFIG: "1"
+          MISE_NO_ENV: "1"
+          MISE_NO_HOOKS: "1"
+          MISE_RUSTUP_HOME: ${{ runner.temp }}/velnor/rustup
+          NODE_AUTH_TOKEN: ""
+          NPM_TOKEN: ""
+          RUSTUP_TOOLCHAIN: 1.98.1
+        run: |
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN GITHUB_TOKEN MISE_GITHUB_TOKEN GH_TOKEN GH_HOST GH_CONFIG_DIR
+          mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo build --locked --offline --manifest-path Cargo.toml --package repo-scan
+      - name: Unit and integration tests
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          CARGO_REGISTRY_TOKEN: ""
+          GH_CONFIG_DIR: ""
+          GH_HOST: ""
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          MISE_AUTO_INSTALL: "false"
+          MISE_CARGO_HOME: ${{ runner.temp }}/velnor/cargo
+          MISE_EXEC_AUTO_INSTALL: "false"
+          MISE_GITHUB_TOKEN: ""
+          MISE_LOCKFILE: "0"
+          MISE_NO_CONFIG: "1"
+          MISE_NO_ENV: "1"
+          MISE_NO_HOOKS: "1"
+          MISE_RUSTUP_HOME: ${{ runner.temp }}/velnor/rustup
+          NODE_AUTH_TOKEN: ""
+          NPM_TOKEN: ""
+          RUSTUP_TOOLCHAIN: 1.98.1
+        run: |
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN GITHUB_TOKEN MISE_GITHUB_TOKEN GH_TOKEN GH_HOST GH_CONFIG_DIR
+          mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo test --locked --offline --manifest-path Cargo.toml --package repo-scan
+      - name: Doctests
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          CARGO_REGISTRY_TOKEN: ""
+          GH_CONFIG_DIR: ""
+          GH_HOST: ""
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          MISE_AUTO_INSTALL: "false"
+          MISE_CARGO_HOME: ${{ runner.temp }}/velnor/cargo
+          MISE_EXEC_AUTO_INSTALL: "false"
+          MISE_GITHUB_TOKEN: ""
+          MISE_LOCKFILE: "0"
+          MISE_NO_CONFIG: "1"
+          MISE_NO_ENV: "1"
+          MISE_NO_HOOKS: "1"
+          MISE_RUSTUP_HOME: ${{ runner.temp }}/velnor/rustup
+          NODE_AUTH_TOKEN: ""
+          NPM_TOKEN: ""
+          RUSTUP_TOOLCHAIN: 1.98.1
+        run: |
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN GITHUB_TOKEN MISE_GITHUB_TOKEN GH_TOKEN GH_HOST GH_CONFIG_DIR
+          mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo test --locked --offline --manifest-path Cargo.toml --package repo-scan --doc
+      - name: Documentation
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          CARGO_REGISTRY_TOKEN: ""
+          GH_CONFIG_DIR: ""
+          GH_HOST: ""
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          MISE_AUTO_INSTALL: "false"
+          MISE_CARGO_HOME: ${{ runner.temp }}/velnor/cargo
+          MISE_EXEC_AUTO_INSTALL: "false"
+          MISE_GITHUB_TOKEN: ""
+          MISE_LOCKFILE: "0"
+          MISE_NO_CONFIG: "1"
+          MISE_NO_ENV: "1"
+          MISE_NO_HOOKS: "1"
+          MISE_RUSTUP_HOME: ${{ runner.temp }}/velnor/rustup
+          NODE_AUTH_TOKEN: ""
+          NPM_TOKEN: ""
+          RUSTDOCFLAGS: "-D warnings"
+          RUSTUP_TOOLCHAIN: 1.98.1
+        run: |
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN GITHUB_TOKEN MISE_GITHUB_TOKEN GH_TOKEN GH_HOST GH_CONFIG_DIR
+          mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo doc --locked --offline --manifest-path Cargo.toml --package repo-scan --no-deps
+  macos:
+    # Deliberately non-velnor: velnor V1 supports only x64-Linux runners, but
+    # repo-scan is macOS-first (FSEvents/getfsstat backends, cfg-gated platform
+    # modules) and a Linux-only run compiles those backends out. Toolchain
+    # follows the repo's existing pinned approach: dtolnay/rust-toolchain at
+    # the same SHA as audit.yml, with the same provenance recording.
+    # Toolchain 1.98.1 matches the repo (audit.yml's 1.85.0 predates it).
+    name: macOS / repo-scan
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: "false"
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # same pin as audit.yml
+        with:
+          toolchain: 1.98.1
+          components: clippy, rustfmt
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked
+      - name: Record tool provenance
+        if: always()
+        run: |
+          rustc --version
+          rustc --version --verbose
+          cargo --version
+          shasum -a 256 "$GITHUB_WORKSPACE/Cargo.lock"
+          echo "runner_image_os=$ImageOS runner_image_version=$ImageVersion"
+          sw_vers
+          echo "source_oid=$GITHUB_SHA"
+          git -C "$GITHUB_WORKSPACE" rev-parse HEAD
+  required:
+    name: Required
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    needs:
+      - actionlint
+      - rust
+      - macos
+    if: always()
+    steps:
+      - name: Verify all jobs passed
+        run: |
+          test "${{ needs.actionlint.result }}" = "success"
+          test "${{ needs.rust.result }}" = "success"
+          test "${{ needs.macos.result }}" = "success"

@@ -1,0 +1,12 @@
+# Hand-written velnor-shaped config (NOT velnor-generated: no official
+# velnor-actions release exists yet, so `velnor-actions plan`/`generate` fail
+# closed with consumer_requires_release_install; see docs/CI.md).
+# Mirrors the velnor consumer-v1 actionlint.yaml shape: empty
+# config-variables plus the self-hosted-runner bridge label, which must equal
+# the workflow runs-on label (ubuntu-26.04).
+
+config-variables: []
+
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04
