@@ -32,7 +32,7 @@ pub fn render_terminal(report: &Report, out: &mut dyn std::io::Write) -> crate::
     ))?;
     w(&format!(
         "target {} ({})\n",
-        escape_display(&crate::identity::redact_remote_url(&report.scan.target_url)),
+        show_prose(&crate::identity::redact_remote_url(&report.scan.target_url)),
         escape_display(&report.scan.state)
     ))?;
     w(&format!(

@@ -263,3 +263,22 @@ fn termsink_secret_pair_path_redacted_on_terminal_only() {
         "lossless path value retained in report"
     );
 }
+
+/// The terminal `target ...` line passes the same prose scrubber as every
+/// other line: a `token=hunter2`-style non-URL target never renders raw.
+#[test]
+fn termsink_target_line_scrubs_secret_pairs() {
+    let bytes = include_bytes!("data/example-report.json");
+    let mut report: repo_scan::report::model::Report =
+        serde_json::from_slice(bytes).expect("example parses");
+    let canary = "TERMSINKTARGET05";
+    report.scan.target_url = format!("manual-scan token={canary}");
+    let mut out: Vec<u8> = Vec::new();
+    repo_scan::report::render::render_terminal(&report, &mut out).expect("render");
+    let text = String::from_utf8(out.clone()).expect("utf8");
+    assert!(text.contains("token=<redacted>"), "{text}");
+    assert!(
+        !contains_bytes(&out, canary.as_bytes()),
+        "canary on terminal output: {text}"
+    );
+}

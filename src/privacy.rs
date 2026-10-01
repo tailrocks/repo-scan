@@ -77,9 +77,15 @@ pub fn private_dir_0700(path: &Path) -> crate::Result<PathBuf> {
 ///
 /// RS-PRIV-05/07 (RETEST-6): on unix the parent directory is pinned through
 /// an `O_NOFOLLOW|O_DIRECTORY` FD and the leaf is created with `openat`
-/// relative to it, so a symlinked ancestor or a mid-call ancestor swap
-/// cannot redirect creation — there is no leaf-only `O_NOFOLLOW` after a
-/// pathname parent check. A symlinked parent is refused, never followed.
+/// relative to it — there is no leaf-only `O_NOFOLLOW` after a pathname
+/// parent check. `O_NOFOLLOW` refuses only a symlink in the final
+/// component, so pre-existing intermediate symlinks still resolve; the
+/// trust-root model binds parents at acquire instead, via
+/// [`private_dir_0700`] (which routes through
+/// [`crate::store::owner::ensure_private_dir_all`]) in `0o700` trees. A
+/// symlink in the final parent component or the leaf is refused, never
+/// followed, and a mid-call ancestor swap is detected by `(dev, ino)`
+/// revalidation (`verify_leaf_matches_path`), failing closed.
 pub fn private_file_0600(path: &Path) -> crate::Result<File> {
     #[cfg(unix)]
     {
@@ -106,9 +112,15 @@ pub fn private_file_0600(path: &Path) -> crate::Result<File> {
 ///
 /// RS-PRIV-05/07 (RETEST-6): on unix the parent directory is pinned through
 /// an `O_NOFOLLOW|O_DIRECTORY` FD and the leaf is opened with `openat`
-/// relative to it, so a symlinked ancestor or a mid-call ancestor swap
-/// cannot redirect the write — there is no leaf-only `O_NOFOLLOW` after a
-/// pathname parent check. A symlinked parent is refused, never followed.
+/// relative to it — there is no leaf-only `O_NOFOLLOW` after a pathname
+/// parent check. `O_NOFOLLOW` refuses only a symlink in the final
+/// component, so pre-existing intermediate symlinks still resolve; the
+/// trust-root model binds parents at acquire instead, via
+/// [`private_dir_0700`] (which routes through
+/// [`crate::store::owner::ensure_private_dir_all`]) in `0o700` trees. A
+/// symlink in the final parent component or the leaf is refused, never
+/// followed, and a mid-call ancestor swap is detected by `(dev, ino)`
+/// revalidation (`verify_leaf_matches_path`), failing closed.
 pub fn private_write_0600(path: &Path, contents: &[u8]) -> crate::Result<()> {
     #[cfg(unix)]
     {

@@ -689,3 +689,117 @@ fn retest_malformed_target_scan_echo_clean() {
         assert_no_canary_in_state(&state, canary);
     }
 }
+
+/// RETEST-1 (bare `user@host`): a credential-shaped bare username is
+/// credential material even with no colon, path, or scheme — it never
+/// echoes intact through any redaction path, while ordinary
+/// `user@example.com` logins still echo (RS-PRIV-10 contract pinned).
+/// End to end: a git remote carrying the bare canary persists and emits
+/// no canary bytes — report file, terminal stdout, stderr, catalog,
+/// snapshot, and staging are all clean.
+#[test]
+fn retest_bare_user_host_canary_never_persist_or_emit() {
+    let canary = "FAILREDACTBARE90";
+    let bare = format!("ghp_{canary}@github.com");
+    // Unit boundary: every redaction path drops the bare canary.
+    for shown in [redact_credentials(&bare), redact_remote_url(&bare)] {
+        assert!(!shown.contains(canary), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+    }
+    assert_eq!(
+        redact_remote_url(&bare),
+        "<redacted>@github.com",
+        "bare user redacts, host preserved"
+    );
+    let scrubbed = scrub_text(&format!("fetch {bare} failed"));
+    assert!(!scrubbed.contains(canary), "{scrubbed}");
+    assert!(scrubbed.contains("<redacted>@github.com"), "{scrubbed}");
+    let (_, evidence) = classify_remote("https://github.com/o/r", &bare, "fetch");
+    assert!(!evidence.is_empty());
+    for line in &evidence {
+        assert!(!line.contains(canary), "{line}");
+    }
+    // Ordinary bare logins still echo (existing contract pinned).
+    assert_eq!(redact_credentials("user@example.com"), "user@example.com");
+    assert_eq!(redact_remote_url("user@example.com"), "user@example.com");
+    assert_eq!(redact_credentials("host:path"), "host:path");
+    assert_eq!(
+        scrub_text("contact user@example.com for access"),
+        "contact user@example.com for access"
+    );
+
+    // End to end: git remote -> scan -> report/catalog/terminal clean.
+    let scratch = fixture::scratch_root("fail-redact-bare-");
+    let root = scratch.path().join("root");
+    private_dir_0700(&root).expect("mkdir");
+    let repo = fixture::normal_clone(&root, "bare-user");
+    fixture::git(&repo, &["remote", "set-url", "origin", &bare]);
+    let root_str = root.to_str().expect("utf8").to_string();
+
+    // File mode: report bytes plus every state file stay clean.
+    let state = scratch.path().join("state");
+    let cwd = scratch.path().join("cwd");
+    private_dir_0700(&cwd).expect("mkdir");
+    let out = run(
+        &[
+            "scan",
+            "https://github.com/OWNER/REPO",
+            "--root",
+            root_str.as_str(),
+            "--report",
+            "rep.json",
+        ],
+        &cwd,
+        &state,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "scan failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report_bytes = std::fs::read(cwd.join("rep.json")).expect("read report");
+    let _: serde_json::Value = serde_json::from_slice(&report_bytes).expect("report JSON");
+    assert!(
+        !contains_bytes(&report_bytes, canary.as_bytes()),
+        "canary in report file"
+    );
+    assert!(
+        !contains_bytes(&out.stdout, canary.as_bytes()),
+        "canary on stdout"
+    );
+    assert!(
+        !contains_bytes(&out.stderr, canary.as_bytes()),
+        "canary on stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_no_canary_in_state(&state, canary);
+
+    // Terminal mode: stdout plus the retained snapshot stay clean.
+    let state_t = scratch.path().join("state-term");
+    let cwd_t = scratch.path().join("cwd-term");
+    private_dir_0700(&cwd_t).expect("mkdir");
+    let out = run(
+        &[
+            "scan",
+            "https://github.com/OWNER/REPO",
+            "--root",
+            root_str.as_str(),
+        ],
+        &cwd_t,
+        &state_t,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "terminal scan failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !contains_bytes(&out.stdout, canary.as_bytes()),
+        "canary on terminal stdout"
+    );
+    assert!(
+        !contains_bytes(&out.stderr, canary.as_bytes()),
+        "canary on terminal stderr"
+    );
+    assert_no_canary_in_state(&state_t, canary);
+}

@@ -453,9 +453,11 @@ fn scrub_query_fragment(tail: &str) -> String {
 /// (`secret@github.com:o/r`) is indistinguishable from the conventional
 /// `git` login without an allowlist, so every scp-like user redacts
 /// (RS-PRIV-10); scp syntax has no query semantics, so any `?`/`#` tail
-/// on the path is opaque and stripped. Inputs that cannot be
-/// represented safely (control characters, or an `@` past the authority
-/// that signals malformed smuggled userinfo such as
+/// on the path is opaque and stripped. A bare `user@host` (no colon,
+/// no path) redacts its user exactly when it is credential-shaped
+/// (RETEST-1); ordinary `user@example.com` logins still echo. Inputs
+/// that cannot be represented safely (control characters, or an `@`
+/// past the authority that signals malformed smuggled userinfo such as
 /// `https://user:secret/ret@host/...`) collapse to [`REDACTED_URL`].
 ///
 /// Remote, submodule, and catalog report fields must use
@@ -464,7 +466,9 @@ fn scrub_query_fragment(tail: &str) -> String {
 /// key-identifiable), while this key-based scrub is for free text.
 pub fn redact_credentials(url: &str) -> String {
     let Some((scheme, rest)) = split_scheme(url) else {
-        return redact_scp_like(url).unwrap_or_else(|| url.to_string());
+        return redact_scp_like(url)
+            .or_else(|| redact_bare_user_host(url))
+            .unwrap_or_else(|| url.to_string());
     };
     if url.chars().any(|c| c.is_control()) {
         return REDACTED_URL.to_string();
@@ -562,6 +566,8 @@ fn is_credential_username(user: &str) -> bool {
         "akia",
         "sk-live",
         "sk-test",
+        "sk_live_",
+        "rk_live_",
     ];
     if MARKERS.iter().any(|m| lower.contains(m)) {
         return true;
@@ -583,11 +589,14 @@ fn is_credential_username(user: &str) -> bool {
 /// and any query/fragment tail is dropped entirely — opaque values such
 /// as `?next=...` are not key-identifiable, so key-based scrubbing
 /// cannot make them safe to persist. Scp-like `user@host:path` likewise
-/// loses any `?`/`#` tail. Malformed input collapses to
-/// [`REDACTED_URL`], mirroring [`redact_credentials`].
+/// loses any `?`/`#` tail, as does a bare `user@host` (whose user
+/// redacts exactly when credential-shaped, RETEST-1). Malformed input
+/// collapses to [`REDACTED_URL`], mirroring [`redact_credentials`].
 pub fn redact_remote_url(url: &str) -> String {
     let Some((scheme, rest)) = split_scheme(url) else {
-        return redact_scp_like(url).unwrap_or_else(|| url.to_string());
+        return redact_scp_like(url)
+            .or_else(|| redact_bare_user_host(url))
+            .unwrap_or_else(|| url.to_string());
     };
     if url.chars().any(|c| c.is_control()) {
         return REDACTED_URL.to_string();
@@ -659,6 +668,61 @@ fn scp_host_path(url: &str) -> Option<&str> {
         return None;
     }
     Some(rest)
+}
+
+/// Split a bare `user@host` shape (no scheme, no colon, no path) into
+/// `(user, host)`, if `text` is one. User rules mirror
+/// [`scp_host_path`] (non-empty single token, no `/`); the host is
+/// non-empty and free of whitespace, controls, `/`, `:`, `@`, `?`, and
+/// `#` (a colon makes it scp-like, handled by [`redact_scp_like`]
+/// first; tails are stripped by the caller before this check). Shared
+/// by [`redact_credentials`], [`redact_remote_url`], and the free-text
+/// scp pass of [`scrub_text`] so a credential-shaped bare username
+/// (RETEST-1) never echoes intact, while ordinary `user@host` logins
+/// (emails) still echo.
+fn bare_user_host(text: &str) -> Option<(&str, &str)> {
+    if text.contains("://") {
+        return None;
+    }
+    let at = text.find('@')?;
+    let (user, rest) = text.split_at(at);
+    let host = &rest[1..];
+    if user.is_empty()
+        || user
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '/')
+    {
+        return None;
+    }
+    if host.is_empty()
+        || host.chars().any(|c| {
+            c.is_whitespace() || c.is_control() || matches!(c, '/' | ':' | '@' | '?' | '#')
+        })
+    {
+        return None;
+    }
+    Some((user, host))
+}
+
+/// Redact a bare `user@host` shape, if `text` is one. Returns `None`
+/// for anything else (emails stay callers' echo), and for a bare login
+/// whose user is NOT credential-shaped (the `user@example.com`
+/// contract). A credential-shaped user (RETEST-1) yields
+/// `<redacted>@host`; any `?`/`#` tail is opaque (bare syntax has no
+/// query semantics) and stripped exactly like the scp pass, even for
+/// non-credential users. Used by [`redact_credentials`],
+/// [`redact_remote_url`], and the free-text scp pass of [`scrub_text`].
+fn redact_bare_user_host(text: &str) -> Option<String> {
+    let head = text.split(['?', '#']).next().unwrap_or(text);
+    let (user, host) = bare_user_host(head)?;
+    if !is_credential_username(user) {
+        return if head.len() != text.len() {
+            Some(head.to_string())
+        } else {
+            None
+        };
+    }
+    Some(format!("{REDACTED}@{host}"))
 }
 
 /// True when a scheme URL carries a non-empty `userinfo@` authority prefix
@@ -812,8 +876,9 @@ pub fn redact_target_for_display(url: &str) -> String {
 }
 
 /// Scrub free text (evidence lines, error strings, reasons) for report
-/// emission: every embedded `scheme://...` token and every scp-like
-/// `user@host:path` token is passed through [`redact_credentials`], and
+/// emission: every embedded `scheme://...` token, every scp-like
+/// `user@host:path` token, and every bare `user@host` token with a
+/// credential-shaped user is passed through [`redact_credentials`], and
 /// sensitive pairs — same-token `key=value`/`key:value` plus spaced, JSON,
 /// CLI-flag, and multiline shapes — have their values replaced with
 /// [`REDACTED`]. Ordinary prose passes through unchanged.
@@ -825,10 +890,11 @@ pub fn scrub_text(text: &str) -> String {
 }
 
 /// Redact embedded scp-like `user@host:path` tokens inside free text
-/// (RS-PRIV-10). Tokens are whitespace-delimited; surrounding quotes and
-/// trailing sentence punctuation are preserved, the user component is
-/// redacted. Scheme URLs were handled by the earlier pass and are
-/// skipped here.
+/// (RS-PRIV-10), plus bare `user@host` tokens whose user is
+/// credential-shaped (RETEST-1). Tokens are whitespace-delimited;
+/// surrounding quotes and trailing sentence punctuation are preserved,
+/// the user component is redacted. Scheme URLs were handled by the
+/// earlier pass and are skipped here.
 fn scrub_embedded_scp(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut token_start: Option<usize> = None;
@@ -845,7 +911,7 @@ fn scrub_embedded_scp(text: &str) -> String {
             out.push_str(token);
             return;
         }
-        match redact_scp_like(stripped) {
+        match redact_scp_like(stripped).or_else(|| redact_bare_user_host(stripped)) {
             Some(redacted) => {
                 let lead = token.len()
                     - token
