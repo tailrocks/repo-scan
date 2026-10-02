@@ -69,3 +69,9 @@ dispatch2 = "0.3"
 
 [dev-dependencies]
 jsonschema = "0.58.3"
+
+[profile.dev]
+debug = 1
+
+[profile.test]
+debug = 1
