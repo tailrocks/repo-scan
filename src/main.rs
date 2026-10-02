@@ -2565,6 +2565,10 @@ struct Runner {
     /// duplicate instance. One small entry per distinct identity; eviction
     /// would duplicate instances, so the map lives for the run.
     probed_git_ids: HashMap<(u64, u64), Vec<u8>>,
+    /// Working-directory identities already persisted this run (R7):
+    /// `(dev, ino)` of `instance.work_dir` to deduplicate checkouts
+    /// across pathname aliases while preserving distinct working trees.
+    probed_work_ids: HashSet<(u64, u64)>,
     /// Set once `probed_git_ids` hits [`MAX_PROBED_GIT_IDS`] (A-F5,
     /// mirroring [`note_applied_scopes`]): further identities persist
     /// without dedupe and one `probe-index-overflow` gap documents it.
@@ -2616,6 +2620,7 @@ impl Runner {
             alias_seen: HashSet::new(),
             alias_overflow: false,
             probed_git_ids: HashMap::new(),
+            probed_work_ids: HashSet::new(),
             probed_overflow: false,
             watchdog: Watchdog::new(Duration::from_secs(WATCHDOG_GRACE_SECS)),
             batch: WriterBatch::new(),
@@ -5464,8 +5469,119 @@ async fn persist_probe(
     if let Some(key) = reads.git_identity {
         match runner.probed_git_ids.get(&key).cloned() {
             Some(first) if first != git_bytes => {
-                let due = runner.note_alias(git_bytes.clone(), first, "same_object", now_ms);
+                let due =
+                    runner.note_alias(git_bytes.clone(), first.clone(), "same_object", now_ms);
                 flush_if_due(runner, store, due).await?;
+                let work_identity = instance
+                    .work_dir
+                    .as_ref()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .map(|md| dir_identity(&md))
+                    .filter(|k| *k != (0, 0));
+                let is_distinct_checkout = match work_identity {
+                    Some(wid) => {
+                        if runner.probed_work_ids.contains(&wid) {
+                            false
+                        } else {
+                            if runner.probed_work_ids.len() < MAX_PROBED_GIT_IDS {
+                                runner.probed_work_ids.insert(wid);
+                            }
+                            true
+                        }
+                    }
+                    None => false,
+                };
+                if !is_distinct_checkout {
+                    return Ok(());
+                }
+                let first_instance_id = format!("git:{}", config::encode_hex(&first));
+                let head = reads.head;
+                let (head_state, head_ref, head_oid, head_algo) = head_columns(&head);
+                let relationship = reads.relationship;
+                let checkout_hex = config::encode_hex(&git_bytes);
+                let main_checkout_id = format!("co:{checkout_hex}");
+                let root_bytes = instance.work_dir.as_ref().map(|p| config::path_as_bytes(p));
+                let availability = match reads.work_present {
+                    Some(false) => "missing",
+                    Some(true) | None => "present",
+                };
+                let main_checkout = NewCheckout {
+                    id: &main_checkout_id,
+                    instance_id: &first_instance_id,
+                    root_path: root_bytes.as_deref(),
+                    git_path: &git_bytes,
+                    relationship,
+                    availability,
+                    head_state,
+                    head_ref: head_ref.as_deref(),
+                    head_oid: head_oid.as_deref(),
+                    head_algo: head_algo.as_deref(),
+                };
+                let due = if root_bytes.is_none() {
+                    TursoStore::buffer_insert_checkout_if_absent(
+                        &mut runner.batch,
+                        &main_checkout,
+                        now_ms,
+                    )
+                } else {
+                    TursoStore::buffer_upsert_checkout(&mut runner.batch, &main_checkout, now_ms)
+                };
+                flush_if_due(runner, store, due).await?;
+
+                let pairs: Vec<(String, String)> = reads
+                    .remotes
+                    .iter()
+                    .map(|r| {
+                        let role = match r.role {
+                            git::RemoteRole::Fetch => "fetch",
+                            git::RemoteRole::Push => "push",
+                        };
+                        (r.url.clone(), role.to_string())
+                    })
+                    .collect();
+                let borrowed: Vec<(&str, &str)> = pairs
+                    .iter()
+                    .map(|(url, role)| (url.as_str(), role.as_str()))
+                    .collect();
+                let is_target_repo = if identity::is_local_target(canonical) {
+                    let target_path_str = canonical.strip_prefix("file://").unwrap_or(canonical);
+                    let t_canon = std::fs::canonicalize(target_path_str)
+                        .unwrap_or_else(|_| PathBuf::from(target_path_str));
+                    let path_canon =
+                        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+                    path_canon == t_canon
+                        || instance
+                            .work_dir
+                            .as_ref()
+                            .and_then(|p| std::fs::canonicalize(p).ok())
+                            == Some(t_canon.clone())
+                        || std::fs::canonicalize(&instance.git_dir).ok() == Some(t_canon.clone())
+                        || std::fs::canonicalize(&instance.common_dir).ok() == Some(t_canon)
+                } else {
+                    false
+                };
+                let (disposition, _) = if is_target_repo {
+                    (identity::MatchDisposition::Confirmed, vec![])
+                } else {
+                    identity::classify_remotes(canonical, borrowed)
+                };
+
+                if matches!(
+                    disposition,
+                    identity::MatchDisposition::Confirmed
+                        | identity::MatchDisposition::Related
+                        | identity::MatchDisposition::Probable
+                ) {
+                    enqueue_status_task(
+                        store,
+                        runner,
+                        generation,
+                        run_rev,
+                        &main_checkout_id,
+                        now_ms,
+                    )
+                    .await?;
+                }
                 return Ok(());
             }
             Some(_) => {}
@@ -5603,6 +5719,17 @@ async fn persist_probe(
         TursoStore::buffer_upsert_checkout(&mut runner.batch, &main_checkout, now_ms)
     };
     flush_if_due(runner, store, due).await?;
+    if let Some(wid) = instance
+        .work_dir
+        .as_ref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|md| dir_identity(&md))
+        .filter(|k| *k != (0, 0))
+    {
+        if runner.probed_work_ids.len() < MAX_PROBED_GIT_IDS {
+            runner.probed_work_ids.insert(wid);
+        }
+    }
 
     // Registered linked worktrees: own checkout rows plus explicit probes
     // for bases outside already discovered paths.
