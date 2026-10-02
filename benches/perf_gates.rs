@@ -548,7 +548,7 @@ fn resolve_binary() -> PathBuf {
     }
     let exe = format!("repo-scan{}", std::env::consts::EXE_SUFFIX);
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for profile in ["debug", "release"] {
+    for profile in ["release", "debug"] {
         let candidate = manifest.join("target").join(profile).join(&exe);
         if candidate.is_file() {
             return candidate;
