@@ -690,24 +690,222 @@ impl FallbackGit {
     /// variables — the effective list fails closed there instead (a
     /// leaked global driver refuses rather than executes). Any scan
     /// error fails closed (unknown → refuse).
+    ///
+    /// FIXREADY6 F2b: the parent effective list never shows
+    /// submodule-scope drivers, but installed `git status` descends
+    /// into submodule worktrees and loads their configs — so a clean
+    /// parent list additionally requires the submodule-scope scan
+    /// ([`Self::submodule_filters_configured`]) to pass. Submodule
+    /// configs load WITH repo-local includes (isolation redirects only
+    /// global/system/HOME; `-c` cannot disable includes), so the
+    /// submodule leg follows `[include]`/`[includeIf]` chains —
+    /// includeIf unconditionally (over-approximation, safe direction).
     fn filters_configured(
         &self,
         git_dir: &Path,
         work_tree: Option<&Path>,
         isolation: &StatusConfigIsolation,
     ) -> bool {
-        match self.run_inner(git_dir, work_tree, &["config", "--list"], Some(isolation)) {
-            Ok(out) => String::from_utf8_lossy(&out).lines().any(|line| {
-                line.split_once('=')
-                    .is_some_and(|(key, _)| Self::is_exec_filter_key(&key.to_ascii_lowercase()))
-            }),
-            Err(e) => {
-                eprintln!(
+        let parent_hit =
+            match self.run_inner(git_dir, work_tree, &["config", "--list"], Some(isolation)) {
+                Ok(out) => String::from_utf8_lossy(&out).lines().any(|line| {
+                    line.split_once('=')
+                        .is_some_and(|(key, _)| Self::is_exec_filter_key(&key.to_ascii_lowercase()))
+                }),
+                Err(e) => {
+                    eprintln!(
                     "repo-scan: fallback: filter-driver scan failed, refusing content reads: {e}"
                 );
-                true
+                    return true;
+                }
+            };
+        if parent_hit {
+            return true;
+        }
+        Self::submodule_filters_configured(git_dir, work_tree)
+    }
+
+    /// Submodule-scope driver scan (FIXREADY6 F2b): installed `git
+    /// status` descends RECURSIVELY into submodule worktrees (proven:
+    /// drivers in absorbed, non-absorbed depth-1, and nested depth-2
+    /// external configs all execute), loading each submodule's own
+    /// config — which the parent effective `config --list` never shows
+    /// (FAIL-2). Mirrors the descent set: absorbed `modules/` trees
+    /// under the git and common dirs (recursive file scan) plus
+    /// recursive live enumeration through worktree `.git` files (for
+    /// non-absorbed layouts the `modules/<name>` construction cannot
+    /// see). True = refuse conversion. Every uncertainty refuses:
+    /// unreadable configs/dirs, breached caps, unresolvable gitdirs,
+    /// unopenable repos, and any submodule past the depth cap.
+    ///
+    /// Boundary vs the gix-side guard (`filter_driver_gap_for_repo`,
+    /// depth-1 live + proceed-on-enumeration-error): different
+    /// executors need different proof. gix fails its own
+    /// enumeration/resolution pre-conversion (loud, safe to proceed
+    /// past), while installed git is independently lenient (it may
+    /// descend where gix stumbles), so this guard refuses on every
+    /// miss. Post-F2a the fallback is the only status path for
+    /// submodule repos, so its guard is the authoritative one. Every
+    /// submodule config is assessed WITH its include chain (installed
+    /// git loads them; `-c` cannot disable includes).
+    fn submodule_filters_configured(git_dir: &Path, work_tree: Option<&Path>) -> bool {
+        // Absorbed trees (recursive, bounded, fail-closed).
+        if super::scan_modules_tree_with_includes(&git_dir.join("modules"), 0).refuses() {
+            return true;
+        }
+        let common_dir = match Self::common_dir_for(git_dir) {
+            Some(common_dir) => common_dir,
+            None => return true,
+        };
+        if common_dir.as_path() != git_dir
+            && super::scan_modules_tree_with_includes(&common_dir.join("modules"), 0).refuses()
+        {
+            return true;
+        }
+        let Some(work_tree) = work_tree else {
+            // No worktree: submodule checkouts cannot resolve, so any
+            // registration (via worktree, index, or HEAD `.gitmodules`)
+            // — or an unprovable registration set — refuses.
+            return Self::registers_submodules(git_dir);
+        };
+        Self::live_submodule_filters_configured(git_dir, work_tree)
+    }
+
+    /// Resolve the common dir for the absorbed-tree scan: `git_dir`
+    /// plus its `commondir` pointer when present. Absent pointer =
+    /// `git_dir` itself. Present-but-unreadable/unparseable/empty =
+    /// `None` (fail closed: the absorbed set is unprovable).
+    fn common_dir_for(git_dir: &Path) -> Option<PathBuf> {
+        let pointer = git_dir.join("commondir");
+        let text = match super::read_bounded_string(&pointer, super::MAX_GIT_CONTROL_BYTES) {
+            Some(text) => text,
+            None if std::fs::symlink_metadata(&pointer).is_err() => {
+                return Some(git_dir.to_path_buf());
+            }
+            None => return None,
+        };
+        let target = text.lines().next().unwrap_or_default().trim();
+        if target.is_empty() {
+            return None;
+        }
+        let target_path = Path::new(target);
+        if target_path.is_absolute() {
+            Some(target_path.to_path_buf())
+        } else {
+            Some(git_dir.join(target_path))
+        }
+    }
+
+    /// True when `git_dir` registers any submodule (or registration is
+    /// unprovable). Bare-repo path of
+    /// [`Self::submodule_filters_configured`].
+    fn registers_submodules(git_dir: &Path) -> bool {
+        let repo = match super::open_repo(git_dir) {
+            Ok(repo) => repo,
+            Err(_) => return true,
+        };
+        let submodules = match repo.submodules() {
+            Ok(submodules) => submodules,
+            Err(_) => return true,
+        };
+        match submodules {
+            Some(mut iter) => iter.next().is_some(),
+            None => false,
+        }
+    }
+
+    /// Recursive live enumeration of submodule gitdirs (non-absorbed
+    /// layouts): each enumerated gitdir's own configs plus its nested
+    /// absorbed tree are scanned, then its submodules are enumerated in
+    /// turn — mirroring installed git's recursive descent through
+    /// worktree `.git` files (`git_dir_try_old_form`, NOT the
+    /// `modules/<name>` construction, which is blind to external
+    /// gitdirs). True = refuse. Bounded by
+    /// `MAX_FILTER_SUBMODULE_SCAN` total visits and
+    /// `MAX_FILTER_MODULES_DEPTH` descent depth; past either cap, or on
+    /// any open/enumeration/resolution failure, refuse. Absent gitdirs
+    /// (uninitialized submodules git cannot descend into) are skipped.
+    ///
+    /// The superproject worktree is carried down the recursion
+    /// (`set_workdir` per level): a submodule gitdir opened standalone
+    /// has no usable `core.worktree`, so without the carried worktree
+    /// nested `.git` files would resolve against nothing (or the
+    /// process cwd) and nested external drivers would be missed —
+    /// while git always resolves them against the superproject
+    /// worktree. The re-pointed repos are enumeration-only (never
+    /// status-scanned); absent worktrees (deinitialized submodules git
+    /// cannot descend into) are skipped.
+    ///
+    /// Top-level exception: when the top gitdir itself cannot open,
+    /// git fails loudly downstream on the same broken gitdir — so the
+    /// scan proceeds UNLESS a worktree `.gitmodules` is present (any
+    /// registration git could descend into refuses instead). Without
+    /// that file there is no registration git could read (index/HEAD
+    /// need the same unopenable gitdir). Nested opens always refuse on
+    /// failure: a present-but-unopenable nested gitdir is unprovable.
+    fn live_submodule_filters_configured(git_dir: &Path, work_tree: &Path) -> bool {
+        let mut stack = vec![(git_dir.to_path_buf(), work_tree.to_path_buf(), 0u8)];
+        let mut seen = 0usize;
+        while let Some((dir, worktree, depth)) = stack.pop() {
+            if !worktree.is_dir() {
+                continue;
+            }
+            let mut repo = match super::open_repo(&dir) {
+                Ok(repo) => repo,
+                Err(_) if depth == 0 => {
+                    if std::fs::symlink_metadata(worktree.join(".gitmodules")).is_ok() {
+                        return true;
+                    }
+                    continue;
+                }
+                Err(_) => return true,
+            };
+            if repo.set_workdir(worktree).is_err() {
+                return true;
+            }
+            let submodules = match repo.submodules() {
+                Ok(submodules) => submodules,
+                Err(_) => return true,
+            };
+            let Some(iter) = submodules else {
+                continue;
+            };
+            for sub in iter {
+                seen += 1;
+                if seen > super::MAX_FILTER_SUBMODULE_SCAN {
+                    return true;
+                }
+                // try_old_form resolves through the worktree `.git`
+                // file/dir (external gitdirs included); `git_dir()`
+                // alone only constructs `modules/<name>`.
+                let sub_gitdir = match sub.git_dir_try_old_form() {
+                    Ok(sub_gitdir) => sub_gitdir,
+                    Err(_) => return true,
+                };
+                // Absent gitdir (uninitialized submodule): git cannot
+                // descend into nothing, so there is nothing to prove.
+                if !sub_gitdir.is_dir() {
+                    continue;
+                }
+                if super::scan_repo_filter_configs_with_includes(&sub_gitdir, &sub_gitdir).refuses()
+                    || super::scan_modules_tree_with_includes(&sub_gitdir.join("modules"), 0)
+                        .refuses()
+                {
+                    return true;
+                }
+                // A submodule existing past the depth cap has
+                // unprovable children: refuse (fail closed).
+                if depth + 1 > super::MAX_FILTER_MODULES_DEPTH {
+                    return true;
+                }
+                let sub_worktree = match sub.work_dir() {
+                    Ok(sub_worktree) => sub_worktree,
+                    Err(_) => return true,
+                };
+                stack.push((sub_gitdir, sub_worktree, depth + 1));
             }
         }
+        false
     }
 
     /// True when `key` (lowercased `section.name.attr` from `config
@@ -868,7 +1066,15 @@ impl StatusConfigIsolation {
 /// [`sanitize_git_env`] so these values win:
 /// - hooks: `core.hooksPath=/dev/null`
 /// - fsmonitor: `core.fsmonitor=false` (wins over repo config AND
-///   `include.path` chains by `-c` precedence — proven by the marker test)
+///   `include.path` chains by `-c` precedence — proven by the marker test;
+///   submodule scope too: parent status descends via a child `git status
+///   --porcelain=2` (argv trace) that inherits the `-c` through git's
+///   `GIT_CONFIG_COUNT` environment propagation, which overrides config
+///   files — so a hook/daemon enabled in a submodule config never runs:
+///   probed on Apple Git 2.54.0 and 2.56.0, the hook ran with the `-c`
+///   removed and stayed silent with the exact scanner argv on both.
+///   Same key covers hook-path and `=true` daemon values, so no
+///   fsmonitor guard scan is needed — the `-c` is the neutralization)
 /// - pager: `--no-pager` flag + `core.pager=cat` + `GIT_PAGER=cat`
 /// - ssh: `core.sshCommand=false` (any transport attempt fails closed;
 ///   the fallback never runs transport subcommands) + `GIT_SSH*` removed

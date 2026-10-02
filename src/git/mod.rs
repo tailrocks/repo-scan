@@ -293,7 +293,7 @@ pub fn config_include_gap(instance: &GitInstance) -> Option<String> {
 /// True when config text holds an `[include]`/`[includeIf ...]` header.
 fn has_include_section(config_text: &str) -> bool {
     for raw_line in config_text.lines() {
-        let line = raw_line.trim();
+        let line = strip_bom(raw_line).trim();
         if line.starts_with('[') {
             let section = line.to_lowercase();
             if section == "[include]" || section.starts_with("[includeif ") {
@@ -311,6 +311,25 @@ fn has_include_section(config_text: &str) -> bool {
 /// drivers — so [`filter_driver_gap`] refuses the probe before the first
 /// status call, and the scheduler records the returned line.
 pub const FILTER_DRIVER_GAP: &str = "filter-drivers-configured";
+
+/// Marker prefix for the explicit submodule-recursion gap (FIXREADY6
+/// 47A7E507 FAIL-1). gix 0.88 status recurses into submodule worktrees
+/// through fresh default-permission opens — the parent's isolated
+/// permissions are NOT propagated (proven from the vendored sources:
+/// `status/iter/mod.rs` hardcodes `BuiltinSubmoduleStatus::new`, whose
+/// `status()` in `status/index_worktree.rs` calls `crate::open`
+/// (default options) unconditionally under non-`parallel`, and
+/// `submodule/mod.rs` `Submodule::open` inherits those default options
+/// before `status_opts` runs full content-converting status). gix
+/// offers no isolated-recursion control (`Platform` exposes only the
+/// `Submodule` ignore/check-dirty mode), so a repository-selected
+/// `filter=` attribute inside a submodule would resolve
+/// operator-configured (user/system/env) helpers and execute them
+/// in-process. [`submodule_recursion_gap`] therefore refuses the probe
+/// before the first status call whenever submodules are registered,
+/// and the scheduler records the returned line: never silent, never
+/// executing.
+pub const SUBMODULE_RECURSION_GAP: &str = "submodule-recursion-unisolated";
 
 /// Isolated-scope declaration recorded on every status observation
 /// (FIXREADY4 F-note1, spec "declare what was inspected"): the status
@@ -388,9 +407,17 @@ fn filter_driver_gap_for_repo(repo: &gix::Repository, instance: &GitInstance) ->
             instance.common_dir.display()
         ));
     }
-    // Live depth-1 enumeration covers non-absorbed layouts the `modules/`
-    // walk cannot see; each enumerated gitdir's own nested tree is walked
-    // too. Past the cap the set is unknown, so refuse (fail closed).
+    // Live depth-1 enumeration; each enumerated gitdir's own nested
+    // tree is walked too. Past the cap the set is unknown, so refuse
+    // (fail closed).
+    //
+    // Resolution note (FIXREADY6 47A7E507): this resolves through
+    // `git_dir()` (the `modules/<name>` construction), which misses
+    // non-absorbed gitdirs — but that miss is unreachable-by-execution:
+    // [`submodule_recursion_gap`] refuses every submodule-bearing probe
+    // before any status call, and the fallback guard (the only status
+    // path for submodule repos) resolves through
+    // `git_dir_try_old_form` recursively.
     let mut seen = 0usize;
     let submodules = match repo.submodules() {
         Ok(submodules) => submodules,
@@ -416,6 +443,41 @@ fn filter_driver_gap_for_repo(repo: &gix::Repository, instance: &GitInstance) ->
                 git_dir.display()
             ));
         }
+    }
+    None
+}
+
+/// Refuse gix status recursion into submodule worktrees (FIXREADY6
+/// 47A7E507 FAIL-1).
+///
+/// Returns `Some` evidence line (prefixed with
+/// [`SUBMODULE_RECURSION_GAP`]) when any submodule is registered —
+/// gix 0.88 status would recurse into its worktree through a fresh
+/// default-permission open, resolving repository-selected `filter=`
+/// attributes against operator-configured (user/system/env) helpers
+/// and executing them in-process — else `None`. Checked on the
+/// already-open isolated parent: submodule names come from the
+/// `.gitmodules` file, which the isolated open reads identically to a
+/// default open, so the check sees exactly the set the recursion
+/// could reach. Enumeration failure is not a refusal: status
+/// construction fails the same enumeration
+/// (`BuiltinSubmoduleStatus::new`) before any content conversion, so
+/// the real error surfaces loudly from the probe.
+///
+/// [`GixInspector::status_interruptible`] enforces this after the
+/// filter-driver gap (driver-bearing fixtures keep their explicit
+/// driver gap) and before any content-converting status call.
+pub fn submodule_recursion_gap(repo: &gix::Repository, instance: &GitInstance) -> Option<String> {
+    let submodules = match repo.submodules() {
+        Ok(submodules) => submodules,
+        Err(_) => return None,
+    };
+    let mut iter = submodules?;
+    if iter.next().is_some() {
+        return Some(format!(
+            "{SUBMODULE_RECURSION_GAP}: {} registers submodules; gix status would recurse into their worktrees through fresh default-permission opens (isolated permissions are not propagated, and gix 0.88 offers no isolated-recursion control), executing repository-selected filter drivers from user/system scope — refusing to execute",
+            instance.git_dir.display()
+        ));
     }
     None
 }
@@ -777,6 +839,13 @@ impl GixInspector {
         if let Some(gap) = filter_driver_gap_for_repo(&repo, instance) {
             return Err(unsupported(gap));
         }
+        // FIXREADY6 F2a: refuse unisolatable submodule recursion (see
+        // [`SUBMODULE_RECURSION_GAP`]) before the first
+        // content-converting call. After the driver check so
+        // driver-bearing fixtures keep their explicit driver gap.
+        if let Some(gap) = submodule_recursion_gap(&repo, instance) {
+            return Err(unsupported(gap));
+        }
         let mut counts = self.run_status_counts(&repo, mode, interrupt.clone())?;
         let after = vec![head_fingerprint(&repo), index_fingerprint(&repo)];
         if after != fingerprints {
@@ -784,6 +853,11 @@ impl GixInspector {
             // Re-check drivers first: a config swapped in during the first
             // pass must not execute on the retry.
             if let Some(gap) = filter_driver_gap_for_repo(&repo, instance) {
+                return Err(unsupported(gap));
+            }
+            // FIXREADY6 F2a: a submodule registered during the first
+            // pass must not execute on the retry either.
+            if let Some(gap) = submodule_recursion_gap(&repo, instance) {
                 return Err(unsupported(gap));
             }
             let retry = self.run_status_counts(&repo, mode, interrupt)?;
@@ -930,12 +1004,30 @@ impl GitInspect for GixInspector {
             let Some(remote) = repo.try_find_remote(name.as_bstr()) else {
                 continue;
             };
-            let remote = remote.map_err(|e| {
-                git_err(format!(
-                    "remote `{}`: {e}",
-                    name.as_bstr().to_string().replace('\n', "?")
-                ))
-            })?;
+            let remote = match remote {
+                Ok(remote) => remote,
+                // Per-remote fault isolation (FIXREADY6 88117623): one
+                // gix-unparseable remote must not fail the whole read
+                // and drop its valid siblings (one junk remote would
+                // hide the repo from inventory). The raw value is
+                // uninterpretable, so the remote surfaces as one
+                // REDACTED_URL row pair (fetch+push, never dropped,
+                // canary-free by construction — the raw bytes never
+                // flow anywhere) and the loop continues with its
+                // siblings. The `unresolvable_identity` verdict for the
+                // collapsed rows carries the unsupported evidence.
+                Err(_) => {
+                    for role in [RemoteRole::Fetch, RemoteRole::Push] {
+                        out.push(RemoteObservation {
+                            name: name.as_bytes().to_vec(),
+                            role,
+                            url: crate::identity::REDACTED_URL.to_string(),
+                            canonical_url: None,
+                        });
+                    }
+                    continue;
+                }
+            };
             // gix applies url.<base>.insteadOf/pushInsteadOf at construction:
             // pure string rewrites, no helper execution (GIT_QUAL §3).
             for (role, direction) in [
@@ -1246,29 +1338,226 @@ fn index_fingerprint(repo: &gix::Repository) -> String {
 }
 
 /// Narrow scan for `path = ...` values under `[include]`/`[includeIf]`.
+/// Scans the continuation-joined text PLUS the original physical lines
+/// (deduped): the joined leg sees the values git loads through `\` +
+/// newline, the unjoined leg keeps every physical line git parses
+/// without joining (comments, section headers) visible — a join-only
+/// scan would hide a `path = ...` line glued onto a preceding `\`-ended
+/// comment while git still loads it. Over-following is the safe
+/// direction (extra candidates only add evidence / refusal).
 fn scan_include_paths(config_text: &str) -> Vec<String> {
+    let joined = join_continuations(config_text);
     let mut out = Vec::new();
-    let mut in_include = false;
-    for raw_line in config_text.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with(['#', ';']) {
-            continue;
-        }
-        if line.starts_with('[') {
-            let section = line.to_lowercase();
-            in_include = section == "[include]" || section.starts_with("[includeif ");
-            continue;
-        }
-        if !in_include {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once('=') {
-            if key.trim().eq_ignore_ascii_case("path") {
-                let value = value.trim().trim_matches('"').trim().to_string();
-                if !value.is_empty() {
-                    out.push(value);
+    for text in [&joined[..], config_text] {
+        let mut in_include = false;
+        for raw_line in text.lines() {
+            let line = strip_bom(raw_line).trim();
+            if line.is_empty() || line.starts_with(['#', ';']) {
+                continue;
+            }
+            if line.starts_with('[') {
+                let section = line.to_lowercase();
+                in_include = section == "[include]" || section.starts_with("[includeif ");
+                continue;
+            }
+            if !in_include {
+                continue;
+            }
+            if let Some((key, value)) = line.split_once('=') {
+                if key.trim().eq_ignore_ascii_case("path") {
+                    for candidate in include_path_candidates(value) {
+                        if !out.contains(&candidate) {
+                            out.push(candidate);
+                        }
+                    }
                 }
             }
+        }
+    }
+    out
+}
+
+/// Join git line continuations the way git 2.56.0 parses values
+/// (every rule below probed via `git config --list --includes`):
+/// a `\` IMMEDIATELY before `\n` (or `\r\n`) joins the next line by
+/// pure concatenation — leading whitespace of the continued line is
+/// kept, inside and outside double quotes. A `\\` pair is an escaped
+/// backslash, not a continuation: the parity of the trailing run
+/// decides (odd joins after pairing the rest, even never joins). A
+/// trailing `\` at EOF (no newline) is dropped (odd run) or paired
+/// (even run). A `\` followed by anything else (space, `\r` + non-`\n`,
+/// EOF-adjacent `\r`) is left untouched for the escape parser, which
+/// fails closed on it exactly as git fatals there.
+fn join_continuations(config_text: &str) -> String {
+    let bytes = config_text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        let mut run_end = i;
+        while run_end < bytes.len() && bytes[run_end] == b'\\' {
+            run_end += 1;
+        }
+        let run = run_end - i;
+        let mut break_end = run_end;
+        if break_end < bytes.len() && bytes[break_end] == b'\r' {
+            break_end += 1;
+        }
+        if break_end < bytes.len() && bytes[break_end] == b'\n' {
+            // `\` run immediately before a line break: the run stays
+            // literal except an odd leftover, which joins (drop it +
+            // the break). Joining never unescapes `\\` pairs — the
+            // escape parser handles those per line later.
+            out.extend(std::iter::repeat_n(b'\\', run - run % 2));
+            if run % 2 == 0 {
+                out.extend_from_slice(&bytes[run_end..=break_end]);
+            }
+            i = break_end + 1;
+        } else if run_end == bytes.len() {
+            // `\` run at EOF without a newline: pairs stay literal,
+            // an odd leftover is dropped.
+            out.extend(std::iter::repeat_n(b'\\', run - run % 2));
+            i = run_end;
+        } else {
+            // Not before a break: literal (the escape parser fails
+            // closed on `\` + non-newline exactly as git fatals).
+            out.extend(std::iter::repeat_n(b'\\', run));
+            i = run_end;
+        }
+    }
+    // Byte ops only ever remove ASCII `\`/`\r`/`\n`, so UTF-8
+    // boundaries are preserved.
+    String::from_utf8(out).unwrap_or_else(|_| config_text.to_string())
+}
+
+/// Strip a leading UTF-8 BOM (`U+FEFF`): git skips the BOM at the start
+/// of a config file, while `str::trim` leaves it — so a BOM'd `[include]`
+/// / `[filter ...]` first line never matched any section scan below (H0:
+/// drivers loaded through a BOM'd include, or named in a BOM'd `[filter]`
+/// block, were invisible to the guard while git executed them). Applied
+/// per line: a superset of git's file-start-only skip, and over-matching
+/// a section header only adds gap evidence / include follows (safe
+/// direction), never a missed driver.
+fn strip_bom(line: &str) -> &str {
+    line.trim_start_matches('\u{FEFF}')
+}
+
+/// Strip a git trailing comment: `;`/`#` outside double quotes ends the
+/// value (probed git 2.56.0: even with NO preceding space, even inside
+/// single quotes — only double quotes protect, e.g. `path = "a;b.inc"`
+/// keeps `;` while `path = 'a;b'` cuts at `;`). A backslash escapes the
+/// next byte, so `\"` neither toggles quoting nor ends anything and
+/// `\;`/`\#` stay literal. Returns the value slice before the comment.
+fn strip_git_comment(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    let mut in_quotes = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => {
+                in_quotes = !in_quotes;
+                i += 1;
+            }
+            b';' | b'#' if !in_quotes => return &value[..i],
+            _ => i += 1,
+        }
+    }
+    value
+}
+
+/// Resolve git quote grouping + backslash escapes in an already
+/// comment-stripped, trimmed value: drop `"` chars, map `\\` `\"` `\n`
+/// `\t` `\b` (the full set git 2.56.0 accepts — probed; anything else,
+/// e.g. `\q` `\r` `\0`, makes git reject the whole file with fatal, so
+/// `None`, as does a trailing lone `\`, which only a line continuation
+/// could complete). `None` means git loads nothing from this file, so the
+/// caller keeps just the raw leg — which then refuses on the undecodable
+/// (missing/unreadable) path rather than blessing it.
+fn unescape_git_value(value: &str) -> Option<String> {
+    if !value.contains(['"', '\\']) {
+        return Some(value.to_string());
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {}
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('b') => out.push('\u{8}'),
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                _ => return None,
+            },
+            _ => out.push(c),
+        }
+    }
+    Some(out)
+}
+
+/// Both-legs include target: the legacy raw parse plus the git-normalized
+/// parse when they differ. No single planted file can satisfy the scanner
+/// while git loads another, by case over the spelling of one `path` line
+/// (probed against git 2.56.0; every uncertainty below refuses via the
+/// caller's missing-target / unreadable-target fail-closed rules):
+///
+/// - Plain spelling (no comment, quotes, or escapes): both legs agree
+///   (deduped) and equal what git loads.
+/// - Trailing comment (`;`/`#`, spaced or bare, H1): the normalized leg
+///   strips it exactly like git and follows the real file; the raw leg
+///   keeps the comment junk, so a decoy planted at the literal
+///   `real.inc ; docs` spelling is ALSO followed — a driver in either
+///   file refuses, and when the junk path exists nowhere it refuses as a
+///   missing include target.
+/// - Double-quoted value with escapes (`\"` `\\` `\n` `\t` `\b`, H2): the
+///   normalized leg unquotes/unescapes exactly like git; the raw leg
+///   (`trim_matches('"')`, no unescape) additionally follows the literal
+///   backslash spelling, so a decoy there is also inspected — driver in
+///   either refuses, missing junk path refuses.
+/// - Unknown escapes (`\q`, `\r`, `\0`, ...): git fatals the whole file
+///   and loads nothing, so only the raw leg is followed — it either names
+///   a driver (refuses) or a nonexistent path (refuses as missing).
+/// - Line continuation (`\` + newline, H3): the callers scan the
+///   JOINED text (see [`join_continuations`]) plus the original
+///   physical lines, so the normalized leg sees the same joined value
+///   git loads (inside and outside quotes; join-then-comment-cut also
+///   replicates git) while the raw leg additionally follows every
+///   split spelling — a decoy at the literal `inc/re\` half is also
+///   inspected, and physical lines git never joins (comments, section
+///   headers) stay visible exactly as git parses them.
+/// - Single quotes: git treats them as ordinary chars (comment inside
+///   still cuts); the normalized leg replicates that, the raw leg adds
+///   the comment-junk variant — both followed, both fail closed.
+///
+/// Residual risk spans TWO models that must each match git on accepted
+/// spellings: the escape TABLE above, and the continuation JOIN rule
+/// (parity of the trailing `\` run, `\r\n` breaks, `\`-at-EOF drop).
+/// Both are pinned by probes against git 2.56.0 (escapes: `\n` `\t`
+/// `\b` `\"` `\\` load, `\q`/`\r`/`\0` fatal; joins: odd run joins,
+/// even run stays literal, `\` + EOF drops, `\`-then-comment cuts
+/// after the join) and by regression tests per escape and per
+/// continuation variant. Where model and git could still differ
+/// (unknown escapes, bad lines), git rejects the file (fatal — later
+/// values never load, earlier ones keep working) while the scanner
+/// keeps parsing every line it can: the follow set can only EXCEED
+/// what git loads, and every excess follow refuses rather than
+/// blessing — over-follow is the safe direction, never a miss.
+fn include_path_candidates(raw_value: &str) -> Vec<String> {
+    let raw = raw_value.trim().trim_matches('"').trim().to_string();
+    let mut out = Vec::with_capacity(2);
+    if !raw.is_empty() {
+        out.push(raw.clone());
+    }
+    let normalized = unescape_git_value(strip_git_comment(raw_value.trim()).trim());
+    if let Some(normalized) = normalized {
+        if !normalized.is_empty() && normalized != raw && !out.contains(&normalized) {
+            out.push(normalized);
         }
     }
     out
@@ -1286,6 +1575,18 @@ const MAX_FILTER_MODULES_DEPTH: u8 = 4;
 /// Maximum entries read from one `modules/` directory during the
 /// filter-driver scan; past the cap the set is unknown, so refuse.
 const MAX_FILTER_MODULES_ENTRIES: usize = 256;
+
+/// Maximum include-chain depth followed per submodule-leg config scan
+/// (mirrors [`MAX_FILTER_MODULES_DEPTH`]): the scanned `config` /
+/// `config.worktree` file is depth 0, its direct includes depth 1, and
+/// so on. Past the cap the driver set is unknown, so refuse.
+const MAX_FILTER_INCLUDE_DEPTH: u8 = 4;
+
+/// Maximum config files read per submodule-leg admin-pair scan
+/// (mirrors [`MAX_FILTER_MODULES_ENTRIES`]): the `config` /
+/// `config.worktree` candidates plus every include reached from them
+/// in one shared budget. Past the cap the set is unknown, so refuse.
+const MAX_FILTER_INCLUDE_FILES: usize = 256;
 
 /// Outcome of one bounded filter-driver scan step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1338,6 +1639,199 @@ fn scan_config_file_for_filters(path: &std::path::Path) -> FilterScan {
     }
 }
 
+/// Submodule-leg twin of [`scan_repo_filter_configs`]: installed `git
+/// status` loads each submodule's own configs WITH repo-local includes
+/// (config isolation redirects only global/system/HOME, and `-c`
+/// cannot disable includes), so every `config` / `config.worktree`
+/// candidate is assessed together with its `[include]` / `[includeIf]`
+/// chain (see [`scan_config_file_for_filters_with_includes`]). Used
+/// ONLY on the fallback submodule leg — the gix leg keeps
+/// [`scan_repo_filter_configs`] (gix loads with includes disabled, so
+/// following them there would over-refuse), and the fallback parent
+/// leg keeps its effective `config --list` (real git, which already
+/// sees through includes).
+fn scan_repo_filter_configs_with_includes(
+    git_dir: &std::path::Path,
+    common_dir: &std::path::Path,
+) -> FilterScan {
+    let mut candidates = vec![
+        git_dir.join("config"),
+        common_dir.join("config"),
+        git_dir.join("config.worktree"),
+        common_dir.join("config.worktree"),
+    ];
+    candidates.sort();
+    candidates.dedup();
+    let mut seen = std::collections::HashSet::new();
+    let mut files = 0usize;
+    for candidate in candidates {
+        if scan_config_file_for_filters_with_includes(&candidate, 0, &mut seen, &mut files)
+            .refuses()
+        {
+            return FilterScan::Refuse;
+        }
+    }
+    FilterScan::Clean
+}
+
+/// Stable identity for one include file (cycle detection): unix
+/// (dev, ino), so hardlink aliases of an already-seen file still
+/// collide; the lexical path elsewhere (missed alias loops there stay
+/// bounded by [`MAX_FILTER_INCLUDE_DEPTH`]). A re-seen identity is a
+/// cycle (or alias loop) and refuses — git itself dies past its own
+/// include-depth cap, so a cycle never earns a clean bill.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct IncludeFileId {
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(not(unix))]
+    path: std::path::PathBuf,
+}
+
+/// lstat identity of `path` (no follow): `None` when the path cannot
+/// even be stated (missing, raced away, permission) — the caller
+/// refuses, never treats that as clean.
+fn include_file_id(path: &std::path::Path) -> Option<IncludeFileId> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|meta| IncludeFileId {
+                dev: meta.dev(),
+                ino: meta.ino(),
+            })
+    }
+    #[cfg(not(unix))]
+    {
+        if std::fs::symlink_metadata(path).is_ok() {
+            Some(IncludeFileId {
+                path: path.to_path_buf(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Scan one config file plus its include chain for executable
+/// filter-driver keys.
+///
+/// Depth 0 is a direct `config` / `config.worktree` candidate (a
+/// missing file is clean — no drivers to execute, same as
+/// [`scan_config_file_for_filters`]); deeper levels are NAMED include
+/// targets, where a missing file refuses: git's treatment of a
+/// missing target (silently ignored vs loud error) is
+/// version-dependent and cannot prove absence across the scan→spawn
+/// race, so fail closed.
+///
+/// Every other uncertainty refuses loudly: present-but-unreadable
+/// files (over-cap, link, FIFO, directory, race), include cycles /
+/// alias loops (re-seen identity), breached depth / file caps, and an
+/// unstatable identity. includeIf CONDITIONS are never evaluated —
+/// every conditional path is followed unconditionally
+/// (over-approximation: refuses when git would not load, the safe
+/// direction; evaluating gitdir:/branch:/hasconfig conditions would
+/// re-implement git's own semantics).
+fn scan_config_file_for_filters_with_includes(
+    path: &std::path::Path,
+    depth: u8,
+    seen: &mut std::collections::HashSet<IncludeFileId>,
+    files: &mut usize,
+) -> FilterScan {
+    if depth > MAX_FILTER_INCLUDE_DEPTH {
+        return FilterScan::Refuse;
+    }
+    *files += 1;
+    if *files > MAX_FILTER_INCLUDE_FILES {
+        return FilterScan::Refuse;
+    }
+    let text = match read_bounded_string(path, MAX_GIT_CONTROL_BYTES) {
+        Some(text) => text,
+        None if depth == 0 && std::fs::symlink_metadata(path).is_err() => {
+            return FilterScan::Clean;
+        }
+        None => return FilterScan::Refuse,
+    };
+    if config_text_names_exec_filter(&text) {
+        return FilterScan::Refuse;
+    }
+    let self_id = match include_file_id(path) {
+        Some(id) => id,
+        None => return FilterScan::Refuse,
+    };
+    if !seen.insert(self_id) {
+        return FilterScan::Refuse;
+    }
+    let base = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    for target in scan_guard_include_paths(&text) {
+        let resolved = resolve_include_path(&target, base);
+        if scan_config_file_for_filters_with_includes(&resolved, depth + 1, seen, files).refuses() {
+            return FilterScan::Refuse;
+        }
+    }
+    FilterScan::Clean
+}
+
+/// Narrow `path = ...` extraction under `[include]` / `[includeIf
+/// ...]` for the submodule-leg guard scan (see
+/// [`scan_config_file_for_filters_with_includes`]). Section matching
+/// is deliberately a SUPERSET of git's spellings (any case, inner
+/// whitespace, trailing comments, quote-adjacent names):
+/// over-matching follows an include git would ignore (safe direction),
+/// while under-matching would miss a driver git loads. includeIf
+/// conditions are never evaluated — every conditional path is
+/// returned unconditionally (over-approximation, documented at the
+/// caller). Scans the continuation-joined text PLUS the original
+/// physical lines (deduped): git joins `\` + newline inside VALUES
+/// only, so the joined leg sees what git loads through a continuation
+/// while the unjoined leg keeps every physical line git parses without
+/// joining (comments, section headers) visible — a join-only scan
+/// would hide a `path = ...` line glued onto a preceding `\`-ended
+/// comment while git still loads it (the mirror-image bypass of the
+/// H3 hole this closes). Over-following is the safe direction.
+fn scan_guard_include_paths(config_text: &str) -> Vec<String> {
+    let joined = join_continuations(config_text);
+    let mut out = Vec::new();
+    for text in [&joined[..], config_text] {
+        let mut in_include = false;
+        for raw_line in text.lines() {
+            let line = strip_bom(raw_line).trim();
+            if line.is_empty() || line.starts_with(['#', ';']) {
+                continue;
+            }
+            if line.starts_with('[') {
+                // Section name runs past optional inner whitespace to the
+                // first whitespace, `]`, or `"`: `[include]`, `[Include]`,
+                // `[ include ]`, `[includeIf "gitdir:/x"]`, trailing comments.
+                let inner = line.strip_prefix('[').unwrap_or_default().trim_start();
+                let name = inner
+                    .split([' ', '\t', ']', '"'])
+                    .next()
+                    .unwrap_or_default();
+                in_include =
+                    name.eq_ignore_ascii_case("include") || name.eq_ignore_ascii_case("includeif");
+                continue;
+            }
+            if !in_include {
+                continue;
+            }
+            if let Some((key, value)) = line.split_once('=') {
+                if key.trim().eq_ignore_ascii_case("path") {
+                    for candidate in include_path_candidates(value) {
+                        if !out.contains(&candidate) {
+                            out.push(candidate);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// True when config text names an executable driver: a
 /// `clean`/`smudge`/`process` key inside any `[filter ...]` section
 /// (case-insensitive; value ignored — presence alone makes gix spawn
@@ -1347,7 +1841,7 @@ fn scan_config_file_for_filters(path: &std::path::Path) -> FilterScan {
 fn config_text_names_exec_filter(config_text: &str) -> bool {
     let mut in_filter = false;
     for raw_line in config_text.lines() {
-        let line = raw_line.trim();
+        let line = strip_bom(raw_line).trim();
         if line.is_empty() || line.starts_with(['#', ';']) {
             continue;
         }
@@ -1421,6 +1915,58 @@ fn scan_modules_tree(modules_dir: &std::path::Path, depth: u8) -> FilterScan {
         }
         if scan_repo_filter_configs(&path, &path).refuses()
             || scan_modules_tree(&path.join("modules"), depth + 1).refuses()
+        {
+            return FilterScan::Refuse;
+        }
+    }
+    FilterScan::Clean
+}
+
+/// Include-following twin of [`scan_modules_tree`] for the fallback
+/// submodule leg (installed git loads submodule configs WITH
+/// repo-local includes): identical walk rules (depth- and entry-capped,
+/// links never followed, every uncertainty refuses), but each
+/// submodule gitdir's configs are assessed with
+/// [`scan_repo_filter_configs_with_includes`]. The gix leg keeps
+/// [`scan_modules_tree`] (gix loads with includes disabled).
+fn scan_modules_tree_with_includes(modules_dir: &std::path::Path, depth: u8) -> FilterScan {
+    if depth > MAX_FILTER_MODULES_DEPTH {
+        return FilterScan::Refuse;
+    }
+    let entries = match std::fs::read_dir(modules_dir) {
+        Ok(entries) => entries,
+        // Absent `modules/` (no submodules) is clean; any other failure
+        // (permissions, races, non-directories) is unknown, so refuse —
+        // except a provably absent path, which simply has no submodules.
+        Err(_) if std::fs::symlink_metadata(modules_dir).is_err() => return FilterScan::Clean,
+        Err(_) => return FilterScan::Refuse,
+    };
+    let mut count = 0usize;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => return FilterScan::Refuse,
+        };
+        count += 1;
+        if count > MAX_FILTER_MODULES_ENTRIES {
+            return FilterScan::Refuse;
+        }
+        let path = entry.path();
+        // lstat, no follow: links never resolve outside the tree.
+        let file_type = match std::fs::symlink_metadata(&path).map(|m| m.file_type()) {
+            Ok(file_type) => file_type,
+            Err(_) => return FilterScan::Refuse,
+        };
+        if file_type.is_symlink() {
+            // A linked name could be a submodule gitdir gix status would
+            // open and recurse into — unprovable, so refuse.
+            return FilterScan::Refuse;
+        }
+        if !file_type.is_dir() {
+            continue;
+        }
+        if scan_repo_filter_configs_with_includes(&path, &path).refuses()
+            || scan_modules_tree_with_includes(&path.join("modules"), depth + 1).refuses()
         {
             return FilterScan::Refuse;
         }

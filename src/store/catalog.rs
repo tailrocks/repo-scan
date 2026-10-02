@@ -1678,6 +1678,18 @@ impl TursoStore {
                 )
                 .await
                 .map_err(store_err)?;
+                // FIXREADY6 resume-gap: a successful (possibly retried)
+                // completion supersedes this task's failure gap — close
+                // `gap:<task>` so a stale in-flight-interrupt gap can
+                // never poison verdicts permanently. The row stays for
+                // audit (`open = 0`); tasks that never failed match zero
+                // rows (no-op).
+                conn.execute(
+                    "UPDATE errors SET open = 0, last_seen_ms = ?1 WHERE id = ?2",
+                    vec![v_int(now_ms), v_text(format!("gap:{}", task.id))],
+                )
+                .await
+                .map_err(store_err)?;
             }
             TaskOutcome::Retry {
                 category,
