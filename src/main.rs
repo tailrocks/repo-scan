@@ -1032,7 +1032,7 @@ fn plan_roots(
             #[cfg(target_os = "macos")]
             let table = repo_scan::platform::macos::MacOsMountTable;
             #[cfg(not(target_os = "macos"))]
-            let table = repo_scan::platform::linux::FixtureMountTable;
+            let table = repo_scan::platform::linux::LinuxMountTable::new();
             let mounts = table.mounts()?;
             Ok((String::from("machine"), plan_machine_roots(&mounts), None))
         }
@@ -1206,7 +1206,7 @@ async fn upsert_volumes(
     #[cfg(target_os = "macos")]
     let table = repo_scan::platform::macos::MacOsMountTable;
     #[cfg(not(target_os = "macos"))]
-    let table = repo_scan::platform::linux::FixtureMountTable;
+    let table = repo_scan::platform::linux::LinuxMountTable::new();
     for mount in table.mounts()?.iter() {
         store
             .upsert_volume(
@@ -3876,7 +3876,7 @@ async fn exec_enumerate(
 
     let adapter = repo_scan::walk::primary_adapter();
     let listing: Box<dyn Iterator<Item = WalkItem> + '_> = match pinned {
-        Some(pinned) => match pinned.into_children(false) {
+        Some(pinned) => match pinned.into_children(true) {
             Ok(children) => Box::new(children),
             Err(e) => {
                 return fail_list_open(runner, store, claimed, dir_id, generation, &path, now, &e)
@@ -3886,7 +3886,7 @@ async fn exec_enumerate(
         None => match adapter.list_dir(
             &path,
             ListOptions {
-                skip_metadata: false,
+                skip_metadata: true,
             },
         ) {
             Ok(listing) => listing,

@@ -437,19 +437,15 @@ where
 }
 
 /// Bounded physical identity for one coordinator path (R7 alias sharing:
-/// follows symlinks). `None` on timeout, admission refusal, or stat
-/// failure: the caller persists unknown/gap instead of silently
-/// substituting a path-derived identity.
+/// follows symlinks). `None` on stat failure: the caller persists
+/// unknown/gap instead of silently substituting a path-derived identity.
+/// Avoids spawning dedicated OS threads for simple path/identity checks (R07).
 #[cfg(unix)]
 pub fn bounded_dir_identity(path: &Path) -> Option<(u64, u64)> {
-    let owned = path.to_path_buf();
-    bounded_identity_io(move || {
-        std::fs::metadata(&owned).ok().map(|md| {
-            let meta = super::fs_entry_metadata(&md);
-            (meta.dev, meta.ino)
-        })
+    std::fs::metadata(path).ok().map(|md| {
+        let meta = super::fs_entry_metadata(&md);
+        (meta.dev, meta.ino)
     })
-    .flatten()
 }
 
 /// Non-unix targets have no stable `(dev, ino)` identity, so coordinator
@@ -1022,33 +1018,49 @@ impl Iterator for PinnedChildren {
                 continue;
             }
             let name = OsString::from_vec(raw_name);
-            let c_name = match CString::new(name.as_os_str().as_bytes()) {
-                Ok(c) => c,
-                Err(_) => {
-                    // Impossible: the name came from a NUL-terminated
-                    // `d_name`. End the stream loudly rather than skip.
-                    self.done = true;
-                    return Some(Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "directory entry name holds NUL",
-                    )));
-                }
-            };
             let dtype = unsafe { (*entry).d_type } as u32;
             let (kind, stored) = match dtype_to_kind(dtype) {
                 Some(kind) if self.skip_metadata => (kind, None),
-                Some(kind) => match fstatat_no_follow(self.dirfd, &c_name) {
-                    Ok(st) => (kind, Some(Ok(st))),
-                    Err(e) => (kind, Some(Err(e))),
-                },
-                None => match fstatat_no_follow(self.dirfd, &c_name) {
-                    Ok(st) => {
-                        let kind = kind_from_mode(st.st_mode);
-                        let stored = (!self.skip_metadata).then_some(Ok(st));
-                        (kind, stored)
+                Some(kind) => {
+                    let c_name = match CString::new(name.as_os_str().as_bytes()) {
+                        Ok(c) => c,
+                        Err(_) => {
+                            // Impossible: the name came from a NUL-terminated
+                            // `d_name`. End the stream loudly rather than skip.
+                            self.done = true;
+                            return Some(Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "directory entry name holds NUL",
+                            )));
+                        }
+                    };
+                    match fstatat_no_follow(self.dirfd, &c_name) {
+                        Ok(st) => (kind, Some(Ok(st))),
+                        Err(e) => (kind, Some(Err(e))),
                     }
-                    Err(e) => return Some(Err(e)),
-                },
+                }
+                None => {
+                    let c_name = match CString::new(name.as_os_str().as_bytes()) {
+                        Ok(c) => c,
+                        Err(_) => {
+                            // Impossible: the name came from a NUL-terminated
+                            // `d_name`. End the stream loudly rather than skip.
+                            self.done = true;
+                            return Some(Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "directory entry name holds NUL",
+                            )));
+                        }
+                    };
+                    match fstatat_no_follow(self.dirfd, &c_name) {
+                        Ok(st) => {
+                            let kind = kind_from_mode(st.st_mode);
+                            let stored = (!self.skip_metadata).then_some(Ok(st));
+                            (kind, stored)
+                        }
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
             };
             let metadata = stored.map(|result| result.map(|st| stat_to_entry(&st)));
             return Some(Ok(super::ChildEntry {

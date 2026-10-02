@@ -97,12 +97,7 @@ fn volume_uuid_of(mount_path: &Path) -> Option<String> {
 /// byte-exact. The mount path hex-encodes raw bytes instead of the lossy
 /// display rendering (which could collide), and carries no `:` that would
 /// corrupt planner-key parsing, which splits the volume at the first `:`.
-pub fn dev_fallback_volume_id(anchor: &str, mount_path: &Path) -> VolumeId {
-    VolumeId(format!(
-        "dev-{anchor}-{}",
-        crate::config::encode_hex(&crate::config::path_as_bytes(mount_path))
-    ))
-}
+pub use super::dev_fallback_volume_id;
 
 /// Native macOS mount table (`getfsstat`).
 #[derive(Debug, Default)]

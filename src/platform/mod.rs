@@ -10,7 +10,7 @@
 #[cfg(target_os = "macos")]
 pub mod macos;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(not(target_os = "macos"), test))]
 pub mod linux;
 
 use crate::events::EventBatch;
@@ -99,4 +99,15 @@ pub fn classify_volume_kind(is_local: bool, fstype: &str, mntfrom: &str) -> Volu
             }
         }
     }
+}
+
+/// Device-anchored fallback volume identity (Item 11): colon-free and
+/// byte-exact. The mount path hex-encodes raw bytes instead of the lossy
+/// display rendering (which could collide), and carries no `:` that would
+/// corrupt planner-key parsing, which splits the volume at the first `:`.
+pub fn dev_fallback_volume_id(anchor: &str, mount_path: &std::path::Path) -> VolumeId {
+    VolumeId(format!(
+        "dev-{anchor}-{}",
+        crate::config::encode_hex(&crate::config::path_as_bytes(mount_path))
+    ))
 }
