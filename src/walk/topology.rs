@@ -659,7 +659,7 @@ impl ScopeFence {
                 ))
             })?;
             let st = fstatat_no_follow(fd.as_raw_fd(), &c_name).map_err(FenceError::Io)?;
-            let kind = kind_from_mode(st.st_mode as u32);
+            let kind = kind_from_mode(st.st_mode);
             if kind == ChildKind::Symlink {
                 if last {
                     // The task path itself is a link: never follow it
@@ -1043,7 +1043,7 @@ impl Iterator for PinnedChildren {
                 },
                 None => match fstatat_no_follow(self.dirfd, &c_name) {
                     Ok(st) => {
-                        let kind = kind_from_mode(st.st_mode as u32);
+                        let kind = kind_from_mode(st.st_mode);
                         let stored = (!self.skip_metadata).then_some(Ok(st));
                         (kind, stored)
                     }
@@ -1096,13 +1096,18 @@ fn dtype_to_kind(dtype: u32) -> Option<ChildKind> {
 /// Map a `st_mode` file-type mask to [`ChildKind`] (never follows links:
 /// the mode always comes from a no-follow stat).
 #[cfg(unix)]
-fn kind_from_mode(mode: u32) -> ChildKind {
-    let file_type = mode & libc::S_IFMT as u32;
-    if file_type == libc::S_IFDIR as u32 {
+// `mode_t` is `u16` on macOS and `u32` on Linux; keeping the casts to
+// `libc::mode_t` guarantees portability across unix targets while
+// `allow(clippy::unnecessary_cast)` prevents warnings when `mode_t`
+// matches the constant's native type.
+#[allow(clippy::unnecessary_cast)]
+fn kind_from_mode(mode: libc::mode_t) -> ChildKind {
+    let file_type = mode & (libc::S_IFMT as libc::mode_t);
+    if file_type == libc::S_IFDIR as libc::mode_t {
         ChildKind::Directory
-    } else if file_type == libc::S_IFREG as u32 {
+    } else if file_type == libc::S_IFREG as libc::mode_t {
         ChildKind::File
-    } else if file_type == libc::S_IFLNK as u32 {
+    } else if file_type == libc::S_IFLNK as libc::mode_t {
         ChildKind::Symlink
     } else {
         ChildKind::Other

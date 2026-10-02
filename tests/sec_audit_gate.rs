@@ -25,11 +25,11 @@ fn audit_gate_files_enforced() {
         "contents: read",
         "actions/checkout@",
         "dtolnay/rust-toolchain@",
-        "cargo install cargo-audit --version 0.21.0 --locked",
+        "cargo install cargo-audit --version 0.22.1 --locked",
         "cargo-audit audit",
         "cargo install cargo-deny --version 0.18.3 --locked",
         "cargo-deny ",
-        "check --locked",
+        "--locked check",
     ] {
         assert!(
             wf_text.contains(needle),
@@ -124,7 +124,7 @@ fn toolchain_and_tools_pinned() {
     for needle in [
         "runs-on: ubuntu-24.04",
         "toolchain: 1.85.0",
-        "cargo-audit --version 0.21.0",
+        "cargo-audit --version 0.22.1",
         "cargo-deny --version 0.18.3",
         "sha256",
     ] {
@@ -148,7 +148,7 @@ fn tool_provenance_and_archive_verification() {
         "Verify pinned tool archives",
         "static.crates.io/crates/",
         "sha256 mismatch",
-        "57398cd543d453b628230e3d855dcbe257a415715cb5687326a092c466d5d230",
+        "2f4e27b0ab2d116c87c29db159ad42565cdcdccf77eb62ef0486ddd017a02da6",
         "9ed51dacad2ea0880a689cb64bdd52cbae3b44578c19833f6cc4e66ebea8d914",
         "source_oid=$GITHUB_SHA",
         "rev-parse HEAD",

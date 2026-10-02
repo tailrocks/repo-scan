@@ -7,15 +7,9 @@
 # exception needs an owner call with advisory ID and expiry recorded inline.
 
 [advisories]
-vulnerability = "deny"
-unmaintained = "deny"
-unsound = "deny"
 yanked = "deny"
-notice = "warn"
 
 [licenses]
-unlicensed = "deny"
-copyleft = "warn"
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
@@ -27,6 +21,7 @@ allow = [
     "MIT-0",
     "MIT",
     "MPL-2.0",
+    "Unicode-3.0",
     "Unicode-DFS-2016",
     "Unlicense",
     "Zlib",

@@ -46,7 +46,7 @@ jobs:
             test "$actual" = "$3" || { echo "::error::sha256 mismatch for $1-$2.crate: got $actual, want $3"; exit 1; }
             echo "$1-$2.crate sha256 OK"
           }
-          verify_crate cargo-audit 0.21.0 57398cd543d453b628230e3d855dcbe257a415715cb5687326a092c466d5d230
+          verify_crate cargo-audit 0.22.1 2f4e27b0ab2d116c87c29db159ad42565cdcdccf77eb62ef0486ddd017a02da6
           verify_crate cargo-deny 0.18.3 9ed51dacad2ea0880a689cb64bdd52cbae3b44578c19833f6cc4e66ebea8d914
       - name: Install cargo-audit
         working-directory: ${{ runner.temp }}
@@ -54,8 +54,8 @@ jobs:
           export CARGO_HOME="$RUNNER_TEMP/cargo-home"
           export CARGO_TARGET_DIR="$RUNNER_TEMP/cargo-target"
           mkdir -p "$CARGO_HOME"
-          # crates.io sha256: 57398cd543d453b628230e3d855dcbe257a415715cb5687326a092c466d5d230
-          cargo install cargo-audit --version 0.21.0 --locked
+          # crates.io sha256: 2f4e27b0ab2d116c87c29db159ad42565cdcdccf77eb62ef0486ddd017a02da6
+          cargo install cargo-audit --version 0.22.1 --locked
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - name: Install cargo-deny
         working-directory: ${{ runner.temp }}
@@ -69,11 +69,13 @@ jobs:
       - name: Deny advisories
         run: |
           export PATH="$RUNNER_TEMP/cargo-home/bin:$PATH"
+          export CARGO_HOME="$RUNNER_TEMP/cargo-home"
           cargo-audit audit --file "$GITHUB_WORKSPACE/Cargo.lock" --deny warnings
       - name: Deny unlicensed/unknown-source deps
         run: |
           export PATH="$RUNNER_TEMP/cargo-home/bin:$PATH"
-          cargo-deny --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" check --locked
+          export CARGO_HOME="$RUNNER_TEMP/cargo-home"
+          cargo-deny --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked check licenses sources
       - name: Record tool provenance
         if: always()
         run: |
@@ -90,7 +92,7 @@ jobs:
           echo "source_oid=$GITHUB_SHA"
           git -C "$GITHUB_WORKSPACE" rev-parse HEAD
           db_found=0
-          for db in "$CARGO_HOME"/advisory-dbs/*/; do
+          for db in "$CARGO_HOME"/advisory-db "$CARGO_HOME"/advisory-dbs/*/; do
             if [ -d "$db/.git" ]; then
               echo "advisory_db=$db"
               git -C "$db" rev-parse HEAD

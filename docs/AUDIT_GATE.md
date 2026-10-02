@@ -19,7 +19,7 @@ Workflow: [.github/workflows/audit.yml](../.github/workflows/audit.yml)
   `dtolnay/rust-toolchain@6bed07…` (1.85.0).
 - Runner image and toolchain are pinned exactly (`ubuntu-24.04`,
   Rust `1.85.0`); audit tools install at exact versions with
-  `--locked` (`cargo-audit 0.21.0`, `cargo-deny 0.18.3`).
+  `--locked` (`cargo-audit 0.22.1`, `cargo-deny 0.18.3`).
   RS-CI-01 residual: a GitHub-hosted `runs-on` label takes no digest,
   so byte-immutability of the runner image is an owner action (move
   the job to a self-hosted or container runner pinned by digest).
@@ -50,7 +50,7 @@ Workflow: [.github/workflows/audit.yml](../.github/workflows/audit.yml)
   the source OID (`source_oid=$GITHUB_SHA` plus
   `git rev-parse HEAD`), and the advisory-database revision
   (`git rev-parse HEAD` in the fetched checkout under
-  `$CARGO_HOME/advisory-dbs`, failing closed when absent). The
+  `$CARGO_HOME/advisory-db` or `$CARGO_HOME/advisory-dbs`, failing closed when absent). The
   advisory database is fetched live on each run (the weekly
   cron consumes current advisories); the pinned tool versions
   plus the lockfile hash and the recorded revisions bind each
@@ -143,8 +143,8 @@ unpinned fallback.
 ## 4. Run locally (no CI needed)
 
 ```sh
-cargo install cargo-audit --version 0.21.0 --locked && cargo audit --deny warnings
-cargo install cargo-deny --version 0.18.3 --locked && cargo deny check --locked
+cargo install cargo-audit --version 0.22.1 --locked && cargo audit --deny warnings
+cargo install cargo-deny --version 0.18.3 --locked && cargo deny --locked check licenses sources
 ```
 
 Both commands read `Cargo.lock` at the repo root; neither modifies it.
