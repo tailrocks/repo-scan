@@ -662,6 +662,21 @@ fn rsp008_contradicted_coverage_refused() {
     assert!(err.to_string().contains("tasks_pending"), "{err}");
 }
 
+#[test]
+fn rsf_5dbc3836_validator_rejects_complete_scan_with_incomplete_status() {
+    let bytes = include_bytes!("data/example-report.json");
+    let mut report: Report = serde_json::from_slice(bytes).expect("example parses");
+    report.scan.state = "complete".to_string();
+    report.coverage.status = "incomplete".to_string();
+    let err = validate_report(&report)
+        .expect_err("validator must reject scan.state=complete when coverage.status=incomplete");
+    assert!(
+        err.to_string()
+            .contains("scan.state is complete but coverage.status is incomplete"),
+        "expected cross-check error, got: {err}"
+    );
+}
+
 /// RSP-009: the envelope binds the revision actually observed stable
 /// across the pre-pass and the stream (single-revision barrier), not the
 /// caller's pinned claim.
@@ -671,6 +686,7 @@ fn rsp009_envelope_binds_observed_revision() {
     let store = open_store(&dir);
     let now = 1_759_154_400_000;
     seed_minimal(&store, now, b"https://github.com/owner/repo.git", "[]");
+    seed_complete_status(&store, now);
     let observed = runtime().block_on(async {
         store.next_revision().await.expect("rev 1");
         store.next_revision().await.expect("rev 2")
@@ -1384,6 +1400,7 @@ fn r3_staged_aggregate_budget_and_byte_release() {
     let store = open_store(&dir);
     let now = 1_759_154_400_000;
     seed_minimal(&store, now, b"https://github.com/owner/repo.git", "[]");
+    seed_complete_status(&store, now);
     let inputs = test_inputs("r3-budget-1");
     let (bytes, _) = runtime()
         .block_on(async { stream_report_from_store(&store, &inputs, Vec::new()).await })

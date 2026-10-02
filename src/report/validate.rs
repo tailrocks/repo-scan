@@ -642,6 +642,12 @@ fn check_coverage(report: &Report, problems: &mut Vec<String>) {
             }
         }
     }
+    if report.scan.state == "complete" && report.coverage.status == "incomplete" {
+        problems.push(format!(
+            "scan.state is complete but coverage.status is incomplete (status was requested with mode {:?})",
+            report.scan.status_mode
+        ));
+    }
     if report.coverage.status == "not_requested" && report.scan.status_mode != "metadata" {
         problems.push(format!(
             "coverage.status is not_requested but scan.status_mode is {:?}",

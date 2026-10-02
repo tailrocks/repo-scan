@@ -2281,3 +2281,61 @@ fn norm_h3_continuation_trailing_backslash_dep() {
         "joined include target listed in deps: {deps:?}"
     );
 }
+
+/// RSF-5DBC3836: repo-local filter driver with no submodules under --status full.
+/// Pre-fix: scan.state = complete, exit 0, while coverage.status = incomplete.
+/// Post-fix: status task parks as unsupported with a gap, scan.state = incomplete,
+/// coverage.status = incomplete, checkouts[0].status.state = unsupported, and exit 3.
+#[cfg(unix)]
+#[test]
+fn rsf_5dbc3836_repo_local_filter_exits_3_and_scan_incomplete() {
+    let tmp = fixture::scratch_root("fr7-5dbc-");
+    let parent = tmp.path().join("repos");
+    repo_scan::privacy::private_dir_0700(&parent).unwrap();
+    let repo = fixture::normal_clone(&parent, "localfilter");
+    let config_path = repo.join(".git/config");
+    let mut text = std::fs::read_to_string(&config_path).unwrap();
+    text.push_str("\n[filter \"custom\"]\n\tclean = /bin/cat\n");
+    repo_scan::privacy::private_write_0600(&config_path, text.as_bytes()).unwrap();
+
+    let state = tmp.path().join("state");
+    let home = tmp.path().join("home");
+    repo_scan::privacy::private_dir_0700(&home).unwrap();
+    let report_path = tmp.path().join("rep.json");
+
+    let out = run_isolated(
+        &state,
+        &home,
+        &[
+            "scan",
+            fixture::FIXTURE_REMOTE_URL,
+            "--root",
+            parent.to_str().unwrap(),
+            "--status",
+            "full",
+            "--report",
+            report_path.to_str().unwrap(),
+        ],
+        tmp.path(),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "unsupported required status must exit 3 (RSF-5DBC3836): {}",
+        stderr_text(&out)
+    );
+    let parsed = read_json(&report_path);
+    assert_eq!(parsed["scan"]["state"].as_str(), Some("incomplete"));
+    assert_eq!(parsed["coverage"]["status"].as_str(), Some("incomplete"));
+    assert!(parsed["coverage"]["gaps"].as_u64().unwrap_or(0) >= 1);
+    assert_eq!(
+        parsed["checkouts"][0]["status"]["state"].as_str(),
+        Some("unsupported")
+    );
+
+    let report_bytes = std::fs::read(&report_path).expect("read report");
+    let typed: repo_scan::report::model::Report =
+        serde_json::from_slice(&report_bytes).expect("typed report");
+    repo_scan::report::validate::validate_report(&typed)
+        .expect("honest incomplete report must validate");
+}

@@ -5960,7 +5960,10 @@ async fn exec_status(
                 observed_rev,
             )
             .await?;
-            return Ok(TaskOutcome::Complete);
+            return Ok(TaskOutcome::Parked {
+                state: TaskState::Unsupported,
+                reason: format!("status unsupported on {}: {e}", git_path.display()),
+            });
         }
         Err(e) => {
             return fail_task(
@@ -6138,6 +6141,7 @@ async fn exec_status(
             });
         }
     }
+    let is_unsupported = observation.is_none();
     match observation {
         None => {
             record_status_row(
@@ -6178,6 +6182,15 @@ async fn exec_status(
             )
             .await?;
         }
+    }
+    if is_unsupported {
+        return Ok(TaskOutcome::Parked {
+            state: TaskState::Unsupported,
+            reason: format!(
+                "status unsupported on {}: status unsupported in both backends",
+                git_path.display()
+            ),
+        });
     }
     Ok(TaskOutcome::Complete)
 }
@@ -6293,7 +6306,7 @@ async fn count_status_pending(store: &TursoStore, generation: u64) -> repo_scan:
     count_query(
         store,
         "SELECT COUNT(*) FROM frontier_tasks WHERE generation = ?1 AND kind = 'status' \
-         AND state NOT IN ('complete', 'unsupported', 'cancelled', 'superseded')",
+         AND state NOT IN ('complete', 'cancelled', 'superseded')",
         vec![turso::Value::Integer(i64::try_from(generation).map_err(
             |_| repo_scan::Error::Store(format!("task generation {generation} exceeds i64 range")),
         )?)],
