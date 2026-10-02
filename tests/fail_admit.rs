@@ -24,20 +24,29 @@ fn admit_current_rss_for_pressure_peak_for_reporting() {
             .expect("macOS retains ru_maxrss peak for reporting");
         assert!(peak > 0, "peak measured");
         assert!(peak >= sample.owner_rss_bytes, "peak {peak} floors current");
+        let method = sampler.accounting_method();
+        assert!(
+            method.contains("peak") || method.contains("PEAK"),
+            "{method}"
+        );
+        assert!(method.contains("reporting only"), "{method}");
+        assert!(
+            method.contains("task_info") && method.contains("resident_size"),
+            "{method}"
+        );
     }
     #[cfg(not(target_os = "macos"))]
-    assert_eq!(sample.owner_peak_rss_bytes, None);
-    let method = sampler.accounting_method();
-    assert!(
-        method.contains("peak") || method.contains("PEAK"),
-        "{method}"
-    );
-    assert!(method.contains("reporting only"), "{method}");
-    #[cfg(target_os = "macos")]
-    assert!(
-        method.contains("task_info") && method.contains("resident_size"),
-        "{method}"
-    );
+    {
+        assert_eq!(sample.owner_peak_rss_bytes, None);
+        #[cfg(target_os = "linux")]
+        {
+            let method = sampler.accounting_method();
+            assert!(
+                method.contains("/proc/self/statm") && method.contains("current"),
+                "{method}"
+            );
+        }
+    }
 }
 
 /// Item 6: sustained excess throttles (reduced caps, no spawn, pacing,

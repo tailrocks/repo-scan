@@ -265,9 +265,15 @@ fn rsf_23d_helper_telemetry_honesty() {
             "method discloses {needle}: {method}"
         );
     }
+    #[cfg(target_os = "macos")]
     assert!(
         method.contains("peak") || method.contains("PEAK"),
         "peak stays labeled: {method}"
+    );
+    #[cfg(target_os = "linux")]
+    assert!(
+        method.contains("/proc/self/statm"),
+        "linux statm source disclosed: {method}"
     );
     // RESOURCE-RECHECK 5: RSS is CURRENT on every target; the macOS
     // `ru_maxrss` peak rides along for reporting only, never as the
