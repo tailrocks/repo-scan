@@ -742,7 +742,7 @@ impl ScopeFence {
     /// Execution-time open of one task directory: the pinned descent
     /// plus the scope-membership check on the resulting true path and
     /// its `fstat` identity. Descent-time root verification (see
-    /// [`ScopeFence::walk_pinned`]) already bound every root prefix to
+    /// `ScopeFence::walk_pinned`) already bound every root prefix to
     /// its build-time descriptor identity.
     #[cfg(unix)]
     pub fn open_pinned(&self, path: &Path) -> Result<FenceOpen, FenceError> {

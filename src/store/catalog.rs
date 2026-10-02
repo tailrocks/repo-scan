@@ -2988,7 +2988,7 @@ impl TursoStore {
     }
 
     /// Idempotent remote upsert keyed by stable id. Stored URLs pass
-    /// through the sink-side redaction (see [`redacted_remote_bytes`]).
+    /// through the sink-side redaction (see `redacted_remote_bytes`).
     pub async fn upsert_remote(
         &self,
         remote: &NewRemote<'_>,
@@ -4076,7 +4076,7 @@ impl TursoStore {
     /// Buffer a remote upsert; see [`TursoStore::buffer_enqueue_task`] for
     /// the flush contract. Returns `WriterBatch::should_flush`. Stored
     /// URLs pass through the sink-side redaction (see
-    /// [`redacted_remote_bytes`]).
+    /// `redacted_remote_bytes`).
     pub fn buffer_upsert_remote(
         batch: &mut WriterBatch,
         remote: &NewRemote<'_>,

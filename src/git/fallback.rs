@@ -618,7 +618,7 @@ impl FallbackGit {
     /// parity with the gix counting policy.
     ///
     /// FIXREADY4 F: both this spawn and its driver guard run under
-    /// [`StatusConfigIsolation`] (empty global/system config, empty HOME,
+    /// `StatusConfigIsolation` (empty global/system config, empty HOME,
     /// no XDG config), so a repository-selected `filter=` attribute can
     /// never resolve to an operator-configured helper — the installed-git
     /// twin of the gix isolated open. Repo-local drivers still load and
@@ -1304,7 +1304,7 @@ pub fn spawn_enveloped(
 /// pgid may be reused). Past the child exit, reader drains are bounded by
 /// [`POST_EXIT_DRAIN_TIMEOUT`] (a descendant-held pipe is an explicit
 /// incomplete gap, never a hang). Timeout, cap, cancel, error, and drain
-/// paths all terminate through [`cleanup_child`] (group-kill unless the
+/// paths all terminate through `cleanup_child` (group-kill unless the
 /// child is already reaped — the drain paths skip the kill, their pgid
 /// may be reused — plus reap and grace-join); helpers whose termination
 /// stays unproven keep their ledger charge and are recorded stuck/unknown.

@@ -430,12 +430,12 @@ const MAX_FULL_PATH_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Bounded cache of reconstructed directory full paths.
 ///
-/// Retention bound: at most [`PATH_CACHE_CAP`] entries and at most
-/// [`MAX_FULL_PATH_CACHE_BYTES`] aggregate bytes; the cache is cleared
+/// Retention bound: at most `PATH_CACHE_CAP` entries and at most
+/// `MAX_FULL_PATH_CACHE_BYTES` aggregate bytes; the cache is cleared
 /// and rebuilt when either bound would be exceeded, so correctness never
-/// depends on it. Values longer than [`MAX_FULL_PATH_BYTES`] are refused
+/// depends on it. Values longer than `MAX_FULL_PATH_BYTES` are refused
 /// *before* retention (never stored): the per-path error is still raised
-/// by [`resolve_full_path`] after reconstruction, but the oversize bytes
+/// by `resolve_full_path` after reconstruction, but the oversize bytes
 /// are never cached.
 pub struct FullPathCache {
     map: HashMap<i64, Vec<u8>>,
@@ -454,12 +454,12 @@ impl FullPathCache {
         self.map.get(key)
     }
 
-    /// Number of retained entries (bounded by [`PATH_CACHE_CAP`]).
+    /// Number of retained entries (bounded by `PATH_CACHE_CAP`).
     pub fn len(&self) -> usize {
         self.map.len()
     }
 
-    /// Aggregate retained bytes (bounded by [`MAX_FULL_PATH_CACHE_BYTES`]).
+    /// Aggregate retained bytes (bounded by `MAX_FULL_PATH_CACHE_BYTES`).
     pub fn total_bytes(&self) -> usize {
         self.total_bytes
     }
