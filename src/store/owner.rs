@@ -84,20 +84,33 @@ pub fn read_owner_marker_text(state_dir: &Path) -> crate::Result<Option<String>>
                 // access still works) falls back to a path-validated
                 // marker read with the same kind/size checks the
                 // off-unix build always runs (documented residual: path
-                // re-resolution instead of FD pinning).
-                if !payload.exists() {
-                    return Ok(None);
+                // re-resolution instead of FD pinning). Lstat semantics:
+                // a dangling payload symlink is a symlink (fail closed
+                // via the path reader), not a missing payload.
+                match std::fs::symlink_metadata(&payload) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => {
+                        return Err(Error::Io(format!(
+                            "cannot inspect {}: {e}",
+                            payload.display()
+                        )));
+                    }
+                    Ok(_) => return read_owner_marker_by_path(state_dir),
                 }
-                return read_owner_marker_by_path(state_dir);
             }
         };
         let mut file = match open_child_file(&dir, std::ffi::OsStr::new(OWNER_MARKER_NAME)) {
             Ok(file) => file,
             Err(e) => {
-                if !owner_marker_path(state_dir).exists() {
-                    return Ok(None);
+                // Lstat semantics (FIXREADY4 C): a dangling marker
+                // symlink must fail closed, never read as missing (a
+                // missing read would let clear delete the payload and
+                // only then refuse at marker removal).
+                match std::fs::symlink_metadata(owner_marker_path(state_dir)) {
+                    Err(nf) if nf.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(_) => return Err(e),
+                    Ok(_) => return Err(e),
                 }
-                return Err(e);
             }
         };
         let meta = file.metadata()?;

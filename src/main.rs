@@ -6224,7 +6224,13 @@ fn fallback_status_counts(
         staged: Some(staged),
         unstaged: Some(unstaged),
         untracked: Some(untracked),
-        unknown_fields: vec![format!("counts via installed-git fallback ({cause})")],
+        // F-note1: the fallback spawn runs under the same empty
+        // global/system config isolation as the gix path, so it carries
+        // the same inspected-scope declaration.
+        unknown_fields: vec![
+            format!("counts via installed-git fallback ({cause})"),
+            git::ISOLATED_SCOPE_DECLARATION.to_string(),
+        ],
         fingerprints: Vec::new(),
     })
 }
@@ -7974,6 +7980,18 @@ async fn run_clear(cfg: &config::Config, args: &repo_scan::cli::ClearArgs) -> Ex
 /// ownership marker drops only on an exact live-`db_id` binding.
 /// RS-PRIV-09: entry/byte/time budgets bound the work; exhaustion prints
 /// INCOMPLETE lines and never reports a complete cleanup.
+///
+/// Ancestor-symlink policy (FIXREADY4 C, explicit): symlinked ancestors
+/// strictly ABOVE `state_dir` resolve normally — the trust-root model
+/// shared with [`store::owner::ensure_private_dir_all`] (system prefixes
+/// like `/tmp`/`/var` are legitimately symlinked on some platforms, and
+/// the operator configured this path). Deletion through such an alias is
+/// FD-bound traversal: the payload dir is pinned once and every victim
+/// leaves through the held FD with `(dev, ino)` binding, so a swap
+/// mid-clear refuses instead of redirecting. Symlinks AT `state_dir`,
+/// `payload/`, the known dirs, or any known victim refuse the clear.
+/// Refusal is atomic: the full deletion set preflights (lstat every
+/// victim) BEFORE any unlink, so a refusal mutates nothing.
 async fn run_clear_inner(state_dir: &Path) -> repo_scan::Result<()> {
     let payload = store::owner::payload_dir(state_dir);
     // Coordinate first: clearing requires exclusive ownership. The
@@ -7982,22 +8000,40 @@ async fn run_clear_inner(state_dir: &Path) -> repo_scan::Result<()> {
     // payload/ untouched (possibly unlistable/foreign/absent) for the
     // fail-closed inspection below.
     let _guard = acquire_guard_for_clear(state_dir)?;
-    if !payload.exists() {
-        println!("cache clear: no persisted state; already absent (success)");
-        return Ok(());
+    // Lstat semantics (FIXREADY4 C): a dangling payload symlink is an
+    // ERROR (refuse, nonzero exit), never "already absent" success —
+    // `Path::exists` follows links and misreads dangling as missing.
+    match std::fs::symlink_metadata(&payload) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("cache clear: no persisted state; already absent (success)");
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(repo_scan::Error::Io(format!(
+                "cannot inspect {}: {e}",
+                payload.display()
+            )));
+        }
+        Ok(md) if md.file_type().is_symlink() => {
+            return Err(unsafe_reset("payload dir is a symlink"));
+        }
+        Ok(md) if !md.is_dir() => {
+            return Err(unsafe_reset("payload dir is not a directory"));
+        }
+        Ok(_) => {}
     }
     if is_symlink_path(state_dir)? {
         return Err(unsafe_reset("state dir is a symlink"));
     }
-    if is_symlink_path(&payload)? {
-        return Err(unsafe_reset("payload dir is a symlink"));
-    }
     let snapshots = payload.join(config::SNAPSHOTS_DIR_NAME);
     let staging = payload.join(config::STAGING_DIR_NAME);
-    if snapshots.exists() && is_symlink_path(&snapshots)? {
+    // No `.exists()` gate (FIXREADY4 C): `is_symlink_path` already
+    // reports false for missing paths, and a DANGLING known-dir symlink
+    // must refuse like any reset-path symlink — never skip silently.
+    if is_symlink_path(&snapshots)? {
         return Err(unsafe_reset("snapshots dir is a symlink"));
     }
-    if staging.exists() && is_symlink_path(&staging)? {
+    if is_symlink_path(&staging)? {
         return Err(unsafe_reset("staging dir is a symlink"));
     }
     let mut st = ClearState::new();
@@ -8038,44 +8074,27 @@ async fn run_clear_inner(state_dir: &Path) -> repo_scan::Result<()> {
              unscanned files stay preserved"
         ));
     }
-    if db_ours {
-        for name in config::KNOWN_ENGINE_FILES
-            .iter()
-            .chain(config::KNOWN_SIDECAR_FILES.iter())
-        {
-            remove_pinned_file(&payload_pin, name, &mut st)?;
-        }
-    } else if db_path.exists() {
-        st.note_preserved(format!(
-            "{} (unknown content; database left in place)",
-            db_path.display()
-        ));
-    }
-    clear_tool_dir(
+    // FIXREADY4 C: full deletion-set preflight BEFORE any unlink. Every
+    // known victim (engine files, sidecars, ownership marker) is opened
+    // through the pinned payload FD, and the known dirs pin here — a
+    // symlink (or an un-pinnable known dir) refuses the whole clear with
+    // ZERO mutation. Previously catalog.db was removed before a symlinked
+    // WAL or marker was even discovered. FIXREADY4 C1: the preflight
+    // identities are BOUND into `set` and threaded through the entire
+    // removal phase below — nothing re-pins or re-opens by bare name.
+    let set = preflight_deletion_set(&payload_pin, &snapshots, &staging)?;
+    remove_preflighted_files(
+        state_dir,
+        &payload_pin,
+        &set,
+        &db_path,
         &snapshots,
-        ClearDirKind::Snapshots,
-        db_ours,
-        &snapshot_rows,
-        &mut st,
-    )?;
-    clear_tool_dir(
         &staging,
-        ClearDirKind::Staging,
         db_ours,
+        marker_bound,
         &snapshot_rows,
         &mut st,
     )?;
-    // RS-PRIV-02: the ownership marker drops only when it exactly binds
-    // the live catalog; otherwise it stays (a substituted symlink
-    // refuses, like any reset-path symlink).
-    if marker_bound {
-        remove_pinned_file(&payload_pin, OWNER_MARKER_NAME, &mut st)?;
-    } else if payload_pin.child_present(OWNER_MARKER_NAME)? {
-        st.note_preserved(format!(
-            "{} (not bound to the live catalog; preserved)",
-            owner_marker_path(state_dir).display()
-        ));
-    }
     // Unknown payload-root entries are listed, never touched. A
     // listing/read failure is INCOMPLETE (never success with
     // uninspected entries): the unknown content stays preserved.
@@ -8134,8 +8153,29 @@ async fn run_clear_inner(state_dir: &Path) -> repo_scan::Result<()> {
     // path-based `remove_dir`, so a swap between check and removal
     // cannot redirect the victim. Never the state dir or lock.
     // Divergence preserves + reports incomplete, never a retry.
-    remove_known_empty_dir(&payload_pin, config::SNAPSHOTS_DIR_NAME, &mut st);
-    remove_known_empty_dir(&payload_pin, config::STAGING_DIR_NAME, &mut st);
+    // FIXREADY4 C1: the guard compares against the HELD preflight pins,
+    // never freshly re-pinned identities.
+    remove_known_empty_dir_expected(
+        &payload_pin,
+        config::SNAPSHOTS_DIR_NAME,
+        set.snapshots.as_ref(),
+        &mut st,
+    );
+    remove_known_empty_dir_expected(
+        &payload_pin,
+        config::STAGING_DIR_NAME,
+        set.staging.as_ref(),
+        &mut st,
+    );
+    // Round-3 C1b binding argument for the fresh state-dir pin (kept
+    // deliberately instead of a threaded preflight pin): the removal is
+    // bound by the CHILD identity, not the parent pin age —
+    // `remove_empty_child_dir` re-opens `payload` from this pin's FD and
+    // re-compares its `(dev, ino)` against the HELD preflight
+    // `payload_pin` identity, so a state dir swapped mid-clear (fresh
+    // pin binds the new tree) mismatches and preserves. A threaded pin
+    // would need the identical `verify()` at use (dirs can swap during
+    // the clear), buying nothing over pin-here-plus-held-child-expect.
     match ClearPinnedDir::pin(state_dir) {
         Ok(state_pin) => {
             state_pin.remove_empty_child_dir("payload", payload_pin.identity(), &mut st);
@@ -8404,8 +8444,14 @@ impl ClearPinnedDir {
     }
 
     /// Degraded-pin child open (unix only): `symlink_metadata` + open,
-    /// mirroring the off-unix branch (same documented residual: path
-    /// re-resolution, no FD pinning).
+    /// mirroring the off-unix branch. Round-3 C1b binding argument (kept
+    /// deliberately): this path only READS — every degraded mutation
+    /// downstream re-binds `(dev, ino)` against the caller-bound
+    /// identity immediately before the unlink
+    /// ([`ClearPinnedDir::remove_child_by_path`]) and refuses loudly on
+    /// mismatch, so a by-path open can never silently authorize a
+    /// by-path mutation. Reads feed content/identity gates (magic,
+    /// hash, marker compare) whose failures preserve, never remove.
     #[cfg(unix)]
     fn open_child_by_path(&self, name: &str) -> repo_scan::Result<Option<std::fs::File>> {
         let path = self.path.join(name);
@@ -8435,34 +8481,47 @@ impl ClearPinnedDir {
         Ok(self.open_child(name)?.is_some())
     }
 
-    /// Remove `name` after re-verifying the parent and re-comparing the
-    /// victim `(dev, ino)` observed at hash time (RS-PRIV-01). A victim
-    /// that vanished reads as converged (`Ok`); a victim whose identity
-    /// changed refuses the reset. Unix uses `unlinkat` from the pinned
-    /// FD; elsewhere (and for a degraded unix pin) the path is
-    /// re-statted and removed.
-    fn remove_child(&self, name: &str, expect: (u64, u64)) -> repo_scan::Result<()> {
+    /// Unlink one entry through the held dir FD with NO re-open
+    /// (FIXREADY4 C1, round-3 C1b): the caller already bound the victim —
+    /// engine files by an open-FD `(dev, ino)` re-compare against the
+    /// preflight observation, snapshot/staging files by a content hash
+    /// read from the open FD — so re-opening here would only widen the
+    /// swap window. The parent still re-verifies first. Unix uses
+    /// `unlinkat` from the pinned FD (a vanished entry reads as
+    /// converged); a degraded unix pin removes through
+    /// [`ClearPinnedDir::remove_child_by_path`], which re-binds
+    /// `(dev, ino)` against `expect` immediately before the unlink and
+    /// refuses loudly on mismatch (no silent by-path mutation).
+    ///
+    /// Accepted residual (round-3 C1b, documented honestly): POSIX has
+    /// no unlink-by-FD, so a microsecond window stands between the last
+    /// bind (caller hash/`fstat`, or the degraded `stat`) and the
+    /// `unlinkat` name resolution. A rename-plant inside that window
+    /// needs payload-dir write — and anyone holding payload-dir write
+    /// can unlink directly, so the race buys an attacker nothing but
+    /// attribution. `unlinkat` with flags 0 never follows a trailing
+    /// symlink (a planted link is itself removed, its target
+    /// untouched) — but that does NOT bound the blast to "link
+    /// removal": a plant that renames a DIFFERENT same-dir entry (last
+    /// link to live data) onto the victim name redirects this unlink
+    /// onto that data. One same-dir entry per race won; window analysis
+    /// above is why the residual is accepted rather than fixed.
+    fn unlink_pinned_child(&self, name: &str, expect: (u64, u64)) -> repo_scan::Result<()> {
         self.verify()?;
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
             use std::os::unix::io::AsRawFd;
-            let file = match self.open_child(name)? {
-                Some(file) => file,
-                None => return Ok(()),
-            };
-            if store::owner::fd_identity(&file)? != expect {
-                return Err(unsafe_reset(&format!(
-                    "victim {name} changed between verify and unlink; refusing"
-                )));
-            }
-            drop(file);
             let bytes = std::ffi::OsStr::new(name).as_bytes();
+            if bytes.is_empty() || bytes.contains(&0) || name.contains('/') {
+                return Err(unsafe_reset("refusing unsafe clear name"));
+            }
             let cname =
                 std::ffi::CString::new(bytes).map_err(|_| unsafe_reset("bad clear name"))?;
             let Some(dir) = self.file.as_ref() else {
-                return self.remove_child_by_path(name);
+                return self.remove_child_by_path(name, expect);
             };
+            let _ = expect;
             // SAFETY: `unlinkat` on the held dir FD with a valid
             // NUL-terminated single-component name unlinks only that entry.
             let rc = unsafe { libc::unlinkat(dir.as_raw_fd(), cname.as_ptr(), 0) };
@@ -8480,17 +8539,21 @@ impl ClearPinnedDir {
         }
         #[cfg(not(unix))]
         {
+            let _ = expect;
             let path = self.path.join(name);
             match std::fs::symlink_metadata(&path) {
                 Ok(md) if md.file_type().is_symlink() => Err(unsafe_reset(&format!(
                     "engine path is a symlink: {}",
                     path.display()
                 ))),
-                Ok(_) => {
-                    let _ = expect;
-                    std::fs::remove_file(&path)?;
-                    Ok(())
-                }
+                Ok(_) => match std::fs::remove_file(&path) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(repo_scan::Error::Io(format!(
+                        "cannot remove {}: {e}",
+                        path.display()
+                    ))),
+                },
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(e) => Err(repo_scan::Error::Io(format!(
                     "cannot inspect {}: {e}",
@@ -8500,28 +8563,47 @@ impl ClearPinnedDir {
         }
     }
 
-    /// Degraded-pin child removal (unix only): the path is re-statted
-    /// (symlinks refuse) and removed, mirroring the off-unix branch.
-    /// The victim `(dev, ino)` was already re-compared by the caller.
+    /// Degraded-pin child removal (unix only): the victim path is
+    /// re-statted (symlinks refuse) and its `(dev, ino)` is re-bound
+    /// against `expect` — the identity the caller bound (preflight
+    /// observation for engine files, open-FD identity of the hashed
+    /// bytes for snapshots/staging) — immediately before the unlink,
+    /// mirroring [`ClearPinnedDir::remove_empty_child_dir_by_path`]. A
+    /// mismatch refuses LOUDLY (round-3 C1b: no silent by-path
+    /// mutation); a vanished victim reads as converged. Residual: the
+    /// `stat`→`unlink` microsecond window (see
+    /// [`ClearPinnedDir::unlink_pinned_child`); a swap inside it still
+    /// needs payload-dir write.
     #[cfg(unix)]
-    fn remove_child_by_path(&self, name: &str) -> repo_scan::Result<()> {
+    fn remove_child_by_path(&self, name: &str, expect: (u64, u64)) -> repo_scan::Result<()> {
+        use std::os::unix::fs::MetadataExt;
         let path = self.path.join(name);
-        match std::fs::symlink_metadata(&path) {
-            Ok(md) if md.file_type().is_symlink() => Err(unsafe_reset(&format!(
-                "engine path is a symlink: {}",
-                path.display()
-            ))),
-            Ok(_) => match std::fs::remove_file(&path) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(repo_scan::Error::Io(format!(
-                    "cannot remove {}: {e}",
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(md) if md.file_type().is_symlink() => {
+                return Err(unsafe_reset(&format!(
+                    "engine path is a symlink: {}",
                     path.display()
-                ))),
-            },
+                )));
+            }
+            Ok(md) => md,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(repo_scan::Error::Io(format!(
+                    "cannot inspect {}: {e}",
+                    path.display()
+                )));
+            }
+        };
+        if (meta.dev(), meta.ino()) != expect {
+            return Err(unsafe_reset(&format!(
+                "victim {name} changed between bind and unlink; refusing"
+            )));
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(repo_scan::Error::Io(format!(
-                "cannot inspect {}: {e}",
+                "cannot remove {}: {e}",
                 path.display()
             ))),
         }
@@ -8745,48 +8827,52 @@ impl ClearPinnedDir {
 }
 
 /// Remove one known (possibly already absent) empty child directory
-/// through the validated parent FD: the child is pinned for its live
-/// `(dev, ino)` and the removal goes through
-/// [`ClearPinnedDir::remove_empty_child_dir`] — never a path-based
-/// `remove_dir`. Missing reads as converged; anything else unexpected
-/// preserves + reports incomplete.
-fn remove_known_empty_dir(parent: &ClearPinnedDir, name: &str, st: &mut ClearState) {
+/// through the validated parent FD against the HELD preflight pin
+/// (FIXREADY4 C1): the child is never re-pinned by name, so the
+/// `(dev, ino)` compare in
+/// [`ClearPinnedDir::remove_empty_child_dir`] is against the preflight
+/// observation, not a fresh self-compare. Missing-at-preflight still
+/// verifies absence via `symlink_metadata` (a raced-in entry preserves +
+/// reports incomplete, never silently converges); a held pin that no
+/// longer verifies preserves + reports incomplete. Never a path-based
+/// `remove_dir`.
+fn remove_known_empty_dir_expected(
+    parent: &ClearPinnedDir,
+    name: &str,
+    held: Option<&ClearPinnedDir>,
+    st: &mut ClearState,
+) {
     let display = parent.path.join(name);
-    match std::fs::symlink_metadata(&display) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        Err(e) => {
-            st.incomplete.push(format!(
-                "cannot inspect {}; preserved ({e})",
-                display.display()
-            ));
-            st.note_preserved(format!("{} (preserved)", display.display()));
-            return;
-        }
-        Ok(md) if md.file_type().is_symlink() => {
-            st.incomplete
-                .push(format!("{} is a symlink; preserved", display.display()));
-            st.note_preserved(format!("{} (symlink; preserved)", display.display()));
-            return;
-        }
-        Ok(md) if !md.is_dir() => {
-            st.note_preserved(format!(
-                "{} (not a directory; preserved)",
-                display.display()
-            ));
-            return;
-        }
-        Ok(_) => {}
-    }
-    let child = match ClearPinnedDir::pin(&display) {
-        Ok(child) => child,
-        Err(e) => {
-            st.incomplete
-                .push(format!("cannot pin {}; preserved ({e})", display.display()));
-            st.note_preserved(format!("{} (preserved)", display.display()));
-            return;
+    let Some(pin) = held else {
+        match std::fs::symlink_metadata(&display) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                st.incomplete.push(format!(
+                    "cannot inspect {}; preserved ({e})",
+                    display.display()
+                ));
+                st.note_preserved(format!("{} (preserved)", display.display()));
+                return;
+            }
+            Ok(md) if md.file_type().is_symlink() => {
+                st.incomplete.push(format!(
+                    "{} raced in as a symlink after preflight; preserved",
+                    display.display()
+                ));
+                st.note_preserved(format!("{} (symlink; preserved)", display.display()));
+                return;
+            }
+            Ok(_) => {
+                st.incomplete.push(format!(
+                    "{} raced in after preflight; preserved",
+                    display.display()
+                ));
+                st.note_preserved(format!("{} (preserved)", display.display()));
+                return;
+            }
         }
     };
-    if let Err(e) = child.verify() {
+    if let Err(e) = pin.verify() {
         st.incomplete.push(format!(
             "{} changed during clear; preserved ({e})",
             display.display()
@@ -8794,7 +8880,7 @@ fn remove_known_empty_dir(parent: &ClearPinnedDir, name: &str, st: &mut ClearSta
         st.note_preserved(format!("{} (preserved)", display.display()));
         return;
     }
-    parent.remove_empty_child_dir(name, child.identity(), st);
+    parent.remove_empty_child_dir(name, pin.identity(), st);
 }
 
 fn unsafe_reset(detail: &str) -> repo_scan::Error {
@@ -8825,6 +8911,21 @@ async fn verify_db_identity(
     payload_pin: &ClearPinnedDir,
     st: &mut ClearState,
 ) -> repo_scan::Result<(bool, bool)> {
+    verify_db_identity_inner(state_dir, db_path, payload_pin, st, None).await
+}
+
+/// [`verify_db_identity`] with a deterministic pre-store-open plant hook
+/// (round-3 C1b seam): `plant` runs after the victim FD opens (and the
+/// magic check passes) but before the read-only store open, so the seam
+/// test plants a swapped catalog between the two real opens. Production
+/// passes `None`.
+async fn verify_db_identity_inner(
+    state_dir: &Path,
+    db_path: &Path,
+    payload_pin: &ClearPinnedDir,
+    st: &mut ClearState,
+    plant: Option<fn(&Path) -> std::io::Result<()>>,
+) -> repo_scan::Result<(bool, bool)> {
     let mut file = match payload_pin.open_child("catalog.db")? {
         Some(file) => file,
         None => return Ok((true, false)),
@@ -8851,17 +8952,39 @@ async fn verify_db_identity(
         ));
         return Ok((false, false));
     }
+    if let Some(plant) = plant {
+        plant(db_path).map_err(|e| repo_scan::Error::Io(format!("seam plant failed: {e}")))?;
+    }
     // SQLite magic alone never proves ownership (R15): require the marker
     // exactly bound to the live catalog, else tool-shaped catalog bytes.
     // An un-openable catalog (e.g. its dir lost read permission, so the
     // store's own dir pin fails) still gets the shape check below: the
     // head bytes need only the already-open victim FD.
+    //
+    // Round-3 C1b: the store opens BY PATH after our FD open, so its
+    // `db_id` is trusted only when the open resolved to our HELD victim
+    // (`catalog_identity` re-bound against the FD's `(dev, ino)`).
+    // Reading an unbound file's `db_id` would let a catalog swapped in
+    // between the two opens authorize a FOREIGN victim (and its marker).
+    // A mismatch (or an unbound open) falls through to the shape check
+    // on the HELD bytes below — the marker then stays, fail closed.
     let store = TursoStore::open_read_only(db_path).await.ok();
     if let Some(store) = store {
-        let bound = catalog_bound_to_marker(&store, state_dir).await?;
-        let _ = store.close().await;
-        if bound {
-            return Ok((true, true));
+        #[cfg(unix)]
+        let bound_to_victim = store.catalog_identity() == Some(store::owner::fd_identity(&file)?);
+        // Off-unix there is no FD identity to bind against (documented
+        // platform residual: path-resolution trust, as everywhere else
+        // off-unix).
+        #[cfg(not(unix))]
+        let bound_to_victim = true;
+        if bound_to_victim {
+            let bound = catalog_bound_to_marker(&store, state_dir).await?;
+            let _ = store.close().await;
+            if bound {
+                return Ok((true, true));
+            }
+        } else {
+            let _ = store.close().await;
         }
     }
     if catalog_head_looks_tool_owned(&read_head_bytes(&mut file)?) {
@@ -8937,12 +9060,202 @@ fn catalog_head_looks_tool_owned(head: &[u8]) -> bool {
     hits >= 2
 }
 
-/// Remove one exact known file from a pinned dir after verifying the open
-/// FD is a regular file; the victim `(dev, ino)` re-compares immediately
-/// before `unlinkat` (RS-PRIV-01). Missing files are a no-op.
-fn remove_pinned_file(
+/// Preflight-bound deletion set (FIXREADY4 C1): every identity the
+/// removal phase may unlink is observed here and HELD through deletion —
+/// victim `(dev, ino)` values plus the known-dir pins themselves (FDs on
+/// unix). The removal phase re-opens victims only through the held
+/// payload FD and unlinks only when the live identity still equals the
+/// preflight one, so a swap between preflight and removal refuses
+/// instead of deleting a substituted victim. A `(dev, ino)` compare
+/// against a freshly observed identity would be vacuous (a file always
+/// equals itself); binding through this set is what makes each compare
+/// meaningful.
+///
+/// Residual: the final `fstat`-then-`unlinkat` step is two syscalls and
+/// POSIX offers no unlink-by-FD, so a swap landing exactly between them
+/// still unlinks the planted name. That window holds no other syscall
+/// and never follows a link (`unlinkat` removes the entry itself), and
+/// any wider race refuses loudly (never false success) — but
+/// never-partial-on-RACE is unachievable without transactional unlink,
+/// which is why the deterministic seam test pins refuse-loudly rather
+/// than zero-mutation for mid-clear swaps.
+struct PreflightedDeletionSet {
+    /// Engine + sidecar victims in removal order: `(name,
+    /// identity-at-preflight)`, where `None` means absent at preflight
+    /// (a victim that races in afterwards refuses).
+    engine: Vec<(String, Option<(u64, u64)>)>,
+    /// Ownership-marker identity at preflight (`None` = absent).
+    marker: Option<(u64, u64)>,
+    /// Held known-dir pins (`None` = absent at preflight). The removal
+    /// phase reuses these pins — it never re-pins by name.
+    snapshots: Option<ClearPinnedDir>,
+    staging: Option<ClearPinnedDir>,
+}
+
+impl PreflightedDeletionSet {
+    /// Preflight identity for one engine/sidecar victim name.
+    fn engine_expect(&self, name: &str) -> Option<(u64, u64)> {
+        self.engine
+            .iter()
+            .find(|(known, _)| known == name)
+            .and_then(|(_, expect)| *expect)
+    }
+}
+
+/// Open every known clear victim through the pinned payload FD before
+/// any unlink (FIXREADY4 C atomicity) and BIND the observed identities
+/// into the returned set for the removal phase (FIXREADY4 C1).
+/// Engine files, sidecars, and the ownership marker record their
+/// `(dev, ino)` (or absence); `open_child` refuses symlinks (including
+/// dangling ones), so a substituted victim refuses the whole clear here
+/// with zero mutation. Snapshot/staging dirs pin here too and the pins
+/// are HELD in the set, so an unusable known dir refuses before any
+/// mutation rather than after the engine files are gone, and the
+/// removal phase never re-resolves them by name.
+/// Returns `Ok` only when the entire deletion set was inspected.
+fn preflight_deletion_set(
+    payload_pin: &ClearPinnedDir,
+    snapshots: &Path,
+    staging: &Path,
+) -> repo_scan::Result<PreflightedDeletionSet> {
+    payload_pin.verify()?;
+    let mut engine = Vec::new();
+    for name in config::KNOWN_ENGINE_FILES
+        .iter()
+        .chain(config::KNOWN_SIDECAR_FILES.iter())
+    {
+        engine.push((
+            name.to_string(),
+            preflight_victim_identity(payload_pin, name)?,
+        ));
+    }
+    let marker = preflight_victim_identity(payload_pin, OWNER_MARKER_NAME)?;
+    let mut pins = Vec::new();
+    for dir in [snapshots, staging] {
+        match std::fs::symlink_metadata(dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => pins.push(None),
+            Err(e) => {
+                return Err(repo_scan::Error::Io(format!(
+                    "cannot inspect {}: {e}",
+                    dir.display()
+                )));
+            }
+            Ok(_) => {
+                pins.push(Some(ClearPinnedDir::pin(dir)?));
+            }
+        }
+    }
+    let mut pins = pins.into_iter();
+    Ok(PreflightedDeletionSet {
+        engine,
+        marker,
+        snapshots: pins.next().unwrap_or(None),
+        staging: pins.next().unwrap_or(None),
+    })
+}
+
+/// `(dev, ino)` of one preflight victim opened through the held payload
+/// FD: `None` when absent (nothing to remove — and anything raced in
+/// afterwards refuses), the live identity otherwise. Symlinks (including
+/// dangling ones) refuse; non-regular entries record their identity for
+/// the removal phase, which preserves them only when still identical.
+fn preflight_victim_identity(
+    payload_pin: &ClearPinnedDir,
+    name: &str,
+) -> repo_scan::Result<Option<(u64, u64)>> {
+    let Some(file) = payload_pin.open_child(name)? else {
+        return Ok(None);
+    };
+    #[cfg(unix)]
+    {
+        Ok(Some(store::owner::fd_identity(&file)?))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Ok(Some((0, 0)))
+    }
+}
+
+/// Removal phase bound to a preflight set (FIXREADY4 C1): engine files,
+/// sidecars, known-dir contents, and the ownership marker leave only
+/// through the held payload FD against the preflight identities in
+/// `set` — nothing here re-pins or re-opens by bare name. Order matches
+/// the historical removal order (engine files, tool dirs, marker); the
+/// payload listing and empty-dir removal stay in the caller, with the
+/// empty-dir phase taking the same held pins. Shared by
+/// [`run_clear_inner`] and the deterministic seam hook
+/// [`test_clear_preflight_removal_seam`].
+#[allow(clippy::too_many_arguments)]
+fn remove_preflighted_files(
+    state_dir: &Path,
+    payload_pin: &ClearPinnedDir,
+    set: &PreflightedDeletionSet,
+    db_path: &Path,
+    snapshots: &Path,
+    staging: &Path,
+    db_ours: bool,
+    marker_bound: bool,
+    snapshot_rows: &HashMap<String, String>,
+    st: &mut ClearState,
+) -> repo_scan::Result<()> {
+    if db_ours {
+        for name in config::KNOWN_ENGINE_FILES
+            .iter()
+            .chain(config::KNOWN_SIDECAR_FILES.iter())
+        {
+            remove_pinned_file_expected(payload_pin, name, set.engine_expect(name), st)?;
+        }
+    } else if db_path.exists() {
+        st.note_preserved(format!(
+            "{} (unknown content; database left in place)",
+            db_path.display()
+        ));
+    }
+    clear_tool_dir_expected(
+        snapshots,
+        set.snapshots.as_ref(),
+        ClearDirKind::Snapshots,
+        db_ours,
+        snapshot_rows,
+        st,
+    )?;
+    clear_tool_dir_expected(
+        staging,
+        set.staging.as_ref(),
+        ClearDirKind::Staging,
+        db_ours,
+        snapshot_rows,
+        st,
+    )?;
+    // RS-PRIV-02: the ownership marker drops only when it exactly binds
+    // the live catalog; otherwise it stays (a substituted symlink
+    // refuses, like any reset-path symlink).
+    if marker_bound {
+        remove_pinned_file_expected(payload_pin, OWNER_MARKER_NAME, set.marker, st)?;
+    } else if payload_pin.child_present(OWNER_MARKER_NAME)? {
+        st.note_preserved(format!(
+            "{} (not bound to the live catalog; preserved)",
+            owner_marker_path(state_dir).display()
+        ));
+    }
+    Ok(())
+}
+
+/// Remove one exact known file from a pinned dir when — and only
+/// when — its live identity still equals the PREFLIGHT one (FIXREADY4
+/// C1): the victim re-opens through the held FD and its `(dev, ino)`
+/// re-compares against `expect` immediately before `unlinkat`
+/// (RS-PRIV-01), with no re-resolution between the compare and the
+/// unlink. A victim that vanished reads as converged (`Ok`); a victim
+/// whose identity changed, or that raced in after an absent preflight
+/// (`expect == None`), refuses the reset. Non-regular victims preserve
+/// (existing behavior) but only when still the preflight identity — a
+/// swapped-in non-regular refuses like any other swap.
+fn remove_pinned_file_expected(
     dir: &ClearPinnedDir,
     name: &str,
+    expect: Option<(u64, u64)>,
     st: &mut ClearState,
 ) -> repo_scan::Result<()> {
     dir.verify()?;
@@ -8950,6 +9263,20 @@ fn remove_pinned_file(
         Some(file) => file,
         None => return Ok(()),
     };
+    let Some(want) = expect else {
+        return Err(unsafe_reset(&format!(
+            "victim {name} raced in after preflight; refusing"
+        )));
+    };
+    #[cfg(unix)]
+    let have = store::owner::fd_identity(&file)?;
+    #[cfg(not(unix))]
+    let have = (0u64, 0u64);
+    if have != want {
+        return Err(unsafe_reset(&format!(
+            "victim {name} changed between preflight and unlink; refusing"
+        )));
+    }
     if !file.metadata()?.is_file() {
         st.note_preserved(format!(
             "{} (not a file; preserved)",
@@ -8957,12 +9284,8 @@ fn remove_pinned_file(
         ));
         return Ok(());
     }
-    #[cfg(unix)]
-    let identity = store::owner::fd_identity(&file)?;
-    #[cfg(not(unix))]
-    let identity = (0u64, 0u64);
     drop(file);
-    dir.remove_child(name, identity)?;
+    dir.unlink_pinned_child(name, want)?;
     st.removed += 1;
     Ok(())
 }
@@ -9161,22 +9484,62 @@ async fn load_snapshot_rows(
 /// proof (spec §15): a tool-shaped name for its directory plus a
 /// catalog-bound checksum row matching its bytes or tool-marker bytes
 /// bound to its filename. A foreign catalog authorizes nothing; nested
-/// directories and symlinks are always retained. RS-PRIV-01: the dir is
-/// FD-pinned and victims open with `openat(O_NOFOLLOW)`, hash from the
-/// FD, and leave with `unlinkat` after a `(dev, ino)` re-compare.
+/// directories and symlinks are always retained. RS-PRIV-01: victims
+/// open with `openat(O_NOFOLLOW)` from the HELD preflight pin, hash from
+/// the FD, and leave with `unlinkat` after a `(dev, ino)` re-compare
+/// against the hash-time identity.
 /// RS-PRIV-09: entry/byte/time budgets bound the scan; exhaustion stops
 /// the dir with an incomplete report, never a silent partial clear.
-fn clear_tool_dir(
+///
+/// FIXREADY4 C1: `held` is the preflight pin — the dir is NEVER re-pinned
+/// by name here. The held pin re-verifies first, so a swapped known dir
+/// refuses instead of clearing a substituted tree. FIXREADY4 C2: a
+/// `None` pin (absent at preflight) still verifies absence via
+/// `symlink_metadata` — a raced-in entry (notably a dangling symlink,
+/// which `Path::exists` misreads as missing) refuses loudly instead of
+/// returning silent success over uninspected entries.
+fn clear_tool_dir_expected(
     dir: &Path,
+    held: Option<&ClearPinnedDir>,
     kind: ClearDirKind,
     db_ours: bool,
     snapshot_rows: &HashMap<String, String>,
     st: &mut ClearState,
 ) -> repo_scan::Result<()> {
-    if !dir.exists() {
-        return Ok(());
-    }
-    let pin = ClearPinnedDir::pin(dir)?;
+    let Some(pin) = held else {
+        match std::fs::symlink_metadata(dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(repo_scan::Error::Io(format!(
+                    "cannot inspect {}: {e}",
+                    dir.display()
+                )));
+            }
+            Ok(md) if md.file_type().is_symlink() => {
+                return Err(unsafe_reset(&format!(
+                    "known dir {} raced in as a symlink after preflight; refusing",
+                    dir.display()
+                )));
+            }
+            Ok(_) => {
+                return Err(unsafe_reset(&format!(
+                    "known dir {} raced in after preflight; refusing",
+                    dir.display()
+                )));
+            }
+        }
+    };
+    pin.verify()?;
+    // Round-3 C1b binding argument for the by-path listing (kept
+    // deliberately instead of held-FD enumeration): names from this
+    // listing are UNTRUSTED HINTS, never trusted — every use below is
+    // FD-relative (`open_child` via `openat` on the held pin, content
+    // hashed from the open FD against a catalog row or the tool
+    // marker, unlink via `unlinkat` on the held pin). A listing from a
+    // swapped-in tree can only nominate names; each nominee still
+    // resolves against the HELD dir and must carry tool-owned bytes to
+    // move. Held-FD enumeration would bind nothing further (an attacker
+    // with dir write plants names in the real dir either way).
     let entries = std::fs::read_dir(dir)
         .map_err(|e| repo_scan::Error::Io(format!("cannot inspect {}: {e}", dir.display())))?;
     let mut scanned = 0usize;
@@ -9211,8 +9574,11 @@ fn clear_tool_dir(
         // Open through the pinned FD; the `DirEntry` file type is
         // advisory only and never trusted for the victim. A symlink here
         // is preserved (never followed, never unlinked): the advisory
-        // pre-check catches the static case and the `ELOOP` fallback
-        // catches a plant between check and open.
+        // by-path pre-check (round-3 C1b: kept deliberately — it decides
+        // nothing) catches the static case and the FD-bound `ELOOP`
+        // fallback in `open_child` catches a plant between check and
+        // open. The BINDING symlink decision is `O_NOFOLLOW` on the held
+        // FD, never this path stat.
         if is_symlink_path(&dir.join(&name))? {
             st.note_preserved(format!(
                 "{} (symlink; preserved)",
@@ -9291,12 +9657,17 @@ fn clear_tool_dir(
                 .is_some_and(|sum| sum.as_str() == digest.as_str());
         let marker_ok = tool_report_id(&bytes).as_deref() == Some(claimed.as_str());
         if row_ok || marker_ok {
+            // Round-3 C1b: the authorization above is CONTENT-bound
+            // (bytes hashed from this open FD against a catalog row or
+            // the tool marker), so the unlink takes NO re-open — the
+            // bound identity travels as `expect` for the degraded
+            // by-path re-bind only.
             #[cfg(unix)]
             let identity = store::owner::fd_identity(&file)?;
             #[cfg(not(unix))]
             let identity = (0u64, 0u64);
             drop(file);
-            pin.remove_child(&name, identity)?;
+            pin.unlink_pinned_child(&name, identity)?;
             st.removed += 1;
         } else {
             st.note_preserved(format!(
@@ -9345,6 +9716,222 @@ fn read_pinned_capped(file: &mut std::fs::File, display: &Path) -> repo_scan::Re
 // `tests/review_fix_main.rs` suite includes this file as a module). Each
 // hook drives the same code the command paths use — never a parallel copy.
 // ---------------------------------------------------------------------------
+
+/// Deterministic preflight/removal seam swap (FIXREADY4 C1/C2
+/// regression): applied between the REAL preflight and the REAL removal
+/// phase inside [`test_clear_preflight_removal_seam`], so each race
+/// plants deterministically instead of relying on thread timing. A
+/// concurrent swapper/clearer stress cannot assert anything stronger:
+/// any race caught after the first unlink is necessarily partial (POSIX
+/// offers no transactional multi-unlink), so the pinned property is
+/// refuse-loudly (never false success, never a followed link), with
+/// zero-mutation guaranteed only for pre-preflight plants (the static
+/// matrix in `tests/fail_clear.rs`).
+#[cfg(all(test, unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestClearSeamSwap {
+    /// No swap: the removal phase must succeed.
+    None,
+    /// Replace `catalog.db` with fresh bytes (new identity).
+    ReplaceVictim,
+    /// Replace `catalog.db-wal` with a symlink to an outside sentinel.
+    PlantVictimSymlink,
+    /// Create `catalog.db-shm`, absent at preflight.
+    RaceInVictim,
+    /// Replace the snapshots dir with a fresh dir (new identity).
+    SwapSnapshotsDir,
+    /// Plant a dangling symlink at the staging path, absent at preflight
+    /// (C2: must refuse loudly, never silent success).
+    RaceInStagingSymlink,
+    /// Replace the marker-authorized snapshot with unauthorized bytes
+    /// (new identity): content binding must preserve it without refusal
+    /// (round-3 C1b: snapshot authorization survives the re-open
+    /// removal because it is content-bound, not identity-bound).
+    ReplaceSnapshotVictim,
+    /// Rewrite the snapshot with byte-identical content (new identity):
+    /// content binding must still remove it (round-3 C1b: removal does
+    /// not depend on inode stability).
+    ReplaceSnapshotIdenticalBytes,
+}
+
+/// Outcome of [`test_clear_preflight_removal_seam`].
+#[cfg(all(test, unix))]
+#[derive(Debug)]
+pub struct TestClearSeamOutcome {
+    pub refused: bool,
+    pub detail: String,
+    pub removed: u64,
+    pub incomplete: Vec<String>,
+    pub preserved: Vec<String>,
+}
+
+/// Drive the REAL preflight, plant one deterministic swap, then drive
+/// the REAL removal phase (FIXREADY4 C1/C2): `state_dir` holds a caller-
+/// built `payload/` tree. Removal runs with `db_ours = true` and an
+/// empty checksum-row map (tool-marker bytes still authorize their own
+/// files). Returns whether the removal refused and why — never a
+/// parallel copy of the phase.
+#[cfg(all(test, unix))]
+pub fn test_clear_preflight_removal_seam(
+    state_dir: &Path,
+    swap: TestClearSeamSwap,
+) -> TestClearSeamOutcome {
+    let mut st = ClearState::new();
+    let done = |st: &ClearState, result: repo_scan::Result<()>| TestClearSeamOutcome {
+        refused: result.is_err(),
+        detail: result.err().map(|e| e.to_string()).unwrap_or_default(),
+        removed: st.removed,
+        incomplete: st.incomplete.clone(),
+        preserved: st.preserved.clone(),
+    };
+    let io_err = |e: std::io::Error| repo_scan::Error::Io(e.to_string());
+    let payload = store::owner::payload_dir(state_dir);
+    let payload_pin = match ClearPinnedDir::pin(&payload) {
+        Ok(pin) => pin,
+        Err(e) => return done(&st, Err(e)),
+    };
+    let snapshots = payload.join(config::SNAPSHOTS_DIR_NAME);
+    let staging = payload.join(config::STAGING_DIR_NAME);
+    let set = match preflight_deletion_set(&payload_pin, &snapshots, &staging) {
+        Ok(set) => set,
+        Err(e) => return done(&st, Err(e)),
+    };
+    // Deterministic race plant BETWEEN preflight and removal.
+    let planted = match swap {
+        TestClearSeamSwap::None => Ok(()),
+        TestClearSeamSwap::ReplaceVictim => std::fs::remove_file(payload.join("catalog.db"))
+            .and_then(|()| {
+                std::fs::write(payload.join("catalog.db"), b"swapped catalog bytes").map(|_| ())
+            })
+            .map_err(io_err),
+        TestClearSeamSwap::PlantVictimSymlink => {
+            let sentinel = state_dir.join("seam-sentinel");
+            std::fs::write(&sentinel, b"outside bytes")
+                .map_err(io_err)
+                .and_then(|()| std::fs::remove_file(payload.join("catalog.db-wal")).map_err(io_err))
+                .and_then(|()| {
+                    std::os::unix::fs::symlink(&sentinel, payload.join("catalog.db-wal"))
+                        .map_err(io_err)
+                })
+        }
+        TestClearSeamSwap::RaceInVictim => {
+            std::fs::write(payload.join("catalog.db-shm"), b"raced-in sidecar bytes")
+                .map(|_| ())
+                .map_err(io_err)
+        }
+        TestClearSeamSwap::SwapSnapshotsDir => {
+            std::fs::rename(&snapshots, state_dir.join("seam-orig-snapshots"))
+                .and_then(|()| std::fs::create_dir(&snapshots))
+                .map_err(io_err)
+        }
+        TestClearSeamSwap::RaceInStagingSymlink => {
+            std::os::unix::fs::symlink(state_dir.join("seam-nowhere"), &staging).map_err(io_err)
+        }
+        TestClearSeamSwap::ReplaceSnapshotVictim => {
+            let victim = snapshots.join("seam-report.json");
+            std::fs::remove_file(&victim)
+                .and_then(|()| std::fs::write(&victim, b"swapped snapshot bytes").map(|_| ()))
+                .map_err(io_err)
+        }
+        TestClearSeamSwap::ReplaceSnapshotIdenticalBytes => {
+            let victim = snapshots.join("seam-report.json");
+            std::fs::read(&victim).map_err(io_err).and_then(|bytes| {
+                std::fs::remove_file(&victim)
+                    .and_then(|()| std::fs::write(&victim, bytes).map(|_| ()))
+                    .map_err(io_err)
+            })
+        }
+    };
+    if let Err(e) = planted {
+        return done(&st, Err(e));
+    }
+    let db_path = payload.join("catalog.db");
+    let rows = HashMap::new();
+    let result = remove_preflighted_files(
+        state_dir,
+        &payload_pin,
+        &set,
+        &db_path,
+        &snapshots,
+        &staging,
+        true,
+        false,
+        &rows,
+        &mut st,
+    );
+    done(&st, result)
+}
+
+/// Deterministic FD-open/store-open seam swap (round-3 C1b): applied
+/// between the REAL victim-FD open and the REAL read-only store open
+/// inside [`test_verify_db_identity_seam`], so the race plants
+/// deterministically instead of relying on thread timing.
+#[cfg(all(test, unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestDbIdentitySwap {
+    /// No swap: a bound catalog reports `(true, true)`.
+    None,
+    /// Replace `catalog.db` with the caller-staged
+    /// `staged-seam-catalog.db` sibling (new identity) after the FD
+    /// open: the store opens a different file than the held victim.
+    SwapDbAfterFdOpen,
+}
+
+/// Outcome of [`test_verify_db_identity_seam`].
+#[cfg(all(test, unix))]
+#[derive(Debug)]
+pub struct TestDbIdentityOutcome {
+    pub result: Result<(bool, bool), String>,
+    pub incomplete: Vec<String>,
+    pub preserved: Vec<String>,
+}
+
+/// Drive the REAL [`verify_db_identity_inner`] with a deterministic plant
+/// between its FD open and its store open (round-3 C1b): `state_dir`
+/// holds a caller-built `payload/` tree (plus a staged replacement
+/// catalog for the swap variant). Never a parallel copy of the phase.
+#[cfg(all(test, unix))]
+pub async fn test_verify_db_identity_seam(
+    state_dir: &Path,
+    swap: TestDbIdentitySwap,
+) -> TestDbIdentityOutcome {
+    let mut st = ClearState::new();
+    let payload = store::owner::payload_dir(state_dir);
+    let payload_pin = match ClearPinnedDir::pin(&payload) {
+        Ok(pin) => pin,
+        Err(e) => {
+            return TestDbIdentityOutcome {
+                result: Err(e.to_string()),
+                incomplete: st.incomplete.clone(),
+                preserved: st.preserved.clone(),
+            };
+        }
+    };
+    let plant = match swap {
+        TestDbIdentitySwap::None => None,
+        TestDbIdentitySwap::SwapDbAfterFdOpen => {
+            Some(staged_db_swap as fn(&Path) -> std::io::Result<()>)
+        }
+    };
+    let db_path = payload.join("catalog.db");
+    let result = verify_db_identity_inner(state_dir, &db_path, &payload_pin, &mut st, plant)
+        .await
+        .map_err(|e| e.to_string());
+    TestDbIdentityOutcome {
+        result,
+        incomplete: st.incomplete.clone(),
+        preserved: st.preserved.clone(),
+    }
+}
+
+/// Swap `catalog.db` for the caller-staged `staged-seam-catalog.db`
+/// sibling (new identity, caller-chosen bytes).
+#[cfg(all(test, unix))]
+fn staged_db_swap(db_path: &Path) -> std::io::Result<()> {
+    let staged = db_path.with_file_name("staged-seam-catalog.db");
+    std::fs::remove_file(db_path)?;
+    std::fs::rename(staged, db_path)
+}
 
 /// Watchdog verdict over an already-measured operation age (R9).
 #[cfg(test)]

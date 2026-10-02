@@ -578,6 +578,13 @@ impl FallbackGit {
     /// untracked directory, spec `summary`) versus `all` (spec `full`).
     /// Returns `(staged, unstaged, untracked)`. Renames are disabled for
     /// parity with the gix counting policy.
+    ///
+    /// FIXREADY4 F: both this spawn and its driver guard run under
+    /// [`StatusConfigIsolation`] (empty global/system config, empty HOME,
+    /// no XDG config), so a repository-selected `filter=` attribute can
+    /// never resolve to an operator-configured helper — the installed-git
+    /// twin of the gix isolated open. Repo-local drivers still load and
+    /// are refused by the guard before any content-converting read.
     pub fn status_counts(
         &self,
         git_dir: &Path,
@@ -591,11 +598,15 @@ impl FallbackGit {
                 self.capabilities.version
             )));
         }
+        // Isolation first (fail closed when the empty-config dir cannot
+        // be built): the guard and the status read must observe the
+        // identical config scope, or the guard proves nothing.
+        let isolation = StatusConfigIsolation::create()?;
         // Repo-selected conversion drivers (filter.<name>.clean/smudge/
         // process) would execute during worktree-content comparison on git
         // versions that convert; driver names are unbounded so `-c` cannot
         // enumerate them — refuse and stay `unsupported`, never execute.
-        if self.filters_configured(git_dir, work_tree) {
+        if self.filters_configured(git_dir, work_tree, &isolation) {
             return Err(crate::Error::Git(format!(
                 "{}installed git ({}) refuses status: executable filter drivers configured; refusing to execute",
                 super::UNSUPPORTED_MARKER,
@@ -607,10 +618,11 @@ impl FallbackGit {
         } else {
             "--untracked-files=all"
         };
-        let out = self.run(
+        let out = self.run_inner(
             git_dir,
             work_tree,
             &["status", "--porcelain=v2", untracked, "--no-renames"],
+            Some(&isolation),
         )?;
         let text = String::from_utf8_lossy(&out);
         let mut staged = 0u64;
@@ -665,17 +677,26 @@ impl FallbackGit {
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
 
-    /// Repo-config scan for executable filter drivers
-    /// (RSF-FALLBACK-HELPER-SECURITY(1)): `config --local --list` never
-    /// executes helpers itself, and it sees through `include.path`
-    /// chains, so a repo-selected `filter.<driver>.clean|smudge|process`
-    /// command in the repo config (or anything it includes) refuses
-    /// worktree-content reads. Scoped to `--local` deliberately:
-    /// user/system-configured drivers are the operator's own trust
-    /// domain, not repo-selected code. Any scan error fails closed
-    /// (unknown → refuse).
-    fn filters_configured(&self, git_dir: &Path, work_tree: Option<&Path>) -> bool {
-        match self.run(git_dir, work_tree, &["config", "--local", "--list"]) {
+    /// Effective-config scan for executable filter drivers
+    /// (RSF-FALLBACK-HELPER-SECURITY(1), FIXREADY4 F): `config --list`
+    /// never executes helpers itself, and it sees through `include.path`
+    /// chains, so a `filter.<driver>.clean|smudge|process` command in the
+    /// effective config refuses worktree-content reads. The spawn runs
+    /// under the SAME [`StatusConfigIsolation`] as the status read, so
+    /// the guard observes exactly what git will observe: global/system
+    /// drivers are neutralized away (nothing to refuse), repo-local and
+    /// included drivers still show and refuse. Scoping to `--local`
+    /// would blind the guard on git versions that ignore the redirect
+    /// variables — the effective list fails closed there instead (a
+    /// leaked global driver refuses rather than executes). Any scan
+    /// error fails closed (unknown → refuse).
+    fn filters_configured(
+        &self,
+        git_dir: &Path,
+        work_tree: Option<&Path>,
+        isolation: &StatusConfigIsolation,
+    ) -> bool {
+        match self.run_inner(git_dir, work_tree, &["config", "--list"], Some(isolation)) {
             Ok(out) => String::from_utf8_lossy(&out).lines().any(|line| {
                 line.split_once('=')
                     .is_some_and(|(key, _)| Self::is_exec_filter_key(&key.to_ascii_lowercase()))
@@ -720,6 +741,22 @@ impl FallbackGit {
         work_tree: Option<&Path>,
         args: &[&str],
     ) -> crate::Result<Vec<u8>> {
+        self.run_inner(git_dir, work_tree, args, None)
+    }
+
+    /// [`run`] with optional status config isolation (FIXREADY4 F): when
+    /// `isolation` is `Some`, the spawn additionally observes empty
+    /// global/system config, an empty HOME, and no XDG config — applied
+    /// AFTER [`sanitize_git_env`] so the isolation values win. Used only
+    /// by the content-converting status read and its driver guard, which
+    /// share one isolation so both observe the identical config scope.
+    fn run_inner(
+        &self,
+        git_dir: &Path,
+        work_tree: Option<&Path>,
+        args: &[&str],
+        isolation: Option<&StatusConfigIsolation>,
+    ) -> crate::Result<Vec<u8>> {
         // Re-bind the executable before every spawn (XSEC-02): the
         // binary must still be the probed (dev, ino, owner, mode, size,
         // mtime) — a swapped, replaced, or re-permissioned binary is
@@ -739,6 +776,9 @@ impl FallbackGit {
         let mut command = Command::new(&canonical);
         command.arg(format!("--git-dir={}", git_dir.display()));
         sanitize_git_env(&mut command);
+        if let Some(isolation) = isolation {
+            isolation.apply(&mut command);
+        }
         command.env("GIT_OPTIONAL_LOCKS", "0");
         if let Some(work_tree) = work_tree {
             command.arg(format!("--work-tree={}", work_tree.display()));
@@ -775,6 +815,51 @@ impl FallbackGit {
             )));
         }
         Ok(outcome.stdout)
+    }
+}
+
+/// Empty-config isolation for the content-converting status read and
+/// its driver guard (FIXREADY4 F, installed-git twin of the gix
+/// isolated open): an owned 0700 tempdir (holding an empty config file)
+/// that becomes the spawn's `HOME`, `GIT_CONFIG_GLOBAL`, and
+/// `GIT_CONFIG_SYSTEM`, with `XDG_CONFIG_HOME` removed (so the XDG
+/// config falls back under the empty HOME). The guard and the status
+/// read share one isolation, so the guard observes exactly what git
+/// will observe. Fails closed when the dir cannot be built. On git
+/// versions that ignore the redirect variables, the guard's effective
+/// `config --list` still sees the leaked drivers and refuses.
+struct StatusConfigIsolation {
+    _dir: tempfile::TempDir,
+    empty_config: PathBuf,
+}
+
+impl StatusConfigIsolation {
+    fn create() -> crate::Result<Self> {
+        let dir = tempfile::TempDir::new().map_err(|e| {
+            crate::Error::Git(format!(
+                "installed git: refusing status: cannot build config isolation: {e}"
+            ))
+        })?;
+        let empty_config = dir.path().join("gitconfig-empty");
+        std::fs::write(&empty_config, b"").map_err(|e| {
+            crate::Error::Git(format!(
+                "installed git: refusing status: cannot build config isolation: {e}"
+            ))
+        })?;
+        Ok(Self {
+            _dir: dir,
+            empty_config,
+        })
+    }
+
+    /// Apply the isolation to one spawn (call AFTER [`sanitize_git_env`]
+    /// so these values win over the sanitized ambient environment).
+    fn apply(&self, command: &mut Command) {
+        command
+            .env("GIT_CONFIG_GLOBAL", &self.empty_config)
+            .env("GIT_CONFIG_SYSTEM", &self.empty_config)
+            .env("HOME", self._dir.path())
+            .env_remove("XDG_CONFIG_HOME");
     }
 }
 
@@ -1856,5 +1941,185 @@ mod tests {
         assert!(!unknown);
         let status = live.wait().expect("reap after kill");
         assert!(!status.success(), "SIGKILL must not read as success");
+    }
+
+    /// Process-env override with `Drop` restore (F-note2): serial-guarded
+    /// tests that must mutate ambient env restore exactly, even on
+    /// assertion panic, so no other test observes them. Mirrors
+    /// `EnvGuard` in `tests/fail_git.rs`.
+    struct EnvOverride {
+        saved: Vec<(String, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvOverride {
+        fn set(vars: &[(&str, &str)]) -> Self {
+            let mut saved = Vec::new();
+            for (key, value) in vars {
+                saved.push((key.to_string(), std::env::var_os(key)));
+                std::env::set_var(key, value);
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvOverride {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(&key, value),
+                    None => std::env::remove_var(&key),
+                }
+            }
+        }
+    }
+
+    /// F-note2 admitted marker test: a HOME + global-config fixture naming
+    /// an executable filter driver, then `FallbackGit::status_counts`
+    /// DIRECT — counts come back `Ok` (global drivers are neutralized by
+    /// isolation, not refused), the marker helper never executes, and the
+    /// fake-git's argv/env log proves every status-path spawn ran under
+    /// the isolation (`GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` point at
+    /// the empty config, `HOME` is the isolation dir, `XDG_CONFIG_HOME`
+    /// is unset). Serial-guarded: ambient env is process-wide.
+    #[test]
+    #[cfg(unix)]
+    fn status_counts_neutralizes_global_drivers_under_isolation() {
+        let _serial = spawn_serial();
+        // Fixture HOME: a global config naming a marker filter driver
+        // plus a global excludes file. If any status-path spawn observed
+        // this scope, the guard would refuse (proving the leak); real git
+        // would execute the driver during conversion.
+        let home = tempfile::tempdir().expect("home");
+        let marker = home.path().join("driver-marker");
+        let driver = home.path().join("marker-helper.sh");
+        std::fs::write(
+            &driver,
+            format!("#!/bin/sh\ntouch \"{}\"\n", marker.display()),
+        )
+        .expect("write helper");
+        let mut perms = std::fs::metadata(&driver).expect("meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&driver, perms).expect("chmod");
+        let global_config = home.path().join(".gitconfig");
+        std::fs::write(
+            &global_config,
+            format!(
+                "[filter \"marker\"]\n\tclean = {}\n\tsmudge = {}\n[core]\n\texcludesFile = {}\n",
+                driver.display(),
+                driver.display(),
+                home.path().join("global-excludes").display(),
+            ),
+        )
+        .expect("write global config");
+        std::fs::write(home.path().join("global-excludes"), "*.ignored\n").expect("excludes");
+        let home_str = home.path().to_str().expect("utf8").to_string();
+        let global_str = global_config.to_str().expect("utf8").to_string();
+        // Poison the ambient env: without sanitize+isolate, every spawn
+        // would observe the fixture scope.
+        let _env = EnvOverride::set(&[
+            ("HOME", home_str.as_str()),
+            ("GIT_CONFIG_GLOBAL", global_str.as_str()),
+            ("GIT_CONFIG_SYSTEM", global_str.as_str()),
+            (
+                "XDG_CONFIG_HOME",
+                home.path().join("xdg").to_str().expect("utf8"),
+            ),
+        ]);
+        // Fake git: `--version` + the feature probe answer canned; the
+        // driver guard (`config --list`) answers empty; the status read
+        // answers one staged, one unstaged, one untracked entry. Both
+        // status-path spawns append an argv/env block to the log.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("spawn.log");
+        let log_str = log.to_str().expect("utf8").to_string();
+        let body = format!(
+            "subcmd=\"\"\nhelp=0\nfor a in \"$@\"; do\ncase \"$a\" in\nstatus|config) subcmd=\"$a\" ;;\n--help) help=1 ;;\nesac\ndone\n\
+             if [ \"$subcmd\" = \"status\" ] && [ \"$help\" = \"0\" ]; then\n\
+             echo \"SPAWN argv=$*\" >> \"{log_str}\"\n\
+             echo \"GLOBAL=${{GIT_CONFIG_GLOBAL-unset}}\" >> \"{log_str}\"\n\
+             echo \"SYSTEM=${{GIT_CONFIG_SYSTEM-unset}}\" >> \"{log_str}\"\n\
+             echo \"HOME=$HOME\" >> \"{log_str}\"\n\
+             echo \"XDG=${{XDG_CONFIG_HOME-unset}}\" >> \"{log_str}\"\n\
+             echo '1 M. N... 100644 100644 100644 abcdef01 abcdef01 staged.txt'\n\
+             echo '1 .M N... 100644 100644 100644 abcdef02 abcdef03 unstaged.txt'\n\
+             echo '? untracked.txt'\nexit 0\nfi\n\
+             if [ \"$subcmd\" = \"config\" ]; then\n\
+             echo \"SPAWN argv=$*\" >> \"{log_str}\"\n\
+             echo \"GLOBAL=${{GIT_CONFIG_GLOBAL-unset}}\" >> \"{log_str}\"\n\
+             echo \"SYSTEM=${{GIT_CONFIG_SYSTEM-unset}}\" >> \"{log_str}\"\n\
+             echo \"HOME=$HOME\" >> \"{log_str}\"\n\
+             echo \"XDG=${{XDG_CONFIG_HOME-unset}}\" >> \"{log_str}\"\nexit 0\nfi\n\
+             echo \" --porcelain[<version>]  machine-readable output\"\nexit 0\n"
+        );
+        let git = git_fixture(dir.path(), "git", "git version 2.47.1", &body);
+        let found = FallbackGit::probe(&git).expect("probe");
+        assert!(found.capabilities().porcelain_v2, "probe must pass");
+        let repo = tempfile::tempdir().expect("repo");
+        let git_dir = repo.path().join("repo.git");
+        std::fs::create_dir(&git_dir).expect("git dir");
+        let (staged, unstaged, untracked) = found
+            .status_counts(&git_dir, Some(repo.path()), true)
+            .expect("global drivers neutralize, never refuse");
+        assert_eq!((staged, unstaged, untracked), (1, 1, 1));
+        assert!(!marker.exists(), "marker helper must never execute");
+        // argv/env proof: exactly the guard + status spawns logged, both
+        // isolated, both carrying the status argv.
+        let text = std::fs::read_to_string(&log).expect("read spawn log");
+        let blocks: Vec<&str> = text.split("SPAWN ").skip(1).collect();
+        assert_eq!(blocks.len(), 2, "guard + status spawns: {text}");
+        let mut saw_guard = false;
+        let mut saw_status = false;
+        for block in &blocks {
+            let mut global = "";
+            let mut system = "";
+            let mut spawn_home = "";
+            let mut xdg = "";
+            for line in block.lines() {
+                if let Some(v) = line.strip_prefix("GLOBAL=") {
+                    global = v;
+                } else if let Some(v) = line.strip_prefix("SYSTEM=") {
+                    system = v;
+                } else if let Some(v) = line.strip_prefix("HOME=") {
+                    spawn_home = v;
+                } else if let Some(v) = line.strip_prefix("XDG=") {
+                    xdg = v;
+                }
+            }
+            assert!(
+                global.ends_with("gitconfig-empty") && !global.contains(home_str.as_str()),
+                "global config isolated, not fixture: {block}"
+            );
+            assert_eq!(
+                system, global,
+                "system config isolated identically: {block}"
+            );
+            assert!(
+                !spawn_home.contains(home_str.as_str()),
+                "HOME isolated, not fixture: {block}"
+            );
+            assert_eq!(
+                std::path::Path::new(global).parent(),
+                Some(std::path::Path::new(spawn_home)),
+                "empty config lives directly under the isolation HOME: {block}"
+            );
+            assert_eq!(xdg, "unset", "XDG config removed: {block}");
+            let argv = block.lines().next().unwrap_or_default();
+            assert!(
+                argv.contains("--git-dir="),
+                "repo selection in argv: {argv}"
+            );
+            if argv.contains("config --list") {
+                saw_guard = true;
+            }
+            if argv.contains("status")
+                && argv.contains("--porcelain=v2")
+                && argv.contains("--untracked-files=normal")
+                && argv.contains("--no-renames")
+            {
+                saw_status = true;
+            }
+        }
+        assert!(saw_guard, "driver-guard spawn logged: {text}");
+        assert!(saw_status, "isolated status spawn logged: {text}");
     }
 }

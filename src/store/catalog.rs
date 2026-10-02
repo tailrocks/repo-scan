@@ -315,6 +315,20 @@ fn sanitized_target_bytes(url_raw: &[u8], what: &str) -> crate::Result<Vec<u8>> 
     Ok(crate::identity::sanitize_target_url(text).into_bytes())
 }
 
+/// Sink-side remote-URL enforcement (FIXREADY4 R): the inspector already
+/// redacts at observation, but the catalog never trusts its callers —
+///
+/// every stored remote `url`/`canonical_url` passes through
+/// [`crate::identity::redact_remote_url`] (idempotent for clean values,
+/// collapsing for `ext::`/unknown-scheme/malformed forms), so no
+/// credential-shaped byte reaches durable state even on a direct or
+/// legacy write path. Lossy conversion (never a refusal): remote bytes
+/// arrive lossy from gix already, and a refusal here could strand a scan
+/// on harmless non-UTF-8 residue.
+fn redacted_remote_bytes(url: &[u8]) -> Vec<u8> {
+    crate::identity::redact_remote_url(&String::from_utf8_lossy(url)).into_bytes()
+}
+
 fn req_i64(row: &turso::Row, idx: usize) -> crate::Result<i64> {
     match row.get_value(idx).map_err(store_err)? {
         turso::Value::Integer(value) => Ok(value),
@@ -866,6 +880,16 @@ impl TursoStore {
     /// catalogs, which seed it in `seed_meta`).
     pub async fn catalog_db_id(&self) -> crate::Result<Option<String>> {
         Self::read_meta_text(&self.conn, "db_id").await
+    }
+
+    /// Catalog-file `(dev, ino)` bound at open (RS-PRIV-08): `Some` on
+    /// unix when the pre/post-open bind succeeded, `None` elsewhere or
+    /// when the bind observed no file. Lets consumers that opened the
+    /// victim through a held FD first (clear's ownership check) prove
+    /// this by-path engine open resolved to that SAME file instead of
+    /// trusting the path — a mismatch reads as unbound (fail closed).
+    pub fn catalog_identity(&self) -> Option<(u64, u64)> {
+        self.catalog_id
     }
 
     /// Explicit transaction helper: `BEGIN IMMEDIATE`, run `f`, then an
@@ -2951,13 +2975,16 @@ impl TursoStore {
         }
     }
 
-    /// Idempotent remote upsert keyed by stable id.
+    /// Idempotent remote upsert keyed by stable id. Stored URLs pass
+    /// through the sink-side redaction (see [`redacted_remote_bytes`]).
     pub async fn upsert_remote(
         &self,
         remote: &NewRemote<'_>,
         observed_ms: i64,
     ) -> crate::Result<()> {
         self.forbid_write("upsert_remote")?;
+        let url = redacted_remote_bytes(remote.url);
+        let canonical_url = remote.canonical_url.map(redacted_remote_bytes);
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO remotes (id, instance_id, checkout_scope_id, name, \
@@ -2969,8 +2996,8 @@ impl TursoStore {
                     v_opt_text(remote.checkout_scope_id.map(str::to_string)),
                     v_blob(remote.name.to_vec()),
                     v_text(remote.role),
-                    v_blob(remote.url.to_vec()),
-                    v_opt_blob(remote.canonical_url.map(<[u8]>::to_vec)),
+                    v_blob(url),
+                    v_opt_blob(canonical_url),
                     v_int(observed_ms),
                 ],
             )
@@ -4035,7 +4062,9 @@ impl TursoStore {
     }
 
     /// Buffer a remote upsert; see [`TursoStore::buffer_enqueue_task`] for
-    /// the flush contract. Returns `WriterBatch::should_flush`.
+    /// the flush contract. Returns `WriterBatch::should_flush`. Stored
+    /// URLs pass through the sink-side redaction (see
+    /// [`redacted_remote_bytes`]).
     pub fn buffer_upsert_remote(
         batch: &mut WriterBatch,
         remote: &NewRemote<'_>,
@@ -4051,8 +4080,8 @@ impl TursoStore {
                 v_opt_text(remote.checkout_scope_id.map(str::to_string)),
                 v_blob(remote.name.to_vec()),
                 v_text(remote.role),
-                v_blob(remote.url.to_vec()),
-                v_opt_blob(remote.canonical_url.map(<[u8]>::to_vec)),
+                v_blob(redacted_remote_bytes(remote.url)),
+                v_opt_blob(remote.canonical_url.map(redacted_remote_bytes)),
                 v_int(observed_ms),
             ],
         )

@@ -620,3 +620,270 @@ fn r16_refs_submodules_snapshot() {
     assert!(second_snapshot.is_file());
     assert!(first_snapshot.is_file(), "first snapshot kept");
 }
+
+/// Tool-marker snapshot bytes authorizing their own removal: the stem
+/// must equal `report_id`.
+#[cfg(unix)]
+fn seam_marker_json(report_id: &str) -> String {
+    format!(
+        "{{\"schema_version\":\"{}\",\"tool\":{{\"name\":\"{}\",\"version\":\"test\"}},\"report_id\":\"{}\"}}",
+        repo_scan::report::model::SCHEMA_VERSION,
+        repo_scan::report::model::TOOL_NAME,
+        report_id
+    )
+}
+
+/// Seam fixture: `state/payload/` with engine victims, a marker-
+/// authorized snapshot, and (unless `omit_staging`) an empty staging
+/// dir. `catalog.db-shm` is always omitted — the raced-in case plants it.
+#[cfg(unix)]
+fn seam_state(tmp: &Path, name: &str, omit_staging: bool) -> PathBuf {
+    let state = tmp.join(name);
+    let payload = state.join("payload");
+    std::fs::create_dir_all(payload.join("report-snapshots")).unwrap();
+    if !omit_staging {
+        std::fs::create_dir_all(payload.join("staging")).unwrap();
+    }
+    std::fs::write(payload.join("catalog.db"), b"seam catalog bytes").unwrap();
+    std::fs::write(payload.join("catalog.db-wal"), b"seam wal bytes").unwrap();
+    std::fs::write(
+        payload.join("report-snapshots").join("seam-report.json"),
+        seam_marker_json("seam-report"),
+    )
+    .unwrap();
+    state
+}
+
+/// Round-2 C1/C2 deterministic preflight/removal seam regression: each
+/// race plants between the REAL preflight and the REAL removal phase
+/// (no thread timing). Every plant refuses LOUDLY — never false
+/// success, never a followed link — while the unswapped control clears
+/// through the held pins. The `removed` counts pin the honest partial-
+/// on-race semantics: a race caught after earlier unlinks cannot un-
+/// unlink (POSIX has no transactional multi-unlink), so it refuses
+/// instead of pretending success.
+#[cfg(unix)]
+#[test]
+fn round2_c1_preflight_removal_seam_refuses_loudly() {
+    use main_under_test::{test_clear_preflight_removal_seam as seam, TestClearSeamSwap as Swap};
+    let tmp = tempfile::tempdir().expect("scratch");
+
+    // Control: no swap — full removal through the held pins.
+    let state = seam_state(tmp.path(), "seam-none", false);
+    let out = seam(&state, Swap::None);
+    assert!(!out.refused, "control must clear: {}", out.detail);
+    assert_eq!(out.removed, 3, "db + wal + snapshot: {out:?}");
+    let payload = state.join("payload");
+    assert!(!payload.join("catalog.db").exists());
+    assert!(!payload.join("catalog.db-wal").exists());
+    assert!(!payload
+        .join("report-snapshots")
+        .join("seam-report.json")
+        .exists());
+
+    // Replaced victim: first engine victim already swapped — zero unlinks.
+    let state = seam_state(tmp.path(), "seam-replace", false);
+    let out = seam(&state, Swap::ReplaceVictim);
+    assert!(out.refused, "swapped victim must refuse: {out:?}");
+    assert!(
+        out.detail.contains("changed between preflight and unlink"),
+        "{}",
+        out.detail
+    );
+    assert_eq!(out.removed, 0, "{out:?}");
+    let payload = state.join("payload");
+    assert_eq!(
+        std::fs::read(payload.join("catalog.db")).expect("swapped db stays"),
+        b"swapped catalog bytes",
+        "swapped victim unlinked instead of refused"
+    );
+    assert!(
+        payload.join("catalog.db-wal").is_file(),
+        "later victims untouched"
+    );
+
+    // Symlinked victim: the link is never followed; the outside sentinel
+    // survives byte-identical. catalog.db unlinked before the race was
+    // caught (loud partial, never false success).
+    let state = seam_state(tmp.path(), "seam-symlink", false);
+    let out = seam(&state, Swap::PlantVictimSymlink);
+    assert!(out.refused, "symlinked victim must refuse: {out:?}");
+    assert!(out.detail.contains("symlink"), "{}", out.detail);
+    assert_eq!(out.removed, 1, "{out:?}");
+    assert_eq!(
+        std::fs::read(state.join("seam-sentinel")).expect("sentinel"),
+        b"outside bytes",
+        "outside sentinel touched"
+    );
+    let payload = state.join("payload");
+    assert!(
+        std::fs::symlink_metadata(payload.join("catalog.db-wal"))
+            .expect("meta")
+            .file_type()
+            .is_symlink(),
+        "planted link itself untouched"
+    );
+    assert!(
+        !payload.join("catalog.db").exists(),
+        "earlier unlink stands (loud partial)"
+    );
+
+    // Raced-in victim (absent at preflight): refuses, entry preserved.
+    let state = seam_state(tmp.path(), "seam-racein", false);
+    let out = seam(&state, Swap::RaceInVictim);
+    assert!(out.refused, "raced-in victim must refuse: {out:?}");
+    assert!(
+        out.detail.contains("raced in after preflight"),
+        "{}",
+        out.detail
+    );
+    assert_eq!(out.removed, 2, "{out:?}");
+    assert_eq!(
+        std::fs::read(state.join("payload").join("catalog.db-shm")).expect("shm stays"),
+        b"raced-in sidecar bytes",
+        "raced-in entry unlinked instead of refused"
+    );
+
+    // Swapped snapshots dir: the held pin no longer verifies — the
+    // substituted tree is never listed or cleared.
+    let state = seam_state(tmp.path(), "seam-swapdir", false);
+    let out = seam(&state, Swap::SwapSnapshotsDir);
+    assert!(out.refused, "swapped known dir must refuse: {out:?}");
+    assert_eq!(out.removed, 2, "{out:?}");
+    assert!(
+        state
+            .join("seam-orig-snapshots")
+            .join("seam-report.json")
+            .is_file(),
+        "pre-swap tree untouched"
+    );
+
+    // C2 raced-in dangling symlink at an absent-at-preflight known dir:
+    // loud refusal, never silent success over uninspected entries.
+    let state = seam_state(tmp.path(), "seam-dangling", true);
+    let out = seam(&state, Swap::RaceInStagingSymlink);
+    assert!(out.refused, "dangling known-dir race must refuse: {out:?}");
+    assert!(out.detail.contains("raced in"), "{}", out.detail);
+    assert!(
+        std::fs::symlink_metadata(state.join("payload").join("staging"))
+            .expect("meta")
+            .file_type()
+            .is_symlink(),
+        "dangling link left untouched"
+    );
+}
+
+/// Round-3 C1b snapshot seam: snapshot authorization is CONTENT-bound,
+/// so it survives the re-open removal — a content-swapped snapshot
+/// preserves WITHOUT refusal (hash mismatch, not identity mismatch),
+/// while byte-identical content under a new identity still removes
+/// (removal does not depend on inode stability).
+#[cfg(unix)]
+#[test]
+fn round3_c1_snapshot_seam_content_bound() {
+    use main_under_test::{test_clear_preflight_removal_seam as seam, TestClearSeamSwap as Swap};
+    let tmp = tempfile::tempdir().expect("scratch");
+
+    // Content swap: preserved, no refusal, siblings still removed.
+    let state = seam_state(tmp.path(), "seam-snapswap", false);
+    let out = seam(&state, Swap::ReplaceSnapshotVictim);
+    assert!(
+        !out.refused,
+        "content swap preserves, never refuses: {out:?}"
+    );
+    assert_eq!(out.removed, 2, "{out:?}");
+    let payload = state.join("payload");
+    assert_eq!(
+        std::fs::read(payload.join("report-snapshots").join("seam-report.json"))
+            .expect("swapped snapshot stays"),
+        b"swapped snapshot bytes",
+        "unauthorized bytes unlinked instead of preserved"
+    );
+    assert!(
+        !payload.join("catalog.db").exists(),
+        "earlier engine unlinks stand"
+    );
+    assert!(!payload.join("catalog.db-wal").exists());
+
+    // Identical bytes, new identity: still removed.
+    let state = seam_state(tmp.path(), "seam-snapidentical", false);
+    let out = seam(&state, Swap::ReplaceSnapshotIdenticalBytes);
+    assert!(!out.refused, "identical bytes must clear: {out:?}");
+    assert_eq!(out.removed, 3, "{out:?}");
+    assert!(
+        !state
+            .join("payload")
+            .join("report-snapshots")
+            .join("seam-report.json")
+            .exists(),
+        "content-bound removal completed"
+    );
+}
+
+/// Round-3 C1b ownership seam: the read-only store open binds to the
+/// HELD victim FD — a catalog swapped in between the FD open and the
+/// store open cannot authorize the held (foreign) victim or its marker.
+/// Before the bind, the swap variant reported `(true, true)` (the
+/// swapped file's `db_id` matched the marker); now it reports
+/// `(false, false)` with the victim preserved.
+#[cfg(unix)]
+#[test]
+fn round3_c1_db_identity_seam_binds_store_open() {
+    use main_under_test::{test_verify_db_identity_seam as seam, TestDbIdentitySwap as Swap};
+    use repo_scan::store::owner::OWNER_MARKER_TAG;
+
+    // Fixture: a marker bound to a REAL tool catalog. Returns the state
+    // dir and the real catalog bytes (for the staged swap plant).
+    let build = |tmp: &tempfile::TempDir, name: &str| {
+        let state = tmp.path().join(name);
+        let payload = state.join("payload");
+        repo_scan::privacy::private_dir_0700(&payload).expect("mkdir");
+        let db = payload.join("catalog.db");
+        let db_id = runtime()
+            .block_on(async {
+                let store = TursoStore::open(&db).await.expect("open");
+                let id = store.catalog_db_id().await.expect("db id");
+                store.close().await.expect("close");
+                id
+            })
+            .expect("catalog carries a db_id");
+        let marker = format!("{OWNER_MARKER_TAG}\ndb_id={db_id}\nwritten_ms=1\npid=1\n");
+        repo_scan::privacy::private_write_0600(&payload.join("owner.marker"), marker.as_bytes())
+            .expect("marker");
+        let real = std::fs::read(&db).expect("read real catalog");
+        (state, payload, real)
+    };
+    // Foreign bytes that pass the magic gate but carry no tool-ownership
+    // evidence (no schema markers).
+    let foreign = {
+        let mut bytes = b"SQLite format 3\0".to_vec();
+        bytes.extend(std::iter::repeat_n(0u8, 4096));
+        bytes
+    };
+
+    // Control: the bound catalog with no swap reports `(true, true)`.
+    let tmp = tempfile::tempdir().expect("scratch");
+    let (state, _, _) = build(&tmp, "seam-dbbind-none");
+    let out = runtime().block_on(seam(&state, Swap::None));
+    assert_eq!(out.result, Ok((true, true)), "{out:?}");
+
+    // Swap: the held victim is foreign; the staged (marker-matching)
+    // catalog lands between the FD open and the store open. The store
+    // opens a different file than the held FD, so the binding fails and
+    // the held bytes decide: foreign, preserved.
+    let (state, payload, real) = build(&tmp, "seam-dbbind-swap");
+    repo_scan::privacy::private_write_0600(&payload.join("catalog.db"), &foreign)
+        .expect("overwrite with foreign bytes");
+    repo_scan::privacy::private_write_0600(&payload.join("staged-seam-catalog.db"), &real)
+        .expect("stage real catalog");
+    let out = runtime().block_on(seam(&state, Swap::SwapDbAfterFdOpen));
+    assert_eq!(out.result, Ok((false, false)), "{out:?}");
+    assert!(
+        out.preserved
+            .iter()
+            .any(|p| p.contains("without tool ownership evidence")),
+        "foreign victim preserved loudly: {out:?}"
+    );
+    // The marker stays: nothing was ever bound.
+    assert!(payload.join("owner.marker").is_file());
+}

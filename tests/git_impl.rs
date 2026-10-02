@@ -664,3 +664,31 @@ fn ssh_alias_config_parses_narrowly() {
     assert!(!map.contains_key("*.example.com"), "wildcards ignored");
     assert!(!map.contains_key("second"), "missing hostname ignored");
 }
+
+/// Round-2 F-note1: every status observation declares the isolated
+/// config scope it was inspected under (spec "declare what was
+/// inspected"), so readers never mistake the counts for operator-`git
+/// status` output, which honors global scope.
+#[test]
+fn status_observations_declare_isolated_scope() {
+    let Some(git_bin) = git_or_skip() else {
+        eprintln!("skip: no installed git");
+        return;
+    };
+    let scratch = tempfile::tempdir().expect("scratch");
+    let work = init_with_commit(&git_bin, scratch.path());
+    let inspector = GixInspector::new();
+    let validated = inspector.validate(&work).expect("validate workdir");
+    for mode in [StatusMode::Metadata, StatusMode::Summary, StatusMode::Full] {
+        let obs = inspector
+            .status(&validated.instance, mode)
+            .expect("status reads");
+        assert!(
+            obs.unknown_fields
+                .iter()
+                .any(|f| f.contains("isolated-config-scope")),
+            "{mode:?} must declare its inspected scope: {:?}",
+            obs.unknown_fields
+        );
+    }
+}

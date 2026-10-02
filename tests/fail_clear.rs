@@ -394,3 +394,333 @@ fn clear_unknown_files_matrix() {
     #[cfg(unix)]
     unlistable_payload_reports_incomplete();
 }
+
+// ---------------------------------------------------------------------------
+// FIXREADY4 C (2AE47A9E + cb2c3c9a): clear atomicity. A refused clear must
+// mutate NOTHING (previously catalog.db was removed before a symlinked
+// WAL/marker was even discovered); a dangling payload path is an ERROR,
+// never success; symlinked ancestors are FD-bound traversal (explicit
+// policy). Every consumer case below asserts either full-clear success
+// or byte-identical state plus a nonzero exit.
+// ---------------------------------------------------------------------------
+
+/// Fresh scratch dir under `/tmp` (0700) for FIXREADY4 C fixtures.
+#[cfg(unix)]
+fn fresh_scratch() -> tempfile::TempDir {
+    let dir = tempfile::Builder::new()
+        .prefix("fail-clear-fixready4c-")
+        .tempdir_in("/tmp")
+        .expect("scratch tempdir under /tmp");
+    repo_scan::privacy::private_dir_0700(dir.path()).expect("scratch root is 0700");
+    dir
+}
+
+/// Snapshot of one state tree: relative path -> file bytes or symlink
+/// target (lstat semantics, never following). The coordination lock is
+/// excluded: every guarded run rewrites its occupancy note by design.
+#[cfg(unix)]
+fn snapshot_state_tree(state: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut stack = vec![state.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let rel = path.strip_prefix(state).unwrap_or(&path).to_path_buf();
+            if rel == Path::new("instance.lock") {
+                continue;
+            }
+            let meta = match std::fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                Err(_) => continue,
+            };
+            if meta.file_type().is_symlink() {
+                let target = std::fs::read_link(&path).expect("read link");
+                out.insert(rel, target.as_os_str().as_encoded_bytes().to_vec());
+            } else if meta.file_type().is_dir() {
+                stack.push(path);
+            } else if meta.is_file() {
+                out.insert(rel, std::fs::read(&path).expect("read file"));
+            }
+        }
+    }
+    out
+}
+
+/// Assert two state snapshots are byte-identical (same entries, same
+/// bytes/targets). `instance.lock` is excluded by the snapshotter.
+#[cfg(unix)]
+fn assert_state_identical(
+    before: &std::collections::BTreeMap<PathBuf, Vec<u8>>,
+    state: &Path,
+    case: &str,
+) {
+    let after = snapshot_state_tree(state);
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>(),
+        "{case}: state entry set changed"
+    );
+    for (rel, bytes) in before {
+        assert_eq!(
+            after.get(rel),
+            Some(bytes),
+            "{case}: {} changed",
+            rel.display()
+        );
+    }
+}
+
+/// Owned payload with a marker exactly bound to the live catalog `db_id`
+/// (the consumer's seeded-scan shape), plus one row-bound snapshot file
+/// and one staging leftover.
+#[cfg(unix)]
+fn owned_bound_payload(dir: &Path) -> (PathBuf, PathBuf) {
+    let (state, payload) = owned_payload(dir);
+    let db = payload.join("catalog.db");
+    let db_id = runtime()
+        .block_on(async {
+            let store = TursoStore::open(&db).await.expect("open");
+            let id = store.catalog_db_id().await.expect("db id");
+            store.close().await.expect("close");
+            id
+        })
+        .expect("catalog carries a db_id");
+    let marker = format!(
+        "{}\ndb_id={db_id}\nwritten_ms=1\npid=1\n",
+        repo_scan::store::owner::OWNER_MARKER_TAG
+    );
+    write_private(&payload.join("owner.marker"), marker.as_bytes());
+    let snap = payload.join("report-snapshots").join("report-c.json");
+    let snap_bytes = marker_report("report-c");
+    write_private(&snap, snap_bytes.as_bytes());
+    save_row(&db, "report-c", snap_bytes.as_bytes());
+    write_private(
+        &payload.join("staging").join(".staging-11-12-report-c.json"),
+        marker_report("report-c").as_bytes(),
+    );
+    (state, payload)
+}
+
+/// WAL-symlink case (2AE47A9E): exit 1 with the catalog, marker,
+/// snapshot, and staging bytes all intact and the outside sentinel
+/// untouched.
+#[cfg(unix)]
+fn wal_symlink_refusal_is_atomic() {
+    let dir = fresh_scratch();
+    let (state, payload) = owned_bound_payload(dir.path());
+    std::fs::remove_file(payload.join("catalog.db-wal")).ok();
+    let sentinel = dir.path().join("wal-sentinel");
+    write_private(&sentinel, b"outside bytes");
+    std::os::unix::fs::symlink(&sentinel, payload.join("catalog.db-wal")).expect("symlink");
+    let before = snapshot_state_tree(&state);
+
+    let out = run(&["cache", "clear", "--all"], dir.path(), &state);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_text(&out));
+    assert_state_identical(&before, &state, "wal-symlink");
+    assert_eq!(
+        std::fs::read(&sentinel).expect("sentinel"),
+        b"outside bytes",
+        "outside sentinel untouched"
+    );
+}
+
+/// Dangling-marker case (cb2c3c9a): a dangling `owner.marker` symlink
+/// refuses with zero mutation — catalog, WAL, snapshot, and staging
+/// all survive.
+#[cfg(unix)]
+fn dangling_marker_refusal_is_atomic() {
+    let dir = fresh_scratch();
+    let (state, payload) = owned_bound_payload(dir.path());
+    std::fs::remove_file(payload.join("owner.marker")).expect("remove marker");
+    std::os::unix::fs::symlink(
+        payload.join("no-such-marker-target"),
+        payload.join("owner.marker"),
+    )
+    .expect("symlink");
+    let before = snapshot_state_tree(&state);
+
+    let out = run(&["cache", "clear", "--all"], dir.path(), &state);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_text(&out));
+    assert_state_identical(&before, &state, "dangling-marker");
+}
+
+/// Dangling-payload case (cb2c3c9a): a dangling payload-dir symlink is
+/// an ERROR (nonzero exit), never exit-0 false success — and the link
+/// itself is left untouched.
+#[cfg(unix)]
+fn dangling_payload_is_error_not_success() {
+    let dir = fresh_scratch();
+    let state = dir.path().join("state");
+    repo_scan::privacy::private_dir_0700(&state).expect("mkdir");
+    std::os::unix::fs::symlink(state.join("no-such-payload"), state.join("payload"))
+        .expect("symlink");
+    let before = snapshot_state_tree(&state);
+
+    let out = run(&["cache", "clear", "--all"], dir.path(), &state);
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "dangling payload must not report success: {}",
+        stdout_text(&out)
+    );
+    assert_state_identical(&before, &state, "dangling-payload");
+    assert!(
+        std::fs::symlink_metadata(state.join("payload"))
+            .expect("metadata")
+            .file_type()
+            .is_symlink(),
+        "dangling link left untouched"
+    );
+}
+
+/// Payload-symlink-to-moved-payload case (cb2c3c9a): exit 1, the moved
+/// payload stays intact, the link stays.
+#[cfg(unix)]
+fn moved_payload_symlink_refusal_is_atomic() {
+    let dir = fresh_scratch();
+    let (state, payload) = owned_bound_payload(dir.path());
+    let moved = dir.path().join("moved-payload");
+    std::fs::rename(&payload, &moved).expect("move payload");
+    std::os::unix::fs::symlink(&moved, &payload).expect("symlink");
+    let before = snapshot_state_tree(&state);
+    let moved_bytes = std::fs::read(moved.join("catalog.db")).expect("moved db");
+
+    let out = run(&["cache", "clear", "--all"], dir.path(), &state);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_text(&out));
+    assert_state_identical(&before, &state, "moved-payload-symlink");
+    assert_eq!(
+        std::fs::read(moved.join("catalog.db")).expect("moved db after"),
+        moved_bytes,
+        "moved payload intact"
+    );
+}
+
+/// State-dir and catalog-db symlink cases (cb2c3c9a): exit 1 with no
+/// observed changes.
+#[cfg(unix)]
+fn dir_and_db_symlink_refusals_are_atomic() {
+    // Symlinked state dir.
+    let dir = fresh_scratch();
+    let (state, _payload) = owned_bound_payload(dir.path());
+    let link = dir.path().join("state-link");
+    std::os::unix::fs::symlink(&state, &link).expect("symlink");
+    let before = snapshot_state_tree(&state);
+    let out = run(&["cache", "clear", "--all"], dir.path(), &link);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_text(&out));
+    assert_state_identical(&before, &state, "state-dir-symlink");
+
+    // Symlinked catalog db.
+    let dir = fresh_scratch();
+    let (state, payload) = owned_bound_payload(dir.path());
+    let outside = dir.path().join("outside.db");
+    write_private(&outside, b"outside database bytes");
+    std::fs::remove_file(payload.join("catalog.db")).expect("remove db");
+    std::os::unix::fs::symlink(&outside, payload.join("catalog.db")).expect("symlink");
+    let before = snapshot_state_tree(&state);
+    let out = run(&["cache", "clear", "--all"], dir.path(), &state);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_text(&out));
+    assert_state_identical(&before, &state, "catalog-db-symlink");
+    assert_eq!(
+        std::fs::read(&outside).expect("outside"),
+        b"outside database bytes",
+        "outside target untouched"
+    );
+}
+
+/// Ancestor-symlink policy (cb2c3c9a, explicit): a symlinked
+/// intermediate ancestor resolves normally (trust-root model: the
+/// operator configured this path) and the clear proceeds as FD-bound
+/// traversal — the resolved payload is removed through the alias.
+#[cfg(unix)]
+fn ancestor_symlink_is_fd_bound_traversal() {
+    let dir = fresh_scratch();
+    let real = dir.path().join("real");
+    let (state, payload) = owned_bound_payload(&real);
+    let alias = dir.path().join("alias");
+    std::os::unix::fs::symlink(&real, &alias).expect("symlink");
+    let via_alias = alias.join("state");
+
+    let out = run(&["cache", "clear", "--all"], dir.path(), &via_alias);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    assert!(
+        !payload.exists() && !payload.is_symlink(),
+        "resolved payload removed through the alias"
+    );
+    assert!(
+        std::fs::symlink_metadata(&alias)
+            .expect("metadata")
+            .file_type()
+            .is_symlink(),
+        "alias itself untouched"
+    );
+    assert!(
+        state.join("instance.lock").is_file(),
+        "coordination lock retained"
+    );
+}
+
+/// Positive control (cb2c3c9a): ordinary owned state clears fully with
+/// exit 0 while retaining `instance.lock`.
+#[cfg(unix)]
+fn positive_control_clears_fully() {
+    let dir = fresh_scratch();
+    let (state, payload) = owned_bound_payload(dir.path());
+
+    let out = run(&["cache", "clear", "--all"], dir.path(), &state);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    assert!(
+        !payload.exists() && !payload.is_symlink(),
+        "payload fully removed"
+    );
+    assert!(
+        state.join("instance.lock").is_file(),
+        "coordination lock retained"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn clear_fixready4_atomicity_matrix() {
+    wal_symlink_refusal_is_atomic();
+    dangling_marker_refusal_is_atomic();
+    dangling_payload_is_error_not_success();
+    moved_payload_symlink_refusal_is_atomic();
+    dir_and_db_symlink_refusals_are_atomic();
+    ancestor_symlink_is_fd_bound_traversal();
+    positive_control_clears_fully();
+    dangling_known_dir_symlink_refusal_is_atomic();
+}
+
+/// Dangling-known-dir case (round-2 C2): a dangling `report-snapshots`
+/// symlink is an ERROR (exit 1, zero mutation) — never silent success
+/// over uninspected entries. The static plant refuses before any unlink;
+/// the raced-in variant (symlink planted after preflight) is pinned by
+/// the deterministic seam test in `tests/review_fix_main.rs`, which is
+/// the only shape that reaches the removal-phase guard.
+#[cfg(unix)]
+fn dangling_known_dir_symlink_refusal_is_atomic() {
+    let dir = fresh_scratch();
+    let (state, payload) = owned_bound_payload(dir.path());
+    std::fs::remove_dir_all(payload.join("report-snapshots")).expect("remove snapshots");
+    std::os::unix::fs::symlink(
+        payload.join("no-such-snapshots-target"),
+        payload.join("report-snapshots"),
+    )
+    .expect("symlink");
+    let before = snapshot_state_tree(&state);
+
+    let out = run(&["cache", "clear", "--all"], dir.path(), &state);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_text(&out));
+    assert_state_identical(&before, &state, "dangling-known-dir");
+    assert!(
+        std::fs::symlink_metadata(payload.join("report-snapshots"))
+            .expect("metadata")
+            .file_type()
+            .is_symlink(),
+        "dangling link left untouched"
+    );
+}

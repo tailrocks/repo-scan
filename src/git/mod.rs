@@ -312,6 +312,33 @@ fn has_include_section(config_text: &str) -> bool {
 /// status call, and the scheduler records the returned line.
 pub const FILTER_DRIVER_GAP: &str = "filter-drivers-configured";
 
+/// Isolated-scope declaration recorded on every status observation
+/// (FIXREADY4 F-note1, spec "declare what was inspected"): the status
+/// path opens isolated, so global `core.excludesFile`, global
+/// gitattributes, and user/system filter drivers are NOT consulted —
+/// counts reflect the repository-local scope only, with no content
+/// conversion. Without this line a reader could mistake the counts for
+/// operator-`git status` output, which honors global scope. Carried in
+/// `unknown_fields` (the free-form per-status channel); it deliberately
+/// matches none of the `unstable`/`no-worktree`/`truncat` state-mapping
+/// substrings, so the report state is unaffected.
+pub const ISOLATED_SCOPE_DECLARATION: &str = "isolated-config-scope: only repository-local git config and attributes were consulted; user/system/global scope (core.excludesFile, global gitattributes, filter drivers) was ignored and no content conversion ran";
+
+/// Attach [`ISOLATED_SCOPE_DECLARATION`] to a status observation,
+/// exactly once (idempotent across the instability-retry merge).
+fn with_scope_declaration(mut observation: StatusObservation) -> StatusObservation {
+    if !observation
+        .unknown_fields
+        .iter()
+        .any(|f| f.contains("isolated-config-scope"))
+    {
+        observation
+            .unknown_fields
+            .push(ISOLATED_SCOPE_DECLARATION.to_string());
+    }
+    observation
+}
+
 /// Bounded pre-scan for executable filter drivers (EXACT-2 defect 1).
 ///
 /// Inspects the repo-local configs gix loads (`config` and
@@ -322,16 +349,23 @@ pub const FILTER_DRIVER_GAP: &str = "filter-drivers-configured";
 /// `filter.<driver>.clean|smudge|process` command — or when a
 /// present-but-unreadable control file makes absence unprovable — else
 /// `None`. Included files are not followed (gix loads with includes
-/// disabled, so their drivers never execute); user/system/env-configured
-/// drivers are the operator's own trust domain (same boundary as
-/// [`fallback`](crate::git::fallback) `--local` scoping and gix's
-/// `is_trusted` default), not repo-selected code.
+/// disabled, so their drivers never execute).
+///
+/// Scope note (FIXREADY4 F, corrected): user/system/env-configured
+/// drivers are NOT merely the operator's trust domain — the repository
+/// SELECTS which operator helper runs via `.gitattributes`, so a global
+/// helper is repo-selected code execution. That scope is neutralized
+/// structurally instead: the status path opens with
+/// [`gix::open::Permissions::isolated`], so non-local drivers never load
+/// and can never execute. This scan covers the remaining scope —
+/// repo-local drivers, which an isolated open still loads — and refuses
+/// them before any content-converting call.
 ///
 /// [`GixInspector::status_interruptible`] enforces this before any
 /// content-converting status call; metadata/bare probes never convert
 /// content and skip the guard.
 pub fn filter_driver_gap(instance: &GitInstance) -> Option<String> {
-    let repo = open_repo(&instance.git_dir).ok()?;
+    let repo = open_repo_isolated(&instance.git_dir).ok()?;
     filter_driver_gap_for_repo(&repo, instance)
 }
 
@@ -706,20 +740,25 @@ impl GixInspector {
         mode: StatusMode,
         interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> crate::Result<StatusObservation> {
-        let repo = open_repo(&instance.git_dir)?;
+        // FIXREADY4 F: the status path opens isolated (no
+        // user/system/env config, attributes, or environment) so a
+        // repository-selected `filter=` attribute can never resolve to
+        // an operator-configured helper. Repo-local drivers still load
+        // and are refused by the gap scan below before any conversion.
+        let repo = open_repo_isolated(&instance.git_dir)?;
         let fingerprints = vec![head_fingerprint(&repo), index_fingerprint(&repo)];
         if mode == StatusMode::Metadata {
-            return Ok(StatusObservation {
+            return Ok(with_scope_declaration(StatusObservation {
                 mode,
                 staged: None,
                 unstaged: None,
                 untracked: None,
                 unknown_fields: Vec::new(),
                 fingerprints,
-            });
+            }));
         }
         if repo.workdir().is_none() {
-            return Ok(StatusObservation {
+            return Ok(with_scope_declaration(StatusObservation {
                 mode,
                 staged: None,
                 unstaged: None,
@@ -729,7 +768,7 @@ impl GixInspector {
                         .to_string(),
                 ],
                 fingerprints,
-            });
+            }));
         }
         // EXACT-2 defect 1: refuse before the first content-converting
         // status call when repo-selected filter drivers are configured.
@@ -763,7 +802,7 @@ impl GixInspector {
         } else {
             counts.fingerprints = after;
         }
-        Ok(counts)
+        Ok(with_scope_declaration(counts))
     }
 
     /// Single status-iteration pass returning raw counts.
@@ -1062,16 +1101,43 @@ impl GitInspect for GixInspector {
 /// the bounded pre-scan [`config_include_gap`] (explicit gap evidence for
 /// the scheduler; included values are not reflected in observations).
 fn open_repo(path: &std::path::Path) -> crate::Result<gix::Repository> {
+    open_repo_with(path, default_repo_permissions())
+}
+
+/// Permissions for observation opens: everything the operator trusts
+/// (system/user/env config, attributes) loads, except include following
+/// and the git binary (see [`open_repo`).
+fn default_repo_permissions() -> gix::open::Permissions {
     let mut permissions = gix::open::Permissions::default();
     permissions.config.includes = false;
     permissions.config.git_binary = false;
+    permissions
+}
+
+/// Open a repository at its exact path with user/system/env config,
+/// non-local attributes, and environment access DISABLED
+/// ([`gix::open::Permissions::isolated`]): only repository-local
+/// configuration and attributes load. Used exclusively by the status
+/// path (FIXREADY4 F): status converts worktree content through
+/// configured clean/process drivers, and the REPOSITORY selects which
+/// driver runs via `.gitattributes` — so a global/system/env-configured
+/// helper is repo-selected code execution, not the operator's trust
+/// domain. Identity/ref/head observations keep [`open_repo`] (effective
+/// remote URLs legitimately honor operator `insteadOf` rewrites).
+fn open_repo_isolated(path: &std::path::Path) -> crate::Result<gix::Repository> {
+    open_repo_with(path, gix::open::Permissions::isolated())
+}
+
+/// Shared exact-path open (normal attempt, then `open_path_as_is` for
+/// arbitrarily named bare stores) under caller-chosen permissions.
+fn open_repo_with(
+    path: &std::path::Path,
+    permissions: gix::open::Permissions,
+) -> crate::Result<gix::Repository> {
     let options = gix::open::Options::default().permissions(permissions);
     match gix::ThreadSafeRepository::open_opts(path.to_path_buf(), options) {
         Ok(repo) => Ok(repo.to_thread_local()),
         Err(first) => {
-            let mut permissions = gix::open::Permissions::default();
-            permissions.config.includes = false;
-            permissions.config.git_binary = false;
             let options = gix::open::Options::default()
                 .permissions(permissions)
                 .open_path_as_is(true);

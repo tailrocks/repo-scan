@@ -108,6 +108,18 @@ pub fn classify_remote(
             )],
         );
     }
+    if redacted == REDACTED_URL {
+        // Already-collapsed observation (FIXREADY4 R): the constructor
+        // redacted an unsupported or sensitive remote form. The row is
+        // preserved (never silently dropped) with the `unsupported`
+        // marker (`unresolvable_identity`), never verbatim bytes.
+        return (
+            MatchDisposition::UnresolvableIdentity,
+            vec![format!(
+                "Effective {role} remote `{redacted}` uses an unsupported or sensitive form that was redacted at observation; identity cannot be determined."
+            )],
+        );
+    }
     if let Some(normalized) = normalize_github_url(remote_url) {
         if normalized == canonical_target {
             return (
@@ -197,6 +209,35 @@ fn split_scheme(url: &str) -> Option<(&str, &str)> {
     Some(url.split_at(end))
 }
 
+/// Split `scheme://rest` with scheme validation (R6b): the first `://`
+/// opens a scheme URL only when the prefix is a non-empty RFC-3986
+/// scheme token (ASCII alphabetic first, then ASCII
+/// alphanumerics/`+`/`-`/`.` — no whitespace, no `=`/`:`/`@`, starting
+/// at offset 0 of the already-trimmed input). A `://` smuggled past
+/// prose, pairs, or transports (`token=... https://...`,
+/// `file:ext::... --url=https://...`, `https:/evil --url=https://...`)
+/// yields `None`, so callers fall through to transport/pair/scrub
+/// handling instead of echoing the whole input verbatim through the
+/// scheme path.
+fn split_valid_scheme(url: &str) -> Option<(&str, &str)> {
+    let off = url.find("://")?;
+    let scheme = &url[..off];
+    if !scheme
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+    {
+        return None;
+    }
+    if !scheme
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    {
+        return None;
+    }
+    Some(url.split_at(off + 3))
+}
+
 /// Length of the authority component of `rest` (the part after `://`):
 /// up to the first `/`, `?`, or `#`, whichever comes first.
 fn authority_len(rest: &str) -> usize {
@@ -204,12 +245,26 @@ fn authority_len(rest: &str) -> usize {
 }
 
 /// True when `key` names secret-bearing material. Matching is over the
-/// lowercased (percent-decoded by callers where needed) key: exact match
-/// for short names, substring match for descriptive names. Over-matching
-/// only over-redacts a value, which is the safe direction.
+/// lowercased (percent-decoded by callers where needed) key. Short key
+/// words use delimited-substring semantics (R7-under): a short word
+/// matches at any occurrence whose RIGHT edge is a boundary — end of
+/// key, a non-alpha byte, or a plural `s`/`es` followed by one of those —
+/// while the left edge is unconstrained. So `mykey`, `mypwd`,
+/// `api-key`, and `x-key` redact (short words were previously
+/// exact-only and echoed as compounds), `keys`/`pins` newly redact
+/// (plural `s` does not break the boundary; safe direction), `passes`/
+/// `door_passes`/`bypasses` redact (plural `es`; round-4 H4), and
+/// `keyboard` still echoes (`key` followed by `b`). Descriptive
+/// words keep plain substring matching (safe-direction
+/// over-redaction): narrowing them
+/// would flip secret-bearing compounds (`authorization`,
+/// `authentication`, `sessionid`) to echo — a fail-open leak (a
+/// JSON-quoted `{"authorization": "Basic xyz"}` redacts whole today).
+/// Over-matching only over-redacts a value, which is the safe
+/// direction.
 fn is_sensitive_key(lower_key: &str) -> bool {
-    const EXACT: &[&str] = &["key", "sig", "pin", "pwd", "otp", "pass"];
-    if EXACT.contains(&lower_key) {
+    const SHORT: &[&str] = &["key", "sig", "pin", "pwd", "otp", "pass"];
+    if SHORT.iter().any(|w| short_word_matches(lower_key, w)) {
         return true;
     }
     const SUBSTR: &[&str] = &[
@@ -231,8 +286,111 @@ fn is_sensitive_key(lower_key: &str) -> bool {
         "secret_key",
         "client_secret",
         "passcode",
+        // Round-5 W1: `pass` (SHORT) fails on alpha continuation, so
+        // `passphrase` echoed; `passkey` listed explicitly (same
+        // secret-bearing family) rather than relying on the `key` suffix.
+        "passphrase",
+        "passkey",
     ];
     SUBSTR.iter().any(|s| lower_key.contains(s))
+}
+
+/// True when `key` carries a LONG (unambiguous) descriptive word (R7-over):
+/// [`is_sensitive_key`]'s substring set restricted to words of at least 5
+/// bytes. Bare `key:value` full inputs are syntactically identical to scp
+/// `host:path`, so the `:`-pair path collapses only on words too specific
+/// to be a host label (`password`, `token`, `secret`, ...) while short
+/// ambiguous words (`auth`, `key`, `jwt`, `pass`, ...) echo as host-like.
+/// `=` pairs never take this path (`=` cannot be scp syntax).
+fn is_strong_sensitive_key(lower_key: &str) -> bool {
+    const LONG: &[&str] = &[
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "credential",
+        "private",
+        "signature",
+        "session",
+        "bearer",
+        "opaque",
+        "apikey",
+        "api_key",
+        "access_key",
+        "secret_key",
+        "client_secret",
+        "passcode",
+        // Round-5 W1: keep `:`-pair parity with `password` (strong words
+        // redact regardless of value shape).
+        "passphrase",
+        "passkey",
+    ];
+    LONG.iter().any(|s| lower_key.contains(s))
+}
+
+/// True when a `:`-pair value is itself credential-shaped (round-4 H3):
+/// the same shape class as [`is_credential_username`] (known
+/// PAT/secret markers, or a long mixed random-looking string). A
+/// credential-shaped value disambiguates an otherwise scp-ambiguous
+/// weak `key:value` pair toward redaction (`jwt:eyJ...`), while
+/// unshaped values (`auth:repo`, `pass:hunter2`) still echo.
+fn is_credential_shaped_value(value: &str) -> bool {
+    is_credential_username(value)
+}
+
+/// True when a `key`/`separator`/`value` triple redacts its value
+/// (round-4 H3, shared by the full-input, same-token, and scheme-path
+/// pair passes so all channels agree; the spaced pass inlines the same
+/// core rule with extra separation conditions — any gap, quote, `=`
+/// separator, CLI flag, or escape disambiguates toward redaction — so
+/// it does not call this): `=` pairs redact on a sensitive key alone
+/// (`=` cannot be scp syntax); `:` pairs redact on a STRONG key, or on
+/// a weak sensitive key with a credential-shaped value
+/// ([`is_credential_shaped_value`]). A weak key with an unshaped value
+/// (`auth:repo`) echoes as scp-like, and a non-sensitive key never
+/// redacts whatever the value shape. An encoded colon separator
+/// (`%3A`, either case — round-5 L2) counts as `:`; anything else
+/// counts as `=`.
+fn sensitive_pair_redacts(key: &str, separator: &str, value: &str) -> bool {
+    let match_key = normalize_key_for_match(key);
+    if match_key.is_empty() {
+        return false;
+    }
+    if separator != ":" && !separator.eq_ignore_ascii_case("%3A") {
+        return is_sensitive_key(&match_key);
+    }
+    is_strong_sensitive_key(&match_key)
+        || (is_sensitive_key(&match_key) && is_credential_shaped_value(value))
+}
+
+/// Delimited-substring match of one SHORT key word (R7-under helper for
+/// [`is_sensitive_key`]): any occurrence whose right edge is end of key,
+/// a non-alpha byte, a plural `s` plus one of those, or a plural `es`
+/// plus one of those (round-4 H4: `passes` → `pass`, so `door_passes`
+/// and `bypasses` redact). The `es` arm requires the literal `s` after
+/// the `e`, so naturally-s-ending words and non-plural `e` continuations
+/// (`keyboard`) are unaffected. `lower_key` is already normalized (ASCII
+/// alphanumerics plus `_`/`-`/`.`, lowercased), so byte indexing is safe.
+fn short_word_matches(lower_key: &str, word: &str) -> bool {
+    let bytes = lower_key.as_bytes();
+    let needle = word.as_bytes();
+    bytes
+        .windows(needle.len())
+        .enumerate()
+        .filter(|(_, window)| *window == needle)
+        .any(|(start, _)| {
+            let after = &bytes[start + needle.len()..];
+            match after.first() {
+                None => true,
+                Some(b) if !b.is_ascii_alphabetic() => true,
+                Some(b's') => after.get(1).is_none_or(|b| !b.is_ascii_alphabetic()),
+                Some(b'e') => {
+                    after.get(1) == Some(&b's')
+                        && after.get(2).is_none_or(|b| !b.is_ascii_alphabetic())
+                }
+                Some(_) => false,
+            }
+        })
 }
 
 /// Percent-decode `text` for detection purposes only (matching keys through
@@ -413,6 +571,58 @@ fn scrub_pairs(section: &str) -> String {
     }
 }
 
+/// Scrub sensitive pairs from a scheme-URL path tail (round-4 H1):
+/// every `/`-separated segment of every whitespace-separated token is
+/// pair-checked under the shared [`sensitive_pair_redacts`] rule, so an
+/// in-path pair (`/token=SECRET`) or a space-separated trailing pair
+/// (`/owner/repo token=SECRET` on a full-input scheme shape) redacts
+/// its value. Once a sensitive key matches, its value extends through
+/// `/` to the end of the whitespace-delimited token (round-5 L1:
+/// base64 values routinely contain `/`, and per-segment splitting
+/// leaked the tail as a fresh segment) — subsequent segments
+/// over-redact (safe direction), like the query pass. Normal path
+/// segments carry no pair and round-trip byte-identical, as does every
+/// whitespace gap. Callers strip `?`/`#` tails first (or route them to
+/// [`scrub_query_fragment`]), so this sees the path only.
+fn scrub_scheme_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut token_start: Option<usize> = None;
+    let flush = |out: &mut String, token: &str| {
+        let mut swallowed = false;
+        for (index, segment) in token.split('/').enumerate() {
+            if swallowed {
+                continue;
+            }
+            if index > 0 {
+                out.push('/');
+            }
+            match split_pair(segment) {
+                Some((key, separator, value)) if sensitive_pair_redacts(key, separator, value) => {
+                    out.push_str(key);
+                    out.push_str(separator);
+                    out.push_str(REDACTED);
+                    swallowed = true;
+                }
+                _ => out.push_str(segment),
+            }
+        }
+    };
+    for (index, ch) in path.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(start) = token_start.take() {
+                flush(&mut out, &path[start..index]);
+            }
+            out.push(ch);
+        } else if token_start.is_none() {
+            token_start = Some(index);
+        }
+    }
+    if let Some(start) = token_start.take() {
+        flush(&mut out, &path[start..]);
+    }
+    out
+}
+
 /// Scrub the query/fragment of a URL tail (the part after the authority).
 /// Sensitive parameter values become [`REDACTED`]; path, structure, and
 /// non-sensitive parameters are preserved.
@@ -427,7 +637,7 @@ fn scrub_query_fragment(tail: &str) -> String {
         None => (before_frag, None),
     };
     let mut out = String::with_capacity(tail.len());
-    out.push_str(path);
+    out.push_str(&scrub_scheme_path(path));
     if let Some(query) = query {
         out.push('?');
         out.push_str(&scrub_pairs(query));
@@ -448,6 +658,8 @@ fn scrub_query_fragment(tail: &str) -> String {
 /// query/fragment parameter values become `<redacted>` while structure
 /// is preserved; valueless (opaque, non-`key=value`) query/fragment
 /// segments cannot be key-identified and become `<redacted>` as well.
+/// In-path and space-separated trailing pairs scrub under the same
+/// pair rule (round-4 H1); normal paths round-trip byte-identical.
 /// Scp-like `user@host:path` has its user component redacted
 /// (`<redacted>@host:path`): a token-as-username
 /// (`secret@github.com:o/r`) is indistinguishable from the conventional
@@ -465,10 +677,23 @@ fn scrub_query_fragment(tail: &str) -> String {
 /// query/fragment tail (opaque `?next=...` values are not
 /// key-identifiable), while this key-based scrub is for free text.
 pub fn redact_credentials(url: &str) -> String {
-    let Some((scheme, rest)) = split_scheme(url) else {
+    // R6b: leading whitespace trims at the sink entry, so a smuggled
+    // `://` cannot hide behind it (` ext::... --url=https://...` takes
+    // the transport path below, never the scheme path).
+    let url = url.trim_start();
+    // R6: the command-transport check runs BEFORE `split_valid_scheme` —
+    // a command line can smuggle `://` (`ext::helper
+    // --url=https://x/...`), and the scheme path would then echo it
+    // verbatim. Scheme URLs never carry a `::` prefix, so this guard
+    // only ever catches transports.
+    if has_command_transport_prefix(url) {
+        return REDACTED_URL.to_string();
+    }
+    let Some((scheme, rest)) = split_valid_scheme(url) else {
         return redact_scp_like(url)
             .or_else(|| redact_bare_user_host(url))
-            .unwrap_or_else(|| url.to_string());
+            .or_else(|| redact_colon_user_host(url))
+            .unwrap_or_else(|| redact_unclassified_shape(url));
     };
     if url.chars().any(|c| c.is_control()) {
         return REDACTED_URL.to_string();
@@ -493,6 +718,178 @@ pub fn redact_credentials(url: &str) -> String {
     }
     let redacted_user = redact_userinfo(userinfo);
     format!("{scheme}{redacted_user}@{host}{scrubbed_tail}")
+}
+
+/// Strict fallback for remote/free-text URL shapes without `://`
+/// (FIXREADY4 R: `ext::`/unknown-scheme/malformed must fail closed, never
+/// echo verbatim). Shared by [`redact_remote_url`] (the persist choke
+/// point: remote observations, catalog rows, report/snapshot/terminal
+/// fields) and [`redact_credentials`] (free-text scrub), so both agree on
+/// every shape:
+///
+/// - the [`REDACTED_URL`] placeholder echoes (idempotent re-scrub);
+/// - control characters collapse (never emitted);
+/// - `file:` URLs (any slash spelling) keep the path but drop every
+///   `?`/`#` tail — file syntax has no query semantics, so tails are
+///   opaque credential-shaped material; a `file:` head carrying `@`
+///   (non-bare userinfo), a `scheme::` command transport, or
+///   whitespace is malformed-as-URL and collapses exactly like the
+///   general fallback (R1), never echoing verbatim;
+/// - `scheme::command` transports (`ext::`, helpers) collapse: an
+///   arbitrary command line is not redactable;
+/// - a known URL scheme written without `://` (`https:/...`, `ssh:...`)
+///   is malformed and collapses;
+/// - a surviving `@` signals malformed smuggled userinfo and collapses,
+///   except a bare `user@host` with a non-credential user (established
+///   `user@example.com` echo contract);
+/// - whitespace signals prose, not a URL: the input routes to the prose
+///   scrubber ([`scrub_text`], pair redaction) instead of collapsing, so
+///   `token=...` pairs still redact on prose-bearing lines (termsink
+///   contract) — bare key-less tokens are unidentifiable there, the same
+///   residual as all free text;
+/// - anything else (plain `host:path`, local paths, `user@host`
+///   non-credential logins handled by the caller) echoes with any `?`/`#`
+///   tail stripped — opaque tails never persist, even on paths — except
+///   a bare sensitive pair (`token=...`, `password:...`), which routes
+///   through pair redaction instead of echoing (R7).
+///
+/// Scp-like and bare `user@host` shapes are classified by the caller
+/// first; this sees only the remainder.
+fn redact_unclassified_shape(url: &str) -> String {
+    if url == REDACTED_URL {
+        return REDACTED_URL.to_string();
+    }
+    if url.chars().any(|c| c.is_control()) {
+        return REDACTED_URL.to_string();
+    }
+    let lower = url.to_ascii_lowercase();
+    if lower == "file:" || lower.starts_with("file:") {
+        let head = url.split(['?', '#']).next().unwrap_or(url);
+        if head.len() <= "file:".len() {
+            return REDACTED_URL.to_string();
+        }
+        // R1: a `file:` URL has no userinfo, command-transport, or
+        // whitespace syntax — those shapes collapse exactly like the
+        // general fallback below (the `@` promise in the doc comment
+        // above covers this branch too), never echo verbatim. The
+        // bare-`user@host` echo contract is preserved through the same
+        // credential-aware check the caller applies. R1b: the `file:`
+        // prefix is not part of the user — the user-shape analysis runs
+        // on the remainder after it, so `file:token123@host` still
+        // redacts like the general path while `file:user:pass@host`
+        // userinfo-collapses instead of echoing verbatim.
+        if head.contains('@') {
+            let inner = &head["file:".len()..];
+            if let Some(redacted) =
+                redact_bare_user_host(inner).or_else(|| redact_colon_user_host(inner))
+            {
+                return redacted;
+            }
+            if bare_user_host(inner).is_some() {
+                return head.to_string();
+            }
+            return REDACTED_URL.to_string();
+        }
+        if has_command_transport_prefix(&head["file:".len()..]) {
+            return REDACTED_URL.to_string();
+        }
+        if head.chars().any(|c| c.is_whitespace()) {
+            return REDACTED_URL.to_string();
+        }
+        return head.to_string();
+    }
+    if has_command_transport_prefix(url) {
+        return REDACTED_URL.to_string();
+    }
+    if has_malformed_known_scheme_prefix(&lower) {
+        return REDACTED_URL.to_string();
+    }
+    if url.contains('@') {
+        // A bare `user@host` with a non-credential user echoes
+        // (established `user@example.com` contract — the caller only
+        // reaches here for exactly that remainder); anything else
+        // carrying `@` is malformed smuggled userinfo and collapses.
+        let head = url.split(['?', '#']).next().unwrap_or(url);
+        if bare_user_host(head).is_some() {
+            return head.to_string();
+        }
+        return REDACTED_URL.to_string();
+    }
+    if url.chars().any(|c| c.is_whitespace()) {
+        return scrub_text(url);
+    }
+    // R6b: every caller excluded valid `scheme://` URLs before reaching
+    // here, so a surviving `://` in a nospace input is an INVALID scheme
+    // smuggled past the validated split (`9foo://token=SECRET`) — it
+    // cannot be pair-scrubbed (the key check below would misread it),
+    // so malformed input collapses, never echoes verbatim. Inputs WITH
+    // whitespace took the scrub branch above instead.
+    if url.contains("://") {
+        return REDACTED_URL.to_string();
+    }
+    let head = url.split(['?', '#']).next().unwrap_or(url);
+    if head.is_empty() {
+        return REDACTED_URL.to_string();
+    }
+    // R7: a bare nospace sensitive pair (`token=...`, `password:...`)
+    // routes through pair redaction — it never reaches the whitespace
+    // prose branch above, so without this it would echo verbatim. No
+    // length cap here (unlike the free-text token pass): a remote is
+    // one value, and fail-closed has no size threshold.
+    //
+    // R7-over: bare-pair redaction does not fire on path-like or
+    // scp-like shapes — a `/` in the key is path-like
+    // (`/tmp/token=bar` survives; the value may still carry `/`, so
+    // `token=a/b` keeps collapsing), and a `:`-separated pair collapses
+    // only on a LONG (unambiguous) key word or a credential-shaped
+    // value (round-4 H3: `auth:repo` is a valid user-less scp
+    // `host:path` and survives, while `password:hunter2` still
+    // collapses and `jwt:eyJ...` newly collapses). The `/`-key guard
+    // is full-input-only: free-text pairs with `/` still redact (the
+    // terminal path-display contract in `tests/fail_termsink.rs`
+    // requires it).
+    if let Some((key, separator, value)) = split_pair(head) {
+        if !key.contains('/') && sensitive_pair_redacts(key, separator, value) {
+            return format!("{key}{separator}{REDACTED}");
+        }
+    }
+    head.to_string()
+}
+
+/// True when `url` starts with a `scheme::` command-transport prefix
+/// (`ext::`, helper `name::address`): `scheme` is ASCII alphanumeric
+/// followed by ASCII alphanumerics/`+`/`-`/`.`, then a literal `::`.
+/// The first character is deliberately NOT alpha-restricted (R5): git
+/// helper names (`git-remote-<name>`) are not alpha-restricted, so
+/// `9foo::...` is a transport, not a path. Single-colon shapes
+/// (`host:path`, scp-like) never match; neither do bracketed (`[::1]`)
+/// or leading-colon inputs.
+fn has_command_transport_prefix(url: &str) -> bool {
+    let bytes = url.as_bytes();
+    let mut i = 0;
+    if bytes.first().is_none_or(|b| !b.is_ascii_alphanumeric()) {
+        return false;
+    }
+    i += 1;
+    while i < bytes.len()
+        && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'+' | b'-' | b'.'))
+    {
+        i += 1;
+    }
+    bytes.len() >= i + 2 && bytes[i] == b':' && bytes[i + 1] == b':'
+}
+
+/// True when the lowercased `url` starts with a known URL scheme name
+/// followed by a single `:` but the URL carries no `://` (the caller only
+/// reaches the fallback when `://` is absent): `https:/...`, `ssh:...`,
+/// `git:...`, `ftp:...`, `sftp:...`, `ftps:...`, `ext:...`, `helper:...`.
+/// Unknown prefixes (`host:path`, drive letters, prose) are not schemes
+/// and keep echoing under the tail-stripping rule.
+fn has_malformed_known_scheme_prefix(lower_url: &str) -> bool {
+    const SCHEMES: &[&str] = &[
+        "https:", "http:", "ssh:", "git:", "ftp:", "ftps:", "sftp:", "ext:", "helper:",
+    ];
+    SCHEMES.iter().any(|s| lower_url.starts_with(s))
 }
 
 /// Redact one `userinfo` authority component: `user:pass@` becomes
@@ -547,6 +944,10 @@ fn is_credential_username(user: &str) -> bool {
         "passwd",
         "password",
         "passcode",
+        // Round-5 W1: sibling parity — a username carrying a
+        // passphrase/passkey word is credential-shaped like `password`.
+        "passphrase",
+        "passkey",
         "bearer",
         "jwt",
         "pat_",
@@ -588,15 +989,30 @@ fn is_credential_username(user: &str) -> bool {
 /// exactly as in [`redact_credentials`] (PAT-shaped usernames included),
 /// and any query/fragment tail is dropped entirely — opaque values such
 /// as `?next=...` are not key-identifiable, so key-based scrubbing
-/// cannot make them safe to persist. Scp-like `user@host:path` likewise
+/// cannot make them safe to persist. In-path and space-separated
+/// trailing pairs scrub under the shared pair rule (round-4 H1) instead
+/// of persisting verbatim. Scp-like `user@host:path` likewise
 /// loses any `?`/`#` tail, as does a bare `user@host` (whose user
-/// redacts exactly when credential-shaped, RETEST-1). Malformed input
-/// collapses to [`REDACTED_URL`], mirroring [`redact_credentials`].
+/// redacts exactly when credential-shaped, RETEST-1). `ext::`/helper
+/// transports, unknown-scheme spellings, and malformed input collapse to
+/// [`REDACTED_URL`] (FIXREADY4 R: fail closed, never verbatim); `file:`
+/// URLs keep the path with tails stripped.
 pub fn redact_remote_url(url: &str) -> String {
-    let Some((scheme, rest)) = split_scheme(url) else {
+    // R6b: leading whitespace trims at the sink entry (this is the
+    // persist/catalog choke point, so the trim covers
+    // `redacted_remote_bytes` too): a smuggled `://` cannot hide behind
+    // it, and a validated scheme always starts at offset 0.
+    let url = url.trim_start();
+    // R6: same ordering as [`redact_credentials`] — a `://`-smuggling
+    // command line collapses here, never through the scheme path.
+    if has_command_transport_prefix(url) {
+        return REDACTED_URL.to_string();
+    }
+    let Some((scheme, rest)) = split_valid_scheme(url) else {
         return redact_scp_like(url)
             .or_else(|| redact_bare_user_host(url))
-            .unwrap_or_else(|| url.to_string());
+            .or_else(|| redact_colon_user_host(url))
+            .unwrap_or_else(|| redact_unclassified_shape(url));
     };
     if url.chars().any(|c| c.is_control()) {
         return REDACTED_URL.to_string();
@@ -607,6 +1023,9 @@ pub fn redact_remote_url(url: &str) -> String {
     if path.contains('@') {
         return REDACTED_URL.to_string();
     }
+    // Round-4 H1: the scheme path is pair-scrubbed (in-path and
+    // space-separated trailing pairs), never echoed verbatim.
+    let path = scrub_scheme_path(path);
     let Some(at) = authority.rfind('@') else {
         return format!("{scheme}{authority}{path}");
     };
@@ -687,10 +1106,13 @@ fn bare_user_host(text: &str) -> Option<(&str, &str)> {
     let at = text.find('@')?;
     let (user, rest) = text.split_at(at);
     let host = &rest[1..];
+    // R1b: a colon in the user is USERINFO (`user:pass@`), never a bare
+    // login — the doc comment always promised no-colon; the check now
+    // enforces it. Colon shapes route to [`redact_colon_user_host`].
     if user.is_empty()
         || user
             .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || c == '/')
+            .any(|c| c.is_whitespace() || c.is_control() || c == '/' || c == ':')
     {
         return None;
     }
@@ -704,25 +1126,102 @@ fn bare_user_host(text: &str) -> Option<(&str, &str)> {
     Some((user, host))
 }
 
+/// Byte offset of the first percent-encoded colon (`%3A`, either
+/// case) in a bare `user@host` user, if any (round-4 H5). `%` is ASCII,
+/// so the offset is a char boundary.
+fn encoded_colon_pos(user: &str) -> Option<usize> {
+    user.as_bytes()
+        .windows(3)
+        .position(|w| w[0] == b'%' && w[1] == b'3' && matches!(w[2], b'a' | b'A'))
+}
+
 /// Redact a bare `user@host` shape, if `text` is one. Returns `None`
 /// for anything else (emails stay callers' echo), and for a bare login
 /// whose user is NOT credential-shaped (the `user@example.com`
 /// contract). A credential-shaped user (RETEST-1) yields
 /// `<redacted>@host`; any `?`/`#` tail is opaque (bare syntax has no
 /// query semantics) and stripped exactly like the scp pass, even for
-/// non-credential users. Used by [`redact_credentials`],
-/// [`redact_remote_url`], and the free-text scp pass of [`scrub_text`].
+/// non-credential users. A leading `file:` prefix is not part of the
+/// user (R1b): analysis runs on the remainder after it, so
+/// `file:token123@host` still yields `<redacted>@host`. An encoded
+/// colon in the user (round-4 H5) is smuggled userinfo, not a bare
+/// login — the password collapses under userinfo semantics
+/// (`user:<redacted>@host`, both sides redacted when the user is
+/// credential-shaped), mirroring [`redact_colon_user_host`]. Used by
+/// [`redact_credentials`], [`redact_remote_url`], and the free-text scp
+/// pass of [`scrub_text`].
 fn redact_bare_user_host(text: &str) -> Option<String> {
-    let head = text.split(['?', '#']).next().unwrap_or(text);
+    let untailed = text.split(['?', '#']).next().unwrap_or(text);
+    let head = match untailed.get(.."file:".len()) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("file:") => &untailed["file:".len()..],
+        _ => untailed,
+    };
     let (user, host) = bare_user_host(head)?;
+    // Round-4 H5: an encoded colon is USERINFO (`user%3Apass@`), never
+    // a bare login — the password collapses regardless of shape, and
+    // the raw (still-encoded) user prefix emits, so decoded bytes never
+    // enter the output. `bare_user_host` already validated the user as
+    // a single token, so the raw prefix is safe to emit.
+    if let Some(colon) = encoded_colon_pos(user) {
+        let raw_user = &user[..colon];
+        let redacted = if is_credential_username(raw_user) {
+            format!("{REDACTED}:{REDACTED}")
+        } else {
+            format!("{raw_user}:{REDACTED}")
+        };
+        return Some(format!("{redacted}@{host}"));
+    }
     if !is_credential_username(user) {
-        return if head.len() != text.len() {
-            Some(head.to_string())
+        return if untailed.len() != text.len() {
+            Some(untailed.to_string())
         } else {
             None
         };
     }
     Some(format!("{REDACTED}@{host}"))
+}
+
+/// Redact a bare `user:pass@host` shape (R1b: a colon in the user means
+/// USERINFO, not a bare login), if `text` is one. The password redacts
+/// regardless of credential-shapedness (`user:<redacted>@host`); a
+/// credential-shaped user yields `<redacted>:<redacted>@host`
+/// (RETEST-1) via the shared [`redact_userinfo`]. Any `?`/`#` tail
+/// strips exactly like the bare pass (bare syntax has no query
+/// semantics), and a leading `file:` prefix is not part of the user —
+/// analysis runs on the remainder after it, so `file:user:pass@host`
+/// yields `user:<redacted>@host` (the general chain reaches here
+/// before the `file:` branch). Returns `None` for anything else.
+/// Chained after [`redact_bare_user_host`] by the redact pair and the
+/// free-text scp pass, so `user:password@host` never echoes verbatim
+/// anywhere.
+fn redact_colon_user_host(text: &str) -> Option<String> {
+    let head = text.split(['?', '#']).next().unwrap_or(text);
+    if head.contains("://") {
+        return None;
+    }
+    let head = match head.get(.."file:".len()) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("file:") => &head["file:".len()..],
+        _ => head,
+    };
+    let at = head.find('@')?;
+    let (userinfo, rest) = head.split_at(at);
+    let host = &rest[1..];
+    if userinfo.is_empty()
+        || !userinfo.contains(':')
+        || userinfo
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '/')
+    {
+        return None;
+    }
+    if host.is_empty()
+        || host.chars().any(|c| {
+            c.is_whitespace() || c.is_control() || matches!(c, '/' | ':' | '@' | '?' | '#')
+        })
+    {
+        return None;
+    }
+    Some(format!("{}@{host}", redact_userinfo(userinfo)))
 }
 
 /// True when a scheme URL carries a non-empty `userinfo@` authority prefix
@@ -803,9 +1302,11 @@ pub fn must_reject_target(url: &str) -> bool {
 /// login (normalization ignores the user and display redacts it, RS-PRIV-10,
 /// so a token-as-username never persists while the shape still resolves);
 /// scheme URLs are stripped of userinfo plus any query/fragment tail
-/// (defense-in-depth behind [`must_reject_target`]); inputs that cannot be
-/// represented safely collapse to [`REDACTED_URL`]. Plain targets
-/// round-trip unchanged (modulo surrounding whitespace).
+/// (defense-in-depth behind [`must_reject_target`]); anything else fails
+/// closed through the shared strict fallback (`ext::`/helper transports,
+/// malformed schemes, smuggled userinfo, whitespace, and tails collapse
+/// to [`REDACTED_URL`], FIXREADY4 R). Plain targets round-trip unchanged
+/// (modulo surrounding whitespace).
 pub fn sanitize_target_url(url: &str) -> String {
     let trimmed = url.trim();
     if let Some(rest) = scp_host_path(trimmed) {
@@ -818,8 +1319,14 @@ pub fn sanitize_target_url(url: &str) -> String {
         let head = rest.split(['?', '#']).next().unwrap_or(rest);
         return format!("git@{head}");
     }
-    let Some((scheme, rest)) = split_scheme(trimmed) else {
-        return trimmed.to_string();
+    // R6 (same ordering bug as the redact pair): a `://`-smuggling
+    // command-line target collapses, never through the scheme path.
+    // R6b: the scheme split is validated, like the redact pair.
+    if has_command_transport_prefix(trimmed) {
+        return REDACTED_URL.to_string();
+    }
+    let Some((scheme, rest)) = split_valid_scheme(trimmed) else {
+        return redact_unclassified_shape(trimmed);
     };
     if trimmed.chars().any(|c| c.is_control()) {
         return REDACTED_URL.to_string();
@@ -830,6 +1337,9 @@ pub fn sanitize_target_url(url: &str) -> String {
     if path.contains('@') {
         return REDACTED_URL.to_string();
     }
+    // Round-4 H1: the scheme path is pair-scrubbed (in-path and
+    // space-separated trailing pairs), never echoed verbatim.
+    let path = scrub_scheme_path(path);
     match authority.rfind('@') {
         Some(at) => format!("{scheme}{}{path}", &authority[at + 1..]),
         None => format!("{scheme}{authority}{path}"),
@@ -876,25 +1386,270 @@ pub fn redact_target_for_display(url: &str) -> String {
 }
 
 /// Scrub free text (evidence lines, error strings, reasons) for report
-/// emission: every embedded `scheme://...` token, every scp-like
-/// `user@host:path` token, and every bare `user@host` token with a
-/// credential-shaped user is passed through [`redact_credentials`], and
+/// emission: `Authorization: Bearer <token>` credentials redact first
+/// (the token follows the scheme word, not the key), then every embedded
+/// `scheme://...` token, every `scheme::` command-transport token, every
+/// scp-like `user@host:path` token, and every bare `user@host` token with
+/// a credential-shaped user is passed through [`redact_credentials`], and
 /// sensitive pairs — same-token `key=value`/`key:value` plus spaced, JSON,
 /// CLI-flag, and multiline shapes — have their values replaced with
 /// [`REDACTED`]. Ordinary prose passes through unchanged.
 pub fn scrub_text(text: &str) -> String {
-    let scrubbed_urls = scrub_embedded_urls(text);
-    let scrubbed_scp = scrub_embedded_scp(&scrubbed_urls);
+    let scrubbed_bearer = scrub_bearer_tokens(text);
+    let scrubbed_urls = scrub_embedded_urls(&scrubbed_bearer);
+    let scrubbed_ext = scrub_embedded_command_transports(&scrubbed_urls);
+    let scrubbed_scp = scrub_embedded_scp(&scrubbed_ext);
     let scrubbed_pairs = scrub_secret_pairs(&scrubbed_scp);
     scrub_spaced_pairs(&scrubbed_pairs)
 }
 
+/// True for the unified scrub gap class (round-3 R3b): C-`isspace`
+/// semantics — ASCII whitespace PLUS vertical tab. Rust's
+/// `is_ascii_whitespace` excludes `\x0b` (unlike C), so ad-hoc gap sets
+/// kept disagreeing: the `Bearer` gap missed `\v\f` while the token
+/// scan stopped at `\f` but ran through `\v`. This class covers the
+/// `Bearer` inter-token gap and the spaced-pair value gap; run ends use
+/// [`is_scrub_blank_byte`], and the remaining scans keep their own
+/// classes (ASCII-whitespace URL token ends, Unicode-whitespace scp and
+/// pair splits, space/tab-only key-separator gaps; sweep gaps add
+/// vertical-tab/form-feed — only a line break stops the sweep).
+fn is_scrub_gap_byte(byte: u8) -> bool {
+    byte.is_ascii_whitespace() || byte == b'\x0b'
+}
+
+/// True for the blank bytes that END a scrubbed token/value run
+/// (round-3 R3b): space, tab, CR, LF. Vertical-tab and form-feed do
+/// NOT end runs (fail closed: a token split by vertical-tab redacts
+/// whole instead of leaking its tail); they only separate as gap bytes (see
+/// [`is_scrub_gap_byte`], which the gap skips consume first).
+fn is_scrub_blank_byte(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
+}
+
+/// Value-redact `Bearer <token>` credentials in free text (FIXREADY4 R):
+/// the `Authorization: Bearer <token>` header shape carries the secret
+/// one token AFTER the key, so key-based pair scrubbing would redact only
+/// the `Bearer` scheme word and orphan the token. A case-insensitive
+/// `bearer` word (ASCII word-boundary delimited) followed by blank space
+/// (spaces, tabs, newlines, vertical tabs, and form feeds — round-2
+/// R3b plus round-3 R3b, so a folded `Bearer\n<token>` header cannot
+/// orphan the token) has its next token replaced with [`REDACTED`].
+/// The redaction runs through the END of the token run no matter its
+/// length (R3a: no cap, so an over-long token cannot leak a tail). Runs
+/// before every other pass so
+/// later key scrubbing still redacts the scheme word itself
+/// (`Authorization: <redacted> <redacted>`). Already-redacted (`<...>`)
+/// and missing values pass through (idempotent). Documented
+/// over-redaction (safe direction): a prose `bearer` at a line end
+/// redacts the next line's first token.
+fn scrub_bearer_tokens(text: &str) -> String {
+    const WORD: &[u8] = b"bearer";
+    fn is_word_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+    }
+    fn is_token_byte(byte: u8) -> bool {
+        !is_scrub_blank_byte(byte)
+            && !matches!(
+                byte,
+                b',' | b';' | b'"' | b'\'' | b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'<' | b'>'
+            )
+    }
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let head = &bytes[i..];
+        let is_match = head.len() > WORD.len()
+            && head[..WORD.len()].eq_ignore_ascii_case(WORD)
+            && (i == 0 || !is_word_byte(bytes[i - 1]))
+            && is_scrub_gap_byte(head[WORD.len()]);
+        if !is_match {
+            let width = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            out.push_str(&text[i..i + width]);
+            i += width;
+            continue;
+        }
+        let mut j = i + WORD.len();
+        while j < bytes.len() && is_scrub_gap_byte(bytes[j]) {
+            j += 1;
+        }
+        let mut k = j;
+        // R3a: no length cap — the run extends through the end of the
+        // token, so an over-long token redacts whole instead of leaking
+        // a tail. The scan is linear and allocation-free.
+        while k < bytes.len() && is_token_byte(bytes[k]) {
+            k += 1;
+        }
+        while k > j && !text.is_char_boundary(k) {
+            k -= 1;
+        }
+        if k == j {
+            out.push_str(&text[i..j]);
+            i = j;
+            continue;
+        }
+        out.push_str(&text[i..j]);
+        out.push_str(REDACTED);
+        i = k;
+    }
+    out
+}
+
+/// Redact embedded `scheme::` command-transport tokens inside free text
+/// (FIXREADY4 R sink-side re-validation, generalized by R2): a command
+/// line is not redactable piece-wise, so the whole whitespace-delimited
+/// token collapses to [`REDACTED_URL`], mirroring the constructor choke
+/// point. Matching is word-boundary-aware with the constructor charset
+/// ([`has_command_transport_prefix`], R5-relaxed): a boundary-delimited
+/// run of scheme characters followed by a literal `::` — so helper
+/// `my-helper::...` and `preext::...` tokens collapse, not just `ext::`.
+///
+/// The `ext` scheme itself always collapses (established contract); any
+/// OTHER scheme collapses only when its post-`::` run carries
+/// command/secret-shaped material (an ASCII uppercase letter or digit),
+/// so lowercase prose and Rust paths (`text::prose`, `next::item`,
+/// `use std::fmt`) keep echoing per the established pin. Residual (R2):
+/// an all-lowercase helper address (`my-helper::secret`) echoes — the
+/// prose echo contract forces the asymmetry, and the constructor still
+/// collapses such remotes at observation. Token ends mirror
+/// [`scrub_embedded_urls`] delimiters.
+///
+/// After a collapse, the same-span remainder of the line is swept for
+/// credential-shaped tokens (R2b): each following token that matches
+/// [`is_credential_username`] (a marked/shaped secret such as
+/// `ext::ssh ghp_XXXX`) redacts too, SKIPPING past non-credential
+/// tokens (round-4 H2: stopping at the first innocent flag leaked a
+/// marked secret behind it) out to the line end. Only
+/// credential-SHAPED tokens redact, so the longer reach stays in the
+/// safe direction. The sweep is strictly line-local (gaps are
+/// spaces/tabs/vertical-tab/form-feed — only a line break ends the
+/// span), so the `ext` always-collapse
+/// (`use ext::fmt`) never extends past its own token, and bare
+/// UNMARKED trailing secrets stay the documented free-text residual
+/// (unidentifiable by construction).
+fn scrub_embedded_command_transports(text: &str) -> String {
+    fn is_word_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+    }
+    fn is_scheme_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
+    }
+    fn token_end(bytes: &[u8], mut k: usize) -> usize {
+        while k < bytes.len() {
+            let byte = bytes[k];
+            // Round-3 R3b: blanks end the token; vertical-tab/form-feed
+            // absorb into it (fail closed: a collapsed command line
+            // cannot leak a split tail).
+            if is_scrub_blank_byte(byte)
+                || matches!(byte, b'"' | b'\'' | b'<' | b'>' | b'`' | b'(' | b')')
+            {
+                break;
+            }
+            k += 1;
+        }
+        k
+    }
+    /// Sweep the same-span remainder of the line after a collapse at
+    /// `end` (R2b): scan every following gap-separated token (spaces,
+    /// tabs, vertical-tab, form-feed) out to the line break; each
+    /// credential-shaped one emits the gap span
+    /// plus [`REDACTED`] (preserving surrounding punctuation, mirroring
+    /// [`scrub_embedded_scp`]), while non-credential tokens are SKIPPED
+    /// (round-4 H2) — the scan cursor advances past them but the emit
+    /// frontier `end` stays, so skipped text re-emits verbatim either
+    /// inside the next redaction's gap span or, at the line break, by
+    /// the main loop continuing from the returned `end`. Only the line
+    /// break and text end stop the sweep. All stops are ASCII, so every
+    /// slice is a char boundary.
+    fn sweep_span_credentials(text: &str, bytes: &[u8], out: &mut String, mut end: usize) -> usize {
+        let mut scan = end;
+        loop {
+            let mut j = scan;
+            // Round-5 L3: vertical-tab/form-feed are gaps (skipped),
+            // like the gap class and token-scan absorption — only a
+            // line break or text end stops the sweep.
+            while j < bytes.len() && matches!(bytes[j], b' ' | b'\t' | b'\x0b' | b'\x0c') {
+                j += 1;
+            }
+            if j >= bytes.len() || matches!(bytes[j], b'\r' | b'\n') {
+                return end;
+            }
+            // Whitespace-only token end (unlike the transport
+            // `token_end` above, quotes stay INSIDE the token so
+            // `'ghp_XXX'` still redacts through the punct trim below;
+            // vertical-tab/form-feed absorb, fail closed).
+            let mut k = j;
+            while k < bytes.len() && !is_scrub_blank_byte(bytes[k]) {
+                k += 1;
+            }
+            if k == j {
+                return end;
+            }
+            let token = &text[j..k];
+            let core = token.trim_start_matches(['\'', '"', '`', '(', '[', '<']);
+            let stripped = core
+                .trim_end_matches(['\'', '"', '`', '.', ',', ';', ':', '!', '?', ')', ']', '>']);
+            if stripped.is_empty() || !is_credential_username(stripped) {
+                scan = k;
+                continue;
+            }
+            let lead = token.len()
+                - token
+                    .trim_start_matches(['\'', '"', '`', '(', '[', '<'])
+                    .len();
+            out.push_str(&text[end..j]);
+            out.push_str(&token[..lead]);
+            out.push_str(REDACTED);
+            out.push_str(&token[lead + stripped.len()..]);
+            end = k;
+            scan = k;
+        }
+    }
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let at_candidate =
+            bytes[i].is_ascii_alphanumeric() && (i == 0 || !is_word_byte(bytes[i - 1]));
+        let mut j = i + 1;
+        while at_candidate && j < bytes.len() && is_scheme_byte(bytes[j]) {
+            j += 1;
+        }
+        let is_match =
+            at_candidate && j + 1 < bytes.len() && bytes[j] == b':' && bytes[j + 1] == b':';
+        if !is_match {
+            let width = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            out.push_str(&text[i..i + width]);
+            i += width;
+            continue;
+        }
+        let end = token_end(bytes, j + 2);
+        let scheme = &text[i..j];
+        // `end` only ever stops at ASCII delimiters, so both slices are
+        // char boundaries.
+        let rest = &text[j + 2..end];
+        let command_shaped = rest
+            .bytes()
+            .any(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+        if scheme.eq_ignore_ascii_case("ext") || command_shaped {
+            out.push_str(REDACTED_URL);
+            i = sweep_span_credentials(text, bytes, &mut out, end);
+        } else {
+            let width = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            out.push_str(&text[i..i + width]);
+            i += width;
+        }
+    }
+    out
+}
+
 /// Redact embedded scp-like `user@host:path` tokens inside free text
 /// (RS-PRIV-10), plus bare `user@host` tokens whose user is
-/// credential-shaped (RETEST-1). Tokens are whitespace-delimited;
-/// surrounding quotes and trailing sentence punctuation are preserved,
-/// the user component is redacted. Scheme URLs were handled by the
-/// earlier pass and are skipped here.
+/// credential-shaped (RETEST-1), plus bare `user:pass@host` userinfo
+/// tokens (R1b: the password always redacts). Tokens are
+/// whitespace-delimited; surrounding quotes and trailing sentence
+/// punctuation are preserved, the user component is redacted. Scheme
+/// URLs were handled by the earlier pass and are skipped here.
 fn scrub_embedded_scp(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut token_start: Option<usize> = None;
@@ -911,7 +1666,10 @@ fn scrub_embedded_scp(text: &str) -> String {
             out.push_str(token);
             return;
         }
-        match redact_scp_like(stripped).or_else(|| redact_bare_user_host(stripped)) {
+        match redact_scp_like(stripped)
+            .or_else(|| redact_bare_user_host(stripped))
+            .or_else(|| redact_colon_user_host(stripped))
+        {
             Some(redacted) => {
                 let lead = token.len()
                     - token
@@ -1015,32 +1773,66 @@ fn scrub_secret_pairs(text: &str) -> String {
 }
 
 /// Redact one whitespace-delimited token when it is a sensitive pair.
+/// R7-over, like the full-input path: a `:`-separated pair needs a LONG
+/// (unambiguous) key word or a credential-shaped value (round-4 H3) —
+/// `auth:repo` echoes as scp-like while `password:hunter2` still
+/// collapses and `jwt:eyJ...` newly collapses. Pairs with `/` in the
+/// key still redact here (the terminal path-display contract in
+/// `tests/fail_termsink.rs` requires it); only the full-input path
+/// treats a `/`-key as path-like.
 fn scrub_pair_token(token: &str) -> Option<String> {
     // Skip anything already URL-shaped (handled by the URL pass) and
     // anything too long to be a `key=value` pair.
     if token.contains("://") || token.len() > 1024 {
         return None;
     }
-    let (key, separator, _) = split_pair(token)?;
-    let match_key = normalize_key_for_match(key);
-    if match_key.is_empty() || !is_sensitive_key(&match_key) {
+    let (key, separator, value) = split_pair(token)?;
+    if !sensitive_pair_redacts(key, separator, value) {
         return None;
     }
     Some(format!("{key}{separator}{REDACTED}"))
 }
 
 /// Split a `key=value` or `key: value` token. A bare `C:\...`-style drive
-/// prefix is not a pair (single-letter key with no `=`).
+/// prefix is not a pair (single-letter key with no `=`). Round-5 L2:
+/// percent-encoded separators (`%3D`/`%3A`, either case) split like
+/// their literal forms — keys already match through `%XX`, so an
+/// encoded separator must not smuggle a pair past the split. The
+/// `=`-family keeps precedence over the `:`-family (as before); within
+/// a family the earliest occurrence wins, and the returned separator
+/// preserves the original spelling for byte-identical re-emission.
 fn split_pair(token: &str) -> Option<(&str, &str, &str)> {
-    if let Some((key, value)) = token.split_once('=') {
+    fn find_family(token: &str, literal: u8, encoded: u8) -> Option<(usize, usize)> {
+        let bytes = token.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == literal {
+                return Some((i, 1));
+            }
+            if bytes[i] == b'%'
+                && i + 2 < bytes.len()
+                && bytes[i + 1] == b'3'
+                && bytes[i + 2].eq_ignore_ascii_case(&encoded)
+            {
+                return Some((i, 3));
+            }
+            i += 1;
+        }
+        None
+    }
+    if let Some((pos, len)) = find_family(token, b'=', b'D') {
+        let key = &token[..pos];
+        let value = &token[pos + len..];
         if !key.is_empty() && !value.is_empty() {
-            return Some((key, "=", value));
+            return Some((key, &token[pos..pos + len], value));
         }
         return None;
     }
-    if let Some((key, value)) = token.split_once(':') {
+    if let Some((pos, len)) = find_family(token, b':', b'A') {
+        let key = &token[..pos];
+        let value = &token[pos + len..];
         if key.len() > 1 && !value.is_empty() {
-            return Some((key, ":", value));
+            return Some((key, &token[pos..pos + len], value));
         }
     }
     None
@@ -1058,7 +1850,7 @@ fn scrub_spaced_pairs(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < bytes.len() {
-        let Some((key_end, clean_len, cli_flag)) = match_key_at(text, i) else {
+        let Some((key_end, clean_len, cli_flag, strong)) = match_key_at(text, i) else {
             // No sensitive key here: emit one char, keep scanning.
             let width = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
             out.push_str(&text[i..i + width]);
@@ -1090,10 +1882,11 @@ fn scrub_spaced_pairs(text: &str) -> String {
             i += width;
             continue;
         }
-        // Gap between separator (or flag) and value: whitespace including
-        // newlines, so multiline values redact.
+        // Gap between separator (or flag) and value: the unified gap
+        // class (whitespace including newlines, so multiline values
+        // redact — round-3 R3b).
         let mut k = j;
-        while k < bytes.len() && matches!(bytes[k], b' ' | b'\t' | b'\r' | b'\n') {
+        while k < bytes.len() && is_scrub_gap_byte(bytes[k]) {
             k += 1;
         }
         // A CLI flag followed by another flag/option or nothing has no value.
@@ -1109,6 +1902,28 @@ fn scrub_spaced_pairs(text: &str) -> String {
             i += width;
             continue;
         };
+        // R7-over: an ADJACENT weak `key:value` (`auth:repo`) is scp
+        // `host:path`, not a pair — echo it exactly like the
+        // same-token path. Any gap, quote, `=` separator, CLI flag,
+        // backslash escape, strong key word, or credential-shaped
+        // value (round-4 H3: `jwt:eyJ...`) disambiguates toward a
+        // pair and still redacts.
+        let first = bytes[i];
+        if !strong
+            && !cli_flag
+            && has_sep
+            && bytes[j - 1] == b':'
+            && j == key_end + 1
+            && k == j
+            && quote.is_none()
+            && !matches!(first, b'"' | b'\'' | b'\\')
+            && !is_credential_shaped_value(&text[val_start..val_end])
+        {
+            let width = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            out.push_str(&text[i..i + width]);
+            i += width;
+            continue;
+        }
         // `text[i..val_start]` already ends with the opening quote for
         // quoted values; only the inner span is replaced.
         out.push_str(&text[i..val_start]);
@@ -1129,11 +1944,12 @@ fn scrub_spaced_pairs(text: &str) -> String {
 /// Match a sensitive key starting at byte `i`: bare (`password`),
 /// quoted (`"password"`), CLI-flag (`--password`), or backslash-escaped
 /// (`\u0073ecret`) form. Returns the byte end of the key, the
-/// normalized-key length (for the drive-letter guard), and whether the
-/// key is a `--flag`. The match must start at a key boundary (start of
-/// text or a non-key character before `i`) and the raw key is capped at
-/// 128 bytes.
-fn match_key_at(text: &str, i: usize) -> Option<(usize, usize, bool)> {
+/// normalized-key length (for the drive-letter guard), whether the
+/// key is a `--flag`, and whether the key is STRONG (R7-over: a long
+/// unambiguous word — adjacent weak `key:value` echoes as scp-like).
+/// The match must start at a key boundary (start of text or a non-key
+/// character before `i`) and the raw key is capped at 128 bytes.
+fn match_key_at(text: &str, i: usize) -> Option<(usize, usize, bool, bool)> {
     let bytes = text.as_bytes();
     if i > 0 {
         let prev = bytes[i - 1];
@@ -1173,7 +1989,8 @@ fn match_key_at(text: &str, i: usize) -> Option<(usize, usize, bool)> {
     if match_key.is_empty() || !is_sensitive_key(&match_key) {
         return None;
     }
-    Some((key_end, match_key.len(), raw.starts_with("--")))
+    let strong = is_strong_sensitive_key(&match_key);
+    Some((key_end, match_key.len(), raw.starts_with("--"), strong))
 }
 
 /// Value span starting at byte `k`: a quoted span (quote-aware, `\`
@@ -1201,8 +2018,11 @@ fn value_span(text: &str, k: usize) -> Option<(usize, usize, Option<char>)> {
         return None;
     }
     let mut j = k;
+    // Round-3 R3b: the run absorbs vertical-tab/form-feed (fail closed:
+    // a split value redacts whole instead of leaking its tail) and
+    // breaks only on blanks and structural delimiters.
     while j < bytes.len()
-        && !bytes[j].is_ascii_whitespace()
+        && !is_scrub_blank_byte(bytes[j])
         && !matches!(bytes[j], b',' | b';' | b'"' | b'\'' | b'}' | b']')
         && j - k <= 1024
     {
