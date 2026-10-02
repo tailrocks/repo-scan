@@ -479,8 +479,14 @@ async fn reclassify_for_target(
                     let cp_canon = std::fs::canonicalize(&cp).ok();
                     gp_canon == Some(t_canon.clone())
                         || cp_canon == Some(t_canon.clone())
-                        || gp_canon.as_ref().and_then(|p| p.parent().map(Path::to_path_buf)) == Some(t_canon.clone())
-                        || cp_canon.as_ref().and_then(|p| p.parent().map(Path::to_path_buf)) == Some(t_canon.clone())
+                        || gp_canon
+                            .as_ref()
+                            .and_then(|p| p.parent().map(Path::to_path_buf))
+                            == Some(t_canon.clone())
+                        || cp_canon
+                            .as_ref()
+                            .and_then(|p| p.parent().map(Path::to_path_buf))
+                            == Some(t_canon.clone())
                 } else {
                     false
                 }

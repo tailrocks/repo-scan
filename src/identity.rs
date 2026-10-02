@@ -170,24 +170,30 @@ fn classify_local_target_remote(
     role: &str,
     redacted: &str,
 ) -> (MatchDisposition, Vec<String>) {
-    let target_path_str = canonical_target.strip_prefix("file://").unwrap_or(canonical_target);
+    let target_path_str = canonical_target
+        .strip_prefix("file://")
+        .unwrap_or(canonical_target);
     let target_path = std::path::Path::new(target_path_str);
-    let target_canon = std::fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
+    let target_canon =
+        std::fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
 
     let trimmed = remote_url.trim();
-    let remote_path_opt: Option<std::path::PathBuf> = if let Some(stripped) = trimmed.strip_prefix("file://") {
-        Some(std::path::PathBuf::from(stripped))
-    } else if trimmed.starts_with('/') || trimmed.starts_with('.') {
-        Some(std::path::PathBuf::from(trimmed))
-    } else if let Ok(parsed) = gix::url::parse(trimmed) {
-        if parsed.scheme == gix::url::Scheme::File {
-            std::str::from_utf8(parsed.path.as_bytes()).ok().map(std::path::PathBuf::from)
+    let remote_path_opt: Option<std::path::PathBuf> =
+        if let Some(stripped) = trimmed.strip_prefix("file://") {
+            Some(std::path::PathBuf::from(stripped))
+        } else if trimmed.starts_with('/') || trimmed.starts_with('.') {
+            Some(std::path::PathBuf::from(trimmed))
+        } else if let Ok(parsed) = gix::url::parse(trimmed) {
+            if parsed.scheme == gix::url::Scheme::File {
+                std::str::from_utf8(parsed.path.as_bytes())
+                    .ok()
+                    .map(std::path::PathBuf::from)
+            } else {
+                None
+            }
         } else {
             None
-        }
-    } else {
-        None
-    };
+        };
 
     if let Some(rpath) = remote_path_opt {
         let r_canon = std::fs::canonicalize(&rpath).unwrap_or(rpath);

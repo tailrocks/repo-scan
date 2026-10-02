@@ -205,7 +205,10 @@ pub fn parse_mountinfo_line(line: &str) -> Option<MountInfoEntry> {
     let root = bytes_to_path(unescape_octal(parts[3]));
     let mount_point = bytes_to_path(unescape_octal(parts[4]));
     let mount_options = parts[5].to_string();
-    let optional_fields: Vec<String> = parts[6..hyphen_idx].iter().map(|&s| s.to_string()).collect();
+    let optional_fields: Vec<String> = parts[6..hyphen_idx]
+        .iter()
+        .map(|&s| s.to_string())
+        .collect();
     let fs_type = String::from_utf8_lossy(&unescape_octal(parts[hyphen_idx + 1])).into_owned();
     let mount_source = String::from_utf8_lossy(&unescape_octal(parts[hyphen_idx + 2])).into_owned();
     let super_options = if hyphen_idx + 3 < parts.len() {
@@ -288,10 +291,7 @@ impl LinuxMountTable {
 
     /// Parse mount entries from a string containing `/proc/self/mountinfo` content.
     pub fn parse_mountinfo_str(content: &str) -> Vec<MountInfoEntry> {
-        content
-            .lines()
-            .filter_map(parse_mountinfo_line)
-            .collect()
+        content.lines().filter_map(parse_mountinfo_line).collect()
     }
 
     /// Parse mount entries from a string containing `/proc/mounts` content.
@@ -459,8 +459,14 @@ mod tests {
     #[test]
     fn test_unescape_octal() {
         assert_eq!(unescape_octal("/normal/path"), b"/normal/path");
-        assert_eq!(unescape_octal("/path\\040with\\040spaces"), b"/path with spaces");
-        assert_eq!(unescape_octal("/path\\011tab\\012newline"), b"/path\ttab\nnewline");
+        assert_eq!(
+            unescape_octal("/path\\040with\\040spaces"),
+            b"/path with spaces"
+        );
+        assert_eq!(
+            unescape_octal("/path\\011tab\\012newline"),
+            b"/path\ttab\nnewline"
+        );
         assert_eq!(unescape_octal("/path\\134backslash"), b"/path\\backslash");
     }
 
@@ -518,7 +524,11 @@ mod tests {
         let line = "21 1 8:1 / /mnt/test rw - ext4 /dev/sda1 rw";
         let entry = parse_mountinfo_line(line).unwrap();
         let vid = entry.volume_id();
-        assert!(!vid.0.contains(':'), "VolumeId must be colon-free: {}", vid.0);
+        assert!(
+            !vid.0.contains(':'),
+            "VolumeId must be colon-free: {}",
+            vid.0
+        );
         assert!(vid.0.starts_with("dev-8_1-"));
     }
 

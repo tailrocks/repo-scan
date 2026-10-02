@@ -610,15 +610,26 @@ fn r06_fair_scheduling_interleaves_probes_and_enumeration() {
         assert_eq!(claimed[0].task.id, "probe:1:repo1");
 
         // The batch must contain BOTH probe tasks and enumeration tasks (interleaved)
-        let probe_count = claimed.iter().filter(|c| c.task.kind == "probe_git").count();
-        let enum_count = claimed.iter().filter(|c| c.task.kind == "enumerate_dir").count();
+        let probe_count = claimed
+            .iter()
+            .filter(|c| c.task.kind == "probe_git")
+            .count();
+        let enum_count = claimed
+            .iter()
+            .filter(|c| c.task.kind == "enumerate_dir")
+            .count();
         let status_count = claimed.iter().filter(|c| c.task.kind == "status").count();
 
-        assert_eq!(probe_count, 2, "both probe tasks claimed promptly in the first batch");
+        assert_eq!(
+            probe_count, 2,
+            "both probe tasks claimed promptly in the first batch"
+        );
         assert!(enum_count > 0, "enumeration continues in the same batch");
-        assert!(status_count > 0, "status tasks make progress without starving enumeration");
+        assert!(
+            status_count > 0,
+            "status tasks make progress without starving enumeration"
+        );
 
         store.close().await.expect("close");
     });
 }
-

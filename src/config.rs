@@ -175,9 +175,7 @@ pub fn resolve_report_dest(path: &Path) -> crate::Result<PathBuf> {
 /// and lexical cleanup).
 pub fn resolve_target_path(path: &Path) -> crate::Result<PathBuf> {
     if path.as_os_str().is_empty() {
-        return Err(crate::Error::InvalidArgs(
-            "empty target path".to_string(),
-        ));
+        return Err(crate::Error::InvalidArgs("empty target path".to_string()));
     }
     absolutize_once(&expand_tilde(path)?)
 }

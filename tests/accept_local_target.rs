@@ -54,7 +54,12 @@ fn local_target_with_github_remote_matches_clones() {
     let unrelated = fixture::normal_clone(&ws, "unrelated");
     fixture::git(
         &unrelated,
-        &["remote", "set-url", "origin", "https://github.com/other/unrelated.git"],
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/other/unrelated.git",
+        ],
     );
 
     let state = dir.path().join("state");
@@ -91,13 +96,23 @@ fn local_only_target_without_remotes() {
     let clone_repo = ws.join("clone-repo");
     fixture::git(
         &ws,
-        &["clone", "-q", local_target.to_str().unwrap(), clone_repo.to_str().unwrap()],
+        &[
+            "clone",
+            "-q",
+            local_target.to_str().unwrap(),
+            clone_repo.to_str().unwrap(),
+        ],
     );
     let other_repo = fixture::unborn_branch(&ws, "other-repo");
     fixture::commit_file(&other_repo, "other.txt", "other\n", "init");
     fixture::git(
         &other_repo,
-        &["remote", "add", "origin", "https://github.com/someone/other.git"],
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/someone/other.git",
+        ],
     );
 
     let state = dir.path().join("state");
@@ -110,14 +125,18 @@ fn local_only_target_without_remotes() {
         &["--status", "metadata"],
     );
     let rep_str = std::fs::read_to_string(&report_path).unwrap_or_default();
-    assert_eq!(out.status.code(), Some(0), "stderr: {}\nreport: {}", stderr_text(&out), rep_str);
-    let report = read_report(&report_path);
-    assert!(
-        report["scan"]["canonical_url"]
-            .as_str()
-            .unwrap()
-            .starts_with("file://")
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}\nreport: {}",
+        stderr_text(&out),
+        rep_str
     );
+    let report = read_report(&report_path);
+    assert!(report["scan"]["canonical_url"]
+        .as_str()
+        .unwrap()
+        .starts_with("file://"));
     let repos = report["repositories"].as_array().expect("repositories");
     assert_eq!(repos.len(), 2, "target-repo and clone-repo confirmed");
     for repo in repos {
@@ -223,7 +242,12 @@ fn local_target_reclassify_on_rescan_preserves_confirmed() {
     let clone_repo = ws.join("clone-repo");
     fixture::git(
         &ws,
-        &["clone", "-q", local_target.to_str().unwrap(), clone_repo.to_str().unwrap()],
+        &[
+            "clone",
+            "-q",
+            local_target.to_str().unwrap(),
+            clone_repo.to_str().unwrap(),
+        ],
     );
 
     let state = dir.path().join("state");
@@ -235,7 +259,12 @@ fn local_target_reclassify_on_rescan_preserves_confirmed() {
         &report_1,
         &["--status", "metadata"],
     );
-    assert_eq!(out1.status.code(), Some(0), "stderr: {}", stderr_text(&out1));
+    assert_eq!(
+        out1.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&out1)
+    );
 
     // Rescan with same state-dir triggers reclassify_for_target
     let report_2 = dir.path().join("rep2.json");
@@ -246,12 +275,21 @@ fn local_target_reclassify_on_rescan_preserves_confirmed() {
         &report_2,
         &["--status", "metadata"],
     );
-    assert_eq!(out2.status.code(), Some(0), "stderr: {}", stderr_text(&out2));
+    assert_eq!(
+        out2.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&out2)
+    );
     let rep2 = read_report(&report_2);
     let repos = rep2["repositories"].as_array().expect("repositories");
     assert_eq!(repos.len(), 2, "both repos preserved on rescan");
     for repo in repos {
-        assert_eq!(repo["match"].as_str(), Some("confirmed"), "must remain confirmed after reclassification");
+        assert_eq!(
+            repo["match"].as_str(),
+            Some("confirmed"),
+            "must remain confirmed after reclassification"
+        );
     }
 }
 
@@ -262,16 +300,34 @@ fn credential_bearing_local_target_rejected_without_leakage() {
     let state = dir.path().join("state");
     let rep = dir.path().join("rep.json");
 
-    let out1 = scan("file://user:supersecretpass@localhost/tmp/repo", dir.path(), &state, &rep, &[]);
+    let out1 = scan(
+        "file://user:supersecretpass@localhost/tmp/repo",
+        dir.path(),
+        &state,
+        &rep,
+        &[],
+    );
     assert_eq!(out1.status.code(), Some(2));
     let err1 = stderr_text(&out1);
-    assert!(!err1.contains("supersecretpass"), "credentials must be redacted");
+    assert!(
+        !err1.contains("supersecretpass"),
+        "credentials must be redacted"
+    );
     assert!(err1.contains("target URL must not embed credentials"));
 
-    let out2 = scan("/tmp/repo?jwt=verysecrettoken", dir.path(), &state, &rep, &[]);
+    let out2 = scan(
+        "/tmp/repo?jwt=verysecrettoken",
+        dir.path(),
+        &state,
+        &rep,
+        &[],
+    );
     assert_eq!(out2.status.code(), Some(2));
     let err2 = stderr_text(&out2);
-    assert!(!err2.contains("verysecrettoken"), "query token must be redacted");
+    assert!(
+        !err2.contains("verysecrettoken"),
+        "query token must be redacted"
+    );
     assert!(err2.contains("target URL must not embed credentials or a query/fragment tail"));
 }
 
