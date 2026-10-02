@@ -277,3 +277,79 @@ fn status_call_budget_bounded_by_lease_window() {
         (45_000, false)
     );
 }
+
+/// R04: on a slow filesystem (e.g. NFS/SMB with high latency), reading few entries
+/// takes longer than the 60s lease TTL. The time-aware renewal policy (renewing every
+/// 20s) keeps the lease alive continuously, whereas the legacy policy (renewing only
+/// every 256 entries) would have let the lease lapse and be reclaimed.
+#[test]
+fn r04_slow_mount_renewal_before_ttl_lapses() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = db_in(&dir);
+        let store = TursoStore::open(&db).await.expect("open");
+        let epoch = store.epoch();
+        let t0 = now_ms();
+        let ttl = 60_000i64;
+        store
+            .enqueue_task(
+                &NewTask {
+                    id: "t-slow-enum",
+                    kind: "enumerate_dir",
+                    generation: 1,
+                    dir_id: None,
+                    scope_key: "s-slow",
+                    expected_rev: 0,
+                    idempotency_key: "idem-slow-enum",
+                },
+                t0,
+            )
+            .await
+            .expect("enqueue");
+        let claimed = store.claim_tasks(epoch, 10, ttl, t0).await.expect("claim");
+        assert_eq!(claimed.len(), 1);
+        let token = claimed[0].token;
+
+        // Simulate 4 steps of 20 seconds each (total 80 seconds).
+        // In each step, only 2 entries are processed (total 8 entries << 256).
+        // Under legacy policy (every 256 entries):
+        //   lease_renewal_expiry(2, 256, ...) -> None
+        //   At t0 + 61_000, lease expires and is reclaimed!
+        // Under R04 time-aware policy:
+        //   lease_renewal_expiry_elapsed(entries, 20s, 20s, now, 60s) -> Some(now + 60s)
+        //   Lease is renewed at each 20s step, surviving 80s of slow traversal!
+        let mut now = t0;
+        let mut entries_seen = 0u64;
+        for _step in 1..=4 {
+            now += 20_000;
+            entries_seen += 2;
+            let expiry = repo_scan::scheduler::admission::lease_renewal_expiry_elapsed(
+                entries_seen,
+                Duration::from_secs(20),
+                Duration::from_secs(20),
+                now,
+                ttl,
+            )
+            .expect("renewal due every 20s");
+            assert_eq!(expiry, now + ttl);
+
+            assert!(store
+                .renew_lease("t-slow-enum", token, epoch, ttl, now)
+                .await
+                .expect("renew"));
+            assert_eq!(store.expire_leases(now).await.expect("expire"), 0);
+        }
+
+        // At 80 seconds past admission, task is still validly leased to the original owner:
+        let task = store
+            .get_task("t-slow-enum")
+            .await
+            .expect("get")
+            .expect("task");
+        assert_eq!(task.state, TaskState::Leased);
+        assert_eq!(task.lease_token, Some(token));
+
+        store.close().await.expect("close");
+    });
+}

@@ -9,10 +9,10 @@
 
 use repo_scan::config;
 use repo_scan::scheduler::admission::{
-    lease_renewal_expiry, stream_restart_due, stream_stall_suspected, StreamBudget,
+    lease_renewal_expiry, lease_renewal_expiry_elapsed, stream_restart_due, stream_stall_suspected,
+    StreamBudget,
 };
 use repo_scan::store::{now_ms, NewGitInstance, Store, TursoStore};
-#[cfg(unix)]
 use std::time::Duration;
 
 #[path = "../src/main.rs"]
@@ -57,6 +57,37 @@ fn state01_lease_renewal_policy() {
     assert_eq!(lease_renewal_expiry(10, 0, 1_000, 60_000), None);
     assert_eq!(
         lease_renewal_expiry(0, 256, i64::MAX, 60_000),
+        Some(i64::MAX)
+    );
+}
+
+/// R04: Time-aware lease renewal is due at entry zero or when elapsed time reaches or exceeds the interval.
+#[test]
+fn r04_lease_renewal_elapsed_policy() {
+    let interval = Duration::from_secs(20);
+    // Initial check (entries_seen == 0) always renews:
+    assert_eq!(
+        lease_renewal_expiry_elapsed(0, Duration::ZERO, interval, 1_000, 60_000),
+        Some(61_000)
+    );
+    // Advancing entries, but within the 20s interval: no renewal (prevents DB write spam)
+    assert_eq!(
+        lease_renewal_expiry_elapsed(100, Duration::from_secs(5), interval, 1_000, 60_000),
+        None
+    );
+    // Interval reached (20s): renews before the 60s lease can lapse
+    assert_eq!(
+        lease_renewal_expiry_elapsed(10, Duration::from_secs(20), interval, 1_000, 60_000),
+        Some(61_000)
+    );
+    // Interval exceeded (slow filesystem): renews
+    assert_eq!(
+        lease_renewal_expiry_elapsed(5, Duration::from_secs(25), interval, 1_000, 60_000),
+        Some(61_000)
+    );
+    // Saturating add:
+    assert_eq!(
+        lease_renewal_expiry_elapsed(0, Duration::ZERO, interval, i64::MAX, 60_000),
         Some(i64::MAX)
     );
 }

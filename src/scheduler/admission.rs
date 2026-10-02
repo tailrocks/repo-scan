@@ -604,6 +604,25 @@ pub fn lease_renewal_expiry(
     Some(now_ms.saturating_add(ttl_ms))
 }
 
+/// R04: Time-and-progress lease renewal policy for long in-loop operations:
+/// renew the task lease when `entries_seen == 0` (initial claim check) or
+/// when elapsed time since the last renewal reaches or exceeds `interval`.
+/// Returns the new expiry (`now_ms + ttl_ms`, saturating) when renewal is due,
+/// else `None`. Pure and unit-testable.
+pub fn lease_renewal_expiry_elapsed(
+    entries_seen: u64,
+    elapsed: Duration,
+    interval: Duration,
+    now_ms: i64,
+    ttl_ms: i64,
+) -> Option<i64> {
+    if entries_seen == 0 || elapsed >= interval {
+        Some(now_ms.saturating_add(ttl_ms))
+    } else {
+        None
+    }
+}
+
 /// Native-stream rotation policy (SR-EVENT-01): a stream older than
 /// `max_age_ms` must be recreated, bounding any silent native-teardown
 /// window to one rotation period. Pure and unit-testable.

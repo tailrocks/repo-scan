@@ -4018,19 +4018,25 @@ async fn exec_enumerate(
     let watchdog_grace = runner.watchdog.grace;
     let mut last_progress = Instant::now();
     let mut progress_mark = 0u64;
+    let mut last_lease_renewal = Instant::now();
     for item in listing {
-        // SR-STATE-01 lease bound: renew our own lease every 256 observed
-        // entries so a slow-but-advancing enumeration never lets it lapse
-        // mid-operation (a lapsed lease invites cross-generation reclaim).
+        // R04 / SR-STATE-01 lease bound: renew our own lease on the initial entry
+        // (entries_seen == 0) and whenever elapsed time reaches or exceeds 20 seconds
+        // (well within the 60s lease TTL). This ensures a slow-but-advancing
+        // enumeration on slow network mounts or high-latency disks renews before the
+        // lease lapses, while avoiding thousands of redundant database updates on
+        // fast/large directories.
         // A renewal matching zero rows means the lease is gone: stop
         // touching the scope and preserve a partial gap instead of racing
         // a completion. A truly blocked `next()` never reaches this line,
         // so the lease still expires on schedule and bounds the wedge from
         // the store side. (TTL mirrors LEASE_TTL_MS; the WHERE clause
         // mirrors `release_claim` and never touches another owner's lease.)
-        if let Some(new_expiry) = repo_scan::scheduler::admission::lease_renewal_expiry(
+        let renewal_interval = Duration::from_secs(20);
+        if let Some(new_expiry) = repo_scan::scheduler::admission::lease_renewal_expiry_elapsed(
             entries_seen,
-            256,
+            last_lease_renewal.elapsed(),
+            renewal_interval,
             store::now_ms(),
             60_000,
         ) {
@@ -4052,6 +4058,7 @@ async fn exec_enumerate(
             match renewed {
                 Ok(matched) if matched > 0 => {
                     runner.counters.db_transactions += 1;
+                    last_lease_renewal = Instant::now();
                 }
                 Ok(_) => {
                     mid_error = Some(format!(
@@ -4097,13 +4104,19 @@ async fn exec_enumerate(
             mid_error = Some(String::from("interrupted; partial enumeration"));
             break;
         }
-        // SR-STATE-01: the wall budget expired — abandon the remainder;
-        // the partial result below is preserved and the scope parks.
-        if deadline.expired() {
+        // R04 / SR-STATE-01: progress-aware execution budget.
+        // A healthy, advancing enumeration is never abandoned merely because total
+        // elapsed wall time exceeded OP_DEADLINE_SECS. Timeout abandonment only occurs
+        // if enumeration has stalled with no observed entries for OP_DEADLINE_SECS
+        // (or deadline expired before any entry was observed).
+        if last_progress.elapsed() >= Duration::from_secs(OP_DEADLINE_SECS)
+            || (entries_seen == 0 && deadline.expired())
+        {
             mid_error = Some(format!(
-                "timeout-abandoned: enumeration of {} exceeded the {OP_DEADLINE_SECS}s \
-                 execution budget after {entries_seen} entries; partial enumeration",
-                path.display()
+                "timeout-abandoned: enumeration of {} exceeded execution budget \
+                 (stalled for {}s) after {entries_seen} entries; partial enumeration",
+                path.display(),
+                last_progress.elapsed().as_secs(),
             ));
             break;
         }
