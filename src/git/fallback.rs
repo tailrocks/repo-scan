@@ -403,8 +403,26 @@ impl FallbackGit {
         // what runs, and its identity must be unchanged across the
         // version and feature probes (PATH-GIT-06, XSEC-02). The
         // discovered spelling stays reported in `path`.
-        let canonical = canonical_executable(path)?;
-        let identity = binary_identity(&canonical)?;
+        let canonical = match canonical_executable(path) {
+            Some(c) => c,
+            None => {
+                eprintln!(
+                    "repo-scan: git probe: canonical_executable failed for {}",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        let identity = match binary_identity(&canonical) {
+            Some(id) => id,
+            None => {
+                eprintln!(
+                    "repo-scan: git probe: binary_identity failed for {}",
+                    canonical.display()
+                );
+                return None;
+            }
+        };
         let mut version_cmd = Command::new(&canonical);
         version_cmd.arg("--version");
         // Sanitize-only (no repo neutralization): `--version` runs with no
@@ -412,28 +430,48 @@ impl FallbackGit {
         // content, or executes helpers — there is no repo-selected vector
         // to neutralize on this argv.
         sanitize_git_env(&mut version_cmd);
-        let outcome = spawn_enveloped(
-            &mut version_cmd,
-            false,
-            GIT_SPAWN_TIMEOUT,
-            MAX_CAPTURE_BYTES,
-        )
-        .ok()?;
+        let outcome =
+            match spawn_enveloped(&mut version_cmd, true, GIT_SPAWN_TIMEOUT, MAX_CAPTURE_BYTES) {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("repo-scan: git probe: version spawn failed: {e}");
+                    return None;
+                }
+            };
         if !outcome.status.success() || outcome.truncated {
+            eprintln!(
+                "repo-scan: git probe: version command failed: status={:?}, truncated={}, stderr={}",
+                outcome.status.code(),
+                outcome.truncated,
+                String::from_utf8_lossy(&outcome.stderr)
+            );
             return None;
         }
         let version = String::from_utf8_lossy(&outcome.stdout).trim().to_string();
         if !version.starts_with("git version ") {
+            eprintln!("repo-scan: git probe: unexpected version output: {version:?}");
             return None;
         }
         let tuple = parse_git_version(&version);
         let at_least =
             |major: u32, minor: u32| tuple.0 > major || (tuple.0 == major && tuple.1 >= minor);
-        if binary_identity(&canonical) != Some(identity) {
+        let current_id = binary_identity(&canonical);
+        if current_id != Some(identity) {
+            eprintln!(
+                "repo-scan: git probe: identity changed before feature probe: before={:?}, after={:?}",
+                Some(identity),
+                current_id
+            );
             return None;
         }
         let feature_probe_ok = probe_porcelain_v2(&canonical);
-        if binary_identity(&canonical) != Some(identity) {
+        let current_id_after = binary_identity(&canonical);
+        if current_id_after != Some(identity) {
+            eprintln!(
+                "repo-scan: git probe: identity changed after feature probe: before={:?}, after={:?}",
+                Some(identity),
+                current_id_after
+            );
             return None;
         }
         Some(Self {

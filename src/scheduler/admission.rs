@@ -371,7 +371,7 @@ pub const HELPER_LEDGER_CAP: usize = 4;
 /// How long a spawn site waits for a ledger slot before refusing loudly.
 /// Production spawns are sequential, so the wait only absorbs transient
 /// contention; past it the spawn fails with an explicit ledger error.
-pub const HELPER_LEDGER_WAIT: Duration = Duration::from_secs(1);
+pub const HELPER_LEDGER_WAIT: Duration = Duration::from_secs(10);
 
 /// Aggregate native event-stream bounds (SR-STATE-02): at most 64 live
 /// streams (one stream costs at least one descriptor, so this stays within
