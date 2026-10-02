@@ -548,13 +548,12 @@ fn fs04_non_utf8_and_controls_round_trip() {
 // ---------------------------------------------------------------------------
 
 fn all_adapters() -> Vec<Box<dyn repo_scan::walk::OneDirAdapter>> {
-    let mut adapters: Vec<Box<dyn repo_scan::walk::OneDirAdapter>> = vec![
+    vec![
         Box::new(repo_scan::walk::IgnoreAdapter),
         Box::new(repo_scan::walk::StdEscape),
-    ];
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    adapters.push(Box::new(repo_scan::walk::DuaAdapter));
-    adapters
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        Box::new(repo_scan::walk::DuaAdapter),
+    ]
 }
 
 /// Stream one directory through an adapter without retaining entries:

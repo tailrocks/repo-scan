@@ -20,13 +20,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 fn all_adapters() -> Vec<Box<dyn OneDirAdapter>> {
-    let mut adapters: Vec<Box<dyn OneDirAdapter>> = vec![
+    vec![
         Box::new(repo_scan::walk::IgnoreAdapter),
         Box::new(repo_scan::walk::StdEscape),
-    ];
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    adapters.push(Box::new(repo_scan::walk::DuaAdapter));
-    adapters
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        Box::new(repo_scan::walk::DuaAdapter),
+    ]
 }
 
 fn adapter_names() -> Vec<&'static str> {

@@ -81,12 +81,12 @@ fn main() {
     let root = build_scope(&holder);
     const ENTRY_CAP: u64 = 500_000;
 
-    let mut adapters: Vec<Box<dyn repo_scan::walk::OneDirAdapter>> = vec![
+    let adapters: Vec<Box<dyn repo_scan::walk::OneDirAdapter>> = vec![
         Box::new(repo_scan::walk::IgnoreAdapter),
         Box::new(repo_scan::walk::StdEscape),
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        Box::new(repo_scan::walk::DuaAdapter),
     ];
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    adapters.push(Box::new(repo_scan::walk::DuaAdapter));
 
     let mut baseline: Option<support::TraversalOutcome> = None;
     let mut all_equivalent = true;
