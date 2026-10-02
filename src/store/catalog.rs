@@ -436,6 +436,38 @@ pub fn task_state_from_str(value: &str) -> crate::Result<TaskState> {
     }
 }
 
+/// Deterministic 63-bit directory ID derived from physical identity (R05).
+///
+/// In SQLite, `INTEGER PRIMARY KEY` is a 64-bit signed integer rowid. Using a
+/// stable positive 63-bit FNV-1a hash of `(volume_id, object_id, incarnation)`
+/// ensures that a directory's ID is known in memory before any database write,
+/// eliminating the need to flush batches just to retrieve autoincrement IDs.
+pub fn dir_identity_id(volume_id: &str, object_id: &str, incarnation: &str) -> i64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in volume_id.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash ^= 0x1f;
+    hash = hash.wrapping_mul(0x100000001b3);
+    for b in object_id.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash ^= 0x1f;
+    hash = hash.wrapping_mul(0x100000001b3);
+    for b in incarnation.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let id = (hash & 0x7fff_ffff_ffff_ffff) as i64;
+    if id == 0 {
+        1
+    } else {
+        id
+    }
+}
+
 /// One durable frontier task (spec §12).
 #[derive(Debug, Clone)]
 pub struct FrontierTask {
@@ -1307,10 +1339,37 @@ impl TursoStore {
             Self::expire_leases_on(conn, now_ms).await?;
             // Bound literal is interpolated (numeric, owner-controlled) so
             // the query needs no bound LIMIT support.
+            //
+            // R06: Fair scheduling across task classes (probe, reconcile,
+            // enumerate, status) using round-robin interleaving so probes and
+            // early repository validations are never starved behind large
+            // enumeration backlogs.
             let sql = format!(
-                "SELECT {TASK_COLUMNS} FROM frontier_tasks WHERE state = 'pending' \
-                    OR (state = 'retry_wait' AND retry_after_ms IS NOT NULL \
-                    AND retry_after_ms <= ?1) ORDER BY generation ASC, id ASC LIMIT {limit}"
+                "SELECT {TASK_COLUMNS} FROM ( \
+                    SELECT {TASK_COLUMNS}, \
+                        ROW_NUMBER() OVER ( \
+                            PARTITION BY generation, CASE \
+                                WHEN kind = 'probe_git' OR id LIKE 'probe:%' THEN 1 \
+                                WHEN kind = 'reconcile' OR id LIKE 'reconcile:%' THEN 2 \
+                                WHEN kind = 'enumerate_dir' OR id LIKE 'enum:%' THEN 3 \
+                                WHEN kind = 'status' OR id LIKE 'status:%' THEN 4 \
+                                ELSE 5 \
+                            END \
+                            ORDER BY attempts ASC, updated_at_ms ASC, id ASC \
+                        ) AS _rn, \
+                        CASE \
+                            WHEN kind = 'probe_git' OR id LIKE 'probe:%' THEN 1 \
+                            WHEN kind = 'reconcile' OR id LIKE 'reconcile:%' THEN 2 \
+                            WHEN kind = 'enumerate_dir' OR id LIKE 'enum:%' THEN 3 \
+                            WHEN kind = 'status' OR id LIKE 'status:%' THEN 4 \
+                            ELSE 5 \
+                        END AS _cls \
+                    FROM frontier_tasks \
+                    WHERE state = 'pending' \
+                        OR (state = 'retry_wait' AND retry_after_ms IS NOT NULL \
+                        AND retry_after_ms <= ?1) \
+                ) \
+                ORDER BY generation ASC, _rn ASC, _cls ASC, id ASC LIMIT {limit}"
             );
             let mut rows = conn
                 .query(sql.as_str(), vec![v_int(now_ms)])
@@ -1398,11 +1457,37 @@ impl TursoStore {
             Self::expire_leases_in_generation_on(conn, generation, now_ms).await?;
             // Bound literal is interpolated (numeric, owner-controlled) so
             // the query needs no bound LIMIT support.
+            //
+            // R06: Fair scheduling across task classes (probe, reconcile,
+            // enumerate, status) using round-robin interleaving so discovered
+            // Git repository candidates are scheduled and validated promptly
+            // while directory enumeration continues in parallel/interleaved.
             let sql = format!(
-                "SELECT {TASK_COLUMNS} FROM frontier_tasks WHERE generation = ?1 \
-                    AND (state = 'pending' OR (state = 'retry_wait' \
-                    AND retry_after_ms IS NOT NULL AND retry_after_ms <= ?2)) \
-                    ORDER BY id ASC LIMIT {limit}"
+                "SELECT {TASK_COLUMNS} FROM ( \
+                    SELECT {TASK_COLUMNS}, \
+                        ROW_NUMBER() OVER ( \
+                            PARTITION BY CASE \
+                                WHEN kind = 'probe_git' OR id LIKE 'probe:%' THEN 1 \
+                                WHEN kind = 'reconcile' OR id LIKE 'reconcile:%' THEN 2 \
+                                WHEN kind = 'enumerate_dir' OR id LIKE 'enum:%' THEN 3 \
+                                WHEN kind = 'status' OR id LIKE 'status:%' THEN 4 \
+                                ELSE 5 \
+                            END \
+                            ORDER BY attempts ASC, updated_at_ms ASC, id ASC \
+                        ) AS _rn, \
+                        CASE \
+                            WHEN kind = 'probe_git' OR id LIKE 'probe:%' THEN 1 \
+                            WHEN kind = 'reconcile' OR id LIKE 'reconcile:%' THEN 2 \
+                            WHEN kind = 'enumerate_dir' OR id LIKE 'enum:%' THEN 3 \
+                            WHEN kind = 'status' OR id LIKE 'status:%' THEN 4 \
+                            ELSE 5 \
+                        END AS _cls \
+                    FROM frontier_tasks \
+                    WHERE generation = ?1 \
+                        AND (state = 'pending' OR (state = 'retry_wait' \
+                        AND retry_after_ms IS NOT NULL AND retry_after_ms <= ?2)) \
+                ) \
+                ORDER BY _rn ASC, _cls ASC, id ASC LIMIT {limit}"
             );
             let generation_i64 = u64_to_i64(generation, "task generation")?;
             let mut rows = conn
@@ -3862,9 +3947,15 @@ impl TursoStore {
         )
     }
 
+    /// Deterministic 63-bit directory ID derived from physical identity (R05).
+    pub fn dir_identity_id(volume_id: &str, object_id: &str, incarnation: &str) -> i64 {
+        dir_identity_id(volume_id, object_id, incarnation)
+    }
+
     /// Buffer the write half of [`TursoStore::upsert_dir`] (insert-or-ignore
-    /// plus attribute refresh). The row id is not known until flush; resolve
-    /// it afterwards with [`TursoStore::lookup_dir_id`]. Returns
+    /// plus attribute refresh). The row id is derived deterministically from
+    /// physical identity (R05) via [`dir_identity_id`], avoiding the need to
+    /// flush just to observe an autoincrement id. Returns
     /// `WriterBatch::should_flush`.
     #[allow(clippy::too_many_arguments)]
     pub fn buffer_dir_upsert(
@@ -3877,11 +3968,13 @@ impl TursoStore {
         incarnation: &str,
         observed_ms: i64,
     ) -> bool {
+        let id = dir_identity_id(volume_id, object_id, incarnation);
         batch.push(
-            "INSERT OR IGNORE INTO directories (parent_id, component, display, \
+            "INSERT OR IGNORE INTO directories (id, parent_id, component, display, \
                 volume_id, object_id, incarnation, last_observed_ms, \
-                invalidation_rev) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+                invalidation_rev) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
             vec![
+                v_int(id),
                 v_opt_int(parent_id),
                 v_blob(component.to_vec()),
                 v_text(display),

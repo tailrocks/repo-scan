@@ -85,6 +85,11 @@ pub fn normalize_github_url(url: &str) -> Option<String> {
     ))
 }
 
+/// True when `target` is a local filesystem repository target (starts with `file://` or `/`).
+pub fn is_local_target(target: &str) -> bool {
+    target.starts_with("file://") || target.starts_with('/')
+}
+
 /// Compare a canonical target against one effective remote observation.
 /// Returns the disposition plus human-readable evidence lines.
 ///
@@ -107,6 +112,9 @@ pub fn classify_remote(
                 "Effective {role} remote URL is empty; identity cannot be determined."
             )],
         );
+    }
+    if is_local_target(canonical_target) {
+        return classify_local_target_remote(canonical_target, remote_url, role, &redacted);
     }
     if redacted == REDACTED_URL {
         // Already-collapsed observation (FIXREADY4 R): the constructor
@@ -153,6 +161,59 @@ pub fn classify_remote(
         }
     }
     lenient_noncanonical_verdict(canonical_target, remote_url, role, &redacted)
+}
+
+/// Compare a local repository target against one effective remote observation.
+fn classify_local_target_remote(
+    canonical_target: &str,
+    remote_url: &str,
+    role: &str,
+    redacted: &str,
+) -> (MatchDisposition, Vec<String>) {
+    let target_path_str = canonical_target.strip_prefix("file://").unwrap_or(canonical_target);
+    let target_path = std::path::Path::new(target_path_str);
+    let target_canon = std::fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
+
+    let trimmed = remote_url.trim();
+    let remote_path_opt: Option<std::path::PathBuf> = if let Some(stripped) = trimmed.strip_prefix("file://") {
+        Some(std::path::PathBuf::from(stripped))
+    } else if trimmed.starts_with('/') || trimmed.starts_with('.') {
+        Some(std::path::PathBuf::from(trimmed))
+    } else if let Ok(parsed) = gix::url::parse(trimmed) {
+        if parsed.scheme == gix::url::Scheme::File {
+            std::str::from_utf8(parsed.path.as_bytes()).ok().map(std::path::PathBuf::from)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(rpath) = remote_path_opt {
+        let r_canon = std::fs::canonicalize(&rpath).unwrap_or(rpath);
+        if r_canon == target_canon {
+            return (
+                MatchDisposition::Confirmed,
+                vec![format!(
+                    "Effective {role} remote `{redacted}` matches the local target repository ({canonical_target})."
+                )],
+            );
+        } else {
+            return (
+                MatchDisposition::Nonmatch,
+                vec![format!(
+                    "Effective {role} remote `{redacted}` points to a different local repository ({}), not the target.",
+                    r_canon.display()
+                )],
+            );
+        }
+    }
+    (
+        MatchDisposition::Nonmatch,
+        vec![format!(
+            "Effective {role} remote `{redacted}` is not a local path matching {canonical_target}."
+        )],
+    )
 }
 
 /// Aggregate per-remote verdicts into one repository disposition.

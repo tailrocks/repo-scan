@@ -518,3 +518,107 @@ fn r12_read_only_open_claims_nothing() {
         store.close().await.expect("close");
     });
 }
+
+/// R06: Fair task claiming interleaves probe tasks ahead of large enumeration
+/// backlogs so discovered Git repositories are scheduled and validated promptly
+/// while directory enumeration continues in parallel or interleaved.
+#[test]
+fn r06_fair_scheduling_interleaves_probes_and_enumeration() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TursoStore::open(&db_in(&dir)).await.expect("open");
+        let epoch = store.epoch();
+        let now = now_ms();
+
+        // Enqueue 20 enumeration tasks: enum:1:d1:i100..i119
+        for i in 100..120 {
+            let id = format!("enum:1:d1:i{i}");
+            let idem = format!("idem:{id}");
+            store
+                .enqueue_task(
+                    &NewTask {
+                        id: &id,
+                        kind: "enumerate_dir",
+                        generation: 1,
+                        dir_id: None,
+                        scope_key: "dir:00",
+                        expected_rev: 0,
+                        idempotency_key: &idem,
+                    },
+                    now,
+                )
+                .await
+                .expect("enqueue enum");
+        }
+
+        // Enqueue 2 Git candidate probe tasks: probe:1:repo1 and probe:1:repo2
+        for name in ["repo1", "repo2"] {
+            let id = format!("probe:1:{name}");
+            let idem = format!("idem:{id}");
+            store
+                .enqueue_task(
+                    &NewTask {
+                        id: &id,
+                        kind: "probe_git",
+                        generation: 1,
+                        dir_id: None,
+                        scope_key: "git:00",
+                        expected_rev: 0,
+                        idempotency_key: &idem,
+                    },
+                    now,
+                )
+                .await
+                .expect("enqueue probe");
+        }
+
+        // Enqueue 2 checkout status tasks: status:repo1:1 and status:repo2:1
+        for name in ["repo1", "repo2"] {
+            let id = format!("status:{name}:1");
+            let idem = format!("idem:{id}");
+            store
+                .enqueue_task(
+                    &NewTask {
+                        id: &id,
+                        kind: "status",
+                        generation: 1,
+                        dir_id: None,
+                        scope_key: "status:00",
+                        expected_rev: 0,
+                        idempotency_key: &idem,
+                    },
+                    now,
+                )
+                .await
+                .expect("enqueue status");
+        }
+
+        // Under old ORDER BY id ASC:
+        // 'e' < 'p' < 's', so claiming 8 tasks would return ONLY enum tasks (enum:1:d1:i100..i107).
+        // Zero probe tasks would be claimed, starving candidate validation.
+        // Under R06 fair scheduling:
+        // Probe tasks are prioritized and interleaved with enumeration and status.
+        let claimed = store
+            .claim_tasks_in_generation(1, epoch, 8, 60_000, now)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 8);
+
+        // First item must be a probe task (prompt validation of discovered candidate)
+        assert_eq!(claimed[0].task.kind, "probe_git");
+        assert_eq!(claimed[0].task.id, "probe:1:repo1");
+
+        // The batch must contain BOTH probe tasks and enumeration tasks (interleaved)
+        let probe_count = claimed.iter().filter(|c| c.task.kind == "probe_git").count();
+        let enum_count = claimed.iter().filter(|c| c.task.kind == "enumerate_dir").count();
+        let status_count = claimed.iter().filter(|c| c.task.kind == "status").count();
+
+        assert_eq!(probe_count, 2, "both probe tasks claimed promptly in the first batch");
+        assert!(enum_count > 0, "enumeration continues in the same batch");
+        assert!(status_count > 0, "status tasks make progress without starving enumeration");
+
+        store.close().await.expect("close");
+    });
+}
+

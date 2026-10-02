@@ -341,13 +341,18 @@ fn cli01_force_rescan_mints_fresh_generation() {
     let gen1 = read_report(&env.cwd_a.join("rep.json"))["scan"]["generation"]
         .as_u64()
         .expect("generation");
-    // Ordinary rescan reuses the generation.
+    // Ordinary rescan reuses the generation on macOS when live events are active;
+    // on Linux (and non-macOS platforms) without live events, it mints a fresh
+    // generation so newly added copies are discovered.
     let out = env.scan(&["--report", "rep.json"], &env.cwd_a);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
     let gen2 = read_report(&env.cwd_a.join("rep.json"))["scan"]["generation"]
         .as_u64()
         .expect("generation");
+    #[cfg(target_os = "macos")]
     assert_eq!(gen1, gen2, "catalog information reused");
+    #[cfg(not(target_os = "macos"))]
+    assert_ne!(gen1, gen2, "fresh generation when events unsupported");
     // Force rescan creates a fresh traversal generation.
     let out = env.scan(&["--report", "rep.json", "--force-rescan"], &env.cwd_a);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));

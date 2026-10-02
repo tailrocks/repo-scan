@@ -171,6 +171,17 @@ pub fn resolve_report_dest(path: &Path) -> crate::Result<PathBuf> {
     absolutize_once(&expand_tilde(path)?)
 }
 
+/// Resolve a local target path (leading `~` expansion, current-directory join,
+/// and lexical cleanup).
+pub fn resolve_target_path(path: &Path) -> crate::Result<PathBuf> {
+    if path.as_os_str().is_empty() {
+        return Err(crate::Error::InvalidArgs(
+            "empty target path".to_string(),
+        ));
+    }
+    absolutize_once(&expand_tilde(path)?)
+}
+
 /// Join a relative path against the current directory exactly once, then
 /// clean `.`/`..` lexically. Absolute paths are only cleaned.
 fn absolutize_once(path: &Path) -> crate::Result<PathBuf> {

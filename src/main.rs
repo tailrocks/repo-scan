@@ -468,7 +468,35 @@ async fn reclassify_for_target(
                 .iter()
                 .map(|(url, role)| (url.as_str(), role.as_str()))
                 .collect();
-            let (disposition, mut fresh) = identity::classify_remotes(canonical, borrowed);
+            let is_target_repo = if identity::is_local_target(canonical) {
+                let target_path_str = canonical.strip_prefix("file://").unwrap_or(canonical);
+                let t_canon = std::fs::canonicalize(target_path_str)
+                    .unwrap_or_else(|_| PathBuf::from(target_path_str));
+                if let Ok(Some(inst)) = store.get_git_instance(id).await {
+                    let gp = config::path_from_bytes(inst.git_path);
+                    let cp = config::path_from_bytes(inst.common_path);
+                    let gp_canon = std::fs::canonicalize(&gp).ok();
+                    let cp_canon = std::fs::canonicalize(&cp).ok();
+                    gp_canon == Some(t_canon.clone())
+                        || cp_canon == Some(t_canon.clone())
+                        || gp_canon.as_ref().and_then(|p| p.parent().map(Path::to_path_buf)) == Some(t_canon.clone())
+                        || cp_canon.as_ref().and_then(|p| p.parent().map(Path::to_path_buf)) == Some(t_canon.clone())
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            let (disposition, mut fresh) = if is_target_repo {
+                (
+                    identity::MatchDisposition::Confirmed,
+                    vec![format!(
+                        "reclassified for target {canonical} at report time: repository matches local target repository"
+                    )],
+                )
+            } else {
+                identity::classify_remotes(canonical, borrowed)
+            };
             let mut evidence: Vec<String> = serde_json::from_str(evidence_json).unwrap_or_default();
             evidence.retain(|line| {
                 !(line.starts_with("Effective ")
@@ -533,19 +561,7 @@ async fn run_scan_inner(
             identity::redact_target_for_display(&args.url),
         )));
     }
-    // Centralized (EXACT-2): everything downstream — canonicalization,
-    // mint, catalog, report, snapshot, terminal — observes only the
-    // sanitized target, never a credential form.
-    let target = identity::sanitize_target_url(&args.url);
-    let canonical = match identity::normalize_github_url(&target) {
-        Some(canonical) => canonical,
-        None => {
-            return Err(repo_scan::Error::InvalidArgs(format!(
-                "target URL is not a supported GitHub shape: {}",
-                identity::redact_target_for_display(&args.url),
-            )));
-        }
-    };
+    let (target, canonical) = resolve_target_identity(&args.url)?;
     // Absolute report destination at request-creation time (spec §3).
     let report_dest = args
         .report
@@ -598,6 +614,7 @@ async fn run_scan_inner(
     // Resume honors the saved generation (R14); a history loss forces a
     // fresh one exactly like `--force-rescan`.
     let saved_generation = resumed.as_ref().and_then(|r| r.generation);
+    let events_live = events.live && events.degraded.is_empty();
     let generation = match saved_generation {
         Some(saved) if store.get_generation(saved).await?.is_some() => {
             store.set_generation_state(saved, "running").await?;
@@ -610,6 +627,7 @@ async fn run_scan_inner(
                 &store,
                 &policy,
                 args.force_rescan,
+                events_live,
                 now,
                 &mut runner.counters,
             )
@@ -623,7 +641,15 @@ async fn run_scan_inner(
                      prior findings stay provisional until replaced"
                 );
             }
-            pick_generation(&store, &policy, force, now, &mut runner.counters).await?
+            pick_generation(
+                &store,
+                &policy,
+                force,
+                events_live,
+                now,
+                &mut runner.counters,
+            )
+            .await?
         }
     };
     if args.force_rescan {
@@ -1001,6 +1027,83 @@ struct ResumedRequest {
     generation: Option<u64>,
 }
 
+/// True when `input` designates a local filesystem path (starts with `file://`,
+/// is a relative/absolute path syntax, or exists as a path on disk).
+fn is_local_path_target(input: &str) -> bool {
+    let trimmed = input.trim();
+    if trimmed.starts_with("file://") {
+        return true;
+    }
+    if trimmed == "."
+        || trimmed == ".."
+        || trimmed == "~"
+        || trimmed.starts_with("./")
+        || trimmed.starts_with("../")
+        || trimmed.starts_with('/')
+        || trimmed.starts_with("~/")
+    {
+        return true;
+    }
+    Path::new(trimmed).exists()
+}
+
+/// Resolve scan target identity: supports remote GitHub URLs and local repository
+/// paths (worktrees, bare repositories, or standard repositories with `.git`).
+fn resolve_target_identity(input: &str) -> repo_scan::Result<(String, String)> {
+    let trimmed = input.trim();
+    if is_local_path_target(trimmed) {
+        let raw_path = if let Some(stripped) = trimmed.strip_prefix("file://") {
+            Path::new(stripped)
+        } else {
+            Path::new(trimmed)
+        };
+        let abs_path = config::resolve_target_path(raw_path)?;
+        if !abs_path.exists() {
+            return Err(repo_scan::Error::InvalidArgs(format!(
+                "target path does not exist: {}",
+                abs_path.display()
+            )));
+        }
+        let canonical_path = std::fs::canonicalize(&abs_path).unwrap_or_else(|_| abs_path.clone());
+        let inspector = git::GixInspector::new();
+        let instance = inspector.open_exact(&canonical_path).map_err(|_| {
+            repo_scan::Error::InvalidArgs(format!(
+                "target path is not a git repository: {}",
+                canonical_path.display()
+            ))
+        })?;
+        let remotes = inspector.remotes(&instance).unwrap_or_default();
+        let origin_remote = remotes
+            .iter()
+            .find(|r| r.name == b"origin" && r.role == git::RemoteRole::Fetch)
+            .or_else(|| remotes.iter().find(|r| r.name == b"origin"))
+            .or_else(|| remotes.iter().find(|r| r.canonical_url.is_some()))
+            .or_else(|| remotes.first());
+
+        if let Some(origin) = origin_remote {
+            if let Some(canonical_url) = &origin.canonical_url {
+                return Ok((input.to_string(), canonical_url.clone()));
+            } else if let Some(canonical_url) = identity::normalize_github_url(&origin.url) {
+                return Ok((input.to_string(), canonical_url));
+            }
+        }
+        let file_url = format!("file://{}", canonical_path.display());
+        return Ok((input.to_string(), file_url));
+    }
+
+    let target = identity::sanitize_target_url(input);
+    let canonical = match identity::normalize_github_url(&target) {
+        Some(canonical) => canonical,
+        None => {
+            return Err(repo_scan::Error::InvalidArgs(format!(
+                "target URL is not a supported GitHub shape: {}",
+                identity::redact_target_for_display(input),
+            )));
+        }
+    };
+    Ok((target, canonical))
+}
+
 /// Resolve scan roots: explicit `--root`s (absolute, recorded as `roots`
 /// scope) or the machine plan (seeds plus every mount-table root).
 fn plan_roots(
@@ -1042,11 +1145,15 @@ fn plan_roots(
 /// Pick the traversal generation: a fresh one on `--force-rescan`, else the
 /// newest generation of this scope policy still holding actionable work
 /// (compatible unfinished discovery is resumed and shared), else the newest
-/// generation (valid catalog information is reused), else a new one.
+/// generation if live events are active (valid catalog information is reused
+/// and reconciled via events), else a fresh generation (when live events are
+/// unsupported or degraded, minting a new generation ensures directory
+/// enumeration tasks run and newly added repositories are discovered).
 async fn pick_generation(
     store: &TursoStore,
     policy: &str,
     force: bool,
+    events_live: bool,
     now_ms: i64,
     counters: &mut RunCounters,
 ) -> repo_scan::Result<u64> {
@@ -1074,10 +1181,12 @@ async fn pick_generation(
                 return Ok(*id);
             }
         }
-        if let Some((id, _)) = generations.first() {
-            store.set_generation_state(*id, "running").await?;
-            counters.db_transactions += 1;
-            return Ok(*id);
+        if events_live {
+            if let Some((id, _)) = generations.first() {
+                store.set_generation_state(*id, "running").await?;
+                counters.db_transactions += 1;
+                return Ok(*id);
+            }
         }
     }
     let prior = generations.first().map(|(id, _)| *id);
@@ -2362,6 +2471,8 @@ struct RunCounters {
     claimed: u64,
     dirs_complete: u64,
     entries: u64,
+    repos_found: u64,
+    probes_complete: u64,
     /// Real store transactions (R13): incremented once per mutating store
     /// call (one autocommit statement, one `with_tx`, or one writer-batch
     /// flush each), never per logical row. This is what the report's
@@ -2721,6 +2832,7 @@ async fn run_until_boundary(
             // SR-STATE-01: one wall budget per admitted task, enforced at
             // every yield point inside `execute_task`.
             let deadline = OpDeadline::new(Duration::from_secs(OP_DEADLINE_SECS));
+            let is_probe = item.task.kind == KIND_PROBE;
             let result = execute_task(
                 runner,
                 store,
@@ -2734,6 +2846,9 @@ async fn run_until_boundary(
             )
             .await;
             runner.admission.release(&permit);
+            if is_probe && result.is_ok() {
+                runner.counters.probes_complete += 1;
+            }
             // RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1: at-most-1 Hz
             // footprint sample with pressure response.
             if runner.admission.telemetry_due() {
@@ -2834,7 +2949,8 @@ async fn run_until_boundary(
             runner.counters.claimed += 1;
             // At-most-2 Hz token-timer gate (RSF-CHAINARGOS-PROGRESS-001):
             // progress lines carry position, pending, and elapsed.
-            if runner.admission.progress_due() {
+            // R06: Also emit promptly on probe completions to surface discovered repositories.
+            if is_probe || runner.admission.progress_due() {
                 emit_progress(runner, store, scan_id, generation).await?;
             }
         }
@@ -3191,13 +3307,15 @@ fn format_progress_line_full_inner(
 ) -> String {
     format!(
         "repo-scan: scan {scan_id} gen {generation} session(this run): claimed={} dirs={} \
-         entries={} stale-requeued={} | cumulative(scan total): tasks_done={}/{} dirs={} \
+         entries={} repos={} probes={} stale-requeued={} | cumulative(scan total): tasks_done={}/{} dirs={} \
          entries={} pending={} | elapsed={}s rate={} eta={} scope={} volume={} \
          scope_total=unknown (full machine dir count unknowable until traversal completes)\
          {growth_note}",
         counters.claimed,
         counters.dirs_complete,
         counters.entries,
+        counters.repos_found,
+        counters.probes_complete,
         counters.stale_requeued,
         totals.done_tasks(),
         totals.total_tasks,
@@ -3230,13 +3348,15 @@ fn format_progress_line(
     let eta = format_progress_eta(counters.claimed, pending, elapsed);
     format!(
         "repo-scan: scan {scan_id} gen {generation} session(this run): claimed={} dirs={} \
-         entries={} stale-requeued={} | cumulative(scan total)=unknown (store totals not \
+         entries={} repos={} probes={} stale-requeued={} | cumulative(scan total)=unknown (store totals not \
          loaded in this context) tasks_total=unknown (frontier denominator not loaded) \
          pending={pending} | elapsed={}s rate={} eta={} scope={} volume={} scope_total=unknown \
          (full machine dir count unknowable until traversal completes)",
         counters.claimed,
         counters.dirs_complete,
         counters.entries,
+        counters.repos_found,
+        counters.probes_complete,
         counters.stale_requeued,
         elapsed.as_secs(),
         rate,
@@ -3845,33 +3965,20 @@ async fn exec_enumerate(
         .file_name()
         .map(|n| config::path_as_bytes(Path::new(n)))
         .unwrap_or_else(|| config::path_as_bytes(dir_path));
-    // RSF-751/AC46/F06D: batch the upsert through the writer batch and
-    // flush only when a spec §5 limit is due or the row id is not yet
-    // knowable (a new identity still buffered), instead of an immediate
-    // flush per directory. Repeats (resume, rediscovery) commit with
-    // neighboring work; the observation below needs no read, so no other
-    // buffered row must be visible here.
+    // R05: stable directory ID is known in memory from physical identity;
+    // no immediate flush is needed to retrieve an autoincrement id.
+    let ino_str = ino.to_string();
+    let dir_id = store::dir_identity_id(&volume_tag, &ino_str, &incarnation);
     let due = TursoStore::buffer_dir_upsert(
         &mut runner.batch,
         None,
         &component,
         &escape_display(&config::path_as_bytes(dir_path)),
         &volume_tag,
-        &ino.to_string(),
+        &ino_str,
         &incarnation,
         now,
     );
-    let mut dir_id = store
-        .lookup_dir_id(&volume_tag, &ino.to_string(), &incarnation)
-        .await?;
-    if dir_id.is_none() {
-        flush_runner_batch(runner, store).await?;
-        dir_id = store
-            .lookup_dir_id(&volume_tag, &ino.to_string(), &incarnation)
-            .await?;
-    }
-    let dir_id = dir_id
-        .ok_or_else(|| repo_scan::Error::Store(String::from("directory upsert left no row")))?;
     flush_if_due(runner, store, due).await?;
 
     let adapter = repo_scan::walk::primary_adapter();
@@ -5375,7 +5482,34 @@ async fn persist_probe(
         .iter()
         .map(|(url, role)| (url.as_str(), role.as_str()))
         .collect();
-    let (disposition, mut match_evidence) = identity::classify_remotes(canonical, borrowed);
+    let is_target_repo = if identity::is_local_target(canonical) {
+        let target_path_str = canonical.strip_prefix("file://").unwrap_or(canonical);
+        let t_canon = std::fs::canonicalize(target_path_str)
+            .unwrap_or_else(|_| PathBuf::from(target_path_str));
+        let path_canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        path_canon == t_canon
+            || instance
+                .work_dir
+                .as_ref()
+                .and_then(|p| std::fs::canonicalize(p).ok())
+                == Some(t_canon.clone())
+            || std::fs::canonicalize(&instance.git_dir).ok() == Some(t_canon.clone())
+            || std::fs::canonicalize(&instance.common_dir).ok() == Some(t_canon)
+    } else {
+        false
+    };
+    let (disposition, mut match_evidence) = if is_target_repo {
+        (
+            identity::MatchDisposition::Confirmed,
+            vec![format!(
+                "Repository at {} matches the requested local target repository ({}).",
+                path.display(),
+                canonical
+            )],
+        )
+    } else {
+        identity::classify_remotes(canonical, borrowed)
+    };
     evidence.append(&mut match_evidence);
     let evidence_json =
         serde_json::to_string(&evidence).map_err(|e| repo_scan::Error::Report(e.to_string()))?;
@@ -5393,6 +5527,7 @@ async fn persist_probe(
         evidence_json: &evidence_json,
     };
     let due = TursoStore::buffer_upsert_git_instance(&mut runner.batch, &new_instance, now_ms);
+    runner.counters.repos_found += 1;
     flush_if_due(runner, store, due).await?;
     for remote in &remotes {
         let role = match remote.role {
@@ -10575,6 +10710,8 @@ pub fn test_format_progress(
         claimed,
         dirs_complete: dirs,
         entries,
+        repos_found: 0,
+        probes_complete: 0,
         db_transactions: 0,
         stale_requeued: stale,
         peak_rss_bytes: 0,
@@ -10625,6 +10762,8 @@ pub fn test_format_progress_full(
         claimed,
         dirs_complete: dirs,
         entries,
+        repos_found: 0,
+        probes_complete: 0,
         db_transactions: 0,
         stale_requeued: stale,
         peak_rss_bytes: 0,
@@ -10695,6 +10834,8 @@ pub fn test_format_progress_full_growth(
         claimed,
         dirs_complete: dirs,
         entries,
+        repos_found: 0,
+        probes_complete: 0,
         db_transactions: 0,
         stale_requeued: stale,
         peak_rss_bytes: 0,

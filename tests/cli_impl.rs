@@ -479,7 +479,10 @@ fn binary_scan_resume_query_lifecycle() {
     assert_ne!(scan_id, scan_id_2);
     let report2: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&report_path).expect("read")).expect("json");
+    #[cfg(target_os = "macos")]
     assert_eq!(report2["scan"]["generation"].as_u64(), Some(generation));
+    #[cfg(not(target_os = "macos"))]
+    assert_ne!(report2["scan"]["generation"].as_u64(), Some(generation));
 
     // Force rescan mints a fresh generation.
     let out = run(

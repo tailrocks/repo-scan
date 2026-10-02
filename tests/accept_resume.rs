@@ -549,10 +549,17 @@ fn resume02_incomplete_scan_keeps_old_findings() {
         gapped["coverage"]["filesystem"].as_str(),
         Some("incomplete")
     );
+    #[cfg(target_os = "macos")]
     assert_eq!(
         gapped["scan"]["generation"].as_u64(),
         Some(1),
         "same catalog"
+    );
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(
+        gapped["scan"]["generation"].as_u64(),
+        Some(2),
+        "fresh generation on Linux"
     );
     assert_eq!(
         gapped["repositories"].as_array().map(|a| a.len()),

@@ -25,7 +25,8 @@ pub mod schema;
 pub mod writer;
 
 pub use catalog::{
-    task_state_as_str, task_state_from_str, CheckoutRow, ClaimedTask, DirObservation, DirRecord,
+    dir_identity_id, task_state_as_str, task_state_from_str, CheckoutRow, ClaimedTask,
+    DirObservation, DirRecord,
     ErrorRow, EventRow, FrontierTask, GenerationRow, GitInstanceRow, IngestedBatch, NewCheckout,
     NewGitInstance, NewRef, NewRemote, NewScan, NewStatus, NewTask, NewVolume, RecoveryReport,
     RefRow, RemoteRow, ReportSnapshotRow, ScanRow, StatusRow, StoreStats, TaskOutcome, TursoStore,
