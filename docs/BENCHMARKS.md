@@ -1,4 +1,4 @@
-# Benchmarks (spec §18)
+# Benchmarks and performance gates
 
 All numbers are recorded on run as JSONL. Never invent latencies or speedups.
 
@@ -49,6 +49,6 @@ Verdict record: `adapters`, `equivalent`, `baseline_dirs/entries/errors`.
 
 PERF-02/03 gates run from [benches/perf_gates.rs](../benches/perf_gates.rs)
 (declared corpus, ≥30 s sustained measurement, 512 MiB pressure injection),
-asserted by [tests/accept_perf.rs](../tests/accept_perf.rs:359)
+asserted by [tests/accept_perf.rs](../tests/accept_perf.rs:362)
 (`perf_02_03_gates_hold`; results: `benches/results/perf_gates.jsonl`).
 Traceability: [docs/CHECKLIST.md](../docs/CHECKLIST.md) PERF-02/03.

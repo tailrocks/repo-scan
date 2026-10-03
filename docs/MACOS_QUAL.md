@@ -1,7 +1,7 @@
-# macOS integration qualification (spec §§7+13)
+# macOS integration qualification
 
 Date: 2026-09-30. Survey from local SDK header, local crate sources, crates.io / docs.rs.
-Normative spec: `repo-scan-spec.md` §§7 (scope/topology/paths), 13 (incremental discovery).
+Scope: filesystem topology/paths and incremental discovery via FSEvents.
 
 ## 1. Recommended crate + API per function
 

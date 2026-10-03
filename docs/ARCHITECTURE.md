@@ -1,9 +1,9 @@
-# repo-scan architecture (Phase 1)
+# repo-scan architecture
 
-Source of truth: `repo-scan-spec.md`. Qualification evidence: `docs/*_QUAL.md`.
+Design contract and architecture for repo-scan. Qualification evidence: `docs/*_QUAL.md`. Report schema: `schemas/report-v1.schema.json`.
 Gate record: `docs/GATE_DECISION.md` (do not edit).
 
-## Ownership and process model (spec §4, as shipped)
+## Ownership and process model (as shipped)
 
 - One catalog-owning process per state directory. There is no IPC: a second
   command waits up to 5 s for the lock, then exits `1` with `owner busy`
@@ -16,18 +16,18 @@ Gate record: `docs/GATE_DECISION.md` (do not edit).
   task through the `Admission` gates, persist findings, complete under
   epoch/lease/revision guards (`src/main.rs:1-11`). The one exception is
   `query --cached`, which opens the catalog read-only with no lock, no epoch
-  claim, and no recovery writes (`src/main.rs:5710-5715`).
-- The owner spawns zero helper processes; the spec §5 admission limits (enum
+  claim, and no recovery writes (`src/main.rs`).
+- The owner spawns zero helper processes; the admission limits (enum
   2 / git 1 / shared 2 / helpers 4) are enforced as in-process caps, so
   exactly one operation is ever admitted at a time
   (`tests/accept_db.rs:9-16`). Scan writes buffer in a `WriterBatch` and
-  commit at the spec §5 limits (`src/main.rs:2158-2162`).
+  commit at configured writer batch limits (`src/main.rs`).
 - Every filesystem/Git access inside inspected scope runs inside the
   traversal fence (below); potentially blocking work is fenced, leased, and
-  watchdog-guarded per task (`src/main.rs:59-66,613-618`). Tool-owned state
-  I/O follows spec §10.
+  watchdog-guarded per task (`src/main.rs`). Tool-owned state
+  I/O follows the qualified Turso storage contract (`docs/TURSO_QUAL.md`).
 
-## Module boundaries (spec §4: these are sufficient)
+## Module boundaries
 
 | Module | Owns | Contract |
 |---|---|---|
@@ -72,18 +72,18 @@ Gate record: `docs/GATE_DECISION.md` (do not edit).
 6. **Resources.** Hard admission (enum 2 / git 1 / shared 2 / helpers 4),
    buffer bounds (prefetch 1024|4MiB, batches 256|256KiB, writer
    512|512KiB|250ms, fds 64), measured targets (1 core, 256 MiB RSS,
-   512 MiB pressure) in `src/config.rs:40-76` (spec §5). The owner samples
+   512 MiB pressure) in `src/config.rs:40-76`. The owner samples
    aggregate RSS each loop and calls `set_pressure` past the 512 MiB
-   threshold (`src/main.rs:2536-2540`); the PERF-02/03 gate harness lives in
-   `benches/perf_gates.rs`, asserted by `tests/accept_perf.rs:359`.
+   threshold (`src/main.rs`); the PERF-02/03 gate harness lives in
+   `benches/perf_gates.rs`, asserted by `tests/accept_perf.rs:362`.
 7. **Reports.** Draft 2020-12 schema at `schemas/report-v1.schema.json`;
    illustrative example at `tests/data/example-report.json`. The binary
    stages through the lib pipeline: stream from the store, verify, retain
-   an immutable snapshot, then atomic publish (`src/main.rs:5555-5663`,
+   an immutable snapshot, then atomic publish (`src/main.rs`,
    `src/report/publish.rs`, `ReportPipeline` at
-   `src/report/builder.rs:1272`). Failed publication marks the snapshot and
+   `src/report/builder.rs`). Failed publication marks the snapshot and
    retries from it without repeating discovery
-   (`src/main.rs:5910-5960`, spec §§15-16).
+   (`src/main.rs`, `docs/TURSO_QUAL.md`, `schemas/report-v1.schema.json`).
 
 ## Shipped hardening (not in the Phase-1 sketch)
 

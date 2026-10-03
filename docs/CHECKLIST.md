@@ -1,4 +1,4 @@
-# Acceptance checklist (spec §17) with test evidence
+# Acceptance checklist with test evidence
 
 Checked = a dedicated test maps to the ID (file:line cited). This lane never runs
 `cargo`, so a check means *covered by the named test*, not *observed passing here*.
@@ -101,7 +101,7 @@ original finding texts.
   (`tests/accept_misc.rs:512`, `tests/events_impl.rs:825,847`).
 - [ ] ERROR-01 — unchecked: permission-denied-then-restored (`tests/accept_db.rs:642`),
   offline-root gap (`:738`), and watchdog grace (`tests/review_fix_main.rs:403`,
-  tripped-count log `src/main.rs:718-721`) are now tested; still missing per spec:
+  tripped-count log `src/main.rs:750-754`) are now tested; still missing:
   stalled-op injection for enumeration/metadata/canonicalization/configuration/
   alternate-store/report-sink (no hook exists, `tests/accept_db.rs:9-16`) and the
   unrelated-activity-cannot-reset-watchdog clause.

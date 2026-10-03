@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://repo-scan.local/schemas/report-v1.schema.json",
   "title": "repo-scan report v1",
-  "description": "Normative report contract for spec section 16. All listed fields are required; unknown values use an explicitly allowed null or state, never omission. Record objects reject undeclared fields in version 1. Non-null relationship IDs must resolve within the report, except envelope, scan, and historical successor IDs (external catalog history) and native identities / event cursors (opaque strings, not foreign keys). Relationship counts must agree with emitted records. ID resolution and count agreement are validated by the REPORT-01 test harness, not by this schema alone.",
+  "description": "Normative report contract for repo-scan v1 reports. All listed fields are required; unknown values use an explicitly allowed null or state, never omission. Record objects reject undeclared fields in version 1. Non-null relationship IDs must resolve within the report, except envelope, scan, and historical successor IDs (external catalog history) and native identities / event cursors (opaque strings, not foreign keys). Relationship counts must agree with emitted records. ID resolution and count agreement are validated by the REPORT-01 test harness, not by this schema alone.",
   "type": "object",
   "required": [
     "schema_version", "report_id", "created_at", "tool", "scan", "coverage",

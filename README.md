@@ -4,7 +4,7 @@ Deterministic, resource-conscious discovery of local copies of a GitHub reposito
 Given a repository URL, `repo-scan` finds matching clones, worktrees, and bare stores,
 inspects branches and working state, and writes a JSON report a recovery agent can consume.
 
-Spec: [repo-scan-spec.md](repo-scan-spec.md).
+Architecture & design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 Adversarial command-path review: [docs/REVIEW_WF4.md](docs/REVIEW_WF4.md).
 
 ## Install / build
@@ -64,7 +64,7 @@ superseded resume, `130` interrupted after bounded progress save.
 - `--state-dir PATH` (global): tool state location. Default on macOS is
   `~/Library/Application Support/repo-scan`; elsewhere `$XDG_STATE_HOME/repo-scan`
   or `~/.local/state/repo-scan`. Resolved to an absolute path once
-  ([src/config.rs](src/config.rs:148)). Layout:
+  ([src/config.rs](src/config.rs)). Layout:
   `instance.lock` (coordination, never deleted) + `payload/` (database, snapshots).
 - `--status metadata|summary|full` (scan only, default `summary`): working-state
   depth. `metadata` skips status probes; `summary` collapses each untracked directory

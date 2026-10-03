@@ -1,7 +1,7 @@
-# Adversarial review WF4: scan/resume/query/invalidate/clear + store tx + publish vs spec §§3,12,15
+# Adversarial review WF4: scan/resume/query/invalidate/clear + store tx + publish
 
 Scope: `src/main.rs` command paths, `src/store` tx boundaries, report staging/publish
-(`src/main.rs` binary path vs `src/report/*` lib path). Spec: `repo-scan-spec.md`.
+(`src/main.rs` binary path vs `src/report/*` lib path). Scope: command paths, store tx boundaries, and report staging/publishing.
 Ordered by bug risk (highest first). Line refs verified against current tree.
 
 ## R1 — High: target-match disposition is global last-scan-wins; reports leak other targets' matches

@@ -51,9 +51,10 @@ fn git_available() -> bool {
 }
 
 fn target_dir() -> PathBuf {
-    std::env::var("CARGO_BUILD_TARGET_DIR")
+    let d = std::env::var("CARGO_BUILD_TARGET_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| manifest_dir().join("target"))
+        .unwrap_or_else(|_| manifest_dir().join("target"));
+    std::fs::canonicalize(&d).unwrap_or(d)
 }
 
 fn harness_bin() -> PathBuf {
