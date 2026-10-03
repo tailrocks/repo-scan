@@ -12,18 +12,22 @@ path = "src/lib.rs"
 [[bin]]
 name = "repo-scan"
 path = "src/main.rs"
+test = false
 
 [[bench]]
 name = "walk_compare"
 harness = false
+test = false
 
 [[bench]]
 name = "scan_cycle"
 harness = false
+test = false
 
 [[bench]]
 name = "perf_gates"
 harness = false
+test = false
 
 [features]
 default = []

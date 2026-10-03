@@ -490,9 +490,9 @@ jobs:
           VELNOR_DOWNSTREAM_TASK_IDS: stack/rust/root/doctest/default,stack/rust/root/doc/default
           VELNOR_MATRIX_ID: stack:rust|task:stack/rust/root/test/default
           VELNOR_MATRIX_KEY: m-8384c14af0d32e34
-          VELNOR_TASK_DIGEST: b3-a81d54383d57025252a109057c1e08a90456e6dbf41c8fad9940de318a398bf7
+          VELNOR_TASK_DIGEST: b3-14d60fa51a95ea6eaf3ce8c74ac07c62cafdc924a32d13d8b756ed85ad354814
           VELNOR_TASK_ID: stack/rust/root/test/default
-        run: "sh -c 'unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN GITHUB_TOKEN MISE_GITHUB_TOKEN GH_TOKEN GH_HOST GH_CONFIG_DIR; date +%s%3N > \"$RUNNER_TEMP/velnor/start-m-8384c14af0d32e34\"; mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo test --locked --offline --manifest-path Cargo.toml --package repo-scan --lib --bins --tests; code=$?; read -r start_ms rest < \"$RUNNER_TEMP/velnor/start-m-8384c14af0d32e34\"; VELNOR_EXIT_CODE=\"$code\" VELNOR_START_MS=\"$start_ms\" VELNOR_INTERNAL_OP=write-task-report-v1 \"$RUNNER_TEMP/velnor/bin/velnor-actions-0.1.0\"; helper_code=$?; if [ \"$code\" -ne 0 ]; then exit \"$code\"; fi; exit \"$helper_code\"'"
+        run: "sh -c 'unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN GITHUB_TOKEN MISE_GITHUB_TOKEN GH_TOKEN GH_HOST GH_CONFIG_DIR; date +%s%3N > \"$RUNNER_TEMP/velnor/start-m-8384c14af0d32e34\"; mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo test --locked --offline --manifest-path Cargo.toml --package repo-scan --lib --tests; code=$?; read -r start_ms rest < \"$RUNNER_TEMP/velnor/start-m-8384c14af0d32e34\"; VELNOR_EXIT_CODE=\"$code\" VELNOR_START_MS=\"$start_ms\" VELNOR_INTERNAL_OP=write-task-report-v1 \"$RUNNER_TEMP/velnor/bin/velnor-actions-0.1.0\"; helper_code=$?; if [ \"$code\" -ne 0 ]; then exit \"$code\"; fi; exit \"$helper_code\"'"
       - name: Doctests
         if: "!contains(needs.plan.outputs.covered_tasks, ',stack/rust/root/doctest/default,')"
         env:

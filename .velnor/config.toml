@@ -8,6 +8,7 @@ schema = 1
 # Optional workflow display and policy settings. Omitted values use Velnor defaults.
 [workflow]
 runner_label = "ubuntu-24.04"
+default_branch = "main"
 
 
 # Optional resource limits for generated jobs.
