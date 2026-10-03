@@ -10093,11 +10093,14 @@ pub fn test_clear_preflight_removal_seam(
     // Deterministic race plant BETWEEN preflight and removal.
     let planted = match swap {
         TestClearSeamSwap::None => Ok(()),
-        TestClearSeamSwap::ReplaceVictim => std::fs::remove_file(payload.join("catalog.db"))
-            .and_then(|()| {
-                std::fs::write(payload.join("catalog.db"), b"swapped catalog bytes").map(|_| ())
-            })
-            .map_err(io_err),
+        TestClearSeamSwap::ReplaceVictim => {
+            let tmp_victim = payload.join("catalog.db.swap");
+            std::fs::write(&tmp_victim, b"swapped catalog bytes")
+                .map_err(io_err)
+                .and_then(|()| {
+                    std::fs::rename(&tmp_victim, payload.join("catalog.db")).map_err(io_err)
+                })
+        }
         TestClearSeamSwap::PlantVictimSymlink => {
             let sentinel = state_dir.join("seam-sentinel");
             std::fs::write(&sentinel, b"outside bytes")
