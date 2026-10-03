@@ -312,7 +312,7 @@ fn rspriv12_query_output_scrubs_stored_paths() {
 #[test]
 fn rsci01_audit_provenance_recorded() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let wf = std::fs::read_to_string(root.join(".github/workflows/audit.yml")).expect("audit.yml");
+    let wf = std::fs::read_to_string(root.join("docs/workflows/audit.yml")).expect("audit.yml");
     for needle in [
         "rustc --version --verbose",
         "cargo-home/bin/cargo-audit",

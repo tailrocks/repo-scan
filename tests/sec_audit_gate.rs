@@ -18,7 +18,7 @@ fn read(rel: &str) -> String {
 
 #[test]
 fn audit_gate_files_enforced() {
-    let wf_text = read(".github/workflows/audit.yml");
+    let wf_text = read("docs/workflows/audit.yml");
     for needle in [
         "push:",
         "pull_request:",
@@ -105,7 +105,7 @@ fn audit_gate_files_enforced() {
 // checkout with isolated Cargo state so PR-controlled config cannot execute.
 #[test]
 fn checkout_persists_no_credentials() {
-    let wf = read(".github/workflows/audit.yml");
+    let wf = read("docs/workflows/audit.yml");
     for needle in [
         "persist-credentials: false",
         "extraheader",
@@ -120,7 +120,7 @@ fn checkout_persists_no_credentials() {
 // CI-SC-02: runner, toolchain, and audit tools are pinned exactly.
 #[test]
 fn toolchain_and_tools_pinned() {
-    let wf = read(".github/workflows/audit.yml");
+    let wf = read("docs/workflows/audit.yml");
     for needle in [
         "runs-on: ubuntu-24.04",
         "toolchain: 1.85.0",
@@ -143,7 +143,7 @@ fn toolchain_and_tools_pinned() {
 // are SHA-256-verified fail-closed before installation.
 #[test]
 fn tool_provenance_and_archive_verification() {
-    let wf = read(".github/workflows/audit.yml");
+    let wf = read("docs/workflows/audit.yml");
     for needle in [
         "Verify pinned tool archives",
         "static.crates.io/crates/",
@@ -184,7 +184,7 @@ fn tool_provenance_and_archive_verification() {
 // workflow points at the doc so edits to either are review-visible.
 #[test]
 fn tamper_evidence_documented() {
-    let wf = read(".github/workflows/audit.yml");
+    let wf = read("docs/workflows/audit.yml");
     assert!(
         wf.contains("docs/AUDIT_GATE.md"),
         "audit.yml must reference docs/AUDIT_GATE.md"
@@ -206,7 +206,7 @@ fn tamper_evidence_documented() {
 // CI-SC-04: bounded execution — job timeout plus PR concurrency cancellation.
 #[test]
 fn bounded_execution() {
-    let wf = read(".github/workflows/audit.yml");
+    let wf = read("docs/workflows/audit.yml");
     for needle in [
         "timeout-minutes:",
         "concurrency:",

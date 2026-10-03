@@ -215,7 +215,7 @@ fn audit_gate_is_documented() {
     assert!(text.contains("cargo audit"), "must name cargo-audit");
     assert!(text.contains("cargo deny"), "must name cargo-deny");
     assert!(
-        text.contains("ENFORCED") && text.contains(".github/workflows/audit.yml"),
+        text.contains("ENFORCED") && text.contains("docs/workflows/audit.yml"),
         "must record the enforcing workflow"
     );
 }
