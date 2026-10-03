@@ -75,7 +75,9 @@ dispatch2 = "0.3"
 jsonschema = "0.58.3"
 
 [profile.dev]
-debug = 1
+debug = 0
+strip = "debuginfo"
 
 [profile.test]
-debug = 1
+debug = 0
+strip = "debuginfo"
