@@ -543,6 +543,20 @@ async fn reclassify_for_target(
 // ---------------------------------------------------------------------------
 
 async fn run_scan(cfg: &config::Config, args: &repo_scan::cli::ScanArgs) -> ExitCode {
+    // Goal Step 6: explicit targets XOR --all. This slice executes exactly
+    // one target; multi-target and --all execution follow with the
+    // shared-generation slice (one filesystem pass for all targets).
+    match args.target_set() {
+        Ok(repo_scan::cli::TargetSet::Targets(t)) if t.len() == 1 => {}
+        Ok(_) => {
+            eprintln!(
+                "repo-scan: not yet implemented: multi-target and --all scans execute in the \
+                 next slice; use exactly one TARGET for now"
+            );
+            return ExitCode::OperationalFailure;
+        }
+        Err(msg) => return fail(&repo_scan::Error::InvalidArgs(msg)),
+    }
     match run_scan_inner(cfg, args, None).await {
         Ok(code) => code,
         Err(e) => fail(&e),
@@ -561,13 +575,19 @@ async fn run_scan_inner(
     // targets (userinfo, any query/fragment tail) are rejected before any
     // persistence or reporting; the error echoes only the display-safe
     // shape, never secret bytes.
-    if identity::must_reject_target(&args.url) {
+    let Some(primary) = args.primary_target() else {
+        return Err(repo_scan::Error::InvalidArgs(
+            "scan requires exactly one TARGET in this slice (multi-target/--all execution follows)"
+                .to_string(),
+        ));
+    };
+    if identity::must_reject_target(primary) {
         return Err(repo_scan::Error::InvalidArgs(format!(
             "target URL must not embed credentials or a query/fragment tail; remove them and retry: {}",
-            identity::redact_target_for_display(&args.url),
+            identity::redact_target_for_display(primary),
         )));
     }
-    let (target, canonical) = resolve_target_identity(&args.url)?;
+    let (target, canonical) = resolve_target_identity(primary)?;
     // Absolute report destination at request-creation time (spec §3).
     let report_dest = args
         .report
@@ -7706,6 +7726,20 @@ async fn run_query_inner(
     cfg: &config::Config,
     args: &repo_scan::cli::QueryArgs,
 ) -> repo_scan::Result<ExitCode> {
+    // Goal Step 6: exactly one of TARGET / --all / --scan. This slice
+    // executes the cached single-target path; --all/--scan/--follow follow
+    // with the replay slice.
+    let selection = match args.selection() {
+        Ok(s) => s,
+        Err(msg) => return Err(repo_scan::Error::InvalidArgs(msg)),
+    };
+    let repo_scan::cli::QuerySelection::Target(url) = selection else {
+        eprintln!(
+            "repo-scan: not yet implemented: query --all/--scan/--follow execute in the next \
+             slice; use one TARGET with --cached for now"
+        );
+        return Ok(ExitCode::OperationalFailure);
+    };
     if !args.cached {
         return Err(repo_scan::Error::InvalidArgs(
             "--cached is required: live queries are not supported".to_string(),
@@ -7780,9 +7814,9 @@ async fn run_query_inner(
         let _ = store.close().await;
         return Ok(ExitCode::Incomplete);
     }
-    let Some(canonical) = normalize_query_cached(&args.url) else {
+    let Some(canonical) = normalize_query_cached(&url) else {
         println!("cached: true");
-        println!("target: {}", identity::redact_target_for_display(&args.url));
+        println!("target: {}", identity::redact_target_for_display(&url));
         println!("canonical: unresolved (unsupported shape or unresolvable host alias)");
         println!("note: aliases resolve only from cached observations; no live probe performed");
         let _ = store.close().await;
@@ -7830,7 +7864,7 @@ async fn run_query_inner(
     )
     .await?;
     println!("cached: true (no live verification performed)");
-    println!("target: {}", identity::redact_target_for_display(&args.url));
+    println!("target: {}", identity::redact_target_for_display(&url));
     println!("canonical: {canonical}");
     for (id, policy, state, created) in &generations {
         println!(
@@ -8136,12 +8170,16 @@ async fn continue_saved_scan(
         row.scope
     );
     let args = repo_scan::cli::ScanArgs {
-        url,
+        targets: vec![url],
+        all: false,
         scope,
         report,
         force_rescan: false,
         status,
         root,
+        format: None,
+        fetch: false,
+        color: None,
     };
     // The row's bound generation (R14), if any; `run_scan_inner`
     // honors it instead of re-picking.
