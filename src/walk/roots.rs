@@ -94,10 +94,11 @@ pub fn plan_machine_roots(mounts: &[MountPoint]) -> Vec<PlannedRoot> {
     roots
 }
 
-/// Full generation scope key (goal Step 9, contract D5): normalized policy
-/// + canonical roots + per-root volume identity, order-independent. Two
-/// scans share filesystem coverage if and only if their keys match; targets
-/// stay OUT (one pass serves all targets; filtering is separate).
+/// Full generation scope key (goal Step 9, contract D5): normalized
+/// policy, canonical roots, and per-root volume identity,
+/// order-independent. Two scans share filesystem coverage if and only if
+/// their keys match; targets stay OUT (one pass serves all targets;
+/// filtering is separate).
 ///
 /// Entry per root: dedup namespace (volume UUID/mount, or `explicit`/`seed`),
 /// canonical path bytes, and the device number pinning the volume. Device

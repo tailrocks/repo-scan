@@ -24,6 +24,18 @@ pub enum Op {
     Remove,
 }
 
+impl Op {
+    /// Journal/wire name (`add` | `replace` | `remove`).
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Op::Add => "add",
+            Op::Replace => "replace",
+            Op::Remove => "remove",
+        }
+    }
+}
+
 /// Event class (contract D4 `type` column).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -68,6 +80,27 @@ impl EventType {
             | EventType::ScanIncomplete
             | EventType::ScanInterrupted
             | EventType::ScanFailed => Op::Add,
+        }
+    }
+
+    /// Journal/wire name (snake_case, matches the serde spelling).
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            EventType::ScanStarted => "scan_started",
+            EventType::DiscoveryProgress => "discovery_progress",
+            EventType::LocationFound => "location_found",
+            EventType::RepositoryFound => "repository_found",
+            EventType::InventoryReady => "inventory_ready",
+            EventType::BranchBatch => "branch_batch",
+            EventType::LocationUpdated => "location_updated",
+            EventType::CoverageUpdated => "coverage_updated",
+            EventType::Error => "error",
+            EventType::RemoteUpdated => "remote_updated",
+            EventType::ScanCompleted => "scan_completed",
+            EventType::ScanIncomplete => "scan_incomplete",
+            EventType::ScanInterrupted => "scan_interrupted",
+            EventType::ScanFailed => "scan_failed",
         }
     }
 }
@@ -264,9 +297,13 @@ mod tests {
         for (t, _, name) in ALL_TYPES {
             let v = serde_json::to_value(t).unwrap();
             assert_eq!(v, serde_json::Value::String(name.to_string()), "{t:?}");
+            assert_eq!(t.name(), name, "journal name for {t:?}");
             let back: EventType = serde_json::from_value(v).unwrap();
             assert_eq!(back, t);
         }
+        assert_eq!(Op::Add.name(), "add");
+        assert_eq!(Op::Replace.name(), "replace");
+        assert_eq!(Op::Remove.name(), "remove");
     }
 
     #[test]
