@@ -775,7 +775,7 @@ fn verify_bound_parent(
 }
 
 /// True when the existing file parses as a `repo-scan` report: a JSON
-/// object with `schema_version: "1.0.0"`, `tool.name: "repo-scan"`, a
+/// object with the current `schema_version`, `tool.name: "repo-scan"`, a
 /// nonempty tool version, and a nonempty snapshot-safe `report_id`. A
 /// filename extension alone is never proof. Reads from an `O_NOFOLLOW`
 /// regular-file FD under the staged-report cap so a swapped-in symlink,

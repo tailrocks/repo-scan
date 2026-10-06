@@ -5,7 +5,7 @@
 
 use repo_scan::model::StatusMode;
 use repo_scan::report::builder::{stream_report_from_store, ReportInputs, ReportPipeline};
-use repo_scan::report::model::{EncodedName, Remote, Scan};
+use repo_scan::report::model::{EncodedName, Remote, Scan, ScanTarget};
 use repo_scan::store::{
     NewCheckout, NewGitInstance, NewRef, NewRemote, NewScan, NewStatus, NewVolume, Store,
     TursoStore,
@@ -62,6 +62,7 @@ fn test_inputs(report_id: &str) -> ReportInputs {
         catalog_revision: 7,
         target_url: "https://github.com/OWNER/REPO".to_string(),
         canonical_url: Some("https://github.com/owner/repo".to_string()),
+        targets: vec![],
         scope: "roots".to_string(),
         scan_state: "complete".to_string(),
         started_at_ms: 1_759_154_398_000,
@@ -323,6 +324,11 @@ fn api_report_model_sanitized_drops_canaries() {
         catalog_revision: 1,
         target_url: "https://user:FAILAPIMODELCANARY05@github.com/o/r".to_string(),
         canonical_url: Some("https://github.com/o/r?jwt=FAILAPIMODELCANARY06".to_string()),
+        targets: vec![ScanTarget {
+            raw: "https://user:FAILAPIMODELCANARY08@github.com/o/r".to_string(),
+            canonical: Some("https://github.com/o/r?jwt=FAILAPIMODELCANARY09".to_string()),
+            matched_repositories: 1,
+        }],
         matching_policy: "v1".to_string(),
         scope: "roots".to_string(),
         state: "complete".to_string(),
@@ -336,6 +342,8 @@ fn api_report_model_sanitized_drops_canaries() {
     let bytes = serde_json::to_vec(&scan).expect("scan json");
     assert!(!contains_bytes(&bytes, b"FAILAPIMODELCANARY05"));
     assert!(!contains_bytes(&bytes, b"FAILAPIMODELCANARY06"));
+    assert!(!contains_bytes(&bytes, b"FAILAPIMODELCANARY08"));
+    assert!(!contains_bytes(&bytes, b"FAILAPIMODELCANARY09"));
     assert!(
         scan.target_url.contains("<redacted>"),
         "{}",

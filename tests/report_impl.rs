@@ -40,6 +40,7 @@ fn test_inputs(report_id: &str) -> ReportInputs {
         catalog_revision: 7,
         target_url: "https://github.com/OWNER/REPO".to_string(),
         canonical_url: Some("https://github.com/owner/repo".to_string()),
+        targets: vec![],
         scope: "roots".to_string(),
         scan_state: "complete".to_string(),
         started_at_ms: 1_759_154_398_000,
@@ -800,7 +801,10 @@ fn caller_owned_sections_stream() {
 /// Compile the shipped Draft 2020-12 schema. Local `$ref`s only, so this
 /// performs no network I/O.
 fn schema_validator() -> jsonschema::Validator {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/schemas/report-v1.schema.json");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/schemas/report-v1.1.schema.json"
+    );
     let bytes = std::fs::read(path).expect("read shipped schema");
     let schema: serde_json::Value = serde_json::from_slice(&bytes).expect("schema parses");
     jsonschema::validator_for(&schema).expect("shipped schema compiles")

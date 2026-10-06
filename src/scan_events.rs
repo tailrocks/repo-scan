@@ -233,7 +233,11 @@ mod tests {
 
     const ALL_TYPES: [(EventType, Op, &str); 14] = [
         (EventType::ScanStarted, Op::Add, "scan_started"),
-        (EventType::DiscoveryProgress, Op::Replace, "discovery_progress"),
+        (
+            EventType::DiscoveryProgress,
+            Op::Replace,
+            "discovery_progress",
+        ),
         (EventType::LocationFound, Op::Add, "location_found"),
         (EventType::RepositoryFound, Op::Add, "repository_found"),
         (EventType::InventoryReady, Op::Add, "inventory_ready"),
@@ -303,15 +307,18 @@ mod tests {
             serde_json::Value::Null,
         );
         assert!(env.reset);
-        let back: Envelope =
-            serde_json::from_str(&serde_json::to_string(&env).unwrap()).unwrap();
+        let back: Envelope = serde_json::from_str(&serde_json::to_string(&env).unwrap()).unwrap();
         assert!(back.reset);
     }
 
     #[test]
     fn coalescible_only_discovery_progress() {
         for (t, _, _) in ALL_TYPES {
-            assert_eq!(is_progress_coalescible(t), t == EventType::DiscoveryProgress, "{t:?}");
+            assert_eq!(
+                is_progress_coalescible(t),
+                t == EventType::DiscoveryProgress,
+                "{t:?}"
+            );
         }
     }
 
@@ -344,11 +351,11 @@ mod tests {
         for bad in [
             "",
             "!!!",
-            "v1:1:2:3", // raw, not base64url
-            &b64url_encode(b"v2:1:2:3"), // wrong version tag
-            &b64url_encode(b"v1:1:2"),   // missing field
-            &b64url_encode(b"v1:1:2:3:4"), // extra field
-            &b64url_encode(b"v1:x:2:3"), // non-numeric
+            "v1:1:2:3",                                     // raw, not base64url
+            &b64url_encode(b"v2:1:2:3"),                    // wrong version tag
+            &b64url_encode(b"v1:1:2"),                      // missing field
+            &b64url_encode(b"v1:1:2:3:4"),                  // extra field
+            &b64url_encode(b"v1:x:2:3"),                    // non-numeric
             &b64url_encode(b"v1:1:2:18446744073709551616"), // u64 overflow
         ] {
             assert_eq!(Cursor::decode(bad), None, "{bad}");

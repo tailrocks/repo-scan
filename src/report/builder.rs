@@ -25,8 +25,8 @@ use crate::report::encode::{
 };
 use crate::report::model::{
     Alias, Branch, Candidate, Checkout, Coverage, ErrorRecord, GeneratedArtifact, Head, ObjectId,
-    PathRecord, Remote, Report, Repository, Resources, Root, Scan, Status, StorageLink, Tool,
-    Volume,
+    PathRecord, Remote, Report, Repository, Resources, Root, Scan, ScanTarget, Status, StorageLink,
+    Tool, Volume,
 };
 use crate::report::publish::{
     check_report_id, check_staged_memory_budget, publish_bound, retain_bound, BoundStaged,
@@ -136,6 +136,8 @@ pub struct ReportInputs {
     pub catalog_revision: u64,
     pub target_url: String,
     pub canonical_url: Option<String>,
+    /// Full requested target set in request order (empty for `--all`).
+    pub targets: Vec<ScanTarget>,
     pub scope: String,
     pub scan_state: String,
     pub started_at_ms: i64,
@@ -1087,6 +1089,15 @@ async fn stream_with_pre_pass<W: Write>(
             .canonical_url
             .as_ref()
             .map(|url| redact_remote_url(url)),
+        targets: inputs
+            .targets
+            .iter()
+            .map(|t| ScanTarget {
+                raw: redact_remote_url(&t.raw),
+                canonical: t.canonical.as_ref().map(|url| redact_remote_url(url)),
+                matched_repositories: t.matched_repositories,
+            })
+            .collect(),
         matching_policy: crate::identity::MATCHING_POLICY.to_string(),
         scope: inputs.scope.clone(),
         state: inputs.scan_state.clone(),

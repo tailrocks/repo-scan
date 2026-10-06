@@ -154,8 +154,7 @@ pub fn render_plain(report: &Report) -> String {
 mod tests {
     use super::*;
     use crate::report::model::{
-        Candidate, Checkout, Coverage, ErrorRecord, Head, Repository, Resources, Scan, Status,
-        Tool,
+        Candidate, Checkout, Coverage, ErrorRecord, Head, Repository, Resources, Scan, Status, Tool,
     };
 
     fn empty_report() -> Report {
@@ -175,6 +174,7 @@ mod tests {
                 catalog_revision: 1,
                 target_url: "https://github.com/o/r".to_string(),
                 canonical_url: None,
+                targets: vec![],
                 matching_policy: "v1".to_string(),
                 scope: "machine".to_string(),
                 state: "running".to_string(),

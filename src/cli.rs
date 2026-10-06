@@ -118,9 +118,9 @@ impl ScanArgs {
     /// Validate the target selection: explicit targets XOR `--all`.
     pub fn target_set(&self) -> Result<TargetSet, String> {
         match (self.all, self.targets.is_empty()) {
-            (true, false) => {
-                Err(String::from("--all cannot be combined with explicit targets"))
-            }
+            (true, false) => Err(String::from(
+                "--all cannot be combined with explicit targets",
+            )),
             (true, true) => Ok(TargetSet::All),
             (false, true) => Err(String::from("provide at least one TARGET or --all")),
             (false, false) => Ok(TargetSet::Targets(self.targets.clone())),

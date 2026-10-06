@@ -116,7 +116,10 @@ fn cli01_six_exact_commands_parse() {
     .expect("scan parses");
     match cli.command {
         Command::Scan(args) => {
-            assert_eq!(args.targets, vec!["https://github.com/OWNER/REPO".to_string()]);
+            assert_eq!(
+                args.targets,
+                vec!["https://github.com/OWNER/REPO".to_string()]
+            );
             assert!(!args.all);
             assert!(matches!(args.scope, Scope::Machine));
             assert_eq!(args.report, Some(PathBuf::from("repository-report.json")));
@@ -211,7 +214,7 @@ fn cli01_command_table_end_to_end() {
     let report_path = env.cwd_a.join("rep.json");
     assert!(report_path.exists(), "report published");
     let report = read_report(&report_path);
-    assert_eq!(report["schema_version"].as_str(), Some("1.0.0"));
+    assert_eq!(report["schema_version"].as_str(), Some("1.1.0"));
     assert_eq!(report["tool"]["name"].as_str(), Some("repo-scan"));
     assert_eq!(report["scan"]["id"].as_str(), Some(scan_id.as_str()));
     assert_eq!(report["scan"]["scope"].as_str(), Some("roots"));
@@ -640,4 +643,122 @@ fn cli03_superseded_resume_names_successor() {
         stdout.contains("no target or destination switch"),
         "{stdout}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Step 6 execution: multi-target union, owner/name, and --all from one pass.
+// ---------------------------------------------------------------------------
+
+const URL_B: &str = "https://github.com/OTHER/REPO2";
+
+/// Second matching clone with a different origin, beside Env's default repo.
+fn add_second_clone(env: &Env) {
+    let other = fixture::normal_clone(&env.fixture, "repo-b");
+    fixture::git(&other, &["remote", "set-url", "origin", URL_B]);
+}
+
+fn confirmed_repos(report: &serde_json::Value) -> Vec<&serde_json::Value> {
+    report["repositories"]
+        .as_array()
+        .expect("repositories array")
+        .iter()
+        .filter(|r| r["match"] == "confirmed")
+        .collect()
+}
+
+#[test]
+fn step6_multi_target_union_single_pass() {
+    let env = Env::new();
+    add_second_clone(&env);
+    let out = run(
+        &[
+            "scan",
+            URL,
+            URL_B,
+            "--root",
+            env.fixture_str.as_str(),
+            "--report",
+            "rep.json",
+        ],
+        &env.cwd_a,
+        &env.state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let report = read_report(&env.cwd_a.join("rep.json"));
+    assert_eq!(report["schema_version"], "1.1.0");
+    // Full target set in request order with per-target match counts.
+    let targets = report["scan"]["targets"].as_array().expect("targets array");
+    assert_eq!(targets.len(), 2);
+    assert_eq!(targets[0]["raw"], URL);
+    assert_eq!(targets[0]["canonical"], "https://github.com/owner/repo");
+    assert_eq!(targets[1]["raw"], URL_B);
+    assert_eq!(targets[1]["canonical"], "https://github.com/other/repo2");
+    assert!(targets[0]["matched_repositories"].as_u64().unwrap() >= 1);
+    assert!(targets[1]["matched_repositories"].as_u64().unwrap() >= 1);
+    // Legacy primary-target fields repeat the first target.
+    assert_eq!(report["scan"]["target_url"], URL);
+    // One report, one generation: both repos confirmed from one pass.
+    assert_eq!(confirmed_repos(&report).len(), 2);
+    assert_eq!(report["scan"]["state"], "complete");
+}
+
+#[test]
+fn step6_owner_name_target_matches_url() {
+    let env = Env::new();
+    let out = run(
+        &[
+            "scan",
+            "OWNER/REPO",
+            "--root",
+            env.fixture_str.as_str(),
+            "--report",
+            "rep.json",
+        ],
+        &env.cwd_a,
+        &env.state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let report = read_report(&env.cwd_a.join("rep.json"));
+    assert_eq!(report["scan"]["target_url"], "OWNER/REPO");
+    assert_eq!(
+        report["scan"]["canonical_url"],
+        "https://github.com/owner/repo"
+    );
+    let targets = report["scan"]["targets"].as_array().expect("targets array");
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0]["raw"], "OWNER/REPO");
+    assert_eq!(targets[0]["canonical"], "https://github.com/owner/repo");
+    assert_eq!(confirmed_repos(&report).len(), 1);
+}
+
+#[test]
+fn step6_all_finds_without_target_filter() {
+    let env = Env::new();
+    add_second_clone(&env);
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            env.fixture_str.as_str(),
+            "--report",
+            "rep.json",
+        ],
+        &env.cwd_a,
+        &env.state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let report = read_report(&env.cwd_a.join("rep.json"));
+    assert_eq!(report["scan"]["target_url"], "--all");
+    assert!(report["scan"]["canonical_url"].is_null());
+    assert_eq!(
+        report["scan"]["targets"]
+            .as_array()
+            .expect("targets array")
+            .len(),
+        0
+    );
+    // No filter: every discovered store is in scope and confirmed.
+    assert_eq!(confirmed_repos(&report).len(), 2);
+    assert_eq!(report["scan"]["state"], "complete");
 }
