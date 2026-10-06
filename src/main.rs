@@ -730,36 +730,71 @@ async fn reclassify_for_targets(
 // Scan
 // ---------------------------------------------------------------------------
 
-/// Scan-scoped event journal writer (D4): assigns contiguous `seq`s, tracks
-/// the per-revision event offset, and resumes numbering after a restart via
-/// [`TursoStore::last_event_seq`] so a resumed scan never reuses a `seq`.
+/// Scan-scoped event journal writer (D4): assigns contiguous 1-based
+/// `seq`s (`seq` 0 is the "before everything" cursor), tracks the
+/// per-revision event offset, and dedupes found events per store/checkout
+/// id so re-probes and resume re-runs never double-emit. `open` replays
+/// the committed prefix to resume numbering AND the emitted sets: a task
+/// whose flush committed but whose completion was lost re-persists its
+/// rows idempotently while its found events stay single.
 struct ScanJournal {
     scan_id: String,
     next_seq: u64,
+    /// This run's catalog revision: `next_revision` runs once per scan,
+    /// so every event this writer journals shares one `rev`.
+    rev: u64,
     last_rev: Option<u64>,
     last_off: u64,
     last_seq: Option<u64>,
+    emitted_stores: HashSet<String>,
+    emitted_checkouts: HashSet<String>,
 }
 
 impl ScanJournal {
-    async fn open(store: &TursoStore, scan_id: &str, resumed: bool) -> repo_scan::Result<Self> {
-        // 1-based: `seq` 0 is the "before everything" cursor, and
-        // `read_scan_events` replays strictly after its `after_seq`.
-        let next_seq = if resumed {
-            store
-                .last_event_seq(scan_id)
-                .await?
-                .map(|seq| seq + 1)
-                .unwrap_or(1)
-        } else {
-            1
-        };
+    async fn open(store: &TursoStore, scan_id: &str, rev: u64) -> repo_scan::Result<Self> {
+        let mut max_seq = 0u64;
+        let mut last_rev = None;
+        let mut last_off = 0u64;
+        let mut emitted_stores = HashSet::new();
+        let mut emitted_checkouts = HashSet::new();
+        loop {
+            let rows = store.read_scan_events(scan_id, max_seq, 500).await?;
+            let short = rows.len() < 500;
+            for row in &rows {
+                max_seq = row.seq;
+                last_rev = Some(row.catalog_rev);
+                last_off = row.event_offset;
+                let id_key = match row.event_type.as_str() {
+                    "repository_found" => Some((&mut emitted_stores, "store_id")),
+                    "location_found" => Some((&mut emitted_checkouts, "checkout_id")),
+                    _ => None,
+                };
+                if let Some((set, key)) = id_key {
+                    let v: serde_json::Value =
+                        serde_json::from_slice(&row.records).map_err(|e| {
+                            repo_scan::Error::Report(format!(
+                                "scan_events row seq {} carries corrupt records: {e}",
+                                row.seq,
+                            ))
+                        })?;
+                    if let Some(id) = v.get(key).and_then(|v| v.as_str()) {
+                        set.insert(id.to_string());
+                    }
+                }
+            }
+            if short {
+                break;
+            }
+        }
         Ok(Self {
             scan_id: scan_id.to_string(),
-            next_seq,
-            last_rev: None,
-            last_off: 0,
-            last_seq: None,
+            next_seq: max_seq + 1,
+            rev,
+            last_rev,
+            last_off,
+            last_seq: if max_seq == 0 { None } else { Some(max_seq) },
+            emitted_stores,
+            emitted_checkouts,
         })
     }
 
@@ -776,27 +811,39 @@ impl ScanJournal {
         }
     }
 
-    /// Journal one lifecycle event against the currently committed catalog
-    /// revision. Each call is its own transaction (lifecycle events are
-    /// rare); per-record streaming batches follow in a later slice.
+    /// Assign the next `(seq, offset)` pair against this run's rev. The
+    /// offset restarts at 0 when the rev changes (a resumed run journals
+    /// under a fresh revision).
+    fn assign(&mut self) -> (u64, u64) {
+        let off = if self.last_rev == Some(self.rev) {
+            self.last_off + 1
+        } else {
+            0
+        };
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.last_rev = Some(self.rev);
+        self.last_off = off;
+        self.last_seq = Some(seq);
+        (seq, off)
+    }
+
+    /// Journal one lifecycle event. Each call is its own transaction
+    /// (lifecycle events are rare); per-record events buffer into the
+    /// writer batch below instead.
     async fn emit(
         &mut self,
         store: &TursoStore,
         event_type: EventType,
         records: &serde_json::Value,
     ) -> repo_scan::Result<()> {
-        let rev = store.current_revision().await?;
-        let off = if self.last_rev == Some(rev) {
-            self.last_off + 1
-        } else {
-            0
-        };
+        let (seq, off) = self.assign();
         let bytes =
             serde_json::to_vec(records).map_err(|e| repo_scan::Error::Report(e.to_string()))?;
         let event = NewScanEvent {
             scan_id: &self.scan_id,
-            seq: self.next_seq,
-            catalog_rev: rev,
+            seq,
+            catalog_rev: self.rev,
             event_offset: off,
             event_type: event_type.name(),
             op: event_type.op().name(),
@@ -804,11 +851,59 @@ impl ScanJournal {
             records: &bytes,
         };
         store.append_scan_event(&event).await?;
-        self.next_seq += 1;
-        self.last_rev = Some(rev);
-        self.last_off = off;
-        self.last_seq = Some(event.seq);
         Ok(())
+    }
+
+    /// Buffer one `repository_found` into the writer batch: it commits
+    /// atomically with the store row that caused it. Returns `None` when
+    /// this store already has a found event in this scan's journal
+    /// (re-probe or resume re-run); otherwise `Some(should_flush)`.
+    fn buffer_repository_found(
+        &mut self,
+        batch: &mut WriterBatch,
+        store_id: &str,
+        records: &[u8],
+    ) -> repo_scan::Result<Option<bool>> {
+        if !self.emitted_stores.insert(store_id.to_string()) {
+            return Ok(None);
+        }
+        let (seq, off) = self.assign();
+        let event = NewScanEvent {
+            scan_id: &self.scan_id,
+            seq,
+            catalog_rev: self.rev,
+            event_offset: off,
+            event_type: EventType::RepositoryFound.name(),
+            op: EventType::RepositoryFound.op().name(),
+            reset: false,
+            records,
+        };
+        Ok(Some(TursoStore::buffer_scan_event(batch, &event)?))
+    }
+
+    /// Buffer one `location_found` into the writer batch (same atomicity
+    /// and dedupe contract as [`Self::buffer_repository_found`]).
+    fn buffer_location_found(
+        &mut self,
+        batch: &mut WriterBatch,
+        checkout_id: &str,
+        records: &[u8],
+    ) -> repo_scan::Result<Option<bool>> {
+        if !self.emitted_checkouts.insert(checkout_id.to_string()) {
+            return Ok(None);
+        }
+        let (seq, off) = self.assign();
+        let event = NewScanEvent {
+            scan_id: &self.scan_id,
+            seq,
+            catalog_rev: self.rev,
+            event_offset: off,
+            event_type: EventType::LocationFound.name(),
+            op: EventType::LocationFound.op().name(),
+            reset: false,
+            records,
+        };
+        Ok(Some(TursoStore::buffer_scan_event(batch, &event)?))
     }
 }
 
@@ -1101,10 +1196,10 @@ async fn run_scan_inner(
         )
         .await?;
     runner.counters.db_transactions += 1;
-    // Lifecycle journal (D4): fresh scans open at seq 0 with `scan_started`;
-    // resumed scans continue after the last committed seq without repeating
-    // the start marker.
-    let mut journal = ScanJournal::open(&store, &scan_id, resumed.is_some()).await?;
+    // Lifecycle journal (D4): opened against this run's revision.
+    // `open` replays the committed prefix, so resumed scans continue
+    // numbering (and found-event dedupe) without repeating `scan_started`.
+    runner.journal = Some(ScanJournal::open(&store, &scan_id, run_rev).await?);
     if resumed.is_none() {
         let started = serde_json::json!({
             "scan_id": &scan_id,
@@ -1125,7 +1220,10 @@ async fn run_scan_inner(
             },
             "resume_cmd": resume_cmd_for(&cfg.state_dir, &scan_id),
         });
-        journal
+        runner
+            .journal
+            .as_mut()
+            .expect("scan journal opened above")
             .emit(&store, EventType::ScanStarted, &started)
             .await?;
         runner.counters.db_transactions += 1;
@@ -1324,7 +1422,10 @@ async fn run_scan_inner(
             "event_history": event_gaps,
         },
     });
-    journal
+    runner
+        .journal
+        .as_mut()
+        .expect("scan journal opened above")
         .emit(&store, EventType::InventoryReady, &ready)
         .await?;
     runner.counters.db_transactions += 1;
@@ -1405,8 +1506,18 @@ async fn run_scan_inner(
                             store::now_ms(),
                         )
                         .await?;
-                    let failed = failed_records(&journal, &err, &cfg.state_dir, &scan_id);
-                    journal.emit(&store, EventType::ScanFailed, &failed).await?;
+                    let failed = failed_records(
+                        runner.journal.as_ref().expect("scan journal opened above"),
+                        &err,
+                        &cfg.state_dir,
+                        &scan_id,
+                    );
+                    runner
+                        .journal
+                        .as_mut()
+                        .expect("scan journal opened above")
+                        .emit(&store, EventType::ScanFailed, &failed)
+                        .await?;
                     let _ = store.close().await;
                     println!("scan_id: {scan_id}");
                     println!("report_id: {report_id}");
@@ -1447,8 +1558,18 @@ async fn run_scan_inner(
                             store::now_ms(),
                         )
                         .await?;
-                    let failed = failed_records(&journal, &err, &cfg.state_dir, &scan_id);
-                    journal.emit(&store, EventType::ScanFailed, &failed).await?;
+                    let failed = failed_records(
+                        runner.journal.as_ref().expect("scan journal opened above"),
+                        &err,
+                        &cfg.state_dir,
+                        &scan_id,
+                    );
+                    runner
+                        .journal
+                        .as_mut()
+                        .expect("scan journal opened above")
+                        .emit(&store, EventType::ScanFailed, &failed)
+                        .await?;
                     let _ = store.close().await;
                     println!("scan_id: {scan_id}");
                     println!("report_id: {report_id}");
@@ -1519,7 +1640,12 @@ async fn run_scan_inner(
             EventType::ScanInterrupted,
             serde_json::json!({
                 "scan_id": &scan_id,
-                "cursor": journal.cursor().map(|c| c.encode()),
+                "cursor": runner
+                    .journal
+                    .as_ref()
+                    .expect("scan journal opened above")
+                    .cursor()
+                    .map(|c| c.encode()),
                 "generation": generation,
                 "scope": {
                     "policy": &policy,
@@ -1559,7 +1685,12 @@ async fn run_scan_inner(
             }),
         )
     };
-    journal.emit(&store, terminal, &terminal_records).await?;
+    runner
+        .journal
+        .as_mut()
+        .expect("scan journal opened above")
+        .emit(&store, terminal, &terminal_records)
+        .await?;
     let _ = store.close().await;
     println!("scan_id: {scan_id}");
     println!("generation: {generation}");
@@ -3193,6 +3324,10 @@ struct Runner {
     /// pushes a check also pushes a batch op, and the batch flushes
     /// (draining the checks) at the spec §5 limits.
     pending_alias_checks: Vec<PendingAliasCheck>,
+    /// This scan's event journal writer (D4): `Some` on every production
+    /// scan (opened in `run_scan_inner` once the scan id exists); `None`
+    /// only on unit-test runners, which persist without journaling.
+    journal: Option<ScanJournal>,
 }
 
 impl Runner {
@@ -3224,6 +3359,7 @@ impl Runner {
             current_volume: String::new(),
             progress_last_total: None,
             pending_alias_checks: Vec::new(),
+            journal: None,
         }
     }
 
@@ -6031,6 +6167,106 @@ async fn collect_probe_reads(
     })))
 }
 
+/// Identity summary for found-event payloads (D4: identity or
+/// `unknown`): the first normalized canonical remote URL, else explicit
+/// unknown. Remote URLs arrive pre-redacted from the probe reads.
+fn found_identity(remotes: &[git::RemoteObservation]) -> (Option<&str>, &'static str) {
+    match remotes.iter().find_map(|r| r.canonical_url.as_deref()) {
+        Some(canonical) => (Some(canonical), "known"),
+        None => (None, "unknown"),
+    }
+}
+
+/// `repository_found` records (D4): store id + the remote evidence the
+/// GitHub group association derives from (group rows land in the groups
+/// slice) + `analysis: "pending"`.
+fn repository_found_records(
+    store_id: &str,
+    remotes: &[git::RemoteObservation],
+) -> repo_scan::Result<Vec<u8>> {
+    let (identity, identity_state) = found_identity(remotes);
+    let records = serde_json::json!({
+        "store_id": store_id,
+        "identity": identity,
+        "identity_state": identity_state,
+        "remotes": remotes.iter().map(|r| serde_json::json!({
+            "name": String::from_utf8_lossy(&r.name),
+            "role": match r.role {
+                git::RemoteRole::Fetch => "fetch",
+                git::RemoteRole::Push => "push",
+            },
+            "url": r.url,
+            "canonical_url": r.canonical_url,
+        })).collect::<Vec<_>>(),
+        "analysis": "pending",
+    });
+    serde_json::to_vec(&records).map_err(|e| repo_scan::Error::Report(e.to_string()))
+}
+
+/// `location_found` records (D4): checkout/store ids, observed path
+/// (lossy display + exact hex), identity or `unknown`, and
+/// `analysis: "pending"`. Alias deltas arrive via `location_updated`.
+fn location_found_records(
+    checkout_id: &str,
+    store_id: &str,
+    path: &[u8],
+    git_path: &[u8],
+    remotes: &[git::RemoteObservation],
+) -> repo_scan::Result<Vec<u8>> {
+    let (identity, identity_state) = found_identity(remotes);
+    let records = serde_json::json!({
+        "checkout_id": checkout_id,
+        "store_id": store_id,
+        "path": String::from_utf8_lossy(path),
+        "path_hex": config::encode_hex(path),
+        "git_path": String::from_utf8_lossy(git_path),
+        "git_path_hex": config::encode_hex(git_path),
+        "identity": identity,
+        "identity_state": identity_state,
+        "analysis": "pending",
+    });
+    serde_json::to_vec(&records).map_err(|e| repo_scan::Error::Report(e.to_string()))
+}
+
+/// Buffer a `repository_found` when this runner journals (production
+/// scans); unit-test runners (`journal: None`) persist without journaling.
+async fn journal_repository_found(
+    runner: &mut Runner,
+    store: &TursoStore,
+    store_id: &str,
+    remotes: &[git::RemoteObservation],
+) -> repo_scan::Result<()> {
+    let Some(journal) = runner.journal.as_mut() else {
+        return Ok(());
+    };
+    let records = repository_found_records(store_id, remotes)?;
+    if let Some(due) = journal.buffer_repository_found(&mut runner.batch, store_id, &records)? {
+        flush_if_due(runner, store, due).await?;
+    }
+    Ok(())
+}
+
+/// Buffer a `location_found` (same journaling contract as
+/// [`journal_repository_found`]).
+async fn journal_location_found(
+    runner: &mut Runner,
+    store: &TursoStore,
+    checkout_id: &str,
+    store_id: &str,
+    path: &[u8],
+    git_path: &[u8],
+    remotes: &[git::RemoteObservation],
+) -> repo_scan::Result<()> {
+    let Some(journal) = runner.journal.as_mut() else {
+        return Ok(());
+    };
+    let records = location_found_records(checkout_id, store_id, path, git_path, remotes)?;
+    if let Some(due) = journal.buffer_location_found(&mut runner.batch, checkout_id, &records)? {
+        flush_if_due(runner, store, due).await?;
+    }
+    Ok(())
+}
+
 /// Persist collected observations from a validated probe. Remotes, refs, and
 /// HEAD fall back to installed git only on structural gaps; operational
 /// failures fail the task (retry, then park) instead of recording fake
@@ -6185,6 +6421,18 @@ async fn persist_probe(
                 } else {
                     identity::classify_remotes(canonical, borrowed)
                 };
+                // The store is already known (first sight journaled it);
+                // this spelling only adds its checkout location.
+                journal_location_found(
+                    runner,
+                    store,
+                    &main_checkout_id,
+                    &first_instance_id,
+                    root_bytes.as_deref().unwrap_or(git_bytes.as_slice()),
+                    &git_bytes,
+                    &reads.remotes,
+                )
+                .await?;
 
                 if matches!(
                     disposition,
@@ -6284,6 +6532,7 @@ async fn persist_probe(
     let due = TursoStore::buffer_upsert_git_instance(&mut runner.batch, &new_instance, now_ms);
     runner.counters.repos_found += 1;
     flush_if_due(runner, store, due).await?;
+    journal_repository_found(runner, store, &instance_id, &remotes).await?;
     for remote in &remotes {
         let role = match remote.role {
             git::RemoteRole::Fetch => "fetch",
@@ -6339,6 +6588,16 @@ async fn persist_probe(
         TursoStore::buffer_upsert_checkout(&mut runner.batch, &main_checkout, now_ms)
     };
     flush_if_due(runner, store, due).await?;
+    journal_location_found(
+        runner,
+        store,
+        &main_checkout_id,
+        &instance_id,
+        root_bytes.as_deref().unwrap_or(git_bytes.as_slice()),
+        &git_bytes,
+        &remotes,
+    )
+    .await?;
     if let Some(wid) = instance
         .work_dir
         .as_ref()
@@ -6396,6 +6655,16 @@ async fn persist_probe(
                 let due =
                     TursoStore::buffer_upsert_checkout(&mut runner.batch, &wt_checkout, now_ms);
                 flush_if_due(runner, store, due).await?;
+                journal_location_found(
+                    runner,
+                    store,
+                    &wt_id,
+                    &instance_id,
+                    &wt_root,
+                    &wt_git,
+                    &remotes,
+                )
+                .await?;
                 checkout_ids.push(wt_id);
             }
             enqueue_probe_task_for_path(store, runner, generation, &wt.base, now_ms).await?;
