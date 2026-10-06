@@ -957,3 +957,120 @@ fn journal_lifecycle_events_span_started_ready_terminal() {
         store.close().await.expect("close");
     });
 }
+
+/// Goal Step 12 (D4): `query --scan` replays the journaled lifecycle as
+/// JSONL envelopes; `--after` resumes after a cursor; unknown scans exit 2.
+#[test]
+fn query_scan_replays_journaled_lifecycle_as_jsonl() {
+    use repo_scan::scan_events::Cursor;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let cwd = dir.path().join("cwd");
+    repo_scan::privacy::private_dir_0700(&cwd).expect("mkdir");
+    let root = dir.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    fixture::normal_clone(&root, "repo");
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            "rep.json",
+        ],
+        &cwd,
+        &state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let scan_id = stdout_line(&out, "scan_id");
+
+    let replay = run(
+        &["query", "--scan", &scan_id, "--format", "jsonl"],
+        &cwd,
+        &state,
+    );
+    assert_eq!(
+        replay.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&replay)
+    );
+    let lines: Vec<serde_json::Value> = stdout_text(&replay)
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each line is valid JSON"))
+        .collect();
+    assert!(
+        lines.len() >= 3,
+        "replay covers the lifecycle, got {}",
+        lines.len()
+    );
+    for (i, env) in lines.iter().enumerate() {
+        assert_eq!(
+            env["schema_version"],
+            serde_json::Value::String("1.0.0".to_string())
+        );
+        assert_eq!(env["scan_id"], serde_json::Value::String(scan_id.clone()));
+        assert_eq!(env["seq"], serde_json::Value::from((i + 1) as u64));
+    }
+    assert_eq!(
+        lines[0]["type"],
+        serde_json::Value::String("scan_started".to_string())
+    );
+    assert_eq!(lines[0]["op"], serde_json::Value::String("add".to_string()));
+    assert!(
+        lines.iter().any(|e| e["type"] == "inventory_ready"),
+        "replay includes inventory_ready"
+    );
+    let last = lines.last().expect("last");
+    assert_eq!(
+        last["type"],
+        serde_json::Value::String("scan_completed".to_string())
+    );
+
+    // `--after` resumes strictly after the cursor: from the first envelope,
+    // replay restarts at seq 2 and still ends at the terminal event.
+    let cursor = Cursor {
+        seq: lines[0]["seq"].as_u64().expect("seq u64"),
+        catalog_rev: lines[0]["catalog_rev"].as_u64().expect("rev u64"),
+        event_offset: lines[0]["event_offset"].as_u64().expect("off u64"),
+    }
+    .encode();
+    let resumed = run(
+        &[
+            "query", "--scan", &scan_id, "--follow", "--format", "jsonl", "--after", &cursor,
+        ],
+        &cwd,
+        &state,
+    );
+    assert_eq!(
+        resumed.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&resumed)
+    );
+    let tail: Vec<serde_json::Value> = stdout_text(&resumed)
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("tail line is valid JSON"))
+        .collect();
+    assert_eq!(tail.len(), lines.len() - 1, "one row skipped by the cursor");
+    assert_eq!(tail[0]["seq"], serde_json::Value::from(2u64));
+    assert_eq!(
+        tail.last().expect("tail last")["type"],
+        serde_json::Value::String("scan_completed".to_string())
+    );
+
+    // Unknown scan IDs follow the resume convention: exit 2, clear error.
+    let missing = run(
+        &["query", "--scan", "scan-no-such", "--format", "jsonl"],
+        &cwd,
+        &state,
+    );
+    assert_eq!(
+        missing.status.code(),
+        Some(2),
+        "stderr: {}",
+        stderr_text(&missing)
+    );
+}

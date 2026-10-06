@@ -113,6 +113,19 @@ pub fn is_progress_coalescible(t: EventType) -> bool {
     matches!(t, EventType::DiscoveryProgress)
 }
 
+/// True for the four terminal classes (contract D4): a follower stops after
+/// the first one; exactly one is journaled per scan.
+#[must_use]
+pub fn is_terminal_event(t: EventType) -> bool {
+    matches!(
+        t,
+        EventType::ScanCompleted
+            | EventType::ScanIncomplete
+            | EventType::ScanInterrupted
+            | EventType::ScanFailed
+    )
+}
+
 /// One scan-event envelope (contract D4).
 ///
 /// Wire shape is `{schema_version, scan_id, seq, catalog_rev, type, op,
@@ -356,6 +369,20 @@ mod tests {
                 t == EventType::DiscoveryProgress,
                 "{t:?}"
             );
+        }
+    }
+
+    #[test]
+    fn terminal_only_four_completed_variants() {
+        for (t, _, _) in ALL_TYPES {
+            let terminal = matches!(
+                t,
+                EventType::ScanCompleted
+                    | EventType::ScanIncomplete
+                    | EventType::ScanInterrupted
+                    | EventType::ScanFailed
+            );
+            assert_eq!(is_terminal_event(t), terminal, "{t:?}");
         }
     }
 

@@ -22,12 +22,12 @@ use repo_scan::report::builder::{
     verify_staged_report, AliasInput, ArtifactInput, CandidateInput,
     ReportInputs as LibReportInputs, ReportPipeline, RootInput, StorageLinkInput,
 };
-use repo_scan::scan_events::{Cursor, EventType};
+use repo_scan::scan_events::{is_terminal_event, Cursor, Envelope, EventType, Op};
 use repo_scan::scheduler::{backoff_for_attempt, Admission, CircuitBreaker, OpClass};
 use repo_scan::store::{
     self, CheckpointCoordinator, CheckpointPolicy, ClaimedTask, NewCheckout, NewGitInstance,
-    NewRef, NewRemote, NewScan, NewScanEvent, NewStatus, NewTask, NewVolume, OwnerGuard, Store,
-    TaskOutcome, TursoStore, WriterBatch,
+    NewRef, NewRemote, NewScan, NewScanEvent, NewStatus, NewTask, NewVolume, OwnerGuard,
+    ScanEventRow, Store, TaskOutcome, TursoStore, WriterBatch,
 };
 use repo_scan::telemetry::{live_helper_rss_bytes, FootprintSampler, SamplerInputs};
 use repo_scan::walk::roots::{plan_machine_roots, PlannedRoot, RootPriority};
@@ -37,6 +37,7 @@ use repo_scan::walk::topology::{
 };
 use repo_scan::walk::{ChildKind, ListOptions, WalkItem};
 use std::collections::{HashMap, HashSet};
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -116,6 +117,12 @@ const QUERY_MAX_GENERATIONS: usize = 1_024;
 const QUERY_MAX_MATCHES: usize = 10_000;
 /// Wall-clock budget for one cached query.
 const QUERY_DEADLINE_SECS: u64 = 60;
+/// Journal rows per replay page for `query --scan` (D4): bounded reads,
+/// oldest first; a short page means the reader caught up to the tip.
+const REPLAY_PAGE_ROWS: u64 = 500;
+/// Poll interval for `query --scan --follow` while the scan is still
+/// running and no terminal event is journaled yet.
+const FOLLOW_POLL: Duration = Duration::from_millis(250);
 /// Rows per catalog page for bounded report-derivation scans
 /// (RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1): errors, instances, and
 /// reclassification reads never hold more than one page from the database
@@ -8318,6 +8325,254 @@ fn snapshots_dir(state_dir: &Path) -> PathBuf {
 // Query (cached only)
 // ---------------------------------------------------------------------------
 
+/// Rebuild the wire [`Envelope`] for one journaled row. The journaled
+/// `op` wins over the class default so a resent batch carrying
+/// `replace` stays `replace` (D4 `add/replace` cell); unknown classes or
+/// corrupt payloads fail loudly, never as silent skips.
+fn envelope_for_row(row: &ScanEventRow) -> repo_scan::Result<Envelope> {
+    let event_type: EventType =
+        serde_json::from_value(serde_json::Value::String(row.event_type.clone())).map_err(|e| {
+            repo_scan::Error::Report(format!(
+                "scan_events row seq {} carries unknown class {:?}: {e}",
+                row.seq, row.event_type,
+            ))
+        })?;
+    let op: Op =
+        serde_json::from_value(serde_json::Value::String(row.op.clone())).map_err(|e| {
+            repo_scan::Error::Report(format!(
+                "scan_events row seq {} carries unknown op {:?}: {e}",
+                row.seq, row.op,
+            ))
+        })?;
+    let records: serde_json::Value = serde_json::from_slice(&row.records).map_err(|e| {
+        repo_scan::Error::Report(format!(
+            "scan_events row seq {} carries corrupt records: {e}",
+            row.seq,
+        ))
+    })?;
+    let mut env = Envelope::new(
+        row.scan_id.clone(),
+        row.seq,
+        row.catalog_rev,
+        row.event_offset,
+        event_type,
+        row.reset,
+        records,
+    );
+    env.op = op;
+    Ok(env)
+}
+
+/// Write one JSONL line. `Ok(false)` means the consumer went away
+/// (broken pipe): the follower stops quietly with committed catalog
+/// records untouched (Step 12); any other IO error fails loudly.
+fn write_jsonl_line(out: &mut impl std::io::Write, line: &str) -> repo_scan::Result<bool> {
+    match writeln!(out, "{line}") {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
+        Err(e) => Err(repo_scan::Error::Io(format!(
+            "cannot write replay line: {e}"
+        ))),
+    }
+}
+
+/// True while the scan row can still journal more events: only the
+/// `running` state (with or without the `:roots:` suffix) keeps a
+/// follower waiting. Any other state — complete, incomplete,
+/// interrupted, failed, superseded — ends the follow at the journal tip,
+/// which also covers pre-journal scans that will never emit.
+fn scan_still_running(state: &str) -> bool {
+    state == "running" || state.starts_with("running:")
+}
+
+/// `query --scan SCAN_ID`: replay the scan's journaled event stream as
+/// JSONL envelopes, oldest first. `--after CURSOR` resumes strictly after
+/// the cursor's `seq`; `--follow` keeps polling a running scan until the
+/// terminal event, Ctrl-C (exit 130), or a broken pipe (quiet exit 0).
+/// Read-only: no owner lock, no epoch claim, servable while a scan holds
+/// the write lock. Unknown scan IDs exit 2 like `resume` on a missing ID.
+async fn run_query_scan_replay(
+    cfg: &config::Config,
+    args: &repo_scan::cli::QueryArgs,
+    scan_id: &str,
+) -> repo_scan::Result<ExitCode> {
+    use repo_scan::cli::OutputFormat;
+    // Explicit format wins; the default is JSONL when redirected, the
+    // live human view on a terminal (human replay: TUI slice).
+    let format = match args.format {
+        Some(f) => f,
+        None if !std::io::stdout().is_terminal() => OutputFormat::Jsonl,
+        None => {
+            eprintln!(
+                "repo-scan: not yet implemented: query --scan human replay executes in the TUI \
+                 slice; use --format jsonl for now"
+            );
+            return Ok(ExitCode::OperationalFailure);
+        }
+    };
+    if format != OutputFormat::Jsonl {
+        // `--follow --format json` never reaches here: `selection()`
+        // rejects it. Plain `--format json` folds the journal into one
+        // snapshot in a later slice.
+        eprintln!(
+            "repo-scan: not yet implemented: query --scan --format json executes in a later \
+             slice; use --format jsonl for now"
+        );
+        return Ok(ExitCode::OperationalFailure);
+    }
+    let db_path = store::owner::catalog_db_path(&cfg.state_dir);
+    if !db_path.exists() {
+        println!("cached: true");
+        println!("suitable_catalog: false");
+        println!(
+            "note: no catalog at {}; no live verification performed",
+            db_path.display()
+        );
+        return Ok(ExitCode::Incomplete);
+    }
+    let mut store = TursoStore::open_read_only(&db_path).await?;
+    if !catalog_bound_to_marker(&store, &cfg.state_dir).await? {
+        println!("cached: true");
+        println!("suitable_catalog: false");
+        println!(
+            "note: catalog at {} is not bound to this tool's ownership marker; \
+             no live verification performed",
+            db_path.display()
+        );
+        let _ = store.close().await;
+        return Ok(ExitCode::Incomplete);
+    }
+    let Some(scan) = store.get_scan(scan_id).await? else {
+        let _ = store.close().await;
+        return Err(repo_scan::Error::InvalidArgs(format!(
+            "no such scan: {scan_id}"
+        )));
+    };
+    let mut after_seq = 0u64;
+    if let Some(after) = &args.after {
+        let Some(cursor) = Cursor::decode(after) else {
+            let _ = store.close().await;
+            return Err(repo_scan::Error::InvalidArgs(format!(
+                "corrupt --after cursor for scan {scan_id}; replay from the start instead"
+            )));
+        };
+        after_seq = cursor.seq;
+    }
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    // Initial replay: page through committed rows; a short page (or an
+    // empty one) means the reader caught up to the tip.
+    let mut terminal_seen = false;
+    loop {
+        let rows = store
+            .read_scan_events(scan_id, after_seq, REPLAY_PAGE_ROWS)
+            .await?;
+        let short_page = rows.len() < REPLAY_PAGE_ROWS as usize;
+        for row in &rows {
+            let env = envelope_for_row(row)?;
+            let line =
+                serde_json::to_string(&env).map_err(|e| repo_scan::Error::Report(e.to_string()))?;
+            if !write_jsonl_line(&mut out, &line)? {
+                let _ = store.close().await;
+                return Ok(ExitCode::Success);
+            }
+            after_seq = row.seq;
+            terminal_seen |= is_terminal_event(env.event_type);
+        }
+        if short_page {
+            break;
+        }
+    }
+    match out.flush() {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+            let _ = store.close().await;
+            return Ok(ExitCode::Success);
+        }
+        Err(e) => {
+            return Err(repo_scan::Error::Io(format!(
+                "cannot flush replay output: {e}"
+            )));
+        }
+    }
+    if !args.follow || terminal_seen {
+        let _ = store.close().await;
+        return Ok(ExitCode::Success);
+    }
+    // Follow: a scan row that already left `running` will never journal
+    // more (pre-journal scans included), so stop at the tip; otherwise
+    // poll until the terminal event lands.
+    if !scan_still_running(&scan.state) {
+        let _ = store.close().await;
+        return Ok(ExitCode::Success);
+    }
+    loop {
+        if interrupted() {
+            let _ = store.close().await;
+            return Ok(ExitCode::Interrupted);
+        }
+        std::thread::sleep(FOLLOW_POLL);
+        // A read-only handle pins its opening snapshot: later commits are
+        // invisible until reopen (measured: a 60s poll never saw new rows,
+        // a fresh open did). Reopen per poll and re-verify the ownership
+        // bind, so a swapped or cleared catalog ends the follow loudly
+        // instead of replaying stale or foreign rows.
+        let _ = store.close().await;
+        store = TursoStore::open_read_only(&db_path).await?;
+        if !catalog_bound_to_marker(&store, &cfg.state_dir).await? {
+            let _ = store.close().await;
+            eprintln!(
+                "repo-scan: follow: catalog at {} lost its ownership bind; \
+                 stopping at the journal tip",
+                db_path.display()
+            );
+            return Ok(ExitCode::Incomplete);
+        }
+        let rows = store
+            .read_scan_events(scan_id, after_seq, REPLAY_PAGE_ROWS)
+            .await?;
+        for row in &rows {
+            let env = envelope_for_row(row)?;
+            let line =
+                serde_json::to_string(&env).map_err(|e| repo_scan::Error::Report(e.to_string()))?;
+            if !write_jsonl_line(&mut out, &line)? {
+                let _ = store.close().await;
+                return Ok(ExitCode::Success);
+            }
+            after_seq = row.seq;
+            terminal_seen |= is_terminal_event(env.event_type);
+        }
+        match out.flush() {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                let _ = store.close().await;
+                return Ok(ExitCode::Success);
+            }
+            Err(e) => {
+                return Err(repo_scan::Error::Io(format!(
+                    "cannot flush replay output: {e}"
+                )));
+            }
+        }
+        if terminal_seen {
+            let _ = store.close().await;
+            return Ok(ExitCode::Success);
+        }
+        match store.get_scan(scan_id).await? {
+            Some(s) if scan_still_running(&s.state) => {}
+            Some(_) => {
+                let _ = store.close().await;
+                return Ok(ExitCode::Success);
+            }
+            None => {
+                let _ = store.close().await;
+                eprintln!("repo-scan: follow: scan {scan_id} is gone; stopping at the journal tip");
+                return Ok(ExitCode::Incomplete);
+            }
+        }
+    }
+}
+
 async fn run_query(cfg: &config::Config, args: &repo_scan::cli::QueryArgs) -> ExitCode {
     match run_query_inner(cfg, args).await {
         Ok(code) => code,
@@ -8332,19 +8587,25 @@ async fn run_query_inner(
     cfg: &config::Config,
     args: &repo_scan::cli::QueryArgs,
 ) -> repo_scan::Result<ExitCode> {
-    // Goal Step 6: exactly one of TARGET / --all / --scan. This slice
-    // executes the cached single-target path; --all/--scan/--follow follow
-    // with the replay slice.
+    // Goal Step 6: exactly one of TARGET / --all / --scan. The cached
+    // single-target path stays inline; --scan replays the journaled event
+    // stream; --all follows in a later slice.
     let selection = match args.selection() {
         Ok(s) => s,
         Err(msg) => return Err(repo_scan::Error::InvalidArgs(msg)),
     };
-    let repo_scan::cli::QuerySelection::Target(url) = selection else {
-        eprintln!(
-            "repo-scan: not yet implemented: query --all/--scan/--follow execute in the next \
-             slice; use one TARGET with --cached for now"
-        );
-        return Ok(ExitCode::OperationalFailure);
+    let url = match selection {
+        repo_scan::cli::QuerySelection::Target(url) => url,
+        repo_scan::cli::QuerySelection::Scan(id) => {
+            return run_query_scan_replay(cfg, args, &id).await;
+        }
+        repo_scan::cli::QuerySelection::All => {
+            eprintln!(
+                "repo-scan: not yet implemented: query --all executes in a later slice; \
+                 use one TARGET with --cached, or --scan SCAN_ID --format jsonl"
+            );
+            return Ok(ExitCode::OperationalFailure);
+        }
     };
     if !args.cached {
         return Err(repo_scan::Error::InvalidArgs(
