@@ -254,6 +254,9 @@ fn api_store_create_scan_request_holds_no_credential_bytes() {
                         scope: "roots",
                         status_mode: "summary",
                         report_dest: None,
+                        targets_json: None,
+                        format: None,
+                        all_targets: None,
                     },
                     now,
                 )
@@ -291,6 +294,9 @@ fn api_store_create_scan_request_holds_no_credential_bytes() {
                     scope: "roots",
                     status_mode: "summary",
                     report_dest: None,
+                    targets_json: None,
+                    format: None,
+                    all_targets: None,
                 },
                 now,
             )
