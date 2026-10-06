@@ -6177,14 +6177,42 @@ fn found_identity(remotes: &[git::RemoteObservation]) -> (Option<&str>, &'static
     }
 }
 
+/// Split a normalized GitHub canonical URL into the D1 group id
+/// `host/account/repo` plus its parts. The normalizer
+/// ([`identity::normalize_github_url`]) always emits lowercase
+/// `https://github.com/owner/repo`, so the group id is the URL tail and
+/// needs no further lowering; `None` only fires on input no normalizer
+/// produced (defensive: probe `canonical_url` values always are).
+fn github_group_parts(canonical: &str) -> Option<(&str, &str, &str, &str)> {
+    let id = canonical.strip_prefix("https://")?;
+    let mut parts = id.split('/');
+    let (host, account, repo) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || host.is_empty() || account.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((id, host, account, repo))
+}
+
 /// `repository_found` records (D4): store id + the remote evidence the
-/// GitHub group association derives from (group rows land in the groups
-/// slice) + `analysis: "pending"`.
+/// GitHub group association derives from + the derived `github_groups`
+/// ids (sorted, deduped; the matching group/member rows land in the same
+/// batch transaction) + `analysis: "pending"`.
 fn repository_found_records(
     store_id: &str,
     remotes: &[git::RemoteObservation],
 ) -> repo_scan::Result<Vec<u8>> {
     let (identity, identity_state) = found_identity(remotes);
+    let mut github_groups: Vec<&str> = remotes
+        .iter()
+        .filter_map(|r| {
+            r.canonical_url
+                .as_deref()
+                .and_then(github_group_parts)
+                .map(|(id, _, _, _)| id)
+        })
+        .collect();
+    github_groups.sort_unstable();
+    github_groups.dedup();
     let records = serde_json::json!({
         "store_id": store_id,
         "identity": identity,
@@ -6198,6 +6226,7 @@ fn repository_found_records(
             "url": r.url,
             "canonical_url": r.canonical_url,
         })).collect::<Vec<_>>(),
+        "github_groups": github_groups,
         "analysis": "pending",
     });
     serde_json::to_vec(&records).map_err(|e| repo_scan::Error::Report(e.to_string()))
@@ -6555,6 +6584,34 @@ async fn persist_probe(
         };
         let due = TursoStore::buffer_upsert_remote(&mut runner.batch, &new_remote, now_ms);
         flush_if_due(runner, store, due).await?;
+        // D1/D5: every normalized remote observation links its store to one
+        // GitHub group (same batch transaction as the remote row, so the
+        // `repository_found.github_groups` ids above always resolve once
+        // committed). Distinct canonicals stay distinct groups — a fork and
+        // its upstream never merge — while URL spellings of one identity
+        // share one group row (`INSERT OR IGNORE` keeps resume replays
+        // idempotent).
+        if let Some((group_id, host, account, repo)) =
+            remote.canonical_url.as_deref().and_then(github_group_parts)
+        {
+            let due_group = TursoStore::buffer_upsert_github_group(
+                &mut runner.batch,
+                group_id,
+                host,
+                account,
+                repo,
+                now_ms,
+            );
+            let due_member = TursoStore::buffer_add_group_member(
+                &mut runner.batch,
+                group_id,
+                &instance_id,
+                &remote.name,
+                role,
+                now_ms,
+            );
+            flush_if_due(runner, store, due_group || due_member).await?;
+        }
     }
 
     let head = reads.head;

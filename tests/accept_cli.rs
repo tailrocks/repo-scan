@@ -1174,3 +1174,224 @@ fn found_events_cover_each_store_and_checkout_once() {
         store.close().await.expect("close");
     });
 }
+
+#[test]
+fn github_groups_link_stores_to_canonical_identities() {
+    use repo_scan::store::{Store, TursoStore};
+    use std::collections::{HashMap, HashSet};
+
+    // Three independent clones: scp + mixed-case spelling, plain https,
+    // and https origin plus a distinct upstream (fork-style). Independent
+    // reference is the installed git CLI (`git remote -v` per clone);
+    // expected group ids are literal GitHub identities, never normalizer
+    // output.
+    const GROUP_MAIN: &str = "github.com/acme/widget";
+    const GROUP_UP: &str = "github.com/other/widget";
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let cwd = dir.path().join("cwd");
+    repo_scan::privacy::private_dir_0700(&cwd).expect("mkdir");
+    let root = dir.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    let clone_a = fixture::normal_clone(&root, "clone-a");
+    fixture::git(
+        &clone_a,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "git@github.com:ACME/Widget.git",
+        ],
+    );
+    let clone_b = fixture::normal_clone(&root, "clone-b");
+    fixture::git(
+        &clone_b,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/acme/widget",
+        ],
+    );
+    let clone_c = fixture::normal_clone(&root, "clone-c");
+    fixture::git(
+        &clone_c,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/acme/widget",
+        ],
+    );
+    fixture::git(
+        &clone_c,
+        &[
+            "remote",
+            "add",
+            "upstream",
+            "https://github.com/other/widget",
+        ],
+    );
+
+    // (name, role) pairs straight from git per clone dir name.
+    let mut git_pairs: HashMap<String, HashSet<(String, String)>> = HashMap::new();
+    for (name, path) in [
+        ("clone-a", &clone_a),
+        ("clone-b", &clone_b),
+        ("clone-c", &clone_c),
+    ] {
+        let mut pairs = HashSet::new();
+        for line in fixture::git_str(path, &["remote", "-v"]).lines() {
+            let mut cols = line.split_whitespace();
+            let (Some(n), _, Some(direction)) = (cols.next(), cols.next(), cols.next()) else {
+                panic!("unexpected git remote -v line: {line}");
+            };
+            let role = direction.trim_matches(|c| c == '(' || c == ')').to_string();
+            assert!(
+                role == "fetch" || role == "push",
+                "git direction is fetch/push: {line}"
+            );
+            pairs.insert((n.to_string(), role));
+        }
+        assert!(!pairs.is_empty(), "{name} has remotes");
+        git_pairs.insert(name.to_string(), pairs);
+    }
+
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            "rep.json",
+        ],
+        &cwd,
+        &state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let scan_id = stdout_line(&out, "scan_id");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+
+        // Exactly two groups: both spellings of one identity merge, the
+        // fork-style upstream stays separate.
+        let groups = store.list_github_groups().await.expect("groups");
+        let ids: Vec<&str> = groups.iter().map(|g| g.id.as_str()).collect();
+        assert_eq!(ids, vec![GROUP_MAIN, GROUP_UP]);
+        for g in &groups {
+            let (host, account, repo) = match g.id.as_str() {
+                GROUP_MAIN => ("github.com", "acme", "widget"),
+                GROUP_UP => ("github.com", "other", "widget"),
+                other => panic!("unexpected group {other}"),
+            };
+            assert_eq!(g.host, host);
+            assert_eq!(g.account, account);
+            assert_eq!(g.repo, repo);
+            assert!(g.observed_at_ms > 0, "observation time kept");
+        }
+
+        // Store -> clone mapping from location_found paths (lossy display
+        // keeps our ASCII dir names intact).
+        let rows = store
+            .read_scan_events(&scan_id, 0, 1_000)
+            .await
+            .expect("read");
+        let mut store_clone: HashMap<String, String> = HashMap::new();
+        let mut store_groups: HashMap<String, Vec<String>> = HashMap::new();
+        for row in &rows {
+            let v: serde_json::Value = serde_json::from_slice(&row.records).expect("json");
+            if row.event_type == "location_found" {
+                let path = v["path"].as_str().expect("path").to_string();
+                let name = ["clone-a", "clone-b", "clone-c"]
+                    .into_iter()
+                    .find(|n| path.contains(n))
+                    .expect("fixture clone path");
+                store_clone.insert(
+                    v["store_id"].as_str().expect("store").to_string(),
+                    name.into(),
+                );
+            } else if row.event_type == "repository_found" {
+                let found: Vec<String> = v["github_groups"]
+                    .as_array()
+                    .expect("github_groups array")
+                    .iter()
+                    .map(|g| g.as_str().expect("group id").to_string())
+                    .collect();
+                store_groups.insert(v["store_id"].as_str().expect("store").to_string(), found);
+            }
+        }
+        assert_eq!(store_clone.len(), 3, "three stores located");
+        assert_eq!(store_groups.len(), 3, "three stores reported");
+
+        // Per-(store, remote, role) member edges match `git remote -v`
+        // exactly; each edge sits under its literal group id.
+        let main_members = store.list_group_members(GROUP_MAIN).await.expect("members");
+        let up_members = store.list_group_members(GROUP_UP).await.expect("members");
+        let mut main_by_store: HashMap<String, HashSet<(String, String)>> = HashMap::new();
+        for m in &main_members {
+            assert!(m.observed_at_ms > 0, "member observation time kept");
+            main_by_store
+                .entry(m.instance_id.clone())
+                .or_default()
+                .insert((
+                    String::from_utf8_lossy(&m.remote_name).into_owned(),
+                    m.role.clone(),
+                ));
+        }
+        assert_eq!(main_by_store.len(), 3, "three stores share one group");
+        for (instance, pairs) in &main_by_store {
+            let clone = store_clone.get(instance).expect("member of a known store");
+            let expect: HashSet<(String, String)> = git_pairs[clone.as_str()]
+                .iter()
+                .filter(|(n, _)| n == "origin")
+                .cloned()
+                .collect();
+            assert_eq!(pairs, &expect, "{clone} origin edges match git");
+        }
+        assert_eq!(up_members.len(), 2, "upstream edges: fetch + push");
+        let up_store = &up_members[0].instance_id;
+        assert_eq!(store_clone.get(up_store).map(String::as_str), Some("clone-c"));
+        assert!(up_members.iter().all(|m| &m.instance_id == up_store));
+        let up_pairs: HashSet<(String, String)> = up_members
+            .iter()
+            .map(|m| {
+                (
+                    String::from_utf8_lossy(&m.remote_name).into_owned(),
+                    m.role.clone(),
+                )
+            })
+            .collect();
+        let expect_up: HashSet<(String, String)> = git_pairs["clone-c"]
+            .iter()
+            .filter(|(n, _)| n == "upstream")
+            .cloned()
+            .collect();
+        assert_eq!(up_pairs, expect_up, "clone-c upstream edges match git");
+        assert!(
+            main_by_store.contains_key(up_store),
+            "one store belongs to both groups"
+        );
+        let both = store.groups_for_instance(up_store).await.expect("groups");
+        let both_ids: HashSet<&str> = both.iter().map(|m| m.group_id.as_str()).collect();
+        assert_eq!(both_ids, HashSet::from([GROUP_MAIN, GROUP_UP]));
+
+        // `repository_found.github_groups` names the same literal ids.
+        for (instance, found) in &store_groups {
+            let clone = store_clone.get(instance).expect("store located");
+            let mut expect = vec![GROUP_MAIN.to_string()];
+            if clone == "clone-c" {
+                expect.push(GROUP_UP.to_string());
+                expect.sort();
+            }
+            assert_eq!(found, &expect, "{clone} event groups");
+        }
+        store.close().await.expect("close");
+    });
+}

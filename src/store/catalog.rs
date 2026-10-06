@@ -4118,6 +4118,25 @@ impl TursoStore {
         }
         Ok(out)
     }
+
+    /// v2: all observed groups, ordered by id (unique-group totals read
+    /// this; one row per distinct normalized identity, so no bound needed).
+    pub async fn list_github_groups(&self) -> crate::Result<Vec<GithubGroupRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, host, account, repo, observed_at_ms \
+                    FROM github_groups ORDER BY id ASC",
+                (),
+            )
+            .await
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            out.push(GithubGroupRow::from_row(&row)?);
+        }
+        Ok(out)
+    }
 }
 
 impl TursoStore {
@@ -4557,6 +4576,54 @@ impl TursoStore {
                 v_text(remote.role),
                 v_blob(redacted_remote_bytes(remote.url)),
                 v_opt_blob(remote.canonical_url.map(redacted_remote_bytes)),
+                v_int(observed_ms),
+            ],
+        )
+    }
+
+    /// Buffer a v2 GitHub group upsert (`INSERT OR IGNORE`, first
+    /// observation wins); same SQL as [`TursoStore::upsert_github_group`].
+    /// The id is the caller-computed `lower(host)/lower(account)/lower(repo)`
+    /// (D1). Returns `WriterBatch::should_flush`.
+    pub fn buffer_upsert_github_group(
+        batch: &mut WriterBatch,
+        id: &str,
+        host: &str,
+        account: &str,
+        repo: &str,
+        observed_ms: i64,
+    ) -> bool {
+        batch.push(
+            "INSERT OR IGNORE INTO github_groups (id, host, account, repo, observed_at_ms) \
+                VALUES (?1, ?2, ?3, ?4, ?5)",
+            vec![
+                v_text(id),
+                v_text(host),
+                v_text(account),
+                v_text(repo),
+                v_int(observed_ms),
+            ],
+        )
+    }
+
+    /// Buffer one v2 store-to-group edge (`INSERT OR IGNORE`); same SQL as
+    /// [`TursoStore::add_group_member`]. Returns `WriterBatch::should_flush`.
+    pub fn buffer_add_group_member(
+        batch: &mut WriterBatch,
+        group_id: &str,
+        instance_id: &str,
+        remote_name: &[u8],
+        role: &str,
+        observed_ms: i64,
+    ) -> bool {
+        batch.push(
+            "INSERT OR IGNORE INTO group_members (group_id, instance_id, remote_name, role, \
+                observed_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+            vec![
+                v_text(group_id),
+                v_text(instance_id),
+                v_blob(remote_name.to_vec()),
+                v_text(role),
                 v_int(observed_ms),
             ],
         )
