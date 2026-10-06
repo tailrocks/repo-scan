@@ -848,3 +848,112 @@ fn case5_distinct_root_sets_never_share_generations() {
         store.close().await.expect("close");
     });
 }
+
+/// Goal Step 12 (D4): a completed scan journals its lifecycle —
+/// `scan_started` … `inventory_ready` … exactly one terminal event — with
+/// contiguous 1-based seqs and non-decreasing committed catalog revs.
+#[test]
+fn journal_lifecycle_events_span_started_ready_terminal() {
+    use repo_scan::store::{Store, TursoStore};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let cwd = dir.path().join("cwd");
+    repo_scan::privacy::private_dir_0700(&cwd).expect("mkdir");
+    let root = dir.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    fixture::normal_clone(&root, "repo");
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            "rep.json",
+        ],
+        &cwd,
+        &state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let scan_id = stdout_line(&out, "scan_id");
+    let generation: u64 = stdout_line(&out, "generation").parse().expect("gen u64");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        let rows = store
+            .read_scan_events(&scan_id, 0, 100)
+            .await
+            .expect("read");
+        assert!(
+            rows.len() >= 3,
+            "lifecycle journals >= 3 rows, got {}",
+            rows.len()
+        );
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row.seq, (i + 1) as u64, "seqs contiguous from 1");
+            assert_eq!(row.scan_id, scan_id, "rows belong to this scan");
+        }
+        assert_eq!(rows[0].event_type, "scan_started");
+        assert_eq!(rows[0].op, "add");
+        let started: serde_json::Value =
+            serde_json::from_slice(&rows[0].records).expect("started json");
+        assert_eq!(
+            started["scan_id"],
+            serde_json::Value::String(scan_id.clone())
+        );
+        assert!(
+            started["scope"]["scope_key"].is_string(),
+            "started carries scope key"
+        );
+        assert_eq!(
+            started["targets"][0]["raw"],
+            serde_json::Value::String(URL.to_string())
+        );
+        assert!(
+            started["resume_cmd"].is_string(),
+            "started carries resume cmd"
+        );
+
+        let ready_pos = rows
+            .iter()
+            .position(|r| r.event_type == "inventory_ready")
+            .expect("inventory_ready journaled");
+        assert_eq!(rows[ready_pos].op, "add");
+        let ready: serde_json::Value =
+            serde_json::from_slice(&rows[ready_pos].records).expect("ready json");
+        assert_eq!(ready["generation"], serde_json::Value::from(generation));
+        assert_eq!(
+            ready["verdict"],
+            serde_json::Value::String("complete".to_string())
+        );
+
+        let terminals: Vec<&str> = rows
+            .iter()
+            .map(|r| r.event_type.as_str())
+            .filter(|t| {
+                matches!(
+                    *t,
+                    "scan_completed" | "scan_incomplete" | "scan_interrupted" | "scan_failed"
+                )
+            })
+            .collect();
+        assert_eq!(
+            terminals,
+            vec!["scan_completed"],
+            "exactly one terminal event"
+        );
+        assert_eq!(rows.last().expect("last").event_type, "scan_completed");
+
+        let mut prev_rev = 0u64;
+        for row in &rows {
+            assert!(row.catalog_rev >= prev_rev, "revs non-decreasing");
+            prev_rev = row.catalog_rev;
+        }
+        store.close().await.expect("close");
+    });
+}

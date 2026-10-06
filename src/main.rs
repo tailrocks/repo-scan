@@ -22,11 +22,12 @@ use repo_scan::report::builder::{
     verify_staged_report, AliasInput, ArtifactInput, CandidateInput,
     ReportInputs as LibReportInputs, ReportPipeline, RootInput, StorageLinkInput,
 };
+use repo_scan::scan_events::{Cursor, EventType};
 use repo_scan::scheduler::{backoff_for_attempt, Admission, CircuitBreaker, OpClass};
 use repo_scan::store::{
     self, CheckpointCoordinator, CheckpointPolicy, ClaimedTask, NewCheckout, NewGitInstance,
-    NewRef, NewRemote, NewScan, NewStatus, NewTask, NewVolume, OwnerGuard, Store, TaskOutcome,
-    TursoStore, WriterBatch,
+    NewRef, NewRemote, NewScan, NewScanEvent, NewStatus, NewTask, NewVolume, OwnerGuard, Store,
+    TaskOutcome, TursoStore, WriterBatch,
 };
 use repo_scan::telemetry::{live_helper_rss_bytes, FootprintSampler, SamplerInputs};
 use repo_scan::walk::roots::{plan_machine_roots, PlannedRoot, RootPriority};
@@ -722,6 +723,119 @@ async fn reclassify_for_targets(
 // Scan
 // ---------------------------------------------------------------------------
 
+/// Scan-scoped event journal writer (D4): assigns contiguous `seq`s, tracks
+/// the per-revision event offset, and resumes numbering after a restart via
+/// [`TursoStore::last_event_seq`] so a resumed scan never reuses a `seq`.
+struct ScanJournal {
+    scan_id: String,
+    next_seq: u64,
+    last_rev: Option<u64>,
+    last_off: u64,
+    last_seq: Option<u64>,
+}
+
+impl ScanJournal {
+    async fn open(store: &TursoStore, scan_id: &str, resumed: bool) -> repo_scan::Result<Self> {
+        // 1-based: `seq` 0 is the "before everything" cursor, and
+        // `read_scan_events` replays strictly after its `after_seq`.
+        let next_seq = if resumed {
+            store
+                .last_event_seq(scan_id)
+                .await?
+                .map(|seq| seq + 1)
+                .unwrap_or(1)
+        } else {
+            1
+        };
+        Ok(Self {
+            scan_id: scan_id.to_string(),
+            next_seq,
+            last_rev: None,
+            last_off: 0,
+            last_seq: None,
+        })
+    }
+
+    /// Cursor of the last committed event, for `scan_interrupted` /
+    /// `scan_failed` payloads (`None` when nothing is journaled yet).
+    fn cursor(&self) -> Option<Cursor> {
+        match (self.last_seq, self.last_rev) {
+            (Some(seq), Some(rev)) => Some(Cursor {
+                seq,
+                catalog_rev: rev,
+                event_offset: self.last_off,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Journal one lifecycle event against the currently committed catalog
+    /// revision. Each call is its own transaction (lifecycle events are
+    /// rare); per-record streaming batches follow in a later slice.
+    async fn emit(
+        &mut self,
+        store: &TursoStore,
+        event_type: EventType,
+        records: &serde_json::Value,
+    ) -> repo_scan::Result<()> {
+        let rev = store.current_revision().await?;
+        let off = if self.last_rev == Some(rev) {
+            self.last_off + 1
+        } else {
+            0
+        };
+        let bytes =
+            serde_json::to_vec(records).map_err(|e| repo_scan::Error::Report(e.to_string()))?;
+        let event = NewScanEvent {
+            scan_id: &self.scan_id,
+            seq: self.next_seq,
+            catalog_rev: rev,
+            event_offset: off,
+            event_type: event_type.name(),
+            op: event_type.op().name(),
+            reset: false,
+            records: &bytes,
+        };
+        store.append_scan_event(&event).await?;
+        self.next_seq += 1;
+        self.last_rev = Some(rev);
+        self.last_off = off;
+        self.last_seq = Some(event.seq);
+        Ok(())
+    }
+}
+
+/// Resume command recorded in lifecycle payloads (D4): replays the exact
+/// state dir + scan id a follower needs to reconnect.
+fn resume_cmd_for(state_dir: &Path, scan_id: &str) -> String {
+    format!(
+        "repo-scan --state-dir {} resume {scan_id}",
+        state_dir.display()
+    )
+}
+
+/// `scan_failed` payload (Step 12): last committed cursor, scrubbed error,
+/// resume capability + command. The staged snapshot survives a publication
+/// failure, so `resumable` is always true here.
+fn failed_records(
+    journal: &ScanJournal,
+    err: &str,
+    state_dir: &Path,
+    scan_id: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "cursor": journal.cursor().map(|c| serde_json::json!({
+            "after": c.encode(),
+            "seq": c.seq,
+            "catalog_rev": c.catalog_rev,
+            "event_offset": c.event_offset,
+        })).unwrap_or(serde_json::Value::Null),
+        "error": err,
+        "resumable": true,
+        "resume_cmd": resume_cmd_for(state_dir, scan_id),
+    })
+}
+
 async fn run_scan(cfg: &config::Config, args: &repo_scan::cli::ScanArgs) -> ExitCode {
     // Goal Step 6: explicit targets XOR --all, validated once; execution
     // resolves the full set and serves it with one filesystem pass.
@@ -980,6 +1094,35 @@ async fn run_scan_inner(
         )
         .await?;
     runner.counters.db_transactions += 1;
+    // Lifecycle journal (D4): fresh scans open at seq 0 with `scan_started`;
+    // resumed scans continue after the last committed seq without repeating
+    // the start marker.
+    let mut journal = ScanJournal::open(&store, &scan_id, resumed.is_some()).await?;
+    if resumed.is_none() {
+        let started = serde_json::json!({
+            "scan_id": &scan_id,
+            "scope": {
+                "policy": &policy,
+                "roots": roots.iter().map(|r| r.path.display().to_string()).collect::<Vec<_>>(),
+                "scope_key": &scope_key,
+            },
+            "targets": resolved.targets.iter().map(|(raw, canonical)| {
+                serde_json::json!({"raw": raw, "canonical": canonical})
+            }).collect::<Vec<_>>(),
+            "options": {
+                "all": resolved.all,
+                "format": format!("{:?}", args.format),
+                "status": format!("{:?}", args.status),
+                "force_rescan": args.force_rescan,
+                "fetch": args.fetch,
+            },
+            "resume_cmd": resume_cmd_for(&cfg.state_dir, &scan_id),
+        });
+        journal
+            .emit(&store, EventType::ScanStarted, &started)
+            .await?;
+        runner.counters.db_transactions += 1;
+    }
     upsert_volumes(&store, &policy, &roots, now, &mut runner.counters).await?;
     // Ingest available event history before traversal (R5).
     let mut drain = ingest_available_events(
@@ -1155,6 +1298,29 @@ async fn run_scan_inner(
     };
     store.set_generation_state(generation, gen_state).await?;
     runner.counters.db_transactions += 1;
+    // Discovery boundary journal (D3/D4): committed right after the
+    // generation state, before report staging. An interrupted run closes the
+    // boundary as `incomplete` — the inventory is partial, never silent.
+    let ready = serde_json::json!({
+        "verdict": if gen_state == "complete" { "complete" } else { "incomplete" },
+        "generation": generation,
+        "counts": {
+            "matched_per_target": &matched_counts,
+            "pending": outcome.pending,
+            "open_gaps": outcome.open_gaps,
+            "unresolvable": outcome.unresolvable,
+            "status_pending": outcome.status_pending,
+            "event_gaps": event_gaps,
+        },
+        "gaps": {
+            "open": outcome.open_gaps,
+            "event_history": event_gaps,
+        },
+    });
+    journal
+        .emit(&store, EventType::InventoryReady, &ready)
+        .await?;
+    runner.counters.db_transactions += 1;
     let discovery_code = if scan_incomplete { 3 } else { 0 };
     // Stage first, publish second through the tested lib pipeline (R3): a
     // failed publication retains the saved snapshot and can be retried
@@ -1215,10 +1381,8 @@ async fn run_scan_inner(
             match emit_file_report(&store, &lib_inputs, dest, &cfg.state_dir, finished_ms).await {
                 Ok(_) => true,
                 Err(e) => {
-                    eprintln!(
-                        "repo-scan: report publication failed: {}",
-                        identity::scrub_text(&e.to_string())
-                    );
+                    let err = identity::scrub_text(&e.to_string());
+                    eprintln!("repo-scan: report publication failed: {err}");
                     store
                         .update_scan_state(
                             &scan_id,
@@ -1234,6 +1398,8 @@ async fn run_scan_inner(
                             store::now_ms(),
                         )
                         .await?;
+                    let failed = failed_records(&journal, &err, &cfg.state_dir, &scan_id);
+                    journal.emit(&store, EventType::ScanFailed, &failed).await?;
                     let _ = store.close().await;
                     println!("scan_id: {scan_id}");
                     println!("report_id: {report_id}");
@@ -1257,10 +1423,8 @@ async fn run_scan_inner(
             {
                 Ok(_) => true,
                 Err(e) => {
-                    eprintln!(
-                        "repo-scan: terminal report failed: {}",
-                        identity::scrub_text(&e.to_string())
-                    );
+                    let err = identity::scrub_text(&e.to_string());
+                    eprintln!("repo-scan: terminal report failed: {err}");
                     store
                         .update_scan_state(
                             &scan_id,
@@ -1276,6 +1440,8 @@ async fn run_scan_inner(
                             store::now_ms(),
                         )
                         .await?;
+                    let failed = failed_records(&journal, &err, &cfg.state_dir, &scan_id);
+                    journal.emit(&store, EventType::ScanFailed, &failed).await?;
                     let _ = store.close().await;
                     println!("scan_id: {scan_id}");
                     println!("report_id: {report_id}");
@@ -1337,6 +1503,56 @@ async fn run_scan_inner(
             .await?;
         ExitCode::Success
     };
+    // Terminal journal (D4): same predicates as the verdict above, so the
+    // journaled class can never disagree with the scan row. Completed and
+    // incomplete scans carry final counts + resume command; interrupted
+    // scans carry the scan id, cursor, and saved scope/options.
+    let (terminal, terminal_records) = if outcome.interrupted {
+        (
+            EventType::ScanInterrupted,
+            serde_json::json!({
+                "scan_id": &scan_id,
+                "cursor": journal.cursor().map(|c| c.encode()),
+                "generation": generation,
+                "scope": {
+                    "policy": &policy,
+                    "roots": roots.iter().map(|r| r.path.display().to_string()).collect::<Vec<_>>(),
+                    "scope_key": &scope_key,
+                },
+                "options": {
+                    "all": resolved.all,
+                    "format": format!("{:?}", args.format),
+                    "status": format!("{:?}", args.status),
+                    "force_rescan": args.force_rescan,
+                    "fetch": args.fetch,
+                },
+                "resume_cmd": resume_cmd_for(&cfg.state_dir, &scan_id),
+            }),
+        )
+    } else {
+        (
+            if scan_incomplete {
+                EventType::ScanIncomplete
+            } else {
+                EventType::ScanCompleted
+            },
+            serde_json::json!({
+                "counts": {
+                    "matched_per_target": &matched_counts,
+                    "pending": outcome.pending,
+                    "open_gaps": outcome.open_gaps,
+                    "unresolvable": outcome.unresolvable,
+                    "status_pending": outcome.status_pending,
+                    "event_gaps": event_gaps,
+                },
+                "generation": generation,
+                "report_id": &report_id,
+                "published": published,
+                "resume_cmd": resume_cmd_for(&cfg.state_dir, &scan_id),
+            }),
+        )
+    };
+    journal.emit(&store, terminal, &terminal_records).await?;
     let _ = store.close().await;
     println!("scan_id: {scan_id}");
     println!("generation: {generation}");
