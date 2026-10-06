@@ -765,3 +765,86 @@ fn step6_all_finds_without_target_filter() {
     assert_eq!(confirmed_repos(&report).len(), 2);
     assert_eq!(report["scan"]["state"], "complete");
 }
+
+// ---------------------------------------------------------------------------
+// Step 15 case 5: distinct explicit root sets never share a generation.
+// ---------------------------------------------------------------------------
+
+/// Distinct root sets get distinct generations with recorded scope keys;
+/// re-scanning a root set lands on its own key — never a foreign one. All
+/// three scans share one state dir, so any policy-name-only reuse would
+/// collapse them onto generation 1.
+#[test]
+fn case5_distinct_root_sets_never_share_generations() {
+    use repo_scan::store::{Store, TursoStore};
+    use repo_scan::walk::roots::{generation_scope_key, PlannedRoot, RootPriority};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let cwd = dir.path().join("cwd");
+    repo_scan::privacy::private_dir_0700(&cwd).expect("mkdir");
+    let r1 = dir.path().join("r1");
+    let r2 = dir.path().join("r2");
+    repo_scan::privacy::private_dir_0700(&r1).expect("mkdir");
+    repo_scan::privacy::private_dir_0700(&r2).expect("mkdir");
+    fixture::normal_clone(&r1, "repo");
+    fixture::normal_clone(&r2, "repo");
+
+    let scan = |root: &Path, rep: &str| {
+        let out = run(
+            &[
+                "scan",
+                URL,
+                "--root",
+                root.to_str().expect("utf8"),
+                "--report",
+                rep,
+            ],
+            &cwd,
+            &state,
+        );
+        assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+        read_report(&cwd.join(rep))
+    };
+    let rep_a = scan(&r1, "a.json");
+    let rep_b = scan(&r2, "b.json");
+    let rep_a2 = scan(&r1, "a2.json");
+    let ga = rep_a["scan"]["generation"].as_u64().expect("gen a");
+    let gb = rep_b["scan"]["generation"].as_u64().expect("gen b");
+    let ga2 = rep_a2["scan"]["generation"].as_u64().expect("gen a2");
+    assert_ne!(ga, gb, "incompatible root sets must not share a generation");
+
+    // Expected keys built independently through the shipped builder over
+    // the same explicit-root shape production plans.
+    let keyed = |root: &Path| {
+        generation_scope_key(
+            "roots",
+            &[PlannedRoot {
+                path: root.to_path_buf(),
+                priority: RootPriority::Early,
+                namespace: String::from("explicit"),
+                volume: None,
+            }],
+        )
+    };
+    let k1 = keyed(&r1);
+    let k2 = keyed(&r2);
+    assert_ne!(k1, k2, "builder distinguishes the sets");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        for (id, want) in [(ga, &k1), (gb, &k2), (ga2, &k1)] {
+            let row = store.get_generation(id).await.expect("get").expect("row");
+            assert_eq!(
+                row.scope_key.as_deref(),
+                Some(want.as_str()),
+                "generation {id} carries its requesting key"
+            );
+        }
+        store.close().await.expect("close");
+    });
+}

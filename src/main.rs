@@ -877,6 +877,8 @@ async fn run_scan_inner(
     // fresh one exactly like `--force-rescan`.
     let saved_generation = resumed.as_ref().and_then(|r| r.generation);
     let events_live = events.live && events.degraded.is_empty();
+    // Full scope key (D5): generation reuse requires equal coverage roots.
+    let scope_key = repo_scan::walk::roots::generation_scope_key(&policy, &roots);
     let generation = match saved_generation {
         Some(saved) if store.get_generation(saved).await?.is_some() => {
             store.set_generation_state(saved, "running").await?;
@@ -888,6 +890,7 @@ async fn run_scan_inner(
             pick_generation(
                 &store,
                 &policy,
+                &scope_key,
                 args.force_rescan,
                 events_live,
                 now,
@@ -906,6 +909,7 @@ async fn run_scan_inner(
             pick_generation(
                 &store,
                 &policy,
+                &scope_key,
                 force,
                 events_live,
                 now,
@@ -1468,16 +1472,21 @@ fn plan_roots(
     }
 }
 
-/// Pick the traversal generation: a fresh one on `--force-rescan`, else the
-/// newest generation of this scope policy still holding actionable work
-/// (compatible unfinished discovery is resumed and shared), else the newest
-/// generation if live events are active (valid catalog information is reused
-/// and reconciled via events), else a fresh generation (when live events are
-/// unsupported or degraded, minting a new generation ensures directory
-/// enumeration tasks run and newly added repositories are discovered).
+/// Pick the traversal generation, reusing only key-compatible coverage
+/// (goal Step 9, contract D5): a fresh one on `--force-rescan`, else the
+/// newest generation whose scope key matches this request still holding
+/// actionable work (compatible unfinished discovery is resumed and shared),
+/// else the newest key-matching generation if live events are active, else
+/// a fresh generation (when live events are unsupported or degraded,
+/// minting a new generation ensures directory enumeration tasks run and
+/// newly added repositories are discovered). Legacy rows (`NULL` scope key)
+/// carry unknown root sets and never satisfy a keyed request; the lineage
+/// `prior` stays the newest same-policy row. Fresh generations record the
+/// requesting key before any seeding.
 async fn pick_generation(
     store: &TursoStore,
     policy: &str,
+    scope_key: &str,
     force: bool,
     events_live: bool,
     now_ms: i64,
@@ -1486,18 +1495,25 @@ async fn pick_generation(
     let mut rows = store
         .connection()
         .query(
-            "SELECT id, state FROM generations WHERE scope_policy = ?1 ORDER BY id DESC",
+            "SELECT id, state, scope_key FROM generations WHERE scope_policy = ?1 ORDER BY id DESC",
             vec![turso::Value::Text(policy.to_string())],
         )
         .await
         .map_err(|e| repo_scan::Error::Store(e.to_string()))?;
     let mut generations = Vec::new();
+    let mut newest_same_policy = None;
     while let Some(row) = rows
         .next()
         .await
         .map_err(|e| repo_scan::Error::Store(e.to_string()))?
     {
-        generations.push((cell_int(&row, 0)? as u64, cell_text(&row, 1)?));
+        let id = cell_int(&row, 0)? as u64;
+        if newest_same_policy.is_none() {
+            newest_same_policy = Some(id);
+        }
+        if cell_opt_text(&row, 2)?.as_deref() == Some(scope_key) {
+            generations.push((id, cell_text(&row, 1)?));
+        }
     }
     if !force {
         for (id, _) in &generations {
@@ -1515,9 +1531,12 @@ async fn pick_generation(
             }
         }
     }
-    let prior = generations.first().map(|(id, _)| *id);
     let generation = store
-        .create_generation(policy, "running", prior, now_ms)
+        .create_generation(policy, "running", newest_same_policy, now_ms)
+        .await?;
+    counters.db_transactions += 1;
+    store
+        .set_generation_scope_key(generation, scope_key)
         .await?;
     counters.db_transactions += 1;
     Ok(generation)
@@ -7011,6 +7030,16 @@ fn cell_text(row: &turso::Row, idx: usize) -> repo_scan::Result<String> {
         turso::Value::Text(value) => Ok(value),
         other => Err(repo_scan::Error::Store(format!(
             "column {idx} expected TEXT, got {other:?}"
+        ))),
+    }
+}
+
+fn cell_opt_text(row: &turso::Row, idx: usize) -> repo_scan::Result<Option<String>> {
+    match row.get_value(idx).map_err(store_err)? {
+        turso::Value::Text(value) => Ok(Some(value)),
+        turso::Value::Null => Ok(None),
+        other => Err(repo_scan::Error::Store(format!(
+            "column {idx} expected TEXT or NULL, got {other:?}"
         ))),
     }
 }

@@ -549,17 +549,14 @@ fn resume02_incomplete_scan_keeps_old_findings() {
         gapped["coverage"]["filesystem"].as_str(),
         Some("incomplete")
     );
-    #[cfg(target_os = "macos")]
-    assert_eq!(
-        gapped["scan"]["generation"].as_u64(),
-        Some(1),
-        "same catalog"
-    );
-    #[cfg(not(target_os = "macos"))]
+    // D5 (Step 15 case 5): the root set {fixture, gone} differs from the
+    // first scan's {fixture}, so coverage cannot be reused even with live
+    // events — a fresh generation on every platform. The old findings below
+    // still come from the shared catalog, not from generation reuse.
     assert_eq!(
         gapped["scan"]["generation"].as_u64(),
         Some(2),
-        "fresh generation on Linux"
+        "fresh generation for a different root set"
     );
     assert_eq!(
         gapped["repositories"].as_array().map(|a| a.len()),
