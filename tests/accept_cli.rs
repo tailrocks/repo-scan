@@ -116,7 +116,8 @@ fn cli01_six_exact_commands_parse() {
     .expect("scan parses");
     match cli.command {
         Command::Scan(args) => {
-            assert_eq!(args.url, "https://github.com/OWNER/REPO");
+            assert_eq!(args.targets, vec!["https://github.com/OWNER/REPO".to_string()]);
+            assert!(!args.all);
             assert!(matches!(args.scope, Scope::Machine));
             assert_eq!(args.report, Some(PathBuf::from("repository-report.json")));
             assert!(!args.force_rescan);
@@ -133,7 +134,10 @@ fn cli01_six_exact_commands_parse() {
     .expect("query parses");
     match cli.command {
         Command::Query(args) => {
-            assert_eq!(args.url, "https://github.com/OWNER/REPO");
+            assert_eq!(
+                args.target.as_deref(),
+                Some("https://github.com/OWNER/REPO")
+            );
             assert!(args.cached);
         }
         _ => panic!("expected query"),
