@@ -8,8 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Report schema version. Must equal `schemas/report-v1.schema.json`.
-pub const SCHEMA_VERSION: &str = "1.0.0";
+/// Report schema version. Must equal `schemas/report-v1.1.schema.json`.
+pub const SCHEMA_VERSION: &str = "1.1.0";
 
 /// Tool name recorded in every envelope.
 pub const TOOL_NAME: &str = "repo-scan";
@@ -28,7 +28,7 @@ where
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Report {
-    /// Must be `1.0.0`.
+    /// Must be [`SCHEMA_VERSION`].
     pub schema_version: String,
     /// Immutable snapshot/report ID.
     pub report_id: String,
@@ -80,6 +80,10 @@ pub struct Scan {
     /// Normalized canonical form, when the shape is supported.
     #[serde(deserialize_with = "deserialize_required_option")]
     pub canonical_url: Option<String>,
+    /// Full requested target set in request order (report 1.1.0). Empty for
+    /// `--all` (no target filter). `target_url`/`canonical_url` above repeat
+    /// the primary target for older consumers.
+    pub targets: Vec<ScanTarget>,
     /// Matching-policy version.
     pub matching_policy: String,
     /// `machine` or `roots`.
@@ -95,6 +99,17 @@ pub struct Scan {
     pub cached: bool,
     /// `metadata`, `summary`, or `full`.
     pub status_mode: String,
+}
+
+/// One requested scan target (report 1.1.0).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanTarget {
+    /// Target exactly as supplied (credentials redacted, never secret bytes).
+    pub raw: String,
+    /// Normalized canonical form, when the shape is supported.
+    pub canonical: Option<String>,
+    /// Repositories `confirmed` for this target in this report.
+    pub matched_repositories: u64,
 }
 
 /// Coverage record. Filesystem, identity, and status are independent.
@@ -424,6 +439,17 @@ impl Scan {
         self.canonical_url = self
             .canonical_url
             .map(|url| crate::identity::redact_remote_url(&url));
+        self.targets = self
+            .targets
+            .into_iter()
+            .map(|t| ScanTarget {
+                raw: crate::identity::redact_remote_url(&t.raw),
+                canonical: t
+                    .canonical
+                    .map(|url| crate::identity::redact_remote_url(&url)),
+                matched_repositories: t.matched_repositories,
+            })
+            .collect();
         self
     }
 }

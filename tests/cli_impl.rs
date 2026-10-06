@@ -387,9 +387,12 @@ fn binary_clear_preserves_foreign_files() {
         store.close().await.expect("close");
     });
     // Tool-owned snapshot bytes: tool-marker fields bound to the filename.
-    let owned_report = "{\"schema_version\":\"1.0.0\",\
-        \"tool\":{\"name\":\"repo-scan\",\"version\":\"test\"},\
-        \"report_id\":\"report-x\"}";
+    let owned_report = format!(
+        "{{\"schema_version\":\"{}\",\
+        \"tool\":{{\"name\":\"repo-scan\",\"version\":\"test\"}},\
+        \"report_id\":\"report-x\"}}",
+        repo_scan::report::model::SCHEMA_VERSION
+    );
     repo_scan::privacy::private_write_0600(
         &payload.join("report-snapshots").join("report-x.json"),
         owned_report.as_bytes(),
@@ -454,7 +457,7 @@ fn binary_scan_resume_query_lifecycle() {
     assert!(report_path.exists());
     let report: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&report_path).expect("read")).expect("json");
-    assert_eq!(report["schema_version"].as_str(), Some("1.0.0"));
+    assert_eq!(report["schema_version"].as_str(), Some("1.1.0"));
     assert_eq!(report["tool"]["name"].as_str(), Some("repo-scan"));
     assert_eq!(report["scan"]["scope"].as_str(), Some("roots"));
     assert_eq!(report["scan"]["state"].as_str(), Some("complete"));
@@ -616,7 +619,12 @@ fn step6_scan_targets_parse_and_validate() {
 fn step6_query_resume_parse_and_validate() {
     // query --all --cached --format json.
     let cli = Cli::try_parse_from([
-        "repo-scan", "query", "--all", "--cached", "--format", "json",
+        "repo-scan",
+        "query",
+        "--all",
+        "--cached",
+        "--format",
+        "json",
     ])
     .expect("query --all parses");
     match cli.command {

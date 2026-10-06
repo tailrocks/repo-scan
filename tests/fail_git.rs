@@ -447,7 +447,7 @@ fn git_control_reads_are_byte_capped() {
 
 /// XSEC-01: relationship inspection runs inside the pinned envelope —
 /// a probe scheduled through a symlink parent completes and persists
-/// under the scheduling spelling (spelling-stable rows), while the
+/// under the canonical store id (one row per physical store), while the
 /// pre-run pin and post-run re-verification bind the execution.
 /// Mid-run swap detection itself is covered by
 /// `relationship_paths_pin_and_reverify_identity`.
@@ -497,13 +497,30 @@ fn relationship_probe_runs_inside_pinned_envelope() {
             matches!(outcome, TaskOutcome::Complete),
             "relationship probe must complete, got {outcome:?}"
         );
+        // Physical store identity (goal Step 5): the scheduling spelling
+        // (through the `link` parent) and the real spelling share one row
+        // under the canonical common dir.
+        let canonical_git =
+            std::fs::canonicalize(scheduled.join(".git")).expect("canonicalize scheduled");
         let id = format!(
+            "git:{}",
+            config::encode_hex(&config::path_as_bytes(&canonical_git))
+        );
+        assert!(
+            store.get_git_instance(&id).await.expect("read").is_some(),
+            "instance persists under the canonical store id"
+        );
+        let scheduled_id = format!(
             "git:{}",
             config::encode_hex(&config::path_as_bytes(&scheduled.join(".git")))
         );
         assert!(
-            store.get_git_instance(&id).await.expect("read").is_some(),
-            "instance persists under the scheduling spelling"
+            store
+                .get_git_instance(&scheduled_id)
+                .await
+                .expect("read")
+                .is_none(),
+            "no second row under the scheduling spelling"
         );
     });
 }
@@ -716,15 +733,23 @@ fn pg01_probe_carries_schedule_identity() {
             }
             other => panic!("swapped probe must park, got {other:?}"),
         }
-        // Nothing persisted under the scheduling spelling.
-        let id = format!(
-            "git:{}",
-            config::encode_hex(&config::path_as_bytes(&victim.join(".git")))
-        );
-        assert!(
-            store.get_git_instance(&id).await.expect("read").is_none(),
-            "swapped probe must persist nothing"
-        );
+        // Nothing persisted under any spelling: a leaked row would land
+        // on the canonical store id, so both spellings are checked.
+        let mut spellings = vec![victim.join(".git")];
+        if let Ok(canonical) = std::fs::canonicalize(victim.join(".git")) {
+            spellings.push(canonical);
+        }
+        for spelling in &spellings {
+            let id = format!(
+                "git:{}",
+                config::encode_hex(&config::path_as_bytes(spelling))
+            );
+            assert!(
+                store.get_git_instance(&id).await.expect("read").is_none(),
+                "swapped probe must persist nothing (checked {})",
+                spelling.display()
+            );
+        }
     });
 }
 
@@ -829,15 +854,23 @@ fn xsec01_mid_inspection_swap_discards() {
             other => panic!("mid-inspection swap must park, got {other:?}"),
         }
         // Two-phase discard: neither the original's nor the swapped-in
-        // repo's observations reached the catalog under this spelling.
-        let id = format!(
-            "git:{}",
-            config::encode_hex(&config::path_as_bytes(&scheduled.join(".git")))
-        );
-        assert!(
-            store.get_git_instance(&id).await.expect("read").is_none(),
-            "mid-inspection swap must persist nothing"
-        );
+        // repo's observations reached the catalog under any spelling (a
+        // leaked row would land on the canonical store id).
+        let mut spellings = vec![scheduled.join(".git")];
+        if let Ok(canonical) = std::fs::canonicalize(scheduled.join(".git")) {
+            spellings.push(canonical);
+        }
+        for spelling in &spellings {
+            let id = format!(
+                "git:{}",
+                config::encode_hex(&config::path_as_bytes(spelling))
+            );
+            assert!(
+                store.get_git_instance(&id).await.expect("read").is_none(),
+                "mid-inspection swap must persist nothing (checked {})",
+                spelling.display()
+            );
+        }
     });
 }
 

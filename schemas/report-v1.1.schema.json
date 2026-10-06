@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://repo-scan.local/schemas/report-v1.schema.json",
-  "title": "repo-scan report v1",
+  "$id": "https://repo-scan.local/schemas/report-v1.1.schema.json",
+  "title": "repo-scan report v1.1",
   "description": "Normative report contract for repo-scan v1 reports. All listed fields are required; unknown values use an explicitly allowed null or state, never omission. Record objects reject undeclared fields in version 1. Non-null relationship IDs must resolve within the report, except envelope, scan, and historical successor IDs (external catalog history) and native identities / event cursors (opaque strings, not foreign keys). Relationship counts must agree with emitted records. ID resolution and count agreement are validated by the REPORT-01 test harness, not by this schema alone.",
   "type": "object",
   "required": [
@@ -12,7 +12,7 @@
   ],
   "additionalProperties": false,
   "properties": {
-    "schema_version": { "const": "1.0.0" },
+    "schema_version": { "const": "1.1.0" },
     "report_id": { "$ref": "#/$defs/Id" },
     "created_at": { "$ref": "#/$defs/Time" },
     "tool": { "$ref": "#/$defs/Tool" },
@@ -50,7 +50,7 @@
       "type": "object",
       "required": [
         "id", "generation", "epoch", "catalog_revision", "target_url",
-        "canonical_url", "matching_policy", "scope", "state", "started_at",
+        "canonical_url", "targets", "matching_policy", "scope", "state", "started_at",
         "finished_at", "superseded_by", "cached", "status_mode"
       ],
       "additionalProperties": false,
@@ -61,6 +61,7 @@
         "catalog_revision": { "$ref": "#/$defs/Count" },
         "target_url": { "type": "string" },
         "canonical_url": { "type": ["string", "null"] },
+        "targets": { "type": "array", "items": { "$ref": "#/$defs/ScanTarget" } },
         "matching_policy": { "type": "string" },
         "scope": { "enum": ["machine", "roots"] },
         "state": { "enum": ["running", "complete", "incomplete", "interrupted", "failed", "superseded"] },
@@ -69,6 +70,16 @@
         "superseded_by": { "type": ["string", "null"], "minLength": 1 },
         "cached": { "type": "boolean" },
         "status_mode": { "enum": ["metadata", "summary", "full"] }
+      }
+    },
+    "ScanTarget": {
+      "type": "object",
+      "required": ["raw", "canonical", "matched_repositories"],
+      "additionalProperties": false,
+      "properties": {
+        "raw": { "type": "string" },
+        "canonical": { "type": ["string", "null"] },
+        "matched_repositories": { "$ref": "#/$defs/Count" }
       }
     },
     "Coverage": {

@@ -423,20 +423,85 @@ fn disposition_str(d: identity::MatchDisposition) -> &'static str {
     }
 }
 
+/// True for evidence lines that carry a match verdict (single-target and
+/// multi-target phrasings). Reclassification strips these before appending
+/// fresh verdicts so repeated runs — including target-set changes between
+/// runs — never accumulate stale lines. Probe-structural lines
+/// (`matching-policy:`, `config files consulted:`, ...) never match.
+fn is_match_verdict_line(line: &str) -> bool {
+    line.starts_with("Effective ")
+        || line.starts_with("No effective remotes")
+        || line.starts_with("reclassified for ")
+        || line.starts_with("for target ")
+}
+
+/// Best disposition across per-target verdicts (goal Step 6 union matching):
+/// any `confirmed` wins, then `related`, then `probable`, then
+/// `unresolvable_identity`, else `nonmatch`. Empty input yields `nonmatch`.
+fn best_disposition(
+    ranks: &[repo_scan::identity::MatchDisposition],
+) -> repo_scan::identity::MatchDisposition {
+    use repo_scan::identity::MatchDisposition as D;
+    let has = |d: D| ranks.contains(&d);
+    if has(D::Confirmed) {
+        D::Confirmed
+    } else if has(D::Related) {
+        D::Related
+    } else if has(D::Probable) {
+        D::Probable
+    } else if has(D::UnresolvableIdentity) {
+        D::UnresolvableIdentity
+    } else {
+        D::Nonmatch
+    }
+}
+
+/// True when stored instance `id` IS the local-target repository named by a
+/// `file://` canonical: same path-identity rule as the single-target
+/// reclassify/probe paths (common dir, git dir, or their parents).
+async fn instance_matches_local_target(
+    store: &TursoStore,
+    id: &str,
+    canonical: &str,
+) -> repo_scan::Result<bool> {
+    let target_path_str = canonical.strip_prefix("file://").unwrap_or(canonical);
+    let t_canon =
+        std::fs::canonicalize(target_path_str).unwrap_or_else(|_| PathBuf::from(target_path_str));
+    let Ok(Some(inst)) = store.get_git_instance(id).await else {
+        return Ok(false);
+    };
+    let gp = config::path_from_bytes(inst.git_path);
+    let cp = config::path_from_bytes(inst.common_path);
+    let gp_canon = std::fs::canonicalize(&gp).ok();
+    let cp_canon = std::fs::canonicalize(&cp).ok();
+    Ok(gp_canon == Some(t_canon.clone())
+        || cp_canon == Some(t_canon.clone())
+        || gp_canon
+            .as_ref()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            == Some(t_canon.clone())
+        || cp_canon
+            .as_ref()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            == Some(t_canon.clone()))
+}
+
 /// Reclassify every stored instance against THIS scan's canonical target
 /// from stored remotes (R1): dispositions are per (instance, target) at
 /// report time, so scanning URL-B after URL-A never leaks URL-A's matches
 /// into URL-B's report (or vice versa). Probe-structural evidence is kept;
 /// stale match verdicts are replaced by fresh ones. Only disposition +
-/// evidence are rewritten — observation times are untouched.
+/// evidence are rewritten — observation times are untouched. Returns the
+/// number of `confirmed` instances (for `scan.targets[].matched_repositories`).
 async fn reclassify_for_target(
     store: &TursoStore,
     canonical: &str,
     counters: &mut RunCounters,
-) -> repo_scan::Result<()> {
+) -> repo_scan::Result<u64> {
     // RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1: chunked pages, one
     // in flight at a time; per-row work is unchanged.
     let mut offset: i64 = 0;
+    let mut confirmed = 0u64;
     loop {
         let sql = format!(
             "SELECT id, evidence FROM git_instances ORDER BY id ASC \
@@ -503,12 +568,11 @@ async fn reclassify_for_target(
             } else {
                 identity::classify_remotes(canonical, borrowed)
             };
+            if disposition == identity::MatchDisposition::Confirmed {
+                confirmed += 1;
+            }
             let mut evidence: Vec<String> = serde_json::from_str(evidence_json).unwrap_or_default();
-            evidence.retain(|line| {
-                !(line.starts_with("Effective ")
-                    || line.starts_with("No effective remotes")
-                    || line.starts_with("reclassified for target "))
-            });
+            evidence.retain(|line| !is_match_verdict_line(line));
             evidence.push(format!(
                 "reclassified for target {canonical} at report time"
             ));
@@ -535,7 +599,123 @@ async fn reclassify_for_target(
             break;
         }
     }
-    Ok(())
+    Ok(confirmed)
+}
+
+/// Reclassify every stored instance against a SET of canonical targets
+/// (goal Step 6 union matching: one filesystem pass serves all targets) or
+/// `--all` (empty `canonicals`: every discovered instance is in scope and
+/// `confirmed`). Same paging shape as [`reclassify_for_target`]; local
+/// `file://` canonicals keep the path-identity rule. Per-target evidence is
+/// prefixed `for target {canonical}: ...` for attribution. Returns
+/// per-target `confirmed` counts aligned with `canonicals` (empty for
+/// `--all`).
+async fn reclassify_for_targets(
+    store: &TursoStore,
+    canonicals: &[String],
+    counters: &mut RunCounters,
+) -> repo_scan::Result<Vec<u64>> {
+    let mut matched = vec![0u64; canonicals.len()];
+    let mut offset: i64 = 0;
+    loop {
+        let sql = format!(
+            "SELECT id, evidence FROM git_instances ORDER BY id ASC \
+             LIMIT {LOAD_CHUNK_ROWS} OFFSET {offset}"
+        );
+        let mut rows = store
+            .connection()
+            .query(sql.as_str(), ())
+            .await
+            .map_err(store_err)?;
+        let mut page: Vec<(String, String)> = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            page.push((cell_text(&row, 0)?, cell_text(&row, 1)?));
+            if page.len() as i64 >= LOAD_CHUNK_ROWS {
+                break;
+            }
+        }
+        if page.is_empty() {
+            break;
+        }
+        let full_page = page.len() as i64 >= LOAD_CHUNK_ROWS;
+        for (id, evidence_json) in &page {
+            let remotes = store.list_remotes(id).await?;
+            let pairs: Vec<(String, String)> = remotes
+                .iter()
+                .map(|r| (String::from_utf8_lossy(&r.url).into_owned(), r.role.clone()))
+                .collect();
+            let borrowed: Vec<(&str, &str)> = pairs
+                .iter()
+                .map(|(url, role)| (url.as_str(), role.as_str()))
+                .collect();
+            let (disposition, mut fresh) = if canonicals.is_empty() {
+                (
+                    identity::MatchDisposition::Confirmed,
+                    vec![String::from(
+                        "matched by --all: no target filter; every discovered instance is in scope",
+                    )],
+                )
+            } else {
+                let mut ranks = Vec::with_capacity(canonicals.len());
+                let mut lines = Vec::new();
+                for (i, canonical) in canonicals.iter().enumerate() {
+                    if identity::is_local_target(canonical)
+                        && instance_matches_local_target(store, id, canonical).await?
+                    {
+                        ranks.push(identity::MatchDisposition::Confirmed);
+                        matched[i] += 1;
+                        lines.push(format!(
+                            "for target {canonical}: repository matches local target repository"
+                        ));
+                        continue;
+                    }
+                    let (verdict, verdict_lines) =
+                        identity::classify_remotes(canonical, borrowed.iter().copied());
+                    if verdict == identity::MatchDisposition::Confirmed {
+                        matched[i] += 1;
+                    }
+                    for line in verdict_lines {
+                        lines.push(format!("for target {canonical}: {line}"));
+                    }
+                    ranks.push(verdict);
+                }
+                (best_disposition(&ranks), lines)
+            };
+            let mut evidence: Vec<String> = serde_json::from_str(evidence_json).unwrap_or_default();
+            evidence.retain(|line| !is_match_verdict_line(line));
+            if canonicals.is_empty() {
+                evidence.push(String::from("reclassified for --all at report time"));
+            } else {
+                for canonical in canonicals {
+                    evidence.push(format!(
+                        "reclassified for target {canonical} at report time"
+                    ));
+                }
+            }
+            evidence.append(&mut fresh);
+            let evidence_json = serde_json::to_string(&evidence)
+                .map_err(|e| repo_scan::Error::Report(e.to_string()))?;
+            store
+                .connection()
+                .execute(
+                    "UPDATE git_instances SET disposition = ?1, evidence = ?2 WHERE id = ?3",
+                    vec![
+                        turso::Value::Text(disposition_str(disposition).to_string()),
+                        turso::Value::Text(evidence_json),
+                        turso::Value::Text(id.clone()),
+                    ],
+                )
+                .await
+                .map_err(store_err)?;
+            counters.db_transactions += 1;
+        }
+        if full_page {
+            offset += page.len() as i64;
+        } else {
+            break;
+        }
+    }
+    Ok(matched)
 }
 
 // ---------------------------------------------------------------------------
@@ -543,23 +723,81 @@ async fn reclassify_for_target(
 // ---------------------------------------------------------------------------
 
 async fn run_scan(cfg: &config::Config, args: &repo_scan::cli::ScanArgs) -> ExitCode {
-    // Goal Step 6: explicit targets XOR --all. This slice executes exactly
-    // one target; multi-target and --all execution follow with the
-    // shared-generation slice (one filesystem pass for all targets).
-    match args.target_set() {
-        Ok(repo_scan::cli::TargetSet::Targets(t)) if t.len() == 1 => {}
-        Ok(_) => {
-            eprintln!(
-                "repo-scan: not yet implemented: multi-target and --all scans execute in the \
-                 next slice; use exactly one TARGET for now"
-            );
-            return ExitCode::OperationalFailure;
-        }
-        Err(msg) => return fail(&repo_scan::Error::InvalidArgs(msg)),
+    // Goal Step 6: explicit targets XOR --all, validated once; execution
+    // resolves the full set and serves it with one filesystem pass.
+    if let Err(msg) = args.target_set() {
+        return fail(&repo_scan::Error::InvalidArgs(msg));
     }
     match run_scan_inner(cfg, args, None).await {
         Ok(code) => code,
         Err(e) => fail(&e),
+    }
+}
+
+/// Scan target set resolved once per request (goal Step 6): explicit
+/// `(sanitized raw, canonical)` pairs in request order, or `--all` (no
+/// target filter). Kept separate from inventory collection: one filesystem
+/// pass serves the whole set.
+struct ResolvedTargets {
+    targets: Vec<(String, String)>,
+    all: bool,
+}
+
+impl ResolvedTargets {
+    /// Primary target (legacy single-target fields use this); `None` for `--all`.
+    fn primary(&self) -> Option<(&str, &str)> {
+        if self.all {
+            return None;
+        }
+        self.targets
+            .first()
+            .map(|(raw, canonical)| (raw.as_str(), canonical.as_str()))
+    }
+
+    /// Canonical forms in request order (empty for `--all`).
+    fn canonicals(&self) -> Vec<String> {
+        self.targets
+            .iter()
+            .map(|(_, canonical)| canonical.clone())
+            .collect()
+    }
+
+    /// True when union matching applies (multi-target or `--all`).
+    /// Exactly one explicit target keeps the legacy single-target path.
+    fn is_set(&self) -> bool {
+        self.all || self.targets.len() > 1
+    }
+}
+
+/// Validate and normalize the scan target set once per request (goal Step
+/// 6). Credential-bearing inputs are rejected before any persistence; every
+/// target resolves to canonical form; `--all` stays target-free.
+fn resolve_scan_targets(args: &repo_scan::cli::ScanArgs) -> repo_scan::Result<ResolvedTargets> {
+    match args.target_set() {
+        Ok(repo_scan::cli::TargetSet::All) => Ok(ResolvedTargets {
+            targets: Vec::new(),
+            all: true,
+        }),
+        Ok(repo_scan::cli::TargetSet::Targets(list)) => {
+            let mut targets = Vec::with_capacity(list.len());
+            for raw in &list {
+                // CLI boundary (RSF-SEC-TARGET-URL, EXACT-2): per target,
+                // before any persistence or reporting; the error echoes
+                // only the display-safe shape, never secret bytes.
+                if identity::must_reject_target(raw) {
+                    return Err(repo_scan::Error::InvalidArgs(format!(
+                        "target URL must not embed credentials or a query/fragment tail; remove them and retry: {}",
+                        identity::redact_target_for_display(raw),
+                    )));
+                }
+                targets.push(resolve_target_identity(raw)?);
+            }
+            Ok(ResolvedTargets {
+                targets,
+                all: false,
+            })
+        }
+        Err(msg) => Err(repo_scan::Error::InvalidArgs(msg)),
     }
 }
 
@@ -575,19 +813,17 @@ async fn run_scan_inner(
     // targets (userinfo, any query/fragment tail) are rejected before any
     // persistence or reporting; the error echoes only the display-safe
     // shape, never secret bytes.
-    let Some(primary) = args.primary_target() else {
-        return Err(repo_scan::Error::InvalidArgs(
-            "scan requires exactly one TARGET in this slice (multi-target/--all execution follows)"
-                .to_string(),
-        ));
+    let resolved = resolve_scan_targets(args)?;
+    // Legacy single-target fields: the primary target, or the `--all`
+    // marker when no target filter applies (report 1.1.0 `scan.targets`
+    // carries the full set; `--all` leaves it empty).
+    let (target, canonical) = match resolved.primary() {
+        Some((raw, canonical)) => (raw.to_string(), Some(canonical.to_string())),
+        None => (String::from("--all"), None),
     };
-    if identity::must_reject_target(primary) {
-        return Err(repo_scan::Error::InvalidArgs(format!(
-            "target URL must not embed credentials or a query/fragment tail; remove them and retry: {}",
-            identity::redact_target_for_display(primary),
-        )));
-    }
-    let (target, canonical) = resolve_target_identity(primary)?;
+    // Probe-time classification key: primary canonical, or "" for `--all`
+    // (union-only instances are corrected by the post-traversal fix-up).
+    let primary_canonical = canonical.as_deref().unwrap_or("");
     // Absolute report destination at request-creation time (spec §3).
     let report_dest = args
         .report
@@ -690,7 +926,7 @@ async fn run_scan_inner(
             mint_scan_id(
                 &store,
                 &target,
-                &canonical,
+                canonical.as_deref(),
                 &policy,
                 args.status,
                 &report_dest,
@@ -704,15 +940,18 @@ async fn run_scan_inner(
         None => now,
     };
     if resumed.is_none() {
-        supersede_stale_scans(
-            &store,
-            &canonical,
-            &policy,
-            &scan_id,
-            now,
-            &mut runner.counters,
-        )
-        .await?;
+        // Per-target supersede (`--all` has no canonical: nothing to match).
+        for supersede_canonical in resolved.canonicals() {
+            supersede_stale_scans(
+                &store,
+                &supersede_canonical,
+                &policy,
+                &scan_id,
+                now,
+                &mut runner.counters,
+            )
+            .await?;
+        }
     }
     // Bind the generation on the running row (R14): the pending outcome
     // carries no terminal verdict (`exit=-1`), only the generation, so an
@@ -753,7 +992,11 @@ async fn run_scan_inner(
     seed_root_tasks(&store, &mut runner, generation, &roots, now).await?;
     // Per-target dispositions before traversal and staging (R1): status
     // refresh, probes, and the report all classify this scan's target.
-    reclassify_for_target(&store, &canonical, &mut runner.counters).await?;
+    let mut matched_counts = if resolved.is_set() {
+        reclassify_for_targets(&store, &resolved.canonicals(), &mut runner.counters).await?
+    } else {
+        vec![reclassify_for_target(&store, primary_canonical, &mut runner.counters).await?]
+    };
     enqueue_status_refresh(&store, &mut runner, generation, run_rev, now).await?;
 
     let mut outcome = run_until_boundary(
@@ -762,11 +1005,53 @@ async fn run_scan_inner(
         epoch,
         generation,
         run_rev,
-        &canonical,
+        primary_canonical,
         args.status,
         &scan_id,
     )
     .await?;
+    // Post-traversal recount (goal Step 6): the pre-traversal classify saw an
+    // empty or partial catalog, so per-target `confirmed` counts are
+    // recomputed here against the drained catalog. Set scans reclassify
+    // set-aware — correcting union-only instances — and refresh their status
+    // in this same run and generation (status task IDs are idempotent per
+    // run, so the repeat refresh is safe). Single-target rows are already
+    // primary-classified (pre-traversal reclassify + probe time), so a
+    // count query suffices and no rewrite churn is added.
+    if !outcome.interrupted {
+        if resolved.is_set() {
+            matched_counts =
+                reclassify_for_targets(&store, &resolved.canonicals(), &mut runner.counters)
+                    .await?;
+            enqueue_status_refresh(&store, &mut runner, generation, run_rev, store::now_ms())
+                .await?;
+            let union_next = run_until_boundary(
+                &mut runner,
+                &store,
+                epoch,
+                generation,
+                run_rev,
+                primary_canonical,
+                args.status,
+                &scan_id,
+            )
+            .await?;
+            outcome.interrupted |= union_next.interrupted;
+            outcome.pending = union_next.pending;
+            outcome.open_gaps = union_next.open_gaps;
+            outcome.unresolvable = union_next.unresolvable;
+            outcome.status_pending = union_next.status_pending;
+        } else {
+            matched_counts = vec![
+                count_query(
+                    &store,
+                    "SELECT COUNT(*) FROM git_instances WHERE disposition = 'confirmed'",
+                    Vec::new(),
+                )
+                .await?,
+            ];
+        }
+    }
     if runner.watchdog.tripped > 0 {
         eprintln!(
             "repo-scan: watchdog tripped {} time(s) this run; stalled scopes were contained",
@@ -822,7 +1107,7 @@ async fn run_scan_inner(
             epoch,
             generation,
             run_rev,
-            &canonical,
+            primary_canonical,
             args.status,
             &scan_id,
         )
@@ -884,6 +1169,18 @@ async fn run_scan_inner(
         epoch,
         target_raw: target.clone(),
         canonical: canonical.clone(),
+        targets: resolved
+            .targets
+            .iter()
+            .enumerate()
+            .map(
+                |(i, (raw, canonical))| repo_scan::report::model::ScanTarget {
+                    raw: raw.clone(),
+                    canonical: Some(canonical.clone()),
+                    matched_repositories: matched_counts.get(i).copied().unwrap_or(0),
+                },
+            )
+            .collect(),
         scope_policy: policy.clone(),
         scan_state: gen_state.to_string(),
         status_mode: args.status,
@@ -1118,11 +1415,11 @@ fn resolve_target_identity(input: &str) -> repo_scan::Result<(String, String)> {
     }
 
     let target = identity::sanitize_target_url(input);
-    let canonical = match identity::normalize_github_url(&target) {
+    let canonical = match identity::normalize_target_input(&target) {
         Some(canonical) => canonical,
         None => {
             return Err(repo_scan::Error::InvalidArgs(format!(
-                "target URL is not a supported GitHub shape: {}",
+                "target is not a supported GitHub shape (owner/name or URL): {}",
                 identity::redact_target_for_display(input),
             )));
         }
@@ -1223,12 +1520,13 @@ async fn pick_generation(
     Ok(generation)
 }
 
-/// Mint a scan ID and persist the request row (raw + canonical URL, scope,
-/// status mode, absolute report destination). Retries ID collisions.
+/// Mint a scan ID and persist the request row (raw + optional canonical URL,
+/// scope, status mode, absolute report destination). Retries ID collisions.
+/// `--all` scans persist the `--all` marker with no canonical.
 async fn mint_scan_id(
     store: &TursoStore,
     raw_url: &str,
-    canonical: &str,
+    canonical: Option<&str>,
     policy: &str,
     status: StatusMode,
     report_dest: &Option<PathBuf>,
@@ -1254,7 +1552,7 @@ async fn mint_scan_id(
                 &NewScan {
                     id: &id,
                     url_raw: safe_url.as_bytes(),
-                    url_canonical: Some(canonical.as_bytes()),
+                    url_canonical: canonical.map(str::as_bytes),
                     scope: policy,
                     status_mode: status_mode_str(status),
                     report_dest: dest_bytes.as_deref(),
@@ -2581,9 +2879,11 @@ struct Runner {
     alias_overflow: bool,
     /// Git-directory identities already persisted this run (R7):
     /// `(dev, ino)` of `instance.git_dir` to the first spelling's bytes.
-    /// A second spelling of the same object records an alias instead of a
-    /// duplicate instance. One small entry per distinct identity; eviction
-    /// would duplicate instances, so the map lives for the run.
+    /// Keyed by the probed store's COMMON-dir identity: a second spelling of
+    /// the same store records a path alias, and a linked-worktree admin dir
+    /// attaches its checkout — neither duplicates the instance. One small
+    /// entry per distinct identity; eviction would duplicate instances, so
+    /// the map lives for the run.
     probed_git_ids: HashMap<(u64, u64), Vec<u8>>,
     /// Working-directory identities already persisted this run (R7):
     /// `(dev, ino)` of `instance.work_dir` to deduplicate checkouts
@@ -5289,7 +5589,9 @@ async fn test_probe_outcome_impl(
 /// reach the catalog — not even through an early batch flush.
 struct ProbeReads {
     incarnation: String,
-    git_identity: Option<(u64, u64)>,
+    /// Physical identity of the COMMON dir: all worktree admin dirs of one
+    /// store share it, so repeats attach instead of duplicating the store.
+    common_identity: Option<(u64, u64)>,
     remotes: Vec<git::RemoteObservation>,
     remotes_note: Option<String>,
     head: git::HeadState,
@@ -5344,13 +5646,13 @@ async fn collect_probe_reads(
     if deadline.expired() {
         return Ok(CollectOutcome::TimedOut);
     }
-    let incarnation = std::fs::symlink_metadata(&instance.git_dir)
+    let incarnation = std::fs::symlink_metadata(&instance.common_dir)
         .map(|md| {
             let (dev, ino) = dir_identity(&md);
             format!("d{dev}i{ino}")
         })
         .unwrap_or_default();
-    let git_identity = std::fs::metadata(&instance.git_dir)
+    let common_identity = std::fs::metadata(&instance.common_dir)
         .ok()
         .map(|md| dir_identity(&md))
         .filter(|key| *key != (0, 0));
@@ -5444,7 +5746,7 @@ async fn collect_probe_reads(
     let branch_upstreams = load_branch_upstreams(&instance.common_dir);
     Ok(CollectOutcome::Reads(Box::new(ProbeReads {
         incarnation,
-        git_identity,
+        common_identity,
         remotes,
         remotes_note,
         head,
@@ -5479,19 +5781,47 @@ async fn persist_probe(
 ) -> repo_scan::Result<()> {
     let instance = &validated.instance;
     let git_bytes = config::path_as_bytes(&instance.git_dir);
-    let common_bytes = config::path_as_bytes(&instance.common_dir);
-    let instance_id = format!("git:{}", config::encode_hex(&git_bytes));
+    // Local-store identity (goal Step 5): the canonical COMMON dir. Linked
+    // worktree admin dirs resolve to their shared store, and distinct
+    // spellings of one directory merge — instance, remote, and ref IDs all
+    // key on this. The stored PATH columns keep observed spellings (goal
+    // Step 7: every spelling stays visible; second spellings add alias
+    // rows), so only ID derivation uses the canonical form. Non-absolute
+    // paths (should not happen: probe inputs are absolute) skip
+    // canonicalization rather than resolving against the process working
+    // directory.
+    let canonical_common = if instance.common_dir.is_absolute() {
+        std::fs::canonicalize(&instance.common_dir).unwrap_or_else(|_| instance.common_dir.clone())
+    } else {
+        instance.common_dir.clone()
+    };
+    let common_bytes = config::path_as_bytes(&canonical_common);
+    let raw_common_bytes = config::path_as_bytes(&instance.common_dir);
+    let instance_id = format!("git:{}", config::encode_hex(&common_bytes));
     let incarnation = reads.incarnation;
 
-    // A second pathname spelling of an already-persisted object records an
-    // alias instead of a duplicate instance (R7). Identity follows
-    // symlinks; the `(0, 0)` fallback (non-unix) never dedupes.
-    if let Some(key) = reads.git_identity {
+    // A repeat probe of an already-persisted STORE (same common dir: a
+    // second spelling, or a linked-worktree admin dir) attaches its
+    // checkout instead of duplicating the instance (R7 + goal Step 5).
+    // Identity follows symlinks; the `(0, 0)` fallback (non-unix) never
+    // dedupes. Shared refs/remotes persist once, on first sight.
+    if let Some(key) = reads.common_identity {
         match runner.probed_git_ids.get(&key).cloned() {
             Some(first) if first != git_bytes => {
-                let due =
-                    runner.note_alias(git_bytes.clone(), first.clone(), "same_object", now_ms);
-                flush_if_due(runner, store, due).await?;
+                // Same-directory spellings record a path alias; a worktree
+                // admin dir is a DIFFERENT directory sharing the store, so
+                // it attaches without an alias row (its admin path is
+                // preserved on its checkout row).
+                let same_dir = if instance.git_dir.is_absolute() {
+                    std::fs::canonicalize(&instance.git_dir).ok() == Some(canonical_common.clone())
+                } else {
+                    instance.git_dir == instance.common_dir
+                };
+                if same_dir {
+                    let due =
+                        runner.note_alias(git_bytes.clone(), first.clone(), "same_object", now_ms);
+                    flush_if_due(runner, store, due).await?;
+                }
                 let work_identity = instance
                     .work_dir
                     .as_ref()
@@ -5606,7 +5936,7 @@ async fn persist_probe(
             }
             Some(_) => {}
             None => {
-                let due = note_probed_git_id(runner, key, git_bytes.clone(), now_ms);
+                let due = note_probed_git_id(runner, key, common_bytes.clone(), now_ms);
                 flush_if_due(runner, store, due).await?;
             }
         }
@@ -5673,7 +6003,7 @@ async fn persist_probe(
     let new_instance = NewGitInstance {
         id: &instance_id,
         git_path: &git_bytes,
-        common_path: &common_bytes,
+        common_path: &raw_common_bytes,
         incarnation: &incarnation,
         format: "git-files",
         bare: Some(instance.is_bare),
@@ -5691,7 +6021,7 @@ async fn persist_probe(
         };
         let remote_id = format!(
             "remote:{}:{}:{role}",
-            config::encode_hex(&git_bytes),
+            config::encode_hex(&common_bytes),
             config::encode_hex(&remote.name),
         );
         let canonical_bytes = remote.canonical_url.as_ref().map(|c| c.as_bytes());
@@ -5819,7 +6149,7 @@ async fn persist_probe(
         };
         let ref_id = format!(
             "ref:{}:{}",
-            config::encode_hex(&git_bytes),
+            config::encode_hex(&common_bytes),
             config::encode_hex(&reference.name),
         );
         let (oid, algo, symbolic) = match &reference.target {
@@ -6724,7 +7054,9 @@ struct ScanReportInputs {
     generation: u64,
     epoch: u64,
     target_raw: String,
-    canonical: String,
+    canonical: Option<String>,
+    /// Full requested target set for report 1.1.0 (empty for `--all`).
+    targets: Vec<repo_scan::report::model::ScanTarget>,
     scope_policy: String,
     scan_state: String,
     status_mode: StatusMode,
@@ -7287,7 +7619,8 @@ async fn build_lib_inputs(
         // never carries credentials even if a legacy stored target did.
         // Strict form (RETEST-2): opaque query/fragment tails drop too.
         target_url: identity::redact_remote_url(&inputs.target_raw),
-        canonical_url: Some(inputs.canonical.clone()),
+        canonical_url: inputs.canonical.clone(),
+        targets: inputs.targets.clone(),
         scope: inputs.scope_policy.clone(),
         scan_state: inputs.scan_state.clone(),
         started_at_ms: inputs.started_ms,
