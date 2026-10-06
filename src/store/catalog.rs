@@ -3928,6 +3928,31 @@ impl TursoStore {
         Ok(rows == 1)
     }
 
+    /// v2: buffer one scan-event journal row into a writer batch (D4),
+    /// committing atomically with the instance/checkout rows that caused
+    /// it. Same `INSERT OR IGNORE` by `(scan_id, seq)` as
+    /// [`Self::append_scan_event`]. Returns `WriterBatch::should_flush`.
+    pub fn buffer_scan_event(
+        batch: &mut WriterBatch,
+        event: &NewScanEvent<'_>,
+    ) -> crate::Result<bool> {
+        Ok(batch.push(
+            "INSERT OR IGNORE INTO scan_events (scan_id, seq, catalog_rev, event_offset, \
+                event_type, op, reset, records) \
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            vec![
+                v_text(event.scan_id),
+                v_int(u64_to_i64(event.seq, "event seq")?),
+                v_int(u64_to_i64(event.catalog_rev, "event catalog_rev")?),
+                v_int(u64_to_i64(event.event_offset, "event offset")?),
+                v_text(event.event_type),
+                v_text(event.op),
+                v_int(i64::from(event.reset)),
+                v_blob(event.records.to_vec()),
+            ],
+        ))
+    }
+
     /// v2: replay journal rows for a scan after `after_seq` (exclusive),
     /// oldest first, capped at `limit` rows (clamped to `[1, 10_000]`).
     pub async fn read_scan_events(

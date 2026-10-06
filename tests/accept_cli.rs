@@ -1074,3 +1074,103 @@ fn query_scan_replays_journaled_lifecycle_as_jsonl() {
         stderr_text(&missing)
     );
 }
+
+/// Goal Step 12 (D4): a discovery scan journals one `repository_found`
+/// per local store and one `location_found` per checkout — each exactly
+/// once, each before `inventory_ready`, each store before its checkouts,
+/// all with `analysis: "pending"`.
+#[test]
+fn found_events_cover_each_store_and_checkout_once() {
+    use repo_scan::store::{Store, TursoStore};
+    use std::collections::{HashMap, HashSet};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let cwd = dir.path().join("cwd");
+    repo_scan::privacy::private_dir_0700(&cwd).expect("mkdir");
+    let root = dir.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    fixture::normal_clone(&root, "repo-a");
+    fixture::normal_clone(&root, "repo-b");
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            "rep.json",
+        ],
+        &cwd,
+        &state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let scan_id = stdout_line(&out, "scan_id");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        let rows = store
+            .read_scan_events(&scan_id, 0, 1_000)
+            .await
+            .expect("read");
+        let records = |seq: u64| -> serde_json::Value {
+            let row = rows.iter().find(|r| r.seq == seq).expect("row by seq");
+            serde_json::from_slice(&row.records).expect("records json")
+        };
+        let repos: Vec<u64> = rows
+            .iter()
+            .filter(|r| r.event_type == "repository_found")
+            .map(|r| r.seq)
+            .collect();
+        let locs: Vec<u64> = rows
+            .iter()
+            .filter(|r| r.event_type == "location_found")
+            .map(|r| r.seq)
+            .collect();
+        assert_eq!(repos.len(), 2, "one repository_found per store");
+        assert_eq!(locs.len(), 2, "one location_found per checkout");
+        let ready = rows
+            .iter()
+            .find(|r| r.event_type == "inventory_ready")
+            .expect("inventory_ready")
+            .seq;
+        for seq in repos.iter().chain(locs.iter()) {
+            assert!(*seq < ready, "found events precede inventory_ready");
+        }
+        // Each store id exactly once; each checkout id exactly once, and
+        // each store's event precedes its checkouts' events.
+        let mut store_seq: HashMap<String, u64> = HashMap::new();
+        for seq in &repos {
+            let v = records(*seq);
+            assert_eq!(
+                v["analysis"],
+                serde_json::Value::String("pending".to_string())
+            );
+            let id = v["store_id"].as_str().expect("store id").to_string();
+            assert!(store_seq.insert(id, *seq).is_none(), "store emitted once");
+        }
+        let mut seen_checkouts: HashSet<String> = HashSet::new();
+        for seq in &locs {
+            let v = records(*seq);
+            assert_eq!(
+                v["analysis"],
+                serde_json::Value::String("pending".to_string())
+            );
+            assert!(v["identity_state"].is_string(), "identity state explicit");
+            let co = v["checkout_id"].as_str().expect("checkout id").to_string();
+            let st = v["store_id"].as_str().expect("store id").to_string();
+            assert!(seen_checkouts.insert(co), "checkout emitted once");
+            let repo_seq = store_seq.get(&st).expect("checkout names an emitted store");
+            assert!(*repo_seq < *seq, "store before its checkouts");
+        }
+        // Seqs stay contiguous across the interleaved stream.
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row.seq, (i + 1) as u64, "contiguous 1-based seqs");
+        }
+        store.close().await.expect("close");
+    });
+}
