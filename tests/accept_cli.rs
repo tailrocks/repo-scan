@@ -619,6 +619,9 @@ fn cli03_superseded_resume_names_successor() {
                     scope: "roots",
                     status_mode: "summary",
                     report_dest: None,
+                    targets_json: None,
+                    format: None,
+                    all_targets: None,
                 },
                 repo_scan::store::now_ms(),
             )

@@ -2535,6 +2535,14 @@ pub struct ScanRow {
     pub created_at_ms: i64,
     /// Last update time.
     pub updated_at_ms: i64,
+    /// v2: JSON array of `{raw, canonical}` for the multi-target request
+    /// served by one filesystem pass; `None` = legacy single-target row
+    /// addressed via `url_raw`.
+    pub targets_json: Option<String>,
+    /// v2: output format (`human|json|jsonl`); `None` = legacy/auto.
+    pub format: Option<String>,
+    /// v2: `--all` filesystem-discovery scan; `None` = legacy row.
+    pub all_targets: Option<bool>,
 }
 
 impl ScanRow {
@@ -2551,6 +2559,9 @@ impl ScanRow {
             successor_id: opt_text(row, 8)?,
             created_at_ms: req_i64(row, 9)?,
             updated_at_ms: req_i64(row, 10)?,
+            targets_json: opt_text(row, 11)?,
+            format: opt_text(row, 12)?,
+            all_targets: opt_i64(row, 13)?.map(|v| v != 0),
         })
     }
 }
@@ -2570,6 +2581,12 @@ pub struct NewScan<'a> {
     pub status_mode: &'a str,
     /// Absolute report destination, exact bytes.
     pub report_dest: Option<&'a [u8]>,
+    /// v2: JSON array of `{raw, canonical}` targets; `None` = legacy row.
+    pub targets_json: Option<&'a str>,
+    /// v2: output format (`human|json|jsonl`); `None` = legacy/auto.
+    pub format: Option<&'a str>,
+    /// v2: `--all` scan; `None` = legacy row.
+    pub all_targets: Option<bool>,
 }
 
 /// One immutable report snapshot.
@@ -2755,6 +2772,10 @@ pub struct GenerationRow {
     pub prior_generation: Option<u64>,
     /// Creation time.
     pub created_at_ms: i64,
+    /// v2: full scope key (roots + volume identities + exclusions +
+    /// traversal policy); `None` = legacy policy-name key in
+    /// `scope_policy`.
+    pub scope_key: Option<String>,
 }
 
 impl GenerationRow {
@@ -2767,6 +2788,118 @@ impl GenerationRow {
                 .map(|prior| i64_to_u64(prior, "prior generation"))
                 .transpose()?,
             created_at_ms: req_i64(row, 4)?,
+            scope_key: opt_text(row, 5)?,
+        })
+    }
+}
+
+/// v2: one scan-event journal append (D4).
+#[derive(Debug, Clone)]
+pub struct NewScanEvent<'a> {
+    /// Scan id.
+    pub scan_id: &'a str,
+    /// Scan-scoped sequence, assigned by the writer.
+    pub seq: u64,
+    /// Catalog revision committed with this event.
+    pub catalog_rev: u64,
+    /// Offset of this event within its revision.
+    pub event_offset: u64,
+    /// Event class (`scan_started`, `location_found`, ...).
+    pub event_type: &'a str,
+    /// `add` | `replace` | `remove`.
+    pub op: &'a str,
+    /// Consumer must drop buffered state.
+    pub reset: bool,
+    /// JSON bytes, stored byte-exact.
+    pub records: &'a [u8],
+}
+
+/// v2: one journaled scan event.
+#[derive(Debug, Clone)]
+pub struct ScanEventRow {
+    /// Scan id.
+    pub scan_id: String,
+    /// Scan-scoped sequence.
+    pub seq: u64,
+    /// Catalog revision committed with this event.
+    pub catalog_rev: u64,
+    /// Offset of this event within its revision.
+    pub event_offset: u64,
+    /// Event class.
+    pub event_type: String,
+    /// `add` | `replace` | `remove`.
+    pub op: String,
+    /// Consumer must drop buffered state.
+    pub reset: bool,
+    /// JSON bytes, byte-exact.
+    pub records: Vec<u8>,
+}
+
+impl ScanEventRow {
+    fn from_row(row: &turso::Row) -> crate::Result<Self> {
+        Ok(Self {
+            scan_id: req_text(row, 0)?,
+            seq: i64_to_u64(req_i64(row, 1)?, "event seq")?,
+            catalog_rev: i64_to_u64(req_i64(row, 2)?, "event catalog_rev")?,
+            event_offset: i64_to_u64(req_i64(row, 3)?, "event offset")?,
+            event_type: req_text(row, 4)?,
+            op: req_text(row, 5)?,
+            reset: req_i64(row, 6)? != 0,
+            records: req_blob(row, 7)?,
+        })
+    }
+}
+
+/// v2: one GitHub group (D1): normalized host/account/repo.
+#[derive(Debug, Clone)]
+pub struct GithubGroupRow {
+    /// Writer-computed `lower(host)/lower(account)/lower(repo)`.
+    pub id: String,
+    /// Normalized host.
+    pub host: String,
+    /// Normalized account or organization.
+    pub account: String,
+    /// Normalized repository name.
+    pub repo: String,
+    /// First observation time.
+    pub observed_at_ms: i64,
+}
+
+impl GithubGroupRow {
+    fn from_row(row: &turso::Row) -> crate::Result<Self> {
+        Ok(Self {
+            id: req_text(row, 0)?,
+            host: req_text(row, 1)?,
+            account: req_text(row, 2)?,
+            repo: req_text(row, 3)?,
+            observed_at_ms: req_i64(row, 4)?,
+        })
+    }
+}
+
+/// v2: one store-to-group edge via the observing remote (D1).
+#[derive(Debug, Clone)]
+pub struct GroupMemberRow {
+    /// Group id.
+    pub group_id: String,
+    /// Local store id.
+    pub instance_id: String,
+    /// Observing remote name, exact bytes.
+    pub remote_name: Vec<u8>,
+    /// `fetch` | `push`.
+    pub role: String,
+    /// Observation time.
+    pub observed_at_ms: i64,
+}
+
+impl GroupMemberRow {
+    fn from_row(row: &turso::Row) -> crate::Result<Self> {
+        Ok(Self {
+            group_id: req_text(row, 0)?,
+            instance_id: req_text(row, 1)?,
+            remote_name: req_blob(row, 2)?,
+            role: req_text(row, 3)?,
+            observed_at_ms: req_i64(row, 4)?,
         })
     }
 }
@@ -3250,8 +3383,9 @@ impl TursoStore {
             .conn
             .execute(
                 "INSERT OR IGNORE INTO scan_requests (id, url_raw, url_canonical, scope, \
-                    status_mode, report_dest, state, created_at_ms, updated_at_ms) \
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?7)",
+                    status_mode, report_dest, state, created_at_ms, updated_at_ms, \
+                    targets_json, format, all_targets) \
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?7, ?8, ?9, ?10)",
                 vec![
                     v_text(scan.id),
                     v_blob(url_raw),
@@ -3260,6 +3394,9 @@ impl TursoStore {
                     v_text(scan.status_mode),
                     v_opt_blob(scan.report_dest.map(<[u8]>::to_vec)),
                     v_int(now_ms),
+                    v_opt_text(scan.targets_json.map(str::to_string)),
+                    v_opt_text(scan.format.map(str::to_string)),
+                    v_opt_int(scan.all_targets.map(i64::from)),
                 ],
             )
             .await
@@ -3300,7 +3437,8 @@ impl TursoStore {
             .conn
             .query(
                 "SELECT id, url_raw, url_canonical, scope, status_mode, report_dest, \
-                    state, outcome, successor_id, created_at_ms, updated_at_ms \
+                    state, outcome, successor_id, created_at_ms, updated_at_ms, \
+                    targets_json, format, all_targets \
                     FROM scan_requests WHERE id = ?1",
                 vec![v_text(id)],
             )
@@ -3737,7 +3875,7 @@ impl TursoStore {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, scope_policy, state, prior_generation, created_at_ms \
+                "SELECT id, scope_policy, state, prior_generation, created_at_ms, scope_key \
                     FROM generations WHERE id = ?1",
                 vec![v_int(u64_to_i64(id, "generation id")?)],
             )
@@ -3747,6 +3885,213 @@ impl TursoStore {
             None => Ok(None),
             Some(row) => Ok(Some(GenerationRow::from_row(&row)?)),
         }
+    }
+
+    /// v2: record the full scope key for a generation (D5). Never set
+    /// (`NULL`) keeps the legacy policy-name key semantics.
+    pub async fn set_generation_scope_key(&self, id: u64, scope_key: &str) -> crate::Result<()> {
+        self.forbid_write("set_generation_scope_key")?;
+        self.conn
+            .execute(
+                "UPDATE generations SET scope_key = ?1 WHERE id = ?2",
+                vec![v_text(scope_key), v_int(u64_to_i64(id, "generation id")?)],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// v2: append one scan-event journal row (D4). `INSERT OR IGNORE` by
+    /// `(scan_id, seq)`: redelivery of the same `seq` is idempotent.
+    /// Returns true when newly inserted.
+    pub async fn append_scan_event(&self, event: &NewScanEvent<'_>) -> crate::Result<bool> {
+        self.forbid_write("append_scan_event")?;
+        let rows = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO scan_events (scan_id, seq, catalog_rev, event_offset, \
+                    event_type, op, reset, records) \
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                vec![
+                    v_text(event.scan_id),
+                    v_int(u64_to_i64(event.seq, "event seq")?),
+                    v_int(u64_to_i64(event.catalog_rev, "event catalog_rev")?),
+                    v_int(u64_to_i64(event.event_offset, "event offset")?),
+                    v_text(event.event_type),
+                    v_text(event.op),
+                    v_int(i64::from(event.reset)),
+                    v_blob(event.records.to_vec()),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(rows == 1)
+    }
+
+    /// v2: replay journal rows for a scan after `after_seq` (exclusive),
+    /// oldest first, capped at `limit` rows (clamped to `[1, 10_000]`).
+    pub async fn read_scan_events(
+        &self,
+        scan_id: &str,
+        after_seq: u64,
+        limit: u64,
+    ) -> crate::Result<Vec<ScanEventRow>> {
+        let limit = limit.clamp(1, 10_000);
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT scan_id, seq, catalog_rev, event_offset, event_type, op, reset, records \
+                    FROM scan_events WHERE scan_id = ?1 AND seq > ?2 \
+                    ORDER BY seq ASC LIMIT ?3",
+                vec![
+                    v_text(scan_id),
+                    v_int(u64_to_i64(after_seq, "after seq")?),
+                    v_int(u64_to_i64(limit, "event limit")?),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            out.push(ScanEventRow::from_row(&row)?);
+        }
+        Ok(out)
+    }
+
+    /// v2: highest journaled `seq` for a scan (`None` when empty), so a
+    /// restarted writer resumes numbering without reuse.
+    pub async fn last_event_seq(&self, scan_id: &str) -> crate::Result<Option<u64>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT MAX(seq) FROM scan_events WHERE scan_id = ?1",
+                vec![v_text(scan_id)],
+            )
+            .await
+            .map_err(store_err)?;
+        match rows.next().await.map_err(store_err)? {
+            None => Ok(None),
+            Some(row) => Ok(opt_i64(&row, 0)?
+                .map(|v| i64_to_u64(v, "event seq"))
+                .transpose()?),
+        }
+    }
+
+    /// v2: upsert one GitHub group (D1). The id is writer-computed
+    /// `lower(host)/lower(account)/lower(repo)`; first observation wins
+    /// (`INSERT OR IGNORE`). Returns true when newly inserted.
+    pub async fn upsert_github_group(
+        &self,
+        id: &str,
+        host: &str,
+        account: &str,
+        repo: &str,
+        now_ms: i64,
+    ) -> crate::Result<bool> {
+        self.forbid_write("upsert_github_group")?;
+        let rows = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO github_groups (id, host, account, repo, observed_at_ms) \
+                    VALUES (?1, ?2, ?3, ?4, ?5)",
+                vec![
+                    v_text(id),
+                    v_text(host),
+                    v_text(account),
+                    v_text(repo),
+                    v_int(now_ms),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(rows == 1)
+    }
+
+    /// v2: attach one store to a group via the observing remote's
+    /// `(name, role)` (D1). Idempotent. Returns true when newly inserted.
+    pub async fn add_group_member(
+        &self,
+        group_id: &str,
+        instance_id: &str,
+        remote_name: &[u8],
+        role: &str,
+        now_ms: i64,
+    ) -> crate::Result<bool> {
+        self.forbid_write("add_group_member")?;
+        let rows = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO group_members (group_id, instance_id, remote_name, role, \
+                    observed_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+                vec![
+                    v_text(group_id),
+                    v_text(instance_id),
+                    v_blob(remote_name.to_vec()),
+                    v_text(role),
+                    v_int(now_ms),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(rows == 1)
+    }
+
+    /// v2: one group by id.
+    pub async fn get_github_group(&self, id: &str) -> crate::Result<Option<GithubGroupRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, host, account, repo, observed_at_ms \
+                    FROM github_groups WHERE id = ?1",
+                vec![v_text(id)],
+            )
+            .await
+            .map_err(store_err)?;
+        match rows.next().await.map_err(store_err)? {
+            None => Ok(None),
+            Some(row) => Ok(Some(GithubGroupRow::from_row(&row)?)),
+        }
+    }
+
+    /// v2: member edges of one group.
+    pub async fn list_group_members(&self, group_id: &str) -> crate::Result<Vec<GroupMemberRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT group_id, instance_id, remote_name, role, observed_at_ms \
+                    FROM group_members WHERE group_id = ?1 \
+                    ORDER BY instance_id ASC, role ASC",
+                vec![v_text(group_id)],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            out.push(GroupMemberRow::from_row(&row)?);
+        }
+        Ok(out)
+    }
+
+    /// v2: groups one store belongs to (via any remote).
+    pub async fn groups_for_instance(
+        &self,
+        instance_id: &str,
+    ) -> crate::Result<Vec<GroupMemberRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT group_id, instance_id, remote_name, role, observed_at_ms \
+                    FROM group_members WHERE instance_id = ?1 \
+                    ORDER BY group_id ASC",
+                vec![v_text(instance_id)],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            out.push(GroupMemberRow::from_row(&row)?);
+        }
+        Ok(out)
     }
 }
 

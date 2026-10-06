@@ -44,7 +44,8 @@
 ///   role)` (D1: keep name + role per store); `remote_name` is `BLOB`
 ///   like `remotes.name` because remote names are raw bytes.
 /// * `scan_events.seq` is the scan-scoped sequence assigned by the writer
-///   (D4); `records` holds JSON bytes stored byte-exact.
+///   (D4), so the key is `(scan_id, seq)`: a bare `seq` primary key would
+///   collide across scans. `records` holds JSON bytes stored byte-exact.
 /// * `scan_requests.targets_json` is a JSON array of `{raw, canonical}`;
 ///   `NULL` means a legacy single-target row addressed via `url_raw`.
 ///   `format` is the D6 output format (`human|json|jsonl`); `all_targets`
@@ -72,17 +73,16 @@ CREATE TABLE IF NOT EXISTS group_members (
 CREATE INDEX IF NOT EXISTS idx_group_members_instance
     ON group_members(instance_id);
 CREATE TABLE IF NOT EXISTS scan_events (
-    seq INTEGER PRIMARY KEY,
     scan_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
     catalog_rev INTEGER NOT NULL,
     event_offset INTEGER NOT NULL,
     event_type TEXT NOT NULL,
     op TEXT NOT NULL,
     reset INTEGER NOT NULL DEFAULT 0,
-    records BLOB NOT NULL
+    records BLOB NOT NULL,
+    PRIMARY KEY (scan_id, seq)
 );
-CREATE INDEX IF NOT EXISTS idx_scan_events_scan_seq
-    ON scan_events(scan_id, seq);
 CREATE INDEX IF NOT EXISTS idx_scan_events_cursor
     ON scan_events(scan_id, catalog_rev, event_offset);
 ALTER TABLE scan_requests ADD COLUMN targets_json TEXT;
@@ -108,10 +108,10 @@ mod tests {
     use super::*;
 
     const TABLES: [&str; 3] = ["github_groups", "group_members", "scan_events"];
-    const INDEXES: [&str; 4] = [
+    // No per-scan seq index: PRIMARY KEY (scan_id, seq) serves it.
+    const INDEXES: [&str; 3] = [
         "idx_github_groups_identity",
         "idx_group_members_instance",
-        "idx_scan_events_scan_seq",
         "idx_scan_events_cursor",
     ];
 

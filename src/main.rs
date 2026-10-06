@@ -930,6 +930,9 @@ async fn run_scan_inner(
                 &policy,
                 args.status,
                 &report_dest,
+                &resolved.targets,
+                args.format,
+                resolved.all,
                 &mut runner.counters,
             )
             .await?
@@ -1521,8 +1524,12 @@ async fn pick_generation(
 }
 
 /// Mint a scan ID and persist the request row (raw + optional canonical URL,
-/// scope, status mode, absolute report destination). Retries ID collisions.
-/// `--all` scans persist the `--all` marker with no canonical.
+/// scope, status mode, absolute report destination, v2 target set / format /
+/// `--all` marker). Retries ID collisions. `--all` scans persist the `--all`
+/// marker with no canonical, an empty target set, and `all_targets`.
+// Parameters mirror the scan-request row 1:1; grouping would churn the
+// single caller for no clarity gain.
+#[allow(clippy::too_many_arguments)]
 async fn mint_scan_id(
     store: &TursoStore,
     raw_url: &str,
@@ -1530,6 +1537,9 @@ async fn mint_scan_id(
     policy: &str,
     status: StatusMode,
     report_dest: &Option<PathBuf>,
+    targets: &[(String, String)],
+    format: Option<repo_scan::cli::OutputFormat>,
+    all: bool,
     counters: &mut RunCounters,
 ) -> repo_scan::Result<String> {
     // Defense-in-depth: the CLI boundary already rejected credential
@@ -1545,6 +1555,21 @@ async fn mint_scan_id(
     let safe_url = identity::sanitize_target_url(raw_url);
     let now = store::now_ms();
     let dest_bytes = report_dest.as_ref().map(|p| config::path_as_bytes(p));
+    // v2 request shape (D5/D6): the full target set served by one
+    // filesystem pass, the output format, and the `--all` marker. The
+    // CLI boundary already rejected credential-bearing targets.
+    let targets_json = serde_json::to_string(
+        &targets
+            .iter()
+            .map(|(raw, canonical)| serde_json::json!({"raw": raw, "canonical": canonical}))
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|e| repo_scan::Error::Report(e.to_string()))?;
+    let format_str = format.map(|f| match f {
+        repo_scan::cli::OutputFormat::Human => "human",
+        repo_scan::cli::OutputFormat::Json => "json",
+        repo_scan::cli::OutputFormat::Jsonl => "jsonl",
+    });
     for _ in 0..3 {
         let id = config::new_scan_id();
         let inserted = store
@@ -1556,6 +1581,9 @@ async fn mint_scan_id(
                     scope: policy,
                     status_mode: status_mode_str(status),
                     report_dest: dest_bytes.as_deref(),
+                    targets_json: Some(targets_json.as_str()),
+                    format: format_str,
+                    all_targets: Some(all),
                 },
                 now,
             )
