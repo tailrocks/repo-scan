@@ -1154,6 +1154,14 @@ async fn run_scan_inner(
     // persistence or reporting; the error echoes only the display-safe
     // shape, never secret bytes.
     let resolved = resolve_scan_targets(args)?;
+    // CLI boundary: `--workers 0` is meaningless (no reader could run);
+    // reject it loudly instead of clamping to a surprise. (Resume maps
+    // a corrupt saved zero to the runtime default before reaching here.)
+    if args.workers == Some(0) {
+        return Err(repo_scan::Error::InvalidArgs(String::from(
+            "--workers must be at least 1",
+        )));
+    }
     // Legacy single-target fields: the primary target, or the `--all`
     // marker when no target filter applies (report 1.1.0 `scan.targets`
     // carries the full set; `--all` leaves it empty).
@@ -1173,7 +1181,11 @@ async fn run_scan_inner(
     let (policy, roots, state_roots) = plan_roots(args)?;
     let (_guard, store) = open_owned_with_wait(&cfg.state_dir).await?;
     let epoch = store.epoch();
-    let mut runner = Runner::new(&cfg.resources);
+    // Step 8 worker pool: admission scales with the effective worker
+    // count (explicit `--workers` or platform default); absolute
+    // process budgets stay fixed inside `effective_limits`.
+    let effective = config::effective_limits(args.workers);
+    let mut runner = Runner::new(&effective);
     // Finding 12: the traversal fence is built once from the planned
     // roots; every enum task re-verifies its directory against it through
     // a pinned descriptor-relative open before listing.
@@ -1278,6 +1290,7 @@ async fn run_scan_inner(
                 args.format,
                 resolved.all,
                 args.fetch,
+                args.workers,
                 &mut runner.counters,
             )
             .await?
@@ -1345,6 +1358,7 @@ async fn run_scan_inner(
                 "status": format!("{:?}", args.status),
                 "force_rescan": args.force_rescan,
                 "fetch": args.fetch,
+                "workers": config::effective_workers(args.workers),
             },
             "resume_cmd": resume_cmd_for(&cfg.state_dir, &scan_id),
         });
@@ -2098,8 +2112,9 @@ async fn pick_generation(
 
 /// Mint a scan ID and persist the request row (raw + optional canonical URL,
 /// scope, status mode, absolute report destination, v2 target set / format /
-/// `--all` marker). Retries ID collisions. `--all` scans persist the `--all`
-/// marker with no canonical, an empty target set, and `all_targets`.
+/// `--all` marker, v3 `--fetch`, v4 `--workers`). Retries ID collisions.
+/// `--all` scans persist the `--all` marker with no canonical, an empty
+/// target set, and `all_targets`.
 // Parameters mirror the scan-request row 1:1; grouping would churn the
 // single caller for no clarity gain.
 #[allow(clippy::too_many_arguments)]
@@ -2114,6 +2129,7 @@ async fn mint_scan_id(
     format: Option<repo_scan::cli::OutputFormat>,
     all: bool,
     fetch: bool,
+    workers: Option<usize>,
     counters: &mut RunCounters,
 ) -> repo_scan::Result<String> {
     // Defense-in-depth: the CLI boundary already rejected credential
@@ -2159,6 +2175,7 @@ async fn mint_scan_id(
                     format: format_str,
                     all_targets: Some(all),
                     fetch: Some(fetch),
+                    workers: workers.map(|w| w as u64),
                 },
                 now,
             )
@@ -11521,6 +11538,9 @@ async fn continue_saved_scan(
         // resume without a fetch phase.
         fetch: row.fetch.unwrap_or(false),
         color: None,
+        // v4: restore the saved `--workers` request; legacy rows (NULL)
+        // resume on the runtime default.
+        workers: config::restore_workers(row.workers),
     };
     // The row's bound generation (R14), if any; `run_scan_inner`
     // honors it instead of re-picking.

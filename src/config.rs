@@ -10,6 +10,67 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Hard ceiling for parallel read workers (Step 8 explicit worker
+/// limit): `--workers` values above this clamp down, never fail. The
+/// bound keeps thread, descriptor, and helper pressure finite even on
+/// large machines; admission permits below still gate each worker.
+pub const MAX_WORKERS: usize = 32;
+
+/// Fallback worker count when the platform reports no parallelism.
+pub const DEFAULT_WORKERS_FALLBACK: usize = 4;
+
+/// Default parallel read workers: the platform's available parallelism
+/// clamped to `[1, MAX_WORKERS]`, or [`DEFAULT_WORKERS_FALLBACK`] when
+/// the platform reports none. Step 16 measures worker settings against
+/// this default; it is a starting point, not a tuned optimum.
+pub fn default_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(DEFAULT_WORKERS_FALLBACK)
+        .clamp(1, MAX_WORKERS)
+}
+
+/// Effective worker count for a scan: the explicit `--workers` request
+/// clamped to `[1, MAX_WORKERS]`, or [`default_workers`] when the flag
+/// is absent. A zero request is a CLI error, not a clamp — it is
+/// rejected at the argument boundary before this runs.
+pub fn effective_workers(requested: Option<usize>) -> usize {
+    requested
+        .unwrap_or_else(default_workers)
+        .clamp(1, MAX_WORKERS)
+}
+
+/// Restore a saved `--workers` request on resume (v4): `None` stays
+/// `None` (the runtime default applies); a saved value clamps to
+/// `[1, MAX_WORKERS]` before narrowing so a corrupt huge value can
+/// neither overflow `usize` nor surprise. A saved zero resolves to
+/// `None` — resume stays resilient instead of failing on a value the
+/// CLI boundary would never have persisted.
+pub fn restore_workers(saved: Option<u64>) -> Option<usize> {
+    match saved {
+        None | Some(0) => None,
+        Some(w) => Some(w.min(MAX_WORKERS as u64) as usize),
+    }
+}
+
+/// Scale [`ResourceLimits`] admission for `workers` parallel readers
+/// (Step 8 worker pool): per-class operation permits and the shared
+/// pool grow with the worker count, and the CPU governor target moves
+/// from the legacy one-core policy to one core per worker. Absolute
+/// process-wide budgets — helpers, descriptors, prefetch, writer
+/// batches — stay fixed: more workers contend for the same bounded
+/// resources instead of multiplying them.
+pub fn effective_limits(workers: Option<usize>) -> ResourceLimits {
+    let n = effective_workers(workers);
+    ResourceLimits {
+        max_enum_ops: n,
+        max_git_probes: n,
+        shared_permits: n,
+        cpu_target_cores: n as f64,
+        ..ResourceLimits::default()
+    }
+}
+
 /// Hard admission + buffer defaults from the spec §5 resource table.
 #[derive(Debug, Clone)]
 pub struct ResourceLimits {
@@ -538,5 +599,49 @@ pub fn split_scan_state(state: &str) -> (&str, Option<Vec<PathBuf>>) {
         (base, None)
     } else {
         (base, Some(roots))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_counts_clamp_and_scale_without_moving_absolutes() {
+        assert_eq!(effective_workers(Some(4)), 4);
+        assert_eq!(effective_workers(Some(1)), 1);
+        assert_eq!(effective_workers(Some(usize::MAX)), MAX_WORKERS);
+        let d = default_workers();
+        assert!((1..=MAX_WORKERS).contains(&d));
+        assert_eq!(effective_workers(None), d);
+        assert_eq!(restore_workers(None), None);
+        assert_eq!(restore_workers(Some(0)), None);
+        assert_eq!(restore_workers(Some(5)), Some(5));
+        assert_eq!(restore_workers(Some(u64::MAX)), Some(MAX_WORKERS));
+        let limits = effective_limits(Some(6));
+        assert_eq!(
+            (
+                limits.max_enum_ops,
+                limits.max_git_probes,
+                limits.shared_permits,
+                limits.cpu_target_cores,
+            ),
+            (6, 6, 6, 6.0)
+        );
+        let base = ResourceLimits::default();
+        assert_eq!(
+            (
+                limits.max_helpers,
+                limits.max_app_fds,
+                limits.prefetch_tasks,
+                limits.writer_rows,
+            ),
+            (
+                base.max_helpers,
+                base.max_app_fds,
+                base.prefetch_tasks,
+                base.writer_rows,
+            )
+        );
     }
 }

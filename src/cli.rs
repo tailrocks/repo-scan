@@ -113,6 +113,12 @@ pub struct ScanArgs {
     /// Terminal color control. `NO_COLOR` and `TERM=dumb` also disable color.
     #[arg(long, value_enum)]
     pub color: Option<ColorChoice>,
+    /// Parallel read workers for discovery and analysis. Default: the
+    /// platform's available parallelism (4 when unknown). Values above
+    /// 32 clamp to 32; 0 is rejected. Saved with the request and
+    /// restored on resume.
+    #[arg(long)]
+    pub workers: Option<usize>,
 }
 
 impl ScanArgs {

@@ -258,6 +258,7 @@ fn api_store_create_scan_request_holds_no_credential_bytes() {
                         format: None,
                         all_targets: None,
                         fetch: None,
+                        workers: None,
                     },
                     now,
                 )
@@ -299,6 +300,7 @@ fn api_store_create_scan_request_holds_no_credential_bytes() {
                     format: None,
                     all_targets: None,
                     fetch: None,
+                    workers: None,
                 },
                 now,
             )

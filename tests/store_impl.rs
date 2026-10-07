@@ -29,7 +29,7 @@ fn round_trip_persists_across_reopen() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = db_in(&dir);
         let store = TursoStore::open(&db).await.expect("open");
-        assert_eq!(store.schema_version().expect("version"), 3);
+        assert_eq!(store.schema_version().expect("version"), 4);
         assert!(store.epoch() >= 1);
 
         let proof = store.durability_proof().await.expect("proof");
@@ -222,6 +222,7 @@ fn round_trip_persists_across_reopen() {
             format: None,
             all_targets: None,
             fetch: None,
+            workers: None,
         };
         assert!(store.create_scan_request(&scan, now).await.expect("scan"));
         assert!(!store
@@ -234,6 +235,7 @@ fn round_trip_persists_across_reopen() {
             .expect("scan state");
         let scan_row = store.get_scan("scan-1").await.expect("get").expect("row");
         assert_eq!(scan_row.state, "complete");
+        assert_eq!(scan_row.workers, None);
 
         assert!(store
             .save_report_snapshot("rep-1", "1.0.0", 3, generation, "staged", None, now)

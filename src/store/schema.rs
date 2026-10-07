@@ -214,7 +214,7 @@ CREATE TABLE IF NOT EXISTS batches (
 ";
 
 /// Ordered migration chain (append-only; referenced by [`crate::store::migrations`]).
-pub static MIGRATIONS: [Migration; 3] = [
+pub static MIGRATIONS: [Migration; 4] = [
     Migration {
         version: 1,
         description: "v1: spec section 11 entities with required lookup indexes",
@@ -229,5 +229,10 @@ pub static MIGRATIONS: [Migration; 3] = [
         version: crate::store::schema_v3::V3Marker::VERSION,
         description: crate::store::schema_v3::V3Marker::DESCRIPTION,
         sql: crate::store::schema_v3::V3_SQL,
+    },
+    Migration {
+        version: crate::store::schema_v4::V4Marker::VERSION,
+        description: crate::store::schema_v4::V4Marker::DESCRIPTION,
+        sql: crate::store::schema_v4::V4_SQL,
     },
 ];

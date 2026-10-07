@@ -2867,6 +2867,9 @@ pub struct ScanRow {
     /// v3: `--fetch` remote refresh requested; `None` = legacy row, no
     /// fetch. Resume restores this.
     pub fetch: Option<bool>,
+    /// v4: explicit `--workers` request; `None` = legacy row or flag
+    /// absent, resolved at runtime. Resume restores this.
+    pub workers: Option<u64>,
 }
 
 impl ScanRow {
@@ -2887,6 +2890,9 @@ impl ScanRow {
             format: opt_text(row, 12)?,
             all_targets: opt_i64(row, 13)?.map(|v| v != 0),
             fetch: opt_i64(row, 14)?.map(|v| v != 0),
+            workers: opt_i64(row, 15)?
+                .map(|v| i64_to_u64(v, "scan workers"))
+                .transpose()?,
         })
     }
 }
@@ -2914,6 +2920,9 @@ pub struct NewScan<'a> {
     pub all_targets: Option<bool>,
     /// v3: `--fetch` remote refresh; `None` = legacy row, no fetch.
     pub fetch: Option<bool>,
+    /// v4: explicit `--workers` request; `None` = legacy row or flag
+    /// absent.
+    pub workers: Option<u64>,
 }
 
 /// One immutable report snapshot.
@@ -3841,13 +3850,17 @@ impl TursoStore {
             .url_canonical
             .map(|bytes| sanitized_target_bytes(bytes, "canonical"))
             .transpose()?;
+        let workers = scan
+            .workers
+            .map(|w| u64_to_i64(w, "scan workers"))
+            .transpose()?;
         let rows = self
             .conn
             .execute(
                 "INSERT OR IGNORE INTO scan_requests (id, url_raw, url_canonical, scope, \
                     status_mode, report_dest, state, created_at_ms, updated_at_ms, \
-                    targets_json, format, all_targets, fetch) \
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?7, ?8, ?9, ?10, ?11)",
+                    targets_json, format, all_targets, fetch, workers) \
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?7, ?8, ?9, ?10, ?11, ?12)",
                 vec![
                     v_text(scan.id),
                     v_blob(url_raw),
@@ -3860,6 +3873,7 @@ impl TursoStore {
                     v_opt_text(scan.format.map(str::to_string)),
                     v_opt_int(scan.all_targets.map(i64::from)),
                     v_opt_int(scan.fetch.map(i64::from)),
+                    v_opt_int(workers),
                 ],
             )
             .await
@@ -3901,7 +3915,7 @@ impl TursoStore {
             .query(
                 "SELECT id, url_raw, url_canonical, scope, status_mode, report_dest, \
                     state, outcome, successor_id, created_at_ms, updated_at_ms, \
-                    targets_json, format, all_targets, fetch \
+                    targets_json, format, all_targets, fetch, workers \
                     FROM scan_requests WHERE id = ?1",
                 vec![v_text(id)],
             )

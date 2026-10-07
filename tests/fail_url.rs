@@ -448,6 +448,7 @@ fn finding3_query_resume_strip_opaque_tails() {
                     format: None,
                     all_targets: None,
                     fetch: None,
+                    workers: None,
                 },
                 repo_scan::store::now_ms(),
             )

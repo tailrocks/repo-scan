@@ -125,6 +125,16 @@ fn cli01_six_exact_commands_parse() {
             assert_eq!(args.report, Some(PathBuf::from("repository-report.json")));
             assert!(!args.force_rescan);
             assert!(matches!(args.status, StatusMode::Summary));
+            assert_eq!(args.workers, None);
+        }
+        _ => panic!("expected scan"),
+    }
+    let cli = Cli::try_parse_from(["repo-scan", "scan", "--all", "--workers", "6"])
+        .expect("workers scan parses");
+    match cli.command {
+        Command::Scan(args) => {
+            assert!(args.all);
+            assert_eq!(args.workers, Some(6));
         }
         _ => panic!("expected scan"),
     }
@@ -320,6 +330,7 @@ fn cli01_exit_codes() {
         vec!["scan", "not-a-url", "--root", empty_str.as_str()],
         vec!["resume", "scan-no-such"],
         vec!["scan", URL, "--scope", "roots"],
+        vec!["scan", URL, "--workers", "0", "--root", empty_str.as_str()],
     ] {
         let out = run(&args, &env.cwd_a, &env.state);
         assert_eq!(
@@ -623,6 +634,7 @@ fn cli03_superseded_resume_names_successor() {
                     format: None,
                     all_targets: None,
                     fetch: None,
+                    workers: None,
                 },
                 repo_scan::store::now_ms(),
             )

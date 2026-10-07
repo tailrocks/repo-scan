@@ -28,7 +28,7 @@ async fn build_v1_catalog(db: &std::path::Path) {
         .connect()
         .expect("turso connect");
     let chain = repo_scan::store::migrations();
-    assert!(chain.len() >= 3, "v3 chain wired");
+    assert!(chain.len() >= 4, "v4 chain wired");
     assert_eq!(chain[0].version, 1);
     conn.execute_batch(chain[0].sql).await.expect("v1 sql");
     conn.execute(
@@ -58,14 +58,14 @@ async fn build_v1_catalog(db: &std::path::Path) {
 }
 
 #[test]
-fn fresh_open_is_v3_with_working_tables() {
+fn fresh_open_is_v4_with_working_tables() {
     let rt = runtime();
     rt.block_on(async {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("catalog.db");
         let store = TursoStore::open(&db).await.expect("open");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 3);
-        assert_eq!(store.schema_version().expect("version"), 3);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 4);
+        assert_eq!(store.schema_version().expect("version"), 4);
 
         // v2 request columns persist through the extended insert.
         let now = now_ms();
@@ -82,6 +82,7 @@ fn fresh_open_is_v3_with_working_tables() {
                     format: Some("jsonl"),
                     all_targets: Some(false),
                     fetch: Some(true),
+                    workers: Some(6),
                 },
                 now,
             )
@@ -96,6 +97,7 @@ fn fresh_open_is_v3_with_working_tables() {
         assert_eq!(row.format.as_deref(), Some("jsonl"));
         assert_eq!(row.all_targets, Some(false));
         assert_eq!(row.fetch, Some(true));
+        assert_eq!(row.workers, Some(6));
 
         // v2 event journal accepts writes immediately.
         let appended = store
@@ -125,9 +127,9 @@ fn v1_catalog_upgrades_preserving_v1_rows() {
         build_v1_catalog(&db).await;
 
         let store = TursoStore::open(&db).await.expect("open upgrades");
-        assert_eq!(store.schema_version().expect("version"), 3);
+        assert_eq!(store.schema_version().expect("version"), 4);
 
-        // v1 rows survive byte-identical; v2/v3 columns read NULL (legacy).
+        // v1 rows survive byte-identical; v2/v3/v4 columns read NULL (legacy).
         let scan = store.get_scan("scan-v1").await.expect("get").expect("row");
         assert_eq!(scan.url_raw, b"https://github.com/o/r");
         assert_eq!(scan.state, "complete");
@@ -135,6 +137,7 @@ fn v1_catalog_upgrades_preserving_v1_rows() {
         assert_eq!(scan.format, None);
         assert_eq!(scan.all_targets, None);
         assert_eq!(scan.fetch, None);
+        assert_eq!(scan.workers, None);
         let generation = store.get_generation(1).await.expect("get").expect("gen");
         assert_eq!(generation.scope_policy, "roots");
         assert_eq!(generation.scope_key, None);
@@ -159,9 +162,9 @@ fn v1_catalog_upgrades_preserving_v1_rows() {
             .expect("append"));
         store.close().await.expect("close");
 
-        // Reopen is idempotent: still v3, rows intact.
+        // Reopen is idempotent: still v4, rows intact.
         let store = TursoStore::open(&db).await.expect("reopen");
-        assert_eq!(store.schema_version().expect("version"), 3);
+        assert_eq!(store.schema_version().expect("version"), 4);
         assert!(store.get_scan("scan-v1").await.expect("get").is_some());
         assert_eq!(store.last_event_seq("scan-v1").await.expect("seq"), Some(1));
         store.close().await.expect("close");
