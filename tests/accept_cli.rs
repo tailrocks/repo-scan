@@ -1573,3 +1573,122 @@ fn error_events_journal_completion_gaps() {
         store.close().await.expect("close");
     });
 }
+
+/// Persisted refs are journaled as `branch_batch` events: one `add` batch
+/// per store (chunked at 500), carrying every ref the installed `git`
+/// reports with matching oids, ordered after the store's
+/// `repository_found`.
+#[test]
+fn branch_batch_journals_persisted_refs() {
+    use repo_scan::store::{Store, TursoStore};
+    use std::collections::{HashMap, HashSet};
+
+    let env = Env::new();
+    let repo = env.fixture.join("repo");
+    // Three local branches on distinct commits plus a tag; `git` is the
+    // independent reference for the expected ref set.
+    fixture::git(&repo, &["checkout", "-qb", "side-a"]);
+    std::fs::write(repo.join("a.txt"), b"a\n").expect("write");
+    fixture::git(&repo, &["add", "-A"]);
+    fixture::git(&repo, &["commit", "-qm", "a"]);
+    fixture::git(&repo, &["checkout", "-q", "main"]);
+    fixture::git(&repo, &["checkout", "-qb", "side-b"]);
+    std::fs::write(repo.join("b.txt"), b"b\n").expect("write");
+    fixture::git(&repo, &["add", "-A"]);
+    fixture::git(&repo, &["commit", "-qm", "b"]);
+    fixture::git(&repo, &["checkout", "-q", "main"]);
+    fixture::git(&repo, &["tag", "v1"]);
+    let mut expected = HashMap::new();
+    for line in fixture::git_str(
+        &repo,
+        &["for-each-ref", "--format=%(refname) %(objectname)"],
+    )
+    .lines()
+    .map(str::to_string)
+    {
+        let (name, oid) = line.split_once(' ').expect("refname oid");
+        expected.insert(name.to_string(), oid.to_string());
+    }
+    assert_eq!(expected.len(), 4, "main + side-a + side-b + v1");
+
+    let out = env.scan(&["--report", "rep.json"], &env.cwd_a);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let scan_id = stdout_line(&out, "scan_id");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let db = env.state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        let rows = store
+            .read_scan_events(&scan_id, 0, 1_000)
+            .await
+            .expect("read");
+        let batches: Vec<_> = rows
+            .iter()
+            .filter(|r| r.event_type == "branch_batch")
+            .collect();
+        assert_eq!(batches.len(), 1, "4 refs fit one chunk");
+        let row = batches[0];
+        assert_eq!(row.op, "add", "first batch per store is add");
+        let v: serde_json::Value = serde_json::from_slice(&row.records).expect("json");
+        assert!(v["rev"].as_i64().is_some(), "observation rev carried");
+        assert_eq!(v["batch_index"].as_u64(), Some(0));
+        assert_eq!(v["batch_count"].as_u64(), Some(1));
+        let branches = v["branches"].as_array().expect("branches array");
+        assert_eq!(branches.len(), expected.len(), "every ref journaled");
+        let mut seen = HashSet::new();
+        for b in branches {
+            let name = b["name"].as_str().expect("name");
+            let want_oid = expected
+                .get(name)
+                .unwrap_or_else(|| panic!("unexpected {name}"));
+            assert_eq!(b["oid"].as_str(), Some(want_oid.as_str()), "oid of {name}");
+            assert_eq!(
+                b["name_hex"].as_str(),
+                Some(hex_of(name.as_bytes()).as_str()),
+                "lossless name of {name}"
+            );
+            let want_kind = if name.starts_with("refs/heads/") {
+                "local"
+            } else {
+                "other"
+            };
+            assert_eq!(b["kind"].as_str(), Some(want_kind), "kind of {name}");
+            assert!(
+                b["state"].as_str().is_some_and(|s| !s.is_empty()),
+                "state of {name}"
+            );
+            assert!(seen.insert(name.to_string()), "no duplicate {name}");
+            assert_eq!(
+                b["id"].as_str().expect("id").split(':').count(),
+                3,
+                "ref id"
+            );
+        }
+        // Ordering: the batch lands after its store's repository_found.
+        let found = rows
+            .iter()
+            .find(|r| {
+                r.event_type == "repository_found"
+                    && serde_json::from_slice::<serde_json::Value>(&r.records)
+                        .map(|f| f["store_id"] == v["store_id"])
+                        .unwrap_or(false)
+            })
+            .expect("repository_found for batch store");
+        assert!(row.seq > found.seq, "batch follows its found event");
+        store.close().await.expect("close");
+    });
+}
+
+/// Lowercase hex of raw bytes (independent of the scanner's encoder).
+fn hex_of(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 0xf) as usize] as char);
+    }
+    out
+}
