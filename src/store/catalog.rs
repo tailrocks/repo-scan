@@ -3094,6 +3094,12 @@ impl GroupMemberRow {
     }
 }
 
+/// Re-observe one ref's oid (v3 fetch phase): single source for
+/// [`TursoStore::update_ref_oid`] and
+/// [`TursoStore::buffer_update_ref_oid`], so the direct round-trip
+/// test covers the buffered statement text too.
+const UPDATE_REF_OID_SQL: &str = "UPDATE refs SET oid = ?2, observed_at_ms = ?3 WHERE id = ?1";
+
 impl TursoStore {
     /// Idempotent directory upsert keyed by physical identity
     /// (`volume_id`, `object_id`, `incarnation`). Returns the row id.
@@ -3494,6 +3500,33 @@ impl TursoStore {
             out.push(RefRow::from_row(&row)?);
         }
         Ok(out)
+    }
+
+    /// Re-observe one persisted ref's object id after a `--fetch`
+    /// (v3): updates `oid` + `observed_at_ms` only, leaving
+    /// instance attribution, kind, upstream, state, and any freshness
+    /// label untouched. The fetch phase pairs this with
+    /// [`TursoStore::label_ref_freshness`] (existing row) or
+    /// [`TursoStore::upsert_ref`] (fetch-created tracking branch).
+    /// Returns true when a row was updated. [`UPDATE_REF_OID_SQL`]
+    /// is the single source shared with
+    /// [`TursoStore::buffer_update_ref_oid`].
+    pub async fn update_ref_oid(
+        &self,
+        ref_id: &str,
+        oid: &[u8],
+        at_ms: i64,
+    ) -> crate::Result<bool> {
+        self.forbid_write("update_ref_oid")?;
+        let changed = self
+            .conn
+            .execute(
+                UPDATE_REF_OID_SQL,
+                vec![v_text(ref_id), v_blob(oid.to_vec()), v_int(at_ms)],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(changed > 0)
     }
 
     /// Label the freshness of one persisted ref (v3). Only used for
@@ -4988,6 +5021,23 @@ impl TursoStore {
                 v_opt_text(refresh.refs_deleted_json.map(str::to_string)),
                 v_opt_text(refresh.detail.map(str::to_string)),
             ],
+        )
+    }
+
+    /// Buffer a ref oid re-observation (v3); see
+    /// [`TursoStore::buffer_enqueue_task`] for the flush contract.
+    /// Same `UPDATE` semantics as [`TursoStore::update_ref_oid`]
+    /// (shared [`UPDATE_REF_OID_SQL`]). Returns
+    /// `WriterBatch::should_flush`.
+    pub fn buffer_update_ref_oid(
+        batch: &mut WriterBatch,
+        ref_id: &str,
+        oid: &[u8],
+        at_ms: i64,
+    ) -> bool {
+        batch.push(
+            UPDATE_REF_OID_SQL,
+            vec![v_text(ref_id), v_blob(oid.to_vec()), v_int(at_ms)],
         )
     }
 

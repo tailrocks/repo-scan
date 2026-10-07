@@ -2088,6 +2088,35 @@ pub struct TrackingRef {
     pub symref: Vec<u8>,
 }
 
+/// Ref state over one post-fetch tracking observation: directly
+/// observed oids are `valid`, as is any symbolic ref whose target
+/// exists in the same observation (`known`). Only a dangling
+/// symbolic ref is non-valid: `unborn` for a branch target,
+/// `invalid` otherwise. An empty oid with no symref (a broken ref)
+/// is `invalid`. Mirrors the probe path's ref-state rules except
+/// this path has no peel data (for-each-ref reports symref targets
+/// only).
+#[must_use]
+pub fn tracking_ref_state(
+    reference: &TrackingRef,
+    known: &std::collections::HashSet<&[u8]>,
+) -> &'static str {
+    if !reference.symref.is_empty() {
+        if known.contains(reference.symref.as_slice()) {
+            return "valid";
+        }
+        if reference.symref.starts_with(b"refs/heads/") {
+            return "unborn";
+        }
+        return "invalid";
+    }
+    if reference.oid.is_empty() {
+        "invalid"
+    } else {
+        "valid"
+    }
+}
+
 impl FallbackGit {
     /// Read every ref under `refs/remotes/` via NUL-delimited
     /// `for-each-ref` (byte-exact). Pure local read, bounded by
@@ -2788,6 +2817,47 @@ mod tests {
             Some(v) => std::env::set_var("GIT_SSH", v),
             None => std::env::remove_var("GIT_SSH"),
         }
+    }
+
+    #[test]
+    fn tracking_ref_state_matrix() {
+        let known: std::collections::HashSet<&[u8]> = [b"refs/remotes/origin/main".as_slice()]
+            .into_iter()
+            .collect();
+        let direct = TrackingRef {
+            name: b"refs/remotes/origin/main".to_vec(),
+            oid: b"0123456789abcdef0123456789abcdef01234567".to_vec(),
+            symref: Vec::new(),
+        };
+        assert_eq!(tracking_ref_state(&direct, &known), "valid");
+        // Symbolic HEAD resolving inside the observation.
+        let head = TrackingRef {
+            name: b"refs/remotes/origin/HEAD".to_vec(),
+            oid: b"0123456789abcdef0123456789abcdef01234567".to_vec(),
+            symref: b"refs/remotes/origin/main".to_vec(),
+        };
+        assert_eq!(tracking_ref_state(&head, &known), "valid");
+        // Dangling symref to a branch target: unborn.
+        let dangling_branch = TrackingRef {
+            name: b"refs/remotes/origin/HEAD".to_vec(),
+            oid: Vec::new(),
+            symref: b"refs/heads/gone".to_vec(),
+        };
+        assert_eq!(tracking_ref_state(&dangling_branch, &known), "unborn");
+        // Dangling symref elsewhere: invalid.
+        let dangling_other = TrackingRef {
+            name: b"refs/remotes/origin/HEAD".to_vec(),
+            oid: Vec::new(),
+            symref: b"refs/tags/v9".to_vec(),
+        };
+        assert_eq!(tracking_ref_state(&dangling_other, &known), "invalid");
+        // Broken ref: no oid, no symref.
+        let broken = TrackingRef {
+            name: b"refs/remotes/origin/broken".to_vec(),
+            oid: Vec::new(),
+            symref: Vec::new(),
+        };
+        assert_eq!(tracking_ref_state(&broken, &known), "invalid");
     }
 
     #[test]
