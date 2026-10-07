@@ -1809,3 +1809,92 @@ fn coverage_updated_reports_gap_deltas() {
         store.close().await.expect("close");
     });
 }
+
+// ---------------------------------------------------------------------------
+// Step 15 case 12: no branch, status, or graph analysis starts before
+// inventory_ready (the instrumented production proof for the Step 8 phase
+// boundary: analysis journals branch_batch/location_updated/remote_updated,
+// and every one must sort after the boundary event).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn case12_no_analysis_before_inventory_ready() {
+    use repo_scan::store::{Store, TursoStore};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let cwd = dir.path().join("cwd");
+    repo_scan::privacy::private_dir_0700(&cwd).expect("mkdir");
+    let root = dir.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    // Two stores (a plain clone plus a main+worktree pair) so both the
+    // branch leg (branch_batch) and the status leg (location_updated)
+    // of analysis observably run.
+    fixture::normal_clone(&root, "repo");
+    fixture::linked_worktree(&root);
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            root.to_str().expect("utf8"),
+            "--status",
+            "summary",
+            "--report",
+            "rep.json",
+        ],
+        &cwd,
+        &state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let scan_id = stdout_line(&out, "scan_id");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        let rows = store
+            .read_scan_events(&scan_id, 0, 1_000)
+            .await
+            .expect("read");
+        let ready: Vec<_> = rows
+            .iter()
+            .filter(|r| r.event_type == "inventory_ready")
+            .collect();
+        assert_eq!(ready.len(), 1, "exactly one boundary event");
+        let boundary = ready[0].seq;
+        // Discovery precedes the boundary: at least one found event lands
+        // before it (non-vacuous discovery leg).
+        assert!(
+            rows.iter().any(|r| (r.event_type == "repository_found"
+                || r.event_type == "location_found")
+                && r.seq < boundary),
+            "a found event precedes inventory_ready"
+        );
+        // Analysis follows the boundary: every branch/status/remote event
+        // sorts strictly after it, and both legs observably ran.
+        let mut saw_batch = false;
+        let mut saw_updated = false;
+        for row in &rows {
+            match row.event_type.as_str() {
+                "branch_batch" => saw_batch = true,
+                "location_updated" => saw_updated = true,
+                _ => {}
+            }
+            assert!(
+                !matches!(
+                    row.event_type.as_str(),
+                    "branch_batch" | "location_updated" | "remote_updated"
+                ) || row.seq > boundary,
+                "analysis event {} at seq {} sorts after inventory_ready at {boundary}",
+                row.event_type,
+                row.seq
+            );
+        }
+        assert!(saw_batch, "branch analysis journaled branch_batch");
+        assert!(saw_updated, "status analysis journaled location_updated");
+        store.close().await.expect("close");
+    });
+}
