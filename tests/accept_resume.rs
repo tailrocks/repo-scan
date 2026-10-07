@@ -834,3 +834,193 @@ fn resume_incomplete_replays_lifecycle_once_and_inspect_completes() {
         stderr_text(&follow)
     );
 }
+
+/// OUTPUTS-M1: an interrupted multi-target scan resumes with the full
+/// target set from `targets_json` — never rebuilt from `url_raw` alone.
+/// A 2-target scan forced `incomplete` (same continue leg as an
+/// interrupt) resumes to a 2-target report in request order.
+#[cfg(unix)]
+#[test]
+fn resume_multi_target_scan_keeps_full_target_set() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const URL_B: &str = "https://github.com/OTHER/REPO2";
+
+    struct Restore<'a> {
+        path: &'a Path,
+    }
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.path, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    fixture::normal_clone(&root, "repo-a");
+    let other = fixture::normal_clone(&root, "repo-b");
+    fixture::git(&other, &["remote", "set-url", "origin", URL_B]);
+    let blocked = root.join("blocked");
+    repo_scan::privacy::private_dir_0700(&blocked).expect("mkdir");
+    repo_scan::privacy::private_write_0600(&blocked.join("secret.txt"), b"x").expect("write");
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o0)).expect("chmod 000");
+    let _restore = Restore { path: &blocked };
+    if std::fs::read_dir(&blocked).is_ok() {
+        eprintln!("resume_multi_target: chmod 000 ineffective (privileged user); skipping");
+        return;
+    }
+
+    let report = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            URL,
+            URL_B,
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report.to_str().expect("utf8"),
+            "--format",
+            "human",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "permission gap is usable-but-incomplete; stderr: {}",
+        stderr_text(&out)
+    );
+    let scan_id = stdout_line(&out, "scan_id");
+    let before = report_json(&report);
+    assert_eq!(
+        before["scan"]["targets"].as_array().expect("targets").len(),
+        2,
+        "first run records both targets"
+    );
+
+    let out = run(
+        &["resume", scan_id.as_str(), "--format", "human"],
+        tmp.path(),
+        &state,
+    );
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr_text(&out));
+    assert_eq!(stdout_line(&out, "scan_id"), scan_id);
+
+    let after = report_json(&report);
+    let targets = after["scan"]["targets"]
+        .as_array()
+        .expect("resumed targets array");
+    assert_eq!(targets.len(), 2, "resumed report: {after}");
+    assert_eq!(targets[0]["raw"], URL);
+    assert_eq!(targets[1]["raw"], URL_B);
+}
+
+/// OUTPUTS-m4: the `--format json` failure tail mirrors the journaled
+/// `scan_failed` payload — cursor, scrubbed error, resume capability +
+/// command — instead of a thin id triple. The cursor agrees with the
+/// committed event row byte for byte.
+#[cfg(unix)]
+#[test]
+fn failure_json_tail_mirrors_scan_failed_payload() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct Restore<'a> {
+        path: &'a Path,
+    }
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.path, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    fixture::normal_clone(&root, "repo");
+    let rodir = tmp.path().join("rodir");
+    repo_scan::privacy::private_dir_0700(&rodir).expect("mkdir");
+    let dest = rodir.join("rep.json");
+    std::fs::set_permissions(&rodir, std::fs::Permissions::from_mode(0o555)).expect("chmod 555");
+    let _restore = Restore { path: &rodir };
+    if repo_scan::privacy::private_write_0600(&rodir.join(".probe"), b"x").is_ok() {
+        let _ = std::fs::remove_file(rodir.join(".probe"));
+        eprintln!("failure_json_tail: destination dir is writable (privileged user); skipping");
+        return;
+    }
+
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            dest.to_str().expect("utf8"),
+            "--format",
+            "json",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "publication failure is operational failure; stderr: {}",
+        stderr_text(&out)
+    );
+    let tail: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("json tail is one JSON document");
+    assert_eq!(tail["state"], "failed");
+    let scan_id = tail["scan_id"].as_str().expect("scan_id").to_string();
+    assert!(tail.get("report_id").is_some(), "tail: {tail}");
+    assert_eq!(tail["resumable"], true, "tail: {tail}");
+    assert!(
+        tail["resume_cmd"]
+            .as_str()
+            .is_some_and(|cmd| cmd.contains(&scan_id)),
+        "resume_cmd names the scan: {tail}"
+    );
+    assert!(
+        tail["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "scrubbed error: {tail}"
+    );
+
+    // The cursor is the committed event's cursor, not a reconstruction.
+    let rt = runtime();
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("reopen");
+        let mut after = 0u64;
+        let mut failed_records = None;
+        loop {
+            let rows = store
+                .read_scan_events(&scan_id, after, 500)
+                .await
+                .expect("read journal");
+            if rows.is_empty() {
+                break;
+            }
+            for row in &rows {
+                after = after.max(row.seq);
+                if row.event_type == "scan_failed" {
+                    failed_records = Some(row.records.clone());
+                }
+            }
+            if rows.len() < 500 {
+                break;
+            }
+        }
+        let records: serde_json::Value =
+            serde_json::from_slice(&failed_records.expect("scan_failed journaled"))
+                .expect("records JSON");
+        assert_eq!(tail["cursor"], records["cursor"], "tail: {tail}");
+        assert_eq!(tail["error"], records["error"], "tail: {tail}");
+        assert_eq!(tail["resume_cmd"], records["resume_cmd"], "tail: {tail}");
+        store.close().await.expect("close");
+    });
+}

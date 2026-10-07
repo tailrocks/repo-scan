@@ -164,7 +164,7 @@ stale generations rejected; redelivery idempotent.
 Additive. Existing single-URL/local-path commands keep working.
 
 - `scan [TARGET]... [--all] [--root R...] [--format human|json|jsonl]
-  [--report F] [--follow] [--fetch] [--color auto|always|never]
+  [--report F] [--fetch] [--color auto|always|never]
   [--status M] [--force-rescan]`: targets = `owner/name` or GitHub URL
   forms; `--all` = filesystem discovery (no GitHub inventory first);
   targets XOR `--all` (reject both/neither... neither with no targets =
@@ -447,7 +447,9 @@ Pinned by `wave6_*` tests in `tests/cli_impl.rs`.
   snapshot covers every repository); `jsonl` replays its journal
   (byte-identical to `query --scan --format jsonl`; `--follow`
   supported and stops at the tip for finished scans); `human` and the
-  default keep the short human summary. Machine lanes stay
+  default keep the short human summary, except human `--follow`,
+  which rides the replay core like `--all` (Step 13 live lane on a
+  TTY, plain live lane redirected; `--after` honored). Machine lanes stay
   machine-clean on misses (stderr note, exit 3, empty stdout);
   unresolvable shapes and fresh state dirs keep today's human notes.
 - Redirected `scan`/`resume` with no `--format` replay the scan
@@ -462,3 +464,11 @@ Pinned by `wave6_*` tests in `tests/cli_impl.rs`.
   `--cached` is exit 2 (now also for `--all`); unknown scan IDs stay
   exit 2 for `query --scan` and `resume`; short `owner/name` targets
   under `--cached` may still report `canonical: unresolved` (exit 3).
+- Emission-failure JSON tail (Step 12): `scan --format json` (or
+  `resume`) whose publication fails prints one JSON object mirroring
+  the journaled `scan_failed` payload — `scan_id` + `state`
+  (`"failed"`) + `report_id` + `cursor` (last committed event, read
+  back from the committed row) + `error` (scrubbed) + `resumable`
+  (always true) + `resume_cmd` — exit 1. Pinned by
+  `failure_json_tail_mirrors_scan_failed_payload` in
+  `tests/accept_resume.rs`.

@@ -554,6 +554,8 @@ fn help_lists_pinned_keys() {
         "up/down or j/k",
         "left/right",
         "enter/space",
+        "group, store, or checkout with branches",
+        "open detail on a leaf",
         "cycle filter: dirty",
         "conflicted",
         "ahead",
@@ -676,6 +678,20 @@ fn narrow_terminal_shows_notice_not_rows() {
     let lines = tui::render_lines(&state, MIN_WIDTH, 24, false);
     let frame = lines.join("\n");
     assert!(!frame.contains("too narrow"));
+    assert!(frame.contains("acme/"));
+}
+
+#[test]
+fn short_terminal_shows_notice_not_rows() {
+    let state = sample_state();
+    let lines = tui::render_lines(&state, 100, tui::MIN_HEIGHT - 1, false);
+    let frame = lines.join("\n");
+    assert!(frame.contains("too short"), "short notice: {frame}");
+    assert!(frame.contains(&tui::MIN_HEIGHT.to_string()));
+    // At the minimum height the row table renders.
+    let lines = tui::render_lines(&state, 100, tui::MIN_HEIGHT, false);
+    let frame = lines.join("\n");
+    assert!(!frame.contains("too short"));
     assert!(frame.contains("acme/"));
 }
 

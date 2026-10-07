@@ -48,8 +48,9 @@ use std::time::Instant;
 /// truncated header plus a narrow-terminal notice instead of the row
 /// table. Rendering never panics at any width, including 0.
 pub const MIN_WIDTH: usize = 40;
-/// Sane minimum terminal height: below this only as many rows fit as
-/// the screen holds (header first, then rows, footer last).
+/// Sane minimum terminal height: below this the frame degrades to a
+/// truncated header plus a short-terminal notice instead of the row
+/// table. Rendering never panics at any height, including 0.
 pub const MIN_HEIGHT: usize = 8;
 /// Minimum redraw interval: the view renders at most ~10fps no matter
 /// how fast snapshots or keys arrive.
@@ -3175,7 +3176,8 @@ pub fn help_lines() -> Vec<String> {
         String::new(),
         "  up/down or j/k    move selection".to_string(),
         "  left/right        collapse / expand (left also moves to parent)".to_string(),
-        "  enter/space       expand/collapse group or store; open detail on a leaf".to_string(),
+        "  enter/space       expand/collapse group, store, or checkout with branches;".to_string(),
+        "                      open detail on a leaf".to_string(),
         "  /                 search account, repo, path, branch (enter keeps, esc clears)"
             .to_string(),
         "  f                 cycle filter: dirty > conflicted > ahead > behind >".to_string(),
@@ -3267,6 +3269,9 @@ pub fn render_lines(state: &ViewState, width: usize, height: usize, color: bool)
     if width < MIN_WIDTH {
         return render_narrow(state, width, height, color);
     }
+    if height < MIN_HEIGHT {
+        return render_short(state, width, height, color);
+    }
     let mut lines: Vec<String> = Vec::new();
     for line in header_lines(&state.snapshot) {
         lines.push(fit_plain(&line, width, color, ansi::BOLD));
@@ -3344,6 +3349,28 @@ fn render_narrow(state: &ViewState, width: usize, height: usize, color: bool) ->
     }
     lines.push(truncate_to_width(
         &format!("terminal too narrow (need {MIN_WIDTH} cols; q quits)"),
+        width,
+    ));
+    if color {
+        lines = lines
+            .iter()
+            .map(|l| format!("{}{l}{}", ansi::BOLD, ansi::RESET))
+            .collect();
+    }
+    lines.truncate(height);
+    lines
+}
+
+/// Short-terminal frame: truncated header plus a notice (the row
+/// table needs [`MIN_HEIGHT`] rows to stay legible: header, at least
+/// one row, footer — D11 sane minimum 40x8).
+fn render_short(state: &ViewState, width: usize, height: usize, color: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    for line in header_lines(&state.snapshot) {
+        lines.push(truncate_to_width(&line, width));
+    }
+    lines.push(truncate_to_width(
+        &format!("terminal too short (need {MIN_HEIGHT} rows; q quits)"),
         width,
     ));
     if color {

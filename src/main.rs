@@ -1377,6 +1377,38 @@ async fn scan_jsonl_tail(cfg: &config::Config, scan_id: &str) -> repo_scan::Resu
     Ok(pipe_open && flushed)
 }
 
+/// Cursor carried by the journaled `scan_failed` row for `scan_id`
+/// (`Null` when the row is missing or unparseable — the tail still
+/// reports the failure; replay corruption stays loud on the JSONL
+/// lane). Read back from the committed event so the JSON failure
+/// object agrees with the journal.
+async fn failed_event_cursor(
+    cfg: &config::Config,
+    scan_id: &str,
+) -> repo_scan::Result<serde_json::Value> {
+    let db_path = store::owner::catalog_db_path(&cfg.state_dir);
+    let store = TursoStore::open_read_only(&db_path).await?;
+    let mut rows = store
+        .connection()
+        .query(
+            "SELECT records FROM scan_events WHERE scan_id = ?1 \
+                AND event_type = 'scan_failed' ORDER BY seq DESC LIMIT 1",
+            vec![turso::Value::Text(scan_id.to_string())],
+        )
+        .await
+        .map_err(store_err)?;
+    let cursor = match rows.next().await.map_err(store_err)? {
+        Some(row) => cell_blob(&row, 0)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|records| records.get("cursor").cloned())
+            .unwrap_or(serde_json::Value::Null),
+        None => serde_json::Value::Null,
+    };
+    let _ = store.close().await;
+    Ok(cursor)
+}
+
 /// Stdout tail for an emission-failed scan (Wave6 output matrix).
 /// The scan row is already `failed` and `scan_failed` is journaled;
 /// the owner store is closed. `resolved` is the Step 6 resolved format
@@ -1389,6 +1421,7 @@ async fn scan_failure_tail(
     report_id: &str,
     snapshot_path: &Path,
     resolved: repo_scan::cli::OutputFormat,
+    err: &str,
 ) -> repo_scan::Result<ExitCode> {
     use repo_scan::cli::OutputFormat;
     if resolved == OutputFormat::Jsonl {
@@ -1408,10 +1441,21 @@ async fn scan_failure_tail(
     if resolved == OutputFormat::Json {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
+        // The JSON failure object mirrors the journaled `scan_failed`
+        // payload (D4): cursor, scrubbed error, resume capability +
+        // command travel on the event, so the one-shot lane carries
+        // them too instead of a thin id triple. The cursor is read
+        // back from the committed event row (never reconstructed),
+        // so the tail agrees with the journal byte for byte.
+        let cursor = failed_event_cursor(cfg, scan_id).await?;
         let object = serde_json::json!({
             "scan_id": scan_id,
             "state": "failed",
             "report_id": report_id,
+            "cursor": cursor,
+            "error": err,
+            "resumable": true,
+            "resume_cmd": resume_cmd_for(&cfg.state_dir, scan_id),
         });
         let line =
             serde_json::to_string(&object).map_err(|e| repo_scan::Error::Report(e.to_string()))?;
@@ -2427,6 +2471,7 @@ async fn run_scan_inner(
                         &report_id,
                         &snapshot_path,
                         resolved_format,
+                        &err,
                     )
                     .await;
                 }
@@ -2473,6 +2518,7 @@ async fn run_scan_inner(
                             &report_id,
                             &snapshot_path,
                             resolved_format,
+                            &err,
                         )
                         .await;
                     }
@@ -2514,6 +2560,7 @@ async fn run_scan_inner(
                             &report_id,
                             &snapshot_path,
                             resolved_format,
+                            &err,
                         )
                         .await;
                     }
@@ -2569,6 +2616,7 @@ async fn run_scan_inner(
                             &report_id,
                             &snapshot_path,
                             resolved_format,
+                            &err,
                         )
                         .await;
                     }
@@ -2613,6 +2661,7 @@ async fn run_scan_inner(
                             &report_id,
                             &snapshot_path,
                             resolved_format,
+                            &err,
                         )
                         .await;
                     }
@@ -15150,8 +15199,12 @@ async fn run_query_target(
         let _ = store.close().await;
         return Ok(ExitCode::Incomplete);
     }
-    if machine {
-        let code = run_query_target_machine(cfg, args, url, &store).await?;
+    // A following human reader rides the replay core like `--all`
+    // (Step 13 live lane on a TTY, plain live lane redirected) —
+    // `--follow`/`--after` are never silently ignored on a cached
+    // target query.
+    if machine || args.follow {
+        let code = run_query_target_replay(cfg, args, url, &store).await?;
         let _ = store.close().await;
         return Ok(code);
     }
@@ -15280,11 +15333,13 @@ async fn run_query_target(
     Ok(ExitCode::Success)
 }
 
-/// Machine lanes for a cached single-target lookup (Wave6): resolve the
+/// Replay lanes for a cached single-target lookup (Wave6): resolve the
 /// latest scan covering the target, then serve it through the same replay
 /// core as `query --scan` — one snapshot printer, one envelope stream, one
-/// follow loop. Diagnostics stay on stderr with an empty stdout (exit 3).
-async fn run_query_target_machine(
+/// follow loop. Serves the machine lanes plus human `--follow` (the plain
+/// human summary has no stream to follow, so it never reaches here).
+/// Diagnostics stay on stderr with an empty stdout (exit 3).
+async fn run_query_target_replay(
     cfg: &config::Config,
     args: &repo_scan::cli::QueryArgs,
     url: &str,
@@ -15762,6 +15817,59 @@ async fn retry_publication(
     Ok(exit)
 }
 
+/// Restore one resume target spelling without carrying a secret
+/// forward (RSF-SEC-TARGET-URL, EXACT-2): rows persisted before the
+/// CLI boundary reject may hold credential-bearing targets. Reuse
+/// the stored canonical target (never credential-bearing) or a
+/// sanitized raw URL so the resumed scan resolves the same
+/// repository without carrying the secret into state or reports.
+fn redacted_resume_target(raw: &str, canonical: Option<&str>) -> String {
+    if identity::must_reject_target(raw) {
+        match canonical {
+            Some(kept) => kept.to_string(),
+            None => identity::sanitize_target_url(raw),
+        }
+    } else {
+        raw.to_string()
+    }
+}
+
+/// Restore the resume target list (OUTPUTS-M1): the v2 multi-target
+/// set from `targets_json` (`[{raw, canonical}]`), in request order.
+/// Legacy rows (`None`), unparseable rows, and empty sets fall back
+/// to the single `url_raw` spelling, so old scans resume exactly as
+/// before. Every spelling passes through the redact-on-read rule.
+fn resume_targets_for(row: &store::ScanRow) -> Vec<String> {
+    let legacy = || {
+        let stored = String::from_utf8_lossy(&row.url_raw).into_owned();
+        let canonical = row
+            .url_canonical
+            .as_ref()
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
+        vec![redacted_resume_target(&stored, canonical.as_deref())]
+    };
+    let Some(encoded) = row.targets_json.as_deref() else {
+        return legacy();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(encoded) else {
+        return legacy();
+    };
+    let Some(items) = value.as_array() else {
+        return legacy();
+    };
+    if items.is_empty() {
+        return legacy();
+    }
+    items
+        .iter()
+        .map(|item| {
+            let raw = item.get("raw").and_then(|v| v.as_str()).unwrap_or("");
+            let canonical = item.get("canonical").and_then(|v| v.as_str());
+            redacted_resume_target(raw, canonical)
+        })
+        .collect()
+}
+
 /// Restore a saved non-terminal request and continue its unfinished work.
 /// Releases ownership first: re-entering the scan loop re-acquires it.
 /// Wave6: an explicit resume `--format` wins, else the scan's saved
@@ -15775,20 +15883,7 @@ async fn continue_saved_scan(
     saved_roots: Option<Vec<PathBuf>>,
     format: Option<repo_scan::cli::OutputFormat>,
 ) -> repo_scan::Result<ExitCode> {
-    // Redact-on-read (RSF-SEC-TARGET-URL, EXACT-2): rows persisted
-    // before the CLI boundary reject may hold credential-bearing targets.
-    // Reuse the stored canonical target (never credential-bearing) or a
-    // sanitized raw URL so the resumed scan resolves the same repository
-    // without carrying the secret forward into state or reports.
-    let stored_url = String::from_utf8_lossy(&row.url_raw).into_owned();
-    let url = if identity::must_reject_target(&stored_url) {
-        match &row.url_canonical {
-            Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-            None => identity::sanitize_target_url(&stored_url),
-        }
-    } else {
-        stored_url
-    };
+    let targets = resume_targets_for(row);
     let status = status_mode_from_str(&row.status_mode).ok_or_else(|| {
         repo_scan::Error::Config(format!("saved status mode is invalid: {}", row.status_mode))
     })?;
@@ -15846,7 +15941,7 @@ async fn continue_saved_scan(
         _ => None,
     };
     let args = repo_scan::cli::ScanArgs {
-        targets: if all { Vec::new() } else { vec![url] },
+        targets: if all { Vec::new() } else { targets },
         all,
         scope,
         report,

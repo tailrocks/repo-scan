@@ -968,6 +968,51 @@ fn wave6_cached_target_query_honors_format() {
 }
 
 #[test]
+fn wave6_cached_target_human_follow_rides_replay_core() {
+    // OUTPUTS-M3: human `--follow`/`--after` on a cached target query
+    // ride the replay core like `--all` — never silently ignored.
+    let env = Wave6Env::new();
+    let out = run(
+        &["scan", URL, "--root", env.fixture_str.as_str()],
+        &env.cwd,
+        &env.state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let envelopes = stdout_jsonl(&out);
+    let scan_id = envelopes[0]["scan_id"]
+        .as_str()
+        .expect("scan id")
+        .to_string();
+
+    // Human follow serves the follow core (plain live lane when
+    // redirected), byte-identical to query --scan --follow — not the
+    // short human summary.
+    let out = run(
+        &["query", URL, "--cached", "--follow", "--format", "human"],
+        &env.cwd,
+        &env.state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        !stdout.contains("cached: true"),
+        "not the summary: {stdout}"
+    );
+    let direct = run(
+        &["query", "--scan", &scan_id, "--follow", "--format", "human"],
+        &env.cwd,
+        &env.state,
+    );
+    assert_eq!(
+        direct.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&direct)
+    );
+    assert_eq!(direct.stdout, out.stdout, "same follow stream");
+}
+
+#[test]
 fn wave6_redirected_default_is_jsonl_with_report() {
     let env = Wave6Env::new();
     // Redirected scan with no --format: JSONL on stdout, and --report
