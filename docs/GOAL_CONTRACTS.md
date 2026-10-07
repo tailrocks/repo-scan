@@ -411,3 +411,43 @@ examples quote that output (IDs/paths trimmed, never invented).
   objects only, never branch tips or checkout files; unsafe refspecs
   are `unsupported`, never written (observed stderr summary:
   `fetch: N refreshed, N failed, N unsupported, N resumed-skip`).
+
+## D13. Wave6 query/format behaviors (Step 6, branch `work/fast-complete-scan`)
+
+Supersedes the D12 output pins (the D12 bullets above stay as the
+Wave4b record). Verified against the debug binary on the Wave6 tree;
+README examples quote that output (IDs/paths trimmed, never invented).
+Pinned by `wave6_*` tests in `tests/cli_impl.rs`.
+
+- `query --all --cached` resolves the latest suitable scan — newest
+  `complete`/`incomplete`/`interrupted` row, machine or explicit-roots
+  scope alike, whose outcome parses and whose retained snapshot file
+  still exists — and serves it through the same replay core as
+  `query --scan`: `--format json` prints the retained snapshot,
+  `--format jsonl` replays the journal (byte-identical to
+  `query --scan --format jsonl`), `--format human` renders the plain
+  lane. No `--format` auto-selects (human on a TTY, JSONL when
+  redirected). `--cached` is required (exit 2 without); no suitable
+  scan is exit 3 with an empty stdout. The old exit-1
+  "not yet implemented" path is gone.
+- `query TARGET --cached` honors `--format`: `json` prints the
+  resolved scan's retained snapshot (latest scan covering the target —
+  primary canonical, multi-target set, or an `--all` scan, whose
+  snapshot covers every repository); `jsonl` replays its journal
+  (byte-identical to `query --scan --format jsonl`; `--follow`
+  supported and stops at the tip for finished scans); `human` and the
+  default keep the short human summary. Machine lanes stay
+  machine-clean on misses (stderr note, exit 3, empty stdout);
+  unresolvable shapes and fresh state dirs keep today's human notes.
+- Redirected `scan`/`resume` with no `--format` replay the scan
+  journal as JSONL (every line parses; the scan's own exit code is
+  kept); the TTY default keeps the legacy terminal report + footers.
+  Explicit `--format` wins everywhere; `--report` still publishes the
+  JSON snapshot file in all lanes. A bare `scan` on a TTY does NOT
+  open the interactive TUI — that needs explicit `--format human`
+  (Step 13 gate `scan_tui_gate`, unit-pinned).
+- Unchanged pins: `--follow` only rides human|jsonl (exit 2 with
+  `--format json`); `--after` requires `--follow`; query without
+  `--cached` is exit 2 (now also for `--all`); unknown scan IDs stay
+  exit 2 for `query --scan` and `resume`; short `owner/name` targets
+  under `--cached` may still report `canonical: unresolved` (exit 3).

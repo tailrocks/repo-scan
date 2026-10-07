@@ -140,3 +140,23 @@ branches/status/graph -> optional `--fetch` refreshes remote-tracking refs
 -> events journal per commit -> report streams one catalog revision ->
 staged snapshot -> verified, retained, atomically published -> served to
 human/json/jsonl lanes from the same retained bytes.
+
+## Output lanes (Step 6, Wave6)
+
+One selector resolves every command's lane
+(`OutputFormat::resolve` in `src/cli.rs`): an explicit `--format`
+always wins; otherwise a terminal gets the live human view and
+redirected output gets the JSONL journal replay. Concretely: a bare
+`scan`/`resume` on a TTY keeps the legacy terminal report and footers,
+while redirected it replays the journal (every line parses);
+`query --scan`/`query --all` print the plain lane on a TTY and replay
+when redirected; `query TARGET --cached` keeps its short summary by
+default and serves the resolved scan's retained snapshot/replay only
+on explicit machine formats. `--report` publishes the JSON snapshot
+file in every lane. The interactive TUI (`src/report/tui.rs`) opens
+only for explicit `--format human` on a TTY — never by default
+(`scan_tui_gate`, pinned in `tests/cli_impl.rs`). `query --all` and
+the machine lanes of `query TARGET --cached` resolve a scan id, then
+delegate to the same `query --scan` replay core, so all three
+selections share one snapshot printer, one envelope stream, and one
+follow loop (`src/main.rs`).

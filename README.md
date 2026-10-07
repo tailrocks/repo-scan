@@ -65,6 +65,9 @@ $BIN --state-dir $SD query https://github.com/OWNER/REPO --cached
 $BIN --state-dir $SD query --scan SCAN_ID --format json
 $BIN --state-dir $SD query --scan SCAN_ID --follow --format jsonl
 
+# Serve the latest finished scan (any scope) in the requested format.
+$BIN --state-dir $SD query --all --cached --format json
+
 # Continue unfinished work (restores ALL saved options; cwd-independent).
 $BIN --state-dir $SD resume SCAN_ID
 
@@ -75,26 +78,28 @@ $BIN --state-dir $SD cache invalidate --root /private/var/folders
 $BIN --state-dir $SD cache clear --all
 ```
 
-`query --all` is accepted by the parser but not yet implemented
-(exit `1`: `use one TARGET with --cached, or --scan SCAN_ID --format jsonl`).
-
 ## Output formats
 
-An explicit `--format` always wins. With no `--format`, `scan`/`resume`
-print the legacy terminal report below (plus `scan_id:`/`report_id:`/
-`snapshot:` footers), while `query --scan` replays the journal as JSONL
-when redirected. `query TARGET --cached` always prints the short human
-summary regardless of `--format`.
+An explicit `--format` always wins. With no `--format`, `scan`,
+`resume`, `query --scan`, and `query --all` print the live human view
+on a terminal and replay the journal as JSONL when redirected.
+`query TARGET --cached` prints the short human summary by default and
+serves the resolved scan's retained snapshot/replay only on explicit
+machine formats.
 
 | Lane | Producer | Content |
 |---|---|---|
-| default (no `--format`) | `scan`, `resume` | legacy terminal report + footers |
-| default (no `--format`, redirected) | `query --scan` | journal replay (JSONL envelopes) |
+| default, on a TTY | `scan` | legacy terminal report below + footers (never the TUI) |
+| default, on a TTY | `resume` | legacy footers (`replayed`, `report_id`) |
+| default, on a TTY | `query --scan`, `query --all` | plain `live_text` lane (no footers) |
+| default, redirected | `scan`, `resume`, `query --scan`, `query --all` | journal replay (JSONL envelopes) |
+| default | `query TARGET --cached` | short human summary (always) |
 | `--format human` on a TTY | `scan`, `query --scan --follow` | interactive TUI (keys: `j`/`k`, `/`, `f`, `s`, `v`, `h`, `q`) |
 | `--format human` redirected | `scan`, `resume` | plain `live_text` lane: header, coverage, totals, `R`/`C`/`B`/`?`/`!` rows (cap 200 + overflow line), then legacy footers |
-| `--format human` | `query --scan` | plain `live_text` lane only (no footers) |
-| `--format json` | `scan`, `query --scan`, `resume` | one JSON document: the retained snapshot (report schema `1.4.0`), plus a trailing newline on stdout |
-| `--format jsonl` | `scan`, `query --scan`, `resume` | the scan journal replayed as event envelopes (event schema `1.0.0`) |
+| `--format human` | `query --scan`, `query --all` | plain `live_text` lane only (no footers) |
+| `--format human` | `query TARGET --cached` | short human summary |
+| `--format json` | `scan`, `query --scan`, `query --all`, `query TARGET --cached`, `resume` | one JSON document: the retained snapshot (report schema `1.4.0`), plus a trailing newline on stdout |
+| `--format jsonl` | `scan`, `query --scan`, `query --all`, `query TARGET --cached`, `resume` | the scan journal replayed as event envelopes (event schema `1.0.0`) |
 
 `--follow` works with `human` and `jsonl` only: `--follow --format json`
 is rejected (exit `2`). `--after CURSOR` requires `--follow`. Machine
@@ -241,10 +246,10 @@ directory — destinations are stored absolute.
 
 | Code | Meaning | Observed when |
 |---|---|---|
-| `0` | success (zero matches is still success) | complete scan, `query --scan`, cached query with matches, `cache invalidate`, `cache clear` |
-| `1` | operational failure | `query --all` (not yet implemented), owner busy after 5 s lock wait |
+| `0` | success (zero matches is still success) | complete scan, `query --scan`, `query --all`, cached query with matches, `cache invalidate`, `cache clear` |
+| `1` | operational failure | owner busy after 5 s lock wait; failed report publication |
 | `2` | invalid arguments | no TARGET and no `--all`; `--all` + targets; `--follow --format json`; `--after` without `--follow`; `--workers 0`; query without `--cached`; unknown scan id |
-| `3` | usable result with gaps / no suitable catalog / superseded resume | scan with unresolvable candidates or pending work; cached query on a fresh state dir (`suitable_catalog: false`) |
+| `3` | usable result with gaps / no suitable catalog / superseded resume | scan with unresolvable candidates or pending work; cached query on a fresh state dir (`suitable_catalog: false`); query with no retained snapshot |
 | `130` | interrupted after bounded progress save | Ctrl-C mid-scan |
 
 ## Options

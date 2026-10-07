@@ -116,6 +116,8 @@ impl W2bEnv {
     fn spawn_scan(&self, target: &str, extra: &[&str]) -> std::process::Child {
         let stdout = std::fs::File::create(self.cwd.join("scan.out")).expect("scan.out");
         let stderr = std::fs::File::create(self.cwd.join("scan.err")).expect("scan.err");
+        // Wave6: explicit human keeps the footer lines these tests parse
+        // (the redirected default is now the JSONL journal replay).
         let mut args = vec![
             "--state-dir".to_string(),
             self.state.to_str().expect("utf8").to_string(),
@@ -125,6 +127,8 @@ impl W2bEnv {
             self.root.to_str().expect("utf8").to_string(),
             "--status".to_string(),
             "metadata".to_string(),
+            "--format".to_string(),
+            "human".to_string(),
         ];
         args.extend(extra.iter().map(|s| s.to_string()));
         std::process::Command::new(w2b_binary())

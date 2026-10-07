@@ -91,7 +91,16 @@ impl Env {
     }
 
     fn scan(&self, extra: &[&str], cwd: &Path) -> std::process::Output {
-        let mut args = vec!["scan", URL, "--root", self.fixture_str.as_str()];
+        // Wave6: explicit human keeps the footer lines these tests parse
+        // (the redirected default is now the JSONL journal replay).
+        let mut args = vec![
+            "scan",
+            URL,
+            "--root",
+            self.fixture_str.as_str(),
+            "--format",
+            "human",
+        ];
         args.extend(extra.iter().copied());
         run(&args, cwd, &self.state)
     }
@@ -257,7 +266,11 @@ fn cli01_command_table_end_to_end() {
     assert!(stdout.contains("matches: 1"), "{stdout}");
 
     // resume of a completed scan: idempotent terminal replay (exit 0).
-    let out = run(&["resume", scan_id.as_str()], &env.cwd_b, &env.state);
+    let out = run(
+        &["resume", scan_id.as_str(), "--format", "human"],
+        &env.cwd_b,
+        &env.state,
+    );
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
     let stdout = stdout_text(&out);
     assert!(stdout.contains("replayed"), "{stdout}");
@@ -468,7 +481,11 @@ fn cli03_completed_resume_idempotent_across_cwd() {
     let report_bytes = std::fs::read(env.cwd_a.join("rep.json")).expect("report");
     // Resume twice from the other cwd: same terminal result, no fresh scan.
     for _ in 0..2 {
-        let out = run(&["resume", scan_id.as_str()], &env.cwd_b, &env.state);
+        let out = run(
+            &["resume", scan_id.as_str(), "--format", "human"],
+            &env.cwd_b,
+            &env.state,
+        );
         assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
         let stdout = stdout_text(&out);
         assert!(stdout.contains("replayed"), "{stdout}");
@@ -533,7 +550,11 @@ fn cli03_failed_publication_retries_to_absolute_dest() {
             .expect("chmod restore");
     }
     // Resume from the other cwd: no rescan, original absolute dest honored.
-    let out = run(&["resume", scan_id.as_str()], &env.cwd_b, &env.state);
+    let out = run(
+        &["resume", scan_id.as_str(), "--format", "human"],
+        &env.cwd_b,
+        &env.state,
+    );
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
     let stdout = stdout_text(&out);
     assert!(stdout.contains("publication retried"), "{stdout}");
@@ -585,7 +606,11 @@ fn cli03_incomplete_resume_restores_dest_and_options() {
     let scan_id = stdout_line(&out, "scan_id");
     // Resume from the other cwd: continues (not replays), same id, same
     // absolute destination, same saved status mode.
-    let out = run(&["resume", scan_id.as_str()], &env.cwd_b, &env.state);
+    let out = run(
+        &["resume", scan_id.as_str(), "--format", "human"],
+        &env.cwd_b,
+        &env.state,
+    );
     assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr_text(&out));
     let stderr = stderr_text(&out);
     assert!(stderr.contains("resuming scan"), "{stderr}");
@@ -649,7 +674,11 @@ fn cli03_superseded_resume_names_successor() {
     let successor = stdout_line(&out, "scan_id");
     assert_ne!(successor, stale_id);
     // Resume of the superseded request: exit 3 with a usable result.
-    let out = run(&["resume", stale_id], &env.cwd_b, &env.state);
+    let out = run(
+        &["resume", stale_id, "--format", "human"],
+        &env.cwd_b,
+        &env.state,
+    );
     assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr_text(&out));
     let stdout = stdout_text(&out);
     assert!(stdout.contains("superseded"), "{stdout}");
@@ -695,6 +724,8 @@ fn step6_multi_target_union_single_pass() {
             env.fixture_str.as_str(),
             "--report",
             "rep.json",
+            "--format",
+            "human",
         ],
         &env.cwd_a,
         &env.state,
@@ -729,6 +760,8 @@ fn step6_owner_name_target_matches_url() {
             env.fixture_str.as_str(),
             "--report",
             "rep.json",
+            "--format",
+            "human",
         ],
         &env.cwd_a,
         &env.state,
@@ -759,6 +792,8 @@ fn step6_all_finds_without_target_filter() {
             env.fixture_str.as_str(),
             "--report",
             "rep.json",
+            "--format",
+            "human",
         ],
         &env.cwd_a,
         &env.state,
@@ -884,6 +919,8 @@ fn journal_lifecycle_events_span_started_ready_terminal() {
             root.to_str().expect("utf8"),
             "--report",
             "rep.json",
+            "--format",
+            "human",
         ],
         &cwd,
         &state,
@@ -992,6 +1029,8 @@ fn query_scan_replays_journaled_lifecycle_as_jsonl() {
             root.to_str().expect("utf8"),
             "--report",
             "rep.json",
+            "--format",
+            "human",
         ],
         &cwd,
         &state,
@@ -1113,6 +1152,8 @@ fn found_events_cover_each_store_and_checkout_once() {
             root.to_str().expect("utf8"),
             "--report",
             "rep.json",
+            "--format",
+            "human",
         ],
         &cwd,
         &state,
@@ -1279,6 +1320,8 @@ fn github_groups_link_stores_to_canonical_identities() {
             root.to_str().expect("utf8"),
             "--report",
             "rep.json",
+            "--format",
+            "human",
         ],
         &cwd,
         &state,
@@ -1457,6 +1500,8 @@ fn location_updated_marks_status_completion() {
             "summary",
             "--report",
             "rep.json",
+            "--format",
+            "human",
         ],
         &cwd,
         &state,
@@ -1865,6 +1910,8 @@ fn case12_body(extra: &[&str]) {
         "summary",
         "--report",
         "rep.json",
+        "--format",
+        "human",
     ];
     args.extend(extra.iter().copied());
     let out = run(&args, &cwd, &state);

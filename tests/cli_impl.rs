@@ -446,6 +446,10 @@ fn binary_scan_resume_query_lifecycle() {
             fixture_str.as_str(),
             "--report",
             "rep.json",
+            // Wave6: explicit human keeps the footer lines (the
+            // redirected default is now the JSONL journal replay).
+            "--format",
+            "human",
         ],
         &cwd_a,
         &state,
@@ -474,6 +478,10 @@ fn binary_scan_resume_query_lifecycle() {
             fixture_str.as_str(),
             "--report",
             "rep.json",
+            // Wave6: explicit human keeps the footer lines (the
+            // redirected default is now the JSONL journal replay).
+            "--format",
+            "human",
         ],
         &cwd_a,
         &state,
@@ -498,6 +506,8 @@ fn binary_scan_resume_query_lifecycle() {
             "--report",
             "rep.json",
             "--force-rescan",
+            "--format",
+            "human",
         ],
         &cwd_a,
         &state,
@@ -512,7 +522,11 @@ fn binary_scan_resume_query_lifecycle() {
 
     // Resume the completed first scan from a different cwd: idempotent
     // terminal replay, no rescan, absolute destination intact.
-    let out = run(&["resume", scan_id.as_str()], &cwd_b, &state);
+    let out = run(
+        &["resume", scan_id.as_str(), "--format", "human"],
+        &cwd_b,
+        &state,
+    );
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(stdout.contains("replayed"), "{stdout}");
@@ -549,6 +563,10 @@ fn binary_scan_resume_query_lifecycle() {
             fixture_str.as_str(),
             "--report",
             "rep.json",
+            // Wave6: explicit human keeps the footer lines (the
+            // redirected default is now the JSONL journal replay).
+            "--format",
+            "human",
         ],
         &cwd_a,
         &state,
@@ -696,4 +714,349 @@ fn step6_query_resume_parse_and_validate() {
         }
         _ => panic!("expected resume"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Wave6 (Step 6): query/format behaviors.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wave6_resolve_format_selector() {
+    // TTY default = human, redirected default = jsonl, explicit wins.
+    // The default never yields `Json`: a bare command never prints a
+    // bare snapshot.
+    assert_eq!(OutputFormat::resolve(None, true), OutputFormat::Human);
+    assert_eq!(OutputFormat::resolve(None, false), OutputFormat::Jsonl);
+    for explicit in [OutputFormat::Human, OutputFormat::Json, OutputFormat::Jsonl] {
+        for tty in [false, true] {
+            assert_eq!(
+                OutputFormat::resolve(Some(explicit), tty),
+                explicit,
+                "explicit wins"
+            );
+        }
+    }
+}
+
+#[test]
+fn wave6_scan_tui_gate_requires_explicit_human() {
+    use repo_scan::cli::scan_tui_gate;
+    // A bare `scan` on a TTY keeps the legacy terminal rendering: the
+    // selector picks the human lane, but the fullscreen TUI opens only
+    // for explicit `--format human` on a TTY (Step 13 pin).
+    assert!(!scan_tui_gate(None, true, true));
+    assert!(scan_tui_gate(Some(OutputFormat::Human), true, true));
+    assert!(!scan_tui_gate(Some(OutputFormat::Human), false, true));
+    assert!(!scan_tui_gate(Some(OutputFormat::Human), true, false));
+    assert!(!scan_tui_gate(Some(OutputFormat::Json), true, true));
+    assert!(!scan_tui_gate(Some(OutputFormat::Jsonl), true, true));
+}
+
+/// Parse captured stdout as JSONL: every line must be valid JSON.
+fn stdout_jsonl(output: &std::process::Output) -> Vec<serde_json::Value> {
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(!text.trim().is_empty(), "expected JSONL on stdout");
+    text.lines()
+        .map(|line| serde_json::from_str(line).expect("every redirected line parses"))
+        .collect()
+}
+
+/// Minimal Wave6 workspace: plain files (no git repos needed for lane
+/// checks) + scratch state + one cwd.
+struct Wave6Env {
+    _dir: tempfile::TempDir,
+    state: PathBuf,
+    cwd: PathBuf,
+    fixture_str: String,
+}
+
+impl Wave6Env {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = dir.path().join("state");
+        let cwd = dir.path().join("cwd");
+        repo_scan::privacy::private_dir_0700(&cwd).expect("mkdir");
+        let fixture = dir.path().join("fixture");
+        repo_scan::privacy::private_dir_0700(&fixture.join("a")).expect("mkdir");
+        repo_scan::privacy::private_write_0600(&fixture.join("a").join("f.txt"), "hi".as_bytes())
+            .expect("write");
+        let fixture_str = fixture.to_str().expect("utf8").to_string();
+        Self {
+            _dir: dir,
+            state,
+            cwd,
+            fixture_str,
+        }
+    }
+}
+
+#[test]
+fn wave6_query_all_serves_latest_snapshot_in_all_formats() {
+    let env = Wave6Env::new();
+    // First an `--all` scan, then a target scan: `query --all` serves
+    // the latest suitable scan regardless of kind.
+    let out = run(
+        &["scan", "--all", "--root", env.fixture_str.as_str()],
+        &env.cwd,
+        &env.state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            env.fixture_str.as_str(),
+            "--force-rescan",
+        ],
+        &env.cwd,
+        &env.state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let envelopes = stdout_jsonl(&out);
+    let scan_id = envelopes[0]["scan_id"]
+        .as_str()
+        .expect("scan id")
+        .to_string();
+    assert_eq!(envelopes.last().expect("tail")["type"], "scan_completed");
+    let report_id = envelopes.last().expect("tail")["records"]["report_id"]
+        .as_str()
+        .expect("report id")
+        .to_string();
+
+    // --format json: the retained snapshot, one document.
+    let out = run(
+        &["query", "--all", "--cached", "--format", "json"],
+        &env.cwd,
+        &env.state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON document");
+    assert_eq!(doc["report_id"], report_id);
+    assert_eq!(doc["scan"]["id"], scan_id);
+
+    // --format jsonl: the scan journal, byte-identical to query --scan.
+    let out = run(
+        &["query", "--all", "--cached", "--format", "jsonl"],
+        &env.cwd,
+        &env.state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let replay = stdout_jsonl(&out);
+    assert_eq!(replay[0]["type"], "scan_started");
+    assert_eq!(replay.last().expect("tail")["type"], "scan_completed");
+    assert!(replay.iter().all(|e| e["scan_id"] == scan_id));
+    let direct = run(
+        &["query", "--scan", scan_id.as_str(), "--format", "jsonl"],
+        &env.cwd,
+        &env.state,
+    );
+    assert_eq!(direct.stdout, out.stdout, "same envelope stream");
+
+    // --format human: the plain lane for the resolved scan.
+    let out = run(
+        &["query", "--all", "--cached", "--format", "human"],
+        &env.cwd,
+        &env.state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(stdout.starts_with(&format!("scan {scan_id}")), "{stdout}");
+
+    // No --format when redirected: JSONL auto-selection.
+    let out = run(&["query", "--all", "--cached"], &env.cwd, &env.state);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let replay = stdout_jsonl(&out);
+    assert_eq!(replay[0]["scan_id"], scan_id);
+
+    // --cached is required; a fresh state dir has no suitable scan.
+    let out = run(&["query", "--all"], &env.cwd, &env.state);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr_text(&out));
+    let fresh = tempfile::tempdir().expect("tempdir");
+    let fresh_state = fresh.path().join("state");
+    let out = run(
+        &["query", "--all", "--cached", "--format", "json"],
+        &env.cwd,
+        &fresh_state,
+    );
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr_text(&out));
+    assert!(out.stdout.is_empty(), "machine-clean miss");
+}
+
+#[test]
+fn wave6_cached_target_query_honors_format() {
+    let env = Wave6Env::new();
+    let out = run(
+        &["scan", URL, "--root", env.fixture_str.as_str()],
+        &env.cwd,
+        &env.state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let envelopes = stdout_jsonl(&out);
+    let scan_id = envelopes[0]["scan_id"]
+        .as_str()
+        .expect("scan id")
+        .to_string();
+    let report_id = envelopes.last().expect("tail")["records"]["report_id"]
+        .as_str()
+        .expect("report id")
+        .to_string();
+
+    // --format json: the resolved scan's retained snapshot.
+    let out = run(
+        &["query", URL, "--cached", "--format", "json"],
+        &env.cwd,
+        &env.state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON document");
+    assert_eq!(doc["report_id"], report_id);
+    assert_eq!(doc["scan"]["id"], scan_id);
+
+    // --format jsonl: the resolved scan's journal, byte-identical to
+    // query --scan (follow terminates: the scan already finished).
+    let out = run(
+        &["query", URL, "--cached", "--format", "jsonl"],
+        &env.cwd,
+        &env.state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let replay = stdout_jsonl(&out);
+    assert!(replay.iter().all(|e| e["scan_id"] == scan_id));
+    let direct = run(
+        &["query", "--scan", scan_id.as_str(), "--format", "jsonl"],
+        &env.cwd,
+        &env.state,
+    );
+    assert_eq!(direct.stdout, out.stdout, "same envelope stream");
+    let out = run(
+        &["query", URL, "--cached", "--follow", "--format", "jsonl"],
+        &env.cwd,
+        &env.state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    assert_eq!(direct.stdout, out.stdout, "follow stops at the tip");
+
+    // --format human and the default keep the short summary.
+    for args in [
+        vec!["query", URL, "--cached", "--format", "human"],
+        vec!["query", URL, "--cached"],
+    ] {
+        let out = run(&args, &env.cwd, &env.state);
+        assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(stdout.contains("cached: true"), "{stdout}");
+    }
+
+    // Machine lanes stay machine-clean on misses: exit 3, empty stdout.
+    let out = run(
+        &["query", "not-a-url", "--cached", "--format", "json"],
+        &env.cwd,
+        &env.state,
+    );
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr_text(&out));
+    assert!(out.stdout.is_empty(), "machine-clean miss");
+    let fresh = tempfile::tempdir().expect("tempdir");
+    let fresh_state = fresh.path().join("state");
+    let out = run(
+        &["query", URL, "--cached", "--format", "json"],
+        &env.cwd,
+        &fresh_state,
+    );
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr_text(&out));
+    assert!(out.stdout.is_empty(), "machine-clean miss");
+}
+
+#[test]
+fn wave6_redirected_default_is_jsonl_with_report() {
+    let env = Wave6Env::new();
+    // Redirected scan with no --format: JSONL on stdout, and --report
+    // still publishes the JSON snapshot file.
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            env.fixture_str.as_str(),
+            "--report",
+            "rep.json",
+        ],
+        &env.cwd,
+        &env.state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let envelopes = stdout_jsonl(&out);
+    assert_eq!(envelopes[0]["type"], "scan_started");
+    assert_eq!(envelopes.last().expect("tail")["type"], "scan_completed");
+    let scan_id = envelopes[0]["scan_id"]
+        .as_str()
+        .expect("scan id")
+        .to_string();
+    let report_id = envelopes.last().expect("tail")["records"]["report_id"]
+        .as_str()
+        .expect("report id")
+        .to_string();
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("scan_id:"),
+        "no legacy footers in the JSONL lane"
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(env.cwd.join("rep.json")).expect("report written"))
+            .expect("report is valid JSON");
+    assert_eq!(report["report_id"], report_id);
+
+    // Redirected resume of the completed scan: JSONL replay, same exit.
+    let out = run(&["resume", scan_id.as_str()], &env.cwd, &env.state);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let replay = stdout_jsonl(&out);
+    assert!(replay.iter().all(|e| e["scan_id"] == scan_id));
+
+    // Explicit --format human keeps the legacy footers.
+    let out = run(
+        &["resume", scan_id.as_str(), "--format", "human"],
+        &env.cwd,
+        &env.state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(stdout.contains("replayed"), "{stdout}");
+    assert_eq!(stdout_line(&out, "scan_id"), scan_id);
+}
+
+#[test]
+fn wave6_contradictory_options_exit_2() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    // --follow only rides human|jsonl.
+    let out = run(
+        &[
+            "query",
+            "--scan",
+            "scan-no-such",
+            "--follow",
+            "--format",
+            "json",
+        ],
+        dir.path(),
+        &state,
+    );
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr_text(&out));
+    // Targets XOR --all on both commands.
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            URL,
+            "--root",
+            dir.path().to_str().expect("utf8"),
+        ],
+        dir.path(),
+        &state,
+    );
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr_text(&out));
+    let out = run(&["query", URL, "--all", "--cached"], dir.path(), &state);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr_text(&out));
+    // --after requires --follow.
+    let out = run(&["query", "--all", "--after", "CURSOR"], dir.path(), &state);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr_text(&out));
 }

@@ -1284,20 +1284,21 @@ async fn scan_jsonl_tail(cfg: &config::Config, scan_id: &str) -> repo_scan::Resu
     Ok(pipe_open && flushed)
 }
 
-/// Stdout tail for an emission-failed scan (Wave2b output matrix).
+/// Stdout tail for an emission-failed scan (Wave6 output matrix).
 /// The scan row is already `failed` and `scan_failed` is journaled;
-/// the owner store is closed. Human/legacy lanes print the legacy
-/// footers; the json lane prints one JSON error object; the jsonl
-/// lane replays the journal (ending in the `scan_failed` event).
+/// the owner store is closed. `resolved` is the Step 6 resolved format
+/// (explicit wins, else TTY/redirected auto-selection): human prints
+/// the legacy footers; json prints one JSON error object; jsonl
+/// replays the journal (ending in the `scan_failed` event).
 async fn scan_failure_tail(
     cfg: &config::Config,
     scan_id: &str,
     report_id: &str,
     snapshot_path: &Path,
-    explicit: Option<repo_scan::cli::OutputFormat>,
+    resolved: repo_scan::cli::OutputFormat,
 ) -> repo_scan::Result<ExitCode> {
     use repo_scan::cli::OutputFormat;
-    if explicit == Some(OutputFormat::Jsonl) {
+    if resolved == OutputFormat::Jsonl {
         // Replay errors here are catalog corruption: loud, but the
         // scan already failed — report the failure either way.
         match scan_jsonl_tail(cfg, scan_id).await {
@@ -1311,7 +1312,7 @@ async fn scan_failure_tail(
         }
         return Ok(ExitCode::OperationalFailure);
     }
-    if explicit == Some(OutputFormat::Json) {
+    if resolved == OutputFormat::Json {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
         let object = serde_json::json!({
@@ -1839,10 +1840,11 @@ async fn run_scan_inner(
     // Step 13: explicit `scan --format human` on a TTY opens the
     // interactive live view for the drains below (plain lane when
     // redirected; the default terminal rendering is untouched).
-    if args.format == Some(repo_scan::cli::OutputFormat::Human)
-        && std::io::stdout().is_terminal()
-        && std::io::stdin().is_terminal()
-    {
+    if repo_scan::cli::scan_tui_gate(
+        args.format,
+        std::io::stdout().is_terminal(),
+        std::io::stdin().is_terminal(),
+    ) {
         use repo_scan::report::tui::{load_live_snapshot, Session, TuiSnapshot};
         let color = tui_color_for(args.color, true);
         let mut view = TuiScanView {
@@ -2253,15 +2255,20 @@ async fn run_scan_inner(
         &snapshot_path,
     )
     .await?;
-    // Wave2b output matrix: an explicit `--format` wins; no explicit
-    // format keeps the legacy terminal/footers behavior. All lanes
-    // stage and retain the same snapshot first (one state model):
-    // human renders it, json prints it, jsonl replays the journal
-    // committed with it. `--report` still publishes the file in every
-    // lane; only the stdout shape changes.
+    // Wave6 output matrix (Step 6 auto-selection): an explicit
+    // `--format` wins; no explicit format resolves through
+    // [`OutputFormat::resolve`][repo_scan::cli::OutputFormat::resolve] —
+    // the legacy terminal/footers behavior on a TTY, the JSONL journal
+    // replay when redirected. All lanes stage and retain the same
+    // snapshot first (one state model): human renders it, json prints
+    // it, jsonl replays the journal committed with it. `--report`
+    // still publishes the file in every lane; only the stdout shape
+    // changes.
     let explicit = args.format;
-    let machine_json = explicit == Some(repo_scan::cli::OutputFormat::Json);
-    let machine_jsonl = explicit == Some(repo_scan::cli::OutputFormat::Jsonl);
+    let resolved_format =
+        repo_scan::cli::OutputFormat::resolve(explicit, std::io::stdout().is_terminal());
+    let machine_json = resolved_format == repo_scan::cli::OutputFormat::Json;
+    let machine_jsonl = resolved_format == repo_scan::cli::OutputFormat::Jsonl;
     let explicit_human = explicit == Some(repo_scan::cli::OutputFormat::Human);
     let published = match &report_dest {
         Some(dest) => {
@@ -2287,8 +2294,14 @@ async fn run_scan_inner(
                         .await?;
                     journal_emission_failed(&mut runner, &store, cfg, &scan_id, &err).await?;
                     let _ = store.close().await;
-                    return scan_failure_tail(cfg, &scan_id, &report_id, &snapshot_path, explicit)
-                        .await;
+                    return scan_failure_tail(
+                        cfg,
+                        &scan_id,
+                        &report_id,
+                        &snapshot_path,
+                        resolved_format,
+                    )
+                    .await;
                 }
             }
         }
@@ -2332,7 +2345,7 @@ async fn run_scan_inner(
                             &scan_id,
                             &report_id,
                             &snapshot_path,
-                            explicit,
+                            resolved_format,
                         )
                         .await;
                     }
@@ -2373,7 +2386,7 @@ async fn run_scan_inner(
                             &scan_id,
                             &report_id,
                             &snapshot_path,
-                            explicit,
+                            resolved_format,
                         )
                         .await;
                     }
@@ -2428,7 +2441,7 @@ async fn run_scan_inner(
                             &scan_id,
                             &report_id,
                             &snapshot_path,
-                            explicit,
+                            resolved_format,
                         )
                         .await;
                     }
@@ -2472,7 +2485,7 @@ async fn run_scan_inner(
                             &scan_id,
                             &report_id,
                             &snapshot_path,
-                            explicit,
+                            resolved_format,
                         )
                         .await;
                     }
@@ -2613,8 +2626,9 @@ async fn run_scan_inner(
         .emit(&store, terminal, &terminal_records)
         .await?;
     let _ = store.close().await;
-    // Wave2b success tails: machine lanes already printed (json) or
-    // replay below (jsonl); human lanes print the legacy footers.
+    // Wave6 success tails: machine lanes already printed (json) or
+    // replay below (jsonl, including the redirected default); human
+    // lanes print the legacy footers.
     if machine_jsonl {
         // A closed consumer ends quietly with the scan's exit code;
         // replay corruption fails loudly (never a silent tail).
@@ -11782,6 +11796,16 @@ fn cell_blob(row: &turso::Row, idx: usize) -> repo_scan::Result<Vec<u8>> {
     }
 }
 
+fn cell_opt_blob(row: &turso::Row, idx: usize) -> repo_scan::Result<Option<Vec<u8>>> {
+    match row.get_value(idx).map_err(store_err)? {
+        turso::Value::Blob(value) => Ok(Some(value)),
+        turso::Value::Null => Ok(None),
+        other => Err(repo_scan::Error::Store(format!(
+            "column {idx} expected BLOB or NULL, got {other:?}"
+        ))),
+    }
+}
+
 async fn count_dirs_complete(store: &TursoStore, generation: u64) -> repo_scan::Result<u64> {
     count_query(
         store,
@@ -14362,12 +14386,8 @@ async fn run_query_scan_replay(
 ) -> repo_scan::Result<ExitCode> {
     use repo_scan::cli::OutputFormat;
     // Explicit format wins; the default is JSONL when redirected, the
-    // live human view on a terminal.
-    let format = match args.format {
-        Some(f) => f,
-        None if !std::io::stdout().is_terminal() => OutputFormat::Jsonl,
-        None => OutputFormat::Human,
-    };
+    // live human view on a terminal (Step 6 auto-selection).
+    let format = OutputFormat::resolve(args.format, std::io::stdout().is_terminal());
     let db_path = store::owner::catalog_db_path(&cfg.state_dir);
     if !db_path.exists() {
         // Machine discipline: even the degraded answer stays off the
@@ -14554,39 +14574,59 @@ async fn run_query_inner(
     args: &repo_scan::cli::QueryArgs,
 ) -> repo_scan::Result<ExitCode> {
     // Goal Step 6: exactly one of TARGET / --all / --scan. The cached
-    // single-target path stays inline; --scan replays the journaled event
-    // stream; --all follows in a later slice.
+    // single-target path answers from state (summary by default, retained
+    // snapshot/replay on explicit machine formats); --scan replays the
+    // journaled event stream; --all resolves the latest suitable scan and
+    // serves it through the same replay core.
     let selection = match args.selection() {
         Ok(s) => s,
         Err(msg) => return Err(repo_scan::Error::InvalidArgs(msg)),
     };
-    let url = match selection {
-        repo_scan::cli::QuerySelection::Target(url) => url,
+    match selection {
         repo_scan::cli::QuerySelection::Scan(id) => {
             return run_query_scan_replay(cfg, args, &id).await;
         }
-        repo_scan::cli::QuerySelection::All => {
-            eprintln!(
-                "repo-scan: not yet implemented: query --all executes in a later slice; \
-                 use one TARGET with --cached, or --scan SCAN_ID --format jsonl"
-            );
-            return Ok(ExitCode::OperationalFailure);
+        repo_scan::cli::QuerySelection::All => return run_query_all(cfg, args).await,
+        repo_scan::cli::QuerySelection::Target(url) => {
+            return run_query_target(cfg, args, &url).await;
         }
-    };
+    }
+}
+
+/// Cached single-target lookup (Wave6): `--format human` and the default
+/// keep the short human summary; explicit `--format json` prints the
+/// resolved scan's retained snapshot and `--format jsonl` replays its
+/// journal — the same envelope stream as `query --scan --format jsonl`.
+/// Machine lanes stay machine-clean (diagnostics on stderr, exit 3, empty
+/// stdout); the human lane keeps today's stdout notes verbatim.
+async fn run_query_target(
+    cfg: &config::Config,
+    args: &repo_scan::cli::QueryArgs,
+    url: &str,
+) -> repo_scan::Result<ExitCode> {
+    use repo_scan::cli::OutputFormat;
     if !args.cached {
         return Err(repo_scan::Error::InvalidArgs(
             "--cached is required: live queries are not supported".to_string(),
         ));
     }
+    let machine = matches!(args.format, Some(OutputFormat::Json | OutputFormat::Jsonl));
     // Absent catalog short-circuits before any lock or file creation.
     let db_path = store::owner::catalog_db_path(&cfg.state_dir);
     if !db_path.exists() {
-        println!("cached: true");
-        println!("suitable_catalog: false");
-        println!(
-            "note: no catalog at {}; no live verification performed",
-            db_path.display()
-        );
+        if machine {
+            eprintln!(
+                "repo-scan: cached query: no catalog at {}; no live verification performed",
+                db_path.display()
+            );
+        } else {
+            println!("cached: true");
+            println!("suitable_catalog: false");
+            println!(
+                "note: no catalog at {}; no live verification performed",
+                db_path.display()
+            );
+        }
         return Ok(ExitCode::Incomplete);
     }
     // RSF-02C3154D-7D7A-420E-A0C5-EA763B8B327D: the cached query opens
@@ -14598,15 +14638,28 @@ async fn run_query_inner(
     // != live `meta.db_id`) is not served — it reports "no suitable
     // catalog", exactly like an absent one.
     if !catalog_bound_to_marker(&store, &cfg.state_dir).await? {
-        println!("cached: true");
-        println!("suitable_catalog: false");
-        println!(
-            "note: catalog at {} is not bound to this tool's ownership marker; \
-             no live verification performed",
-            db_path.display()
-        );
+        if machine {
+            eprintln!(
+                "repo-scan: cached query: catalog at {} is not bound to this tool's ownership \
+                 marker; no live verification performed",
+                db_path.display()
+            );
+        } else {
+            println!("cached: true");
+            println!("suitable_catalog: false");
+            println!(
+                "note: catalog at {} is not bound to this tool's ownership marker; \
+                 no live verification performed",
+                db_path.display()
+            );
+        }
         let _ = store.close().await;
         return Ok(ExitCode::Incomplete);
+    }
+    if machine {
+        let code = run_query_target_machine(cfg, args, url, &store).await?;
+        let _ = store.close().await;
+        return Ok(code);
     }
     // RS-PRIV-09: row-count and time budgets; exhaustion truncates with
     // an explicit incomplete note, never a silent partial answer.
@@ -14647,9 +14700,9 @@ async fn run_query_inner(
         let _ = store.close().await;
         return Ok(ExitCode::Incomplete);
     }
-    let Some(canonical) = normalize_query_cached(&url) else {
+    let Some(canonical) = normalize_query_cached(url) else {
         println!("cached: true");
-        println!("target: {}", identity::redact_target_for_display(&url));
+        println!("target: {}", identity::redact_target_for_display(url));
         println!("canonical: unresolved (unsupported shape or unresolvable host alias)");
         println!("note: aliases resolve only from cached observations; no live probe performed");
         let _ = store.close().await;
@@ -14697,7 +14750,7 @@ async fn run_query_inner(
     )
     .await?;
     println!("cached: true (no live verification performed)");
-    println!("target: {}", identity::redact_target_for_display(&url));
+    println!("target: {}", identity::redact_target_for_display(url));
     println!("canonical: {canonical}");
     for (id, policy, state, created) in &generations {
         println!(
@@ -14731,6 +14784,181 @@ async fn run_query_inner(
     println!("pending_tasks: {pending_all}");
     let _ = store.close().await;
     Ok(ExitCode::Success)
+}
+
+/// Machine lanes for a cached single-target lookup (Wave6): resolve the
+/// latest scan covering the target, then serve it through the same replay
+/// core as `query --scan` — one snapshot printer, one envelope stream, one
+/// follow loop. Diagnostics stay on stderr with an empty stdout (exit 3).
+async fn run_query_target_machine(
+    cfg: &config::Config,
+    args: &repo_scan::cli::QueryArgs,
+    url: &str,
+    store: &TursoStore,
+) -> repo_scan::Result<ExitCode> {
+    let Some(canonical) = normalize_query_cached(url) else {
+        eprintln!(
+            "repo-scan: cached query: target {} is unresolved (unsupported shape or \
+             unresolvable host alias); no live probe performed",
+            identity::redact_target_for_display(url)
+        );
+        return Ok(ExitCode::Incomplete);
+    };
+    let Some(scan_id) =
+        resolve_latest_suitable_scan(store, &cfg.state_dir, Some(&canonical)).await?
+    else {
+        eprintln!(
+            "repo-scan: cached query: no retained snapshot for target {}; run a scan first",
+            identity::redact_target_for_display(url)
+        );
+        return Ok(ExitCode::Incomplete);
+    };
+    let replay_args = repo_scan::cli::QueryArgs {
+        target: None,
+        all: false,
+        scan: Some(scan_id.clone()),
+        cached: true,
+        format: args.format,
+        follow: args.follow,
+        after: args.after.clone(),
+    };
+    run_query_scan_replay(cfg, &replay_args, &scan_id).await
+}
+
+/// `query --all --cached` (Wave6): resolve the latest suitable scan —
+/// newest terminal scan with a retained snapshot, machine or
+/// explicit-roots scope alike — and serve it through the same replay
+/// core as `query --scan`, in the requested format. Requires `--cached`
+/// like every other catalog-serving query; exit 3 with an empty stdout
+/// when no suitable scan exists.
+async fn run_query_all(
+    cfg: &config::Config,
+    args: &repo_scan::cli::QueryArgs,
+) -> repo_scan::Result<ExitCode> {
+    if !args.cached {
+        return Err(repo_scan::Error::InvalidArgs(
+            "--cached is required: live queries are not supported".to_string(),
+        ));
+    }
+    let db_path = store::owner::catalog_db_path(&cfg.state_dir);
+    if !db_path.exists() {
+        eprintln!(
+            "repo-scan: query --all: no catalog at {}; no live verification performed",
+            db_path.display()
+        );
+        return Ok(ExitCode::Incomplete);
+    }
+    let store = TursoStore::open_read_only(&db_path).await?;
+    if !catalog_bound_to_marker(&store, &cfg.state_dir).await? {
+        eprintln!(
+            "repo-scan: query --all: catalog at {} is not bound to this tool's ownership \
+             marker; no live verification performed",
+            db_path.display()
+        );
+        let _ = store.close().await;
+        return Ok(ExitCode::Incomplete);
+    }
+    let resolved = resolve_latest_suitable_scan(&store, &cfg.state_dir, None).await?;
+    let _ = store.close().await;
+    let Some(scan_id) = resolved else {
+        eprintln!(
+            "repo-scan: query --all: no finished scan with a retained snapshot; run a scan first"
+        );
+        return Ok(ExitCode::Incomplete);
+    };
+    let replay_args = repo_scan::cli::QueryArgs {
+        target: None,
+        all: false,
+        scan: Some(scan_id.clone()),
+        cached: true,
+        format: args.format,
+        follow: args.follow,
+        after: args.after.clone(),
+    };
+    run_query_scan_replay(cfg, &replay_args, &scan_id).await
+}
+
+/// Resolve the newest scan row worth serving (Wave6): terminal state
+/// (`complete`, `incomplete`, or `interrupted`) with a parseable outcome
+/// whose retained snapshot file still exists. `failed`/`superseded`/live
+/// rows are never suitable. With `canonical`, the row must also cover
+/// the target — primary canonical, multi-target set, or an `--all` scan
+/// (whose snapshot covers every repository). Newest first by
+/// `(created_at_ms, id)`; the read is bounded (RS-PRIV-09).
+async fn resolve_latest_suitable_scan(
+    store: &TursoStore,
+    state_dir: &Path,
+    canonical: Option<&str>,
+) -> repo_scan::Result<Option<String>> {
+    let sql = format!(
+        "SELECT id, url_canonical, targets_json, all_targets, outcome FROM scan_requests \
+         WHERE state IN ('complete', 'incomplete', 'interrupted') AND outcome IS NOT NULL \
+         ORDER BY created_at_ms DESC, id DESC LIMIT {}",
+        QUERY_MAX_GENERATIONS + 1
+    );
+    let mut rows = store
+        .connection()
+        .query(&sql, ())
+        .await
+        .map_err(store_err)?;
+    while let Some(row) = rows.next().await.map_err(store_err)? {
+        let id = cell_text(&row, 0)?;
+        let url_canonical = cell_opt_blob(&row, 1)?;
+        let targets_json = cell_opt_text(&row, 2)?;
+        let all_targets = cell_opt_int(&row, 3)?.is_some_and(|v| v != 0);
+        let outcome = cell_opt_text(&row, 4)?;
+        if let Some(want) = canonical {
+            if !scan_covers_target(
+                url_canonical.as_deref(),
+                targets_json.as_deref(),
+                all_targets,
+                want,
+            ) {
+                continue;
+            }
+        }
+        let Some(outcome) = outcome else { continue };
+        if snapshot_for_outcome(state_dir, &outcome).is_none() {
+            continue;
+        }
+        return Ok(Some(id));
+    }
+    Ok(None)
+}
+
+/// True when a scan row covers `canonical`: its primary canonical matches,
+/// its multi-target set names it, or it is an `--all` scan (full-catalog
+/// snapshot). Unparseable rows never match.
+fn scan_covers_target(
+    url_canonical: Option<&[u8]>,
+    targets_json: Option<&str>,
+    all_targets: bool,
+    canonical: &str,
+) -> bool {
+    if all_targets {
+        return true;
+    }
+    if url_canonical.is_some_and(|bytes| bytes == canonical.as_bytes()) {
+        return true;
+    }
+    let Some(encoded) = targets_json else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(encoded) else {
+        return false;
+    };
+    value
+        .as_array()
+        .is_some_and(|targets| targets.iter().any(|t| t["canonical"] == canonical))
+}
+
+/// Retained snapshot path for a scan outcome, when the outcome parses and
+/// the file still exists. Anything else (unparseable outcome, unsafe ID,
+/// missing file) is unsuitable, never an error.
+fn snapshot_for_outcome(state_dir: &Path, outcome: &str) -> Option<PathBuf> {
+    let report_id = config::parse_outcome(outcome).map(|d| d.report_id)?;
+    let path = config::snapshot_path(state_dir, &report_id).ok()?;
+    path.is_file().then_some(path)
 }
 
 /// Cached-only target normalization: direct `github.com` hosts take the
@@ -14792,10 +15020,12 @@ async fn run_resume_inner(
                 130 => ExitCode::Interrupted,
                 _ => ExitCode::OperationalFailure,
             };
-            // Wave2b output matrix: explicit `--format` wins, else the
-            // legacy footers. The snapshot lanes read the same
-            // retained bytes the scan lanes wrote.
-            if args.format == Some(OutputFormat::Json) {
+            // Wave6 output matrix: explicit `--format` wins, else the
+            // Step 6 auto-selection (legacy footers on a TTY, journal
+            // replay when redirected). The snapshot lanes read the
+            // same retained bytes the scan lanes wrote.
+            let resolved = OutputFormat::resolve(args.format, std::io::stdout().is_terminal());
+            if resolved == OutputFormat::Json {
                 let snapshot = config::snapshot_path(&cfg.state_dir, &recorded.report_id)?;
                 let stdout = std::io::stdout();
                 let mut out = std::io::BufWriter::new(stdout.lock());
@@ -14805,7 +15035,7 @@ async fn run_resume_inner(
                 drop(guard);
                 return Ok(code);
             }
-            if args.format == Some(OutputFormat::Jsonl) {
+            if resolved == OutputFormat::Jsonl {
                 let stdout = std::io::stdout();
                 let mut out = std::io::BufWriter::new(stdout.lock());
                 let mut after = None;
@@ -14844,9 +15074,11 @@ async fn run_resume_inner(
             Ok(code)
         }
         "superseded" => {
-            // Wave2b: the machine lanes carry one JSON object (no
-            // prose); human keeps the legacy footers.
-            if args.format == Some(OutputFormat::Json) || args.format == Some(OutputFormat::Jsonl) {
+            // Wave6: the machine lanes carry one JSON object (no
+            // prose); human keeps the legacy footers. No explicit
+            // format auto-selects (TTY footers, redirected object).
+            let resolved = OutputFormat::resolve(args.format, std::io::stdout().is_terminal());
+            if resolved == OutputFormat::Json || resolved == OutputFormat::Jsonl {
                 let stdout = std::io::stdout();
                 let mut out = stdout.lock();
                 let object = serde_json::json!({
@@ -14908,8 +15140,9 @@ async fn run_resume_inner(
 }
 
 /// Retry a failed report publication from the retained snapshot bytes.
-/// Wave2b: the tail follows the resume `--format` (machine lanes stay
-/// machine-clean; human keeps the legacy footers).
+/// Wave6: the tail follows the resume `--format` (machine lanes stay
+/// machine-clean; human keeps the legacy footers); no explicit format
+/// auto-selects through the Step 6 selector.
 async fn retry_publication(
     cfg: &config::Config,
     store: &TursoStore,
@@ -14993,14 +15226,17 @@ async fn retry_publication(
             store::now_ms(),
         )
         .await?;
-    if format == Some(repo_scan::cli::OutputFormat::Json) {
+    // Wave6: explicit `--format` wins, else the Step 6 auto-selection
+    // (legacy footers on a TTY, journal replay when redirected).
+    let resolved = repo_scan::cli::OutputFormat::resolve(format, std::io::stdout().is_terminal());
+    if resolved == repo_scan::cli::OutputFormat::Json {
         let stdout = std::io::stdout();
         let mut out = std::io::BufWriter::new(stdout.lock());
         print_snapshot_json(snapshot, &mut out)?;
         let _ = flush_replay(&mut out)?;
         return Ok(exit);
     }
-    if format == Some(repo_scan::cli::OutputFormat::Jsonl) {
+    if resolved == repo_scan::cli::OutputFormat::Jsonl {
         let stdout = std::io::stdout();
         let mut out = std::io::BufWriter::new(stdout.lock());
         let mut after = None;
@@ -15034,8 +15270,9 @@ async fn retry_publication(
 
 /// Restore a saved non-terminal request and continue its unfinished work.
 /// Releases ownership first: re-entering the scan loop re-acquires it.
-/// Wave2b: an explicit resume `--format` wins, else the scan's saved
-/// format is restored (D6: resume restores ALL saved options).
+/// Wave6: an explicit resume `--format` wins, else the scan's saved
+/// format is restored (D6: resume restores ALL saved options); with no
+/// saved format either, the scan loop auto-selects (TTY/redirected).
 async fn continue_saved_scan(
     cfg: &config::Config,
     guard: OwnerGuard,
@@ -15105,8 +15342,9 @@ async fn continue_saved_scan(
     // marker as a target and fails with InvalidArgs. Legacy rows
     // (NULL) resume single-target via `url_raw` as before.
     let all = row.all_targets.unwrap_or(false);
-    // Wave2b: explicit resume `--format` wins; otherwise restore the
-    // scan's saved format (legacy/NULL rows resume legacy output).
+    // Wave6: explicit resume `--format` wins; otherwise restore the
+    // scan's saved format (legacy/NULL rows fall through to the Step 6
+    // auto-selection inside the scan loop).
     let saved_format = match row.format.as_deref() {
         Some("human") => Some(repo_scan::cli::OutputFormat::Human),
         Some("json") => Some(repo_scan::cli::OutputFormat::Json),

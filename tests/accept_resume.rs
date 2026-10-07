@@ -311,7 +311,13 @@ fn resume01_kill_mid_scan_resume_completes_without_redo() {
     let (scan_id, killed_complete, total_at_kill) = killed;
 
     // Resume the same scan id to completion.
-    let out = run(&["resume", scan_id.as_str()], tmp.path(), &state);
+    // Wave6: explicit human keeps the footer lines (the redirected
+    // default is now the JSONL journal replay).
+    let out = run(
+        &["resume", scan_id.as_str(), "--format", "human"],
+        tmp.path(),
+        &state,
+    );
     assert_eq!(
         out.status.code(),
         Some(0),

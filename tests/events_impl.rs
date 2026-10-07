@@ -1020,6 +1020,10 @@ impl Wave1dEnv {
             .arg(self.report_path())
             .arg("--status")
             .arg("metadata")
+            // Wave6: explicit human keeps the footer lines (the
+            // redirected default is now the JSONL journal replay).
+            .arg("--format")
+            .arg("human")
             .current_dir(&self.cwd)
             .stdout(std::process::Stdio::from(stdout))
             .stderr(std::process::Stdio::from(stderr))

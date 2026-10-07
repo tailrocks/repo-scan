@@ -182,8 +182,12 @@ fn termsink_lower_layer_remote_never_emits_raw() {
 }
 
 /// Secret-pair path components redact on the terminal display channel
-/// only: stdout/stderr stay clean while the report keeps the lossless
-/// `value` bytes (display/value split, mirroring the query path display).
+/// only: stderr and the readable terminal render stay clean while the
+/// machine lanes (report file, JSON snapshot, JSONL journal) keep the
+/// lossless `value` bytes (display/value split, mirroring the query path
+/// display). Wave6: redirected scans replay the journal, so the legacy
+/// terminal render is pinned through the real pipeline report instead of
+/// captured stdout (no PTY here).
 #[test]
 fn termsink_secret_pair_path_redacted_on_terminal_only() {
     let dir = tempfile::tempdir_in("/tmp").expect("tmpdir under /tmp");
@@ -196,9 +200,9 @@ fn termsink_secret_pair_path_redacted_on_terminal_only() {
     );
     let root_str = root.to_str().expect("utf8").to_string();
 
-    // Terminal mode (spec §3: no --report renders the readable report):
-    // the repository renders with the secret pair scrubbed on stdout.
-    // File mode prints only the summary lines, never the render.
+    // Redirected mode: the scan replays the journal (machine lane), which
+    // carries the lossless path like the JSON report does; stderr stays
+    // scrubbed either way.
     let state = dir.path().join("state-term");
     let cwd = dir.path().join("cwd-term");
     repo_scan::privacy::private_dir_0700(&cwd).expect("mkdir");
@@ -219,21 +223,18 @@ fn termsink_secret_pair_path_redacted_on_terminal_only() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        let _: serde_json::Value = serde_json::from_str(line).expect("JSONL replay");
+    }
     assert!(
-        stdout.contains("repositories: 1"),
-        "repo rendered: {stdout}"
-    );
-    assert!(
-        stdout.contains("token=<redacted>"),
-        "scrubbed pair rendered: {stdout}"
-    );
-    assert!(
-        !contains_bytes(&out.stdout, canary.as_bytes()),
-        "canary on terminal stdout: {stdout}"
+        contains_bytes(&out.stdout, canary.as_bytes()),
+        "lossless path value retained in the journal lane"
     );
     assert!(!contains_bytes(&out.stderr, canary.as_bytes()));
 
-    // File mode: the report keeps the lossless path value bytes.
+    // File mode: the report keeps the lossless path value bytes, and the
+    // same report renders scrubbed through the terminal renderer (the
+    // TTY-only lane, pinned here without a PTY).
     let state_f = dir.path().join("state-file");
     let cwd_f = dir.path().join("cwd-file");
     repo_scan::privacy::private_dir_0700(&cwd_f).expect("mkdir");
@@ -255,12 +256,25 @@ fn termsink_secret_pair_path_redacted_on_terminal_only() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(!contains_bytes(&out.stdout, canary.as_bytes()));
     assert!(!contains_bytes(&out.stderr, canary.as_bytes()));
     let report = std::fs::read(cwd_f.join("rep.json")).expect("read report");
     assert!(
         contains_bytes(&report, canary.as_bytes()),
         "lossless path value retained in report"
+    );
+    let parsed: repo_scan::report::model::Report =
+        serde_json::from_slice(&report).expect("report parses");
+    let mut rendered: Vec<u8> = Vec::new();
+    repo_scan::report::render::render_terminal(&parsed, &mut rendered).expect("render");
+    let text = String::from_utf8(rendered.clone()).expect("utf8");
+    assert!(text.contains("repositories: 1"), "repo rendered: {text}");
+    assert!(
+        text.contains("token=<redacted>"),
+        "scrubbed pair rendered: {text}"
+    );
+    assert!(
+        !contains_bytes(&rendered, canary.as_bytes()),
+        "canary on terminal render: {text}"
     );
 }
 

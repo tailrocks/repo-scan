@@ -680,6 +680,8 @@ fn report_02_stalled_publish_does_not_pin_reader() {
             root_str.as_str(),
             "--report",
             "report.json",
+            "--format",
+            "human",
         ],
         dir.path(),
         &state,
@@ -730,6 +732,8 @@ fn report_02_failed_publish_retries_from_snapshot() {
             root_str.as_str(),
             "--report",
             "blocked.json",
+            "--format",
+            "human",
         ],
         dir.path(),
         &state,
@@ -744,7 +748,13 @@ fn report_02_failed_publish_retries_from_snapshot() {
     // Remove the blocker; resume retries from the saved snapshot without
     // repeating discovery.
     std::fs::remove_file(&dest).expect("unblock");
-    let out = run(&["resume", scan_id.as_str()], dir.path(), &state);
+    // Wave6: explicit human keeps the footer lines (the redirected
+    // default is now the JSONL journal replay).
+    let out = run(
+        &["resume", scan_id.as_str(), "--format", "human"],
+        dir.path(),
+        &state,
+    );
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert_eq!(
         out.status.code(),
@@ -829,6 +839,8 @@ fn report_02_unrelated_files_never_overwritten() {
             root_str.as_str(),
             "--report",
             "user.json",
+            "--format",
+            "human",
         ],
         dir.path(),
         &state,
@@ -898,6 +910,8 @@ fn report_02_symlink_destination_is_refused() {
             root_str.as_str(),
             "--report",
             "link.json",
+            "--format",
+            "human",
         ],
         dir.path(),
         &state,

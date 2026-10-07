@@ -69,6 +69,8 @@ fn scan(
     report: &Path,
     extra: &[&str],
 ) -> std::process::Output {
+    // Wave6: explicit human keeps the footer lines these tests parse
+    // (the redirected default is now the JSONL journal replay).
     let mut args: Vec<String> = vec![
         "scan".to_string(),
         url.to_string(),
@@ -76,6 +78,8 @@ fn scan(
         "roots".to_string(),
         "--report".to_string(),
         report.to_str().expect("utf8 report").to_string(),
+        "--format".to_string(),
+        "human".to_string(),
     ];
     for r in roots {
         args.push("--root".to_string());
@@ -88,7 +92,16 @@ fn scan(
 }
 
 fn resume(state: &Path, scan_id: &str) -> std::process::Output {
-    run(&["resume".to_string(), scan_id.to_string()], state, state)
+    run(
+        &[
+            "resume".to_string(),
+            scan_id.to_string(),
+            "--format".to_string(),
+            "human".to_string(),
+        ],
+        state,
+        state,
+    )
 }
 
 /// R1: dispositions are per scan target at report time. Scanning B after A

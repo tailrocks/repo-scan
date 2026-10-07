@@ -47,6 +47,34 @@ pub enum OutputFormat {
     Jsonl,
 }
 
+impl OutputFormat {
+    /// Step 6 auto-selection (Wave6): an explicit `--format` always wins;
+    /// otherwise the live human view goes to a terminal and JSONL goes to
+    /// redirected output. Never yields `Json` by default (a bare command
+    /// never prints a bare snapshot). Every command resolves through this
+    /// one selector so TTY/redirected behavior stays uniform and
+    /// unit-testable.
+    pub fn resolve(explicit: Option<OutputFormat>, stdout_is_tty: bool) -> OutputFormat {
+        match explicit {
+            Some(format) => format,
+            None if stdout_is_tty => OutputFormat::Human,
+            None => OutputFormat::Jsonl,
+        }
+    }
+}
+
+/// Interactive-TUI gate for `scan` (Step 13, Wave6 pin): only an explicit
+/// `scan --format human` on a TTY opens the interactive live view. A bare
+/// `scan` on a TTY keeps the legacy terminal rendering — the TTY default
+/// selects the human *lane*, never the fullscreen TUI by itself.
+pub fn scan_tui_gate(
+    explicit: Option<OutputFormat>,
+    stdout_is_tty: bool,
+    stdin_is_tty: bool,
+) -> bool {
+    explicit == Some(OutputFormat::Human) && stdout_is_tty && stdin_is_tty
+}
+
 /// Terminal color control (goal Step 13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ColorChoice {
