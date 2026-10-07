@@ -1833,6 +1833,35 @@ async fn run_scan_inner(
     // gate execution to the post-boundary drain.
     enqueue_analysis_refresh(&store, &mut runner, generation, run_rev, now).await?;
 
+    // Step 13: explicit `scan --format human` on a TTY opens the
+    // interactive live view for the drains below (plain lane when
+    // redirected; the default terminal rendering is untouched).
+    if args.format == Some(repo_scan::cli::OutputFormat::Human)
+        && std::io::stdout().is_terminal()
+        && std::io::stdin().is_terminal()
+    {
+        use repo_scan::report::tui::{load_live_snapshot, Session, TuiSnapshot};
+        let color = tui_color_for(args.color, true);
+        let mut view = TuiScanView {
+            session: Session::open(TuiSnapshot::empty(), color),
+            rows_refresh_at: Instant::now(),
+        };
+        // Best-effort first paint from committed rows (pre-existing
+        // catalog contents show immediately; discoveries stream in
+        // via the progress ticks).
+        if let Ok(snapshot) = load_live_snapshot(&store).await {
+            view.session.update(snapshot);
+        }
+        view.session.update_header(|header| {
+            header.scan_id = scan_id.clone();
+            header.scan_state = "running".to_string();
+            header.phase = "discovery".to_string();
+            header.target = target.clone();
+        });
+        view.session.redraw();
+        runner.tui = Some(view);
+    }
+
     let mut outcome = run_until_boundary(
         &mut runner,
         &store,
@@ -2343,7 +2372,9 @@ async fn run_scan_inner(
                 }
             } else if explicit_human {
                 // Explicit human lane: retain, then render the stable
-                // plain text (same snapshot the JSON lane prints).
+                // plain text (same snapshot the JSON lane prints) —
+                // or browse the retained snapshot in the live TUI
+                // when it still owns the screen (Step 13).
                 match ReportPipeline::stage_and_retain(
                     &store,
                     &lib_inputs,
@@ -2354,12 +2385,17 @@ async fn run_scan_inner(
                 .await
                 {
                     Ok(snapshot) => {
-                        let stdout = std::io::stdout();
-                        let mut out = stdout.lock();
-                        print_snapshot_human(&snapshot, &mut out)?;
+                        if runner.tui.is_some() {
+                            tui_browse_final(&mut runner, &snapshot).await?;
+                        } else {
+                            let stdout = std::io::stdout();
+                            let mut out = stdout.lock();
+                            print_snapshot_human(&snapshot, &mut out)?;
+                        }
                         true
                     }
                     Err(e) => {
+                        runner.tui = None; // restore before diagnostics
                         let err = identity::scrub_text(&e.to_string());
                         eprintln!("repo-scan: human report failed: {err}");
                         store
@@ -2444,9 +2480,13 @@ async fn run_scan_inner(
         let mut out = stdout.lock();
         print_snapshot_json(&snapshot_path, &mut out)?;
     } else if explicit_human && report_dest.is_some() {
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
-        print_snapshot_human(&snapshot_path, &mut out)?;
+        if runner.tui.is_some() {
+            tui_browse_final(&mut runner, &snapshot_path).await?;
+        } else {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            print_snapshot_human(&snapshot_path, &mut out)?;
+        }
     }
     // Completed snapshots are retained bounded (case 17); referenced
     // snapshots (including this scan's, once the outcome below binds
@@ -4322,6 +4362,11 @@ struct Runner {
     /// with the writer batch, and [`classify_flushed_completions`]
     /// resolves every entry against committed rows after each flush.
     pending_completions: Vec<PendingCompletion>,
+    /// Live TUI session for explicit `scan --format human` on a TTY
+    /// (Step 13): `Some` while the interactive view owns the screen.
+    /// Dropped — terminal restored via RAII — on detach (`q`/esc),
+    /// completion, interruption, or failure.
+    tui: Option<TuiScanView>,
 }
 
 impl Runner {
@@ -4356,6 +4401,7 @@ impl Runner {
             journal: None,
             open_gaps: HashSet::new(),
             pending_completions: Vec::new(),
+            tui: None,
         }
     }
 
@@ -5231,6 +5277,114 @@ async fn journal_discovery_progress(
 /// (`journal_progress`) the tick also journals a coalesced
 /// `discovery_progress` gauge event (Step 12); probe-prompt lines stay
 /// stderr-only.
+/// Live TUI state for explicit `scan --format human` on a TTY
+/// (Step 13): the interactive session plus the last live-row
+/// refresh time.
+struct TuiScanView {
+    session: repo_scan::report::tui::Session,
+    rows_refresh_at: Instant,
+}
+
+/// Map the CLI `--color` choice to a resolved TUI color decision
+/// (`NO_COLOR`/`TERM=dumb` honored inside the resolver; `None`
+/// means `auto`).
+fn tui_color_for(choice: Option<repo_scan::cli::ColorChoice>, stdout_is_tty: bool) -> bool {
+    use repo_scan::cli::ColorChoice;
+    use repo_scan::report::tui::{resolve_color, ColorMode};
+    let mode = match choice {
+        None | Some(ColorChoice::Auto) => ColorMode::Auto,
+        Some(ColorChoice::Always) => ColorMode::Always,
+        Some(ColorChoice::Never) => ColorMode::Never,
+    };
+    resolve_color(mode, stdout_is_tty)
+}
+
+/// One live TUI tick from the scan loop (main thread only): header
+/// gauges refresh from the tick's in-memory counters (zero new
+/// queries), rows refresh from committed catalog state at most every
+/// 2 s (bounded queries — workers never run aggregates), keys poll
+/// non-blocking, and redraws throttle to ~10fps. `q`/esc detaches
+/// (the scan continues with plain stderr progress); Ctrl-C detaches
+/// and flags interruption for the bounded save.
+async fn tui_tick_scan(
+    runner: &mut Runner,
+    store: &TursoStore,
+    phase: DrainPhase,
+    totals: &ProgressTotals,
+    elapsed: Duration,
+) -> repo_scan::Result<()> {
+    use repo_scan::report::tui::{load_live_snapshot, SessionAction, ROWS_REFRESH_MIN_MS};
+    let claimed = runner.counters.claimed;
+    let action = {
+        let Some(view) = runner.tui.as_mut() else {
+            return Ok(());
+        };
+        let phase_name = match phase {
+            DrainPhase::Discovery => "discovery",
+            DrainPhase::Analysis => "analysis",
+        };
+        view.session.update_header(|header| {
+            header.phase = phase_name.to_string();
+            header.elapsed_s = elapsed.as_secs();
+            header.discovered = totals.done_tasks();
+            header.completed = claimed;
+            header.pending = totals.pending;
+        });
+        if view.rows_refresh_at.elapsed() >= Duration::from_millis(ROWS_REFRESH_MIN_MS) {
+            view.rows_refresh_at = Instant::now();
+            // Best-effort: a failed refresh keeps stale rows rather
+            // than failing the scan (the next tick retries).
+            if let Ok(snapshot) = load_live_snapshot(store).await {
+                let header = std::mem::take(&mut view.session.state.snapshot.header);
+                view.session.update(snapshot);
+                view.session.update_header(|slot| *slot = header);
+            }
+        }
+        view.session.poll()
+    };
+    match action {
+        SessionAction::Continue => {}
+        SessionAction::Quit => {
+            runner.tui = None; // drop restores the terminal; scan continues plain
+        }
+        SessionAction::Interrupt => {
+            runner.tui = None;
+            INTERRUPTED.store(true, Ordering::SeqCst);
+        }
+    }
+    Ok(())
+}
+
+/// Browse the final retained snapshot in the scan TUI (Step 13):
+/// replaces event-folded live rows with the exact retained bytes
+/// (selection preserved by id) and runs until `q`/esc. Ctrl-C here
+/// just leaves the view — the scan already saved. Restores the
+/// terminal before returning; the legacy footers print after.
+async fn tui_browse_final(runner: &mut Runner, snapshot: &Path) -> repo_scan::Result<()> {
+    use repo_scan::report::builder::verify_bound_report;
+    use repo_scan::report::publish::BoundStaged;
+    use repo_scan::report::tui::TuiSnapshot;
+    let Some(mut view) = runner.tui.take() else {
+        return Ok(());
+    };
+    let mut note: Option<String> = None;
+    match BoundStaged::open(snapshot).and_then(|bound| verify_bound_report(&bound)) {
+        Ok(report) => {
+            view.session
+                .update(TuiSnapshot::from_report(&report, store::now_ms()));
+        }
+        Err(e) => {
+            note = Some(identity::scrub_text(&e.to_string()));
+        }
+    }
+    let _ = view.session.run(); // Quit or Interrupt both just leave the view
+    drop(view); // explicit: terminal restored before any diagnostic below
+    if let Some(note) = note {
+        eprintln!("repo-scan: tui: final snapshot unreadable, kept live rows: {note}");
+    }
+    Ok(())
+}
+
 async fn emit_progress(
     runner: &mut Runner,
     store: &TursoStore,
@@ -5251,22 +5405,33 @@ async fn emit_progress(
     };
     runner.progress_last_total = Some(totals.total_tasks);
     let elapsed = runner.run_started.elapsed();
-    let line = format_progress_line_full_with_growth(
-        scan_id,
-        generation,
-        &runner.counters,
-        &totals,
-        elapsed,
-        &runner.current_scope,
-        &runner.current_volume,
-        denominator_grew,
-        new_since_tick,
-    );
-    eprintln!("{line}");
+    // Step 13 live view: while attached, the TUI tick replaces the
+    // stderr line (gauges from these same in-memory counters; a
+    // detach inside the tick resumes stderr below).
+    if runner.tui.is_some() {
+        tui_tick_scan(runner, store, phase, &totals, elapsed).await?;
+    }
+    if runner.tui.is_none() {
+        let line = format_progress_line_full_with_growth(
+            scan_id,
+            generation,
+            &runner.counters,
+            &totals,
+            elapsed,
+            &runner.current_scope,
+            &runner.current_volume,
+            denominator_grew,
+            new_since_tick,
+        );
+        eprintln!("{line}");
+    }
     if journal_progress {
         let open_gaps = count_open_errors(store).await?;
         let records = discovery_progress_records(phase, elapsed, &totals, open_gaps)?;
         journal_discovery_progress(runner, store, &records).await?;
+        if let Some(view) = runner.tui.as_mut() {
+            view.session.update_header(|header| header.gaps = open_gaps);
+        }
     }
     Ok(())
 }
@@ -13737,13 +13902,446 @@ async fn read_scan_events_after_position(
 ///   rejected by `selection()`): the scan's verified retained snapshot
 ///   as one JSON document — the same bytes the human lane renders and
 ///   the JSONL lane folds into.
-/// - `--format human` (no `--follow`; human follow stays in the TUI
-///   slice): the retained snapshot as stable plain text.
+/// - `--format human` without `--follow`: the retained snapshot
+///   as stable plain text. With `--follow`: the Step 13 live TUI on
+///   a TTY, the plain live lane when redirected (both read-only).
 ///
 /// Machine lanes carry no prose, ANSI, or cursor codes on stdout;
 /// diagnostics go to stderr. Read-only: no owner lock, no epoch claim,
 /// servable while a scan holds the write lock. Unknown scan IDs exit 2
 /// like `resume` on a missing ID.
+///
+/// `query --scan --follow --format human` (Step 13): the interactive
+/// live TUI when both stdio ends are terminals, the readable
+/// plain-text live lane otherwise. Read-only throughout: no owner
+/// lock, no epoch claim; quitting the view never disturbs the scan
+/// or the catalog.
+async fn run_follow_human(
+    cfg: &config::Config,
+    scan_id: &str,
+    after: Option<&str>,
+) -> repo_scan::Result<ExitCode> {
+    if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
+        run_follow_human_tui(cfg, scan_id, after).await
+    } else {
+        run_follow_human_plain(cfg, scan_id).await
+    }
+}
+
+/// Open the catalog read-only for a human follow (shared preamble):
+/// absent/unbound catalogs degrade to stderr + exit 3 with empty
+/// stdout, exactly like the JSONL lane; unknown scan IDs are exit 2.
+async fn open_follow_store(
+    cfg: &config::Config,
+    scan_id: &str,
+) -> repo_scan::Result<Option<(TursoStore, store::ScanRow)>> {
+    let db_path = store::owner::catalog_db_path(&cfg.state_dir);
+    if !db_path.exists() {
+        eprintln!(
+            "repo-scan: cached query: no catalog at {}; no live verification performed",
+            db_path.display()
+        );
+        return Ok(None);
+    }
+    let store = TursoStore::open_read_only(&db_path).await?;
+    if !catalog_bound_to_marker(&store, &cfg.state_dir).await? {
+        eprintln!(
+            "repo-scan: cached query: catalog at {} is not bound to this tool's ownership \
+             marker; no live verification performed",
+            db_path.display()
+        );
+        let _ = store.close().await;
+        return Ok(None);
+    }
+    let Some(scan) = store.get_scan(scan_id).await? else {
+        let _ = store.close().await;
+        return Err(repo_scan::Error::InvalidArgs(format!(
+            "no such scan: {scan_id}"
+        )));
+    };
+    Ok(Some((store, scan)))
+}
+
+/// Interactive live TUI over one scan's journal (Step 13): folds
+/// committed envelopes into the grouped view, polls for new rows
+/// until the terminal event, then swaps to the exact retained bytes
+/// for browsing. `q`/esc quits (exit 0); Ctrl-C restores and exits
+/// 130. Rendering runs on this (main) thread only, reading through
+/// the read-only connection.
+async fn run_follow_human_tui(
+    cfg: &config::Config,
+    scan_id: &str,
+    after: Option<&str>,
+) -> repo_scan::Result<ExitCode> {
+    use repo_scan::report::tui::{Session, SessionAction, TuiSnapshot};
+    let Some((mut store, scan)) = open_follow_store(cfg, scan_id).await? else {
+        return Ok(ExitCode::Incomplete);
+    };
+    let start = match after {
+        None => ReplayPosition {
+            after: None,
+            reset_first: false,
+        },
+        Some(cursor) => match resolve_after_cursor(&store, scan_id, cursor).await {
+            Ok(position) => position,
+            Err(e) => {
+                let _ = store.close().await;
+                return Err(e);
+            }
+        },
+    };
+    let mut after_pos = start.after;
+    let mut reset_first = start.reset_first;
+    let mut snapshot = TuiSnapshot::empty();
+    snapshot.header.scan_state = "running".to_string();
+    // Initial replay: fold committed rows oldest-first (bounded
+    // pages); a reset position drops buffered state first.
+    let mut terminal_seen = false;
+    loop {
+        let rows =
+            read_scan_events_after_position(&store, scan_id, after_pos, REPLAY_PAGE_ROWS).await?;
+        let short_page = rows.len() < REPLAY_PAGE_ROWS as usize;
+        for row in &rows {
+            let env = envelope_for_row(row)?;
+            if env.reset || reset_first {
+                snapshot = TuiSnapshot::empty();
+                reset_first = false;
+            }
+            snapshot.apply_envelope(&env);
+            after_pos = Some((row.catalog_rev, row.event_offset));
+            terminal_seen |= is_terminal_event(env.event_type);
+        }
+        if short_page {
+            break;
+        }
+    }
+    // A terminal scan browses its exact retained bytes (selection
+    // preserved by id when the snapshot stages).
+    let mut final_loaded = false;
+    if terminal_seen {
+        final_loaded = follow_load_final(&store, cfg, scan_id, &mut snapshot).await;
+    }
+    // Query has no `--color` flag: auto from the TTY + environment.
+    let mut session = Session::open(snapshot, tui_color_for(None, true));
+    session.redraw();
+    if terminal_seen && !scan_still_running(&scan.state) {
+        // Already finished: pure browse until quit (no polling).
+        return follow_browse_until_quit(&mut session, store).await;
+    }
+    let db_path = store::owner::catalog_db_path(&cfg.state_dir);
+    let mut last_poll = Instant::now();
+    // First poll immediately (a terminal event may have landed
+    // during the initial replay).
+    let mut terminal = terminal_seen;
+    loop {
+        match session.poll() {
+            SessionAction::Continue => {}
+            SessionAction::Quit => {
+                session.detach();
+                let _ = store.close().await;
+                return Ok(ExitCode::Success);
+            }
+            SessionAction::Interrupt => {
+                session.detach();
+                let _ = store.close().await;
+                return Ok(ExitCode::Interrupted);
+            }
+        }
+        if interrupted() {
+            session.detach();
+            let _ = store.close().await;
+            return Ok(ExitCode::Interrupted);
+        }
+        if terminal {
+            // Terminal event journaled: browse the final state until
+            // quit (no more data can arrive).
+            std::thread::sleep(Duration::from_millis(30));
+            continue;
+        }
+        if last_poll.elapsed() < FOLLOW_POLL {
+            std::thread::sleep(Duration::from_millis(30));
+            continue;
+        }
+        last_poll = Instant::now();
+        // A read-only handle pins its opening snapshot: reopen per
+        // poll (same discipline as the JSONL follow).
+        let _ = store.close().await;
+        store = TursoStore::open_read_only(&db_path).await?;
+        if !catalog_bound_to_marker(&store, &cfg.state_dir).await? {
+            session.detach();
+            let _ = store.close().await;
+            eprintln!(
+                "repo-scan: follow: catalog at {} lost its ownership bind; \
+                 stopping at the journal tip",
+                db_path.display()
+            );
+            return Ok(ExitCode::Incomplete);
+        }
+        let rows =
+            read_scan_events_after_position(&store, scan_id, after_pos, REPLAY_PAGE_ROWS).await?;
+        for row in &rows {
+            let env = envelope_for_row(row)?;
+            if env.reset {
+                let mut fresh = TuiSnapshot::empty();
+                std::mem::swap(&mut session.state.snapshot, &mut fresh);
+            }
+            session.state.snapshot.apply_envelope(&env);
+            after_pos = Some((row.catalog_rev, row.event_offset));
+            terminal |= is_terminal_event(env.event_type);
+        }
+        if terminal && !final_loaded {
+            final_loaded = true;
+            let mut fresh = std::mem::take(&mut session.state.snapshot);
+            if follow_load_final(&store, cfg, scan_id, &mut fresh).await {
+                session.update(fresh);
+            } else {
+                session.state.snapshot = fresh;
+            }
+        }
+        if !terminal {
+            match store.get_scan(scan_id).await? {
+                Some(s) if scan_still_running(&s.state) => {}
+                Some(_) => {
+                    // Pre-journal scan: the tip is final; browse it.
+                    terminal = true;
+                    let mut fresh = std::mem::take(&mut session.state.snapshot);
+                    if follow_load_final(&store, cfg, scan_id, &mut fresh).await {
+                        session.update(fresh);
+                    } else {
+                        session.state.snapshot = fresh;
+                    }
+                }
+                None => {
+                    session.detach();
+                    let _ = store.close().await;
+                    eprintln!(
+                        "repo-scan: follow: scan {scan_id} is gone; stopping at the journal tip"
+                    );
+                    return Ok(ExitCode::Incomplete);
+                }
+            }
+        }
+    }
+}
+
+/// Browse an already-terminal scan until quit (no polling: no more
+/// data can arrive). Ctrl-C exits 130 like the streaming follow.
+async fn follow_browse_until_quit(
+    session: &mut repo_scan::report::tui::Session,
+    store: TursoStore,
+) -> repo_scan::Result<ExitCode> {
+    use repo_scan::report::tui::SessionAction;
+    loop {
+        match session.poll() {
+            SessionAction::Continue => {}
+            SessionAction::Quit => {
+                session.detach();
+                let _ = store.close().await;
+                return Ok(ExitCode::Success);
+            }
+            SessionAction::Interrupt => {
+                session.detach();
+                let _ = store.close().await;
+                return Ok(ExitCode::Interrupted);
+            }
+        }
+        if interrupted() {
+            session.detach();
+            let _ = store.close().await;
+            return Ok(ExitCode::Interrupted);
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
+/// Swap event-folded live rows for the scan's exact retained bytes
+/// (selection preserved by id). True when a verified snapshot
+/// replaced the folded state; false keeps the folded rows.
+async fn follow_load_final(
+    store: &TursoStore,
+    cfg: &config::Config,
+    scan_id: &str,
+    snapshot: &mut repo_scan::report::tui::TuiSnapshot,
+) -> bool {
+    use repo_scan::report::builder::verify_bound_report;
+    use repo_scan::report::publish::BoundStaged;
+    use repo_scan::report::tui::TuiSnapshot;
+    let Ok(Some(row)) = store.get_scan(scan_id).await else {
+        return false;
+    };
+    let Some(path) = snapshot_for_scan(&cfg.state_dir, &row) else {
+        return false;
+    };
+    if !path.is_file() {
+        return false;
+    }
+    let Ok(bound) = BoundStaged::open(&path) else {
+        return false;
+    };
+    let Ok(report) = verify_bound_report(&bound) else {
+        return false;
+    };
+    *snapshot = TuiSnapshot::from_report(&report, store::now_ms());
+    true
+}
+
+/// Plain-text live lane for `query --scan --follow --format human`
+/// when redirected (Step 13): re-renders the retained snapshot (or
+/// the live `--report` file mid-scan) whenever its bytes change, at
+/// most once per second, until the terminal event. Stdout carries
+/// `live_text` renders only; diagnostics go to stderr; a broken pipe
+/// ends quietly with exit 0.
+async fn run_follow_human_plain(
+    cfg: &config::Config,
+    scan_id: &str,
+) -> repo_scan::Result<ExitCode> {
+    let Some((mut store, scan)) = open_follow_store(cfg, scan_id).await? else {
+        return Ok(ExitCode::Incomplete);
+    };
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    let mut after_pos: Option<(u64, u64)> = None;
+    let mut terminal_seen = false;
+    let mut last_hash: Option<String> = None;
+    let mut last_render: Option<Instant> = None;
+    // Render the current snapshot (if any) before the first poll so
+    // short follows still print exactly one document.
+    if follow_plain_maybe_render(cfg, &scan, &mut out, &mut last_hash, &mut last_render)?
+        && !flush_replay(&mut out)?
+    {
+        let _ = store.close().await;
+        return Ok(ExitCode::Success);
+    }
+    // A finished scan with no journal activity still gets its
+    // terminal render: the poll loop below always runs once.
+    let db_path = store::owner::catalog_db_path(&cfg.state_dir);
+    loop {
+        if interrupted() {
+            let _ = store.close().await;
+            return Ok(ExitCode::Interrupted);
+        }
+        // Terminal detection only (bounded pages from the last tip).
+        loop {
+            let rows =
+                read_scan_events_after_position(&store, scan_id, after_pos, REPLAY_PAGE_ROWS)
+                    .await?;
+            let short_page = rows.len() < REPLAY_PAGE_ROWS as usize;
+            for row in &rows {
+                let env = envelope_for_row(row)?;
+                after_pos = Some((row.catalog_rev, row.event_offset));
+                terminal_seen |= is_terminal_event(env.event_type);
+            }
+            if short_page {
+                break;
+            }
+        }
+        let current = store.get_scan(scan_id).await?;
+        let running = current
+            .as_ref()
+            .is_some_and(|s| scan_still_running(&s.state));
+        if let Some(row) = current.as_ref() {
+            // A terminal event forces the final render even inside
+            // the 1 s throttle (the last revision must print).
+            if terminal_seen {
+                last_render = None;
+            }
+            if follow_plain_maybe_render(cfg, row, &mut out, &mut last_hash, &mut last_render)?
+                && !flush_replay(&mut out)?
+            {
+                let _ = store.close().await;
+                return Ok(ExitCode::Success);
+            }
+        }
+        if terminal_seen || !running {
+            if current.is_none() {
+                let _ = store.close().await;
+                eprintln!("repo-scan: follow: scan {scan_id} is gone; stopping at the journal tip");
+                return Ok(ExitCode::Incomplete);
+            }
+            let _ = store.close().await;
+            return Ok(ExitCode::Success);
+        }
+        std::thread::sleep(FOLLOW_POLL);
+        let _ = store.close().await;
+        store = TursoStore::open_read_only(&db_path).await?;
+        if !catalog_bound_to_marker(&store, &cfg.state_dir).await? {
+            let _ = store.close().await;
+            eprintln!(
+                "repo-scan: follow: catalog at {} lost its ownership bind; \
+                 stopping at the journal tip",
+                db_path.display()
+            );
+            return Ok(ExitCode::Incomplete);
+        }
+    }
+}
+
+/// Render the follow-plain candidate (retained snapshot, else the
+/// live `--report` file) when its bytes changed and the 1 s throttle
+/// admits. True when a render was written.
+fn follow_plain_maybe_render(
+    cfg: &config::Config,
+    scan: &store::ScanRow,
+    out: &mut impl std::io::Write,
+    last_hash: &mut Option<String>,
+    last_render: &mut Option<Instant>,
+) -> repo_scan::Result<bool> {
+    use repo_scan::report::live_text::render_plain;
+    let candidate = follow_plain_candidate(cfg, scan);
+    let Some(path) = candidate else {
+        return Ok(false);
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(false), // replaced mid-read; retry next poll
+    };
+    let hash = fnv1a_hex(&bytes);
+    if last_hash.as_ref() == Some(&hash) {
+        return Ok(false);
+    }
+    if last_render.is_some_and(|at| at.elapsed() < Duration::from_secs(1)) {
+        return Ok(false);
+    }
+    // A torn mid-replacement read fails parsing and retries next
+    // poll (atomic replacement bounds the window to one poll).
+    let Ok(report) = serde_json::from_slice::<repo_scan::report::model::Report>(&bytes) else {
+        return Ok(false);
+    };
+    match out
+        .write_all(render_plain(&report).as_bytes())
+        .and_then(|()| out.flush())
+    {
+        Ok(()) => {
+            *last_hash = Some(hash);
+            *last_render = Some(Instant::now());
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+            *last_hash = Some(hash);
+            Ok(true) // the caller detects the closed pipe on flush
+        }
+        Err(e) => Err(repo_scan::Error::from(e)),
+    }
+}
+
+/// Plain-follow render candidate: the retained snapshot when the
+/// scan staged one, else the live `--report` destination (case 17
+/// running revisions) when it exists.
+fn follow_plain_candidate(cfg: &config::Config, scan: &store::ScanRow) -> Option<PathBuf> {
+    if let Some(snapshot) = snapshot_for_scan(&cfg.state_dir, scan) {
+        if snapshot.is_file() {
+            return Some(snapshot);
+        }
+    }
+    if let Some(bytes) = scan.report_dest.as_ref() {
+        let dest = config::path_from_bytes(bytes.clone());
+        if dest.is_file() {
+            return Some(dest);
+        }
+    }
+    None
+}
+
 async fn run_query_scan_replay(
     cfg: &config::Config,
     args: &repo_scan::cli::QueryArgs,
@@ -13784,15 +14382,12 @@ async fn run_query_scan_replay(
         )));
     };
     // Snapshot lanes (never `--follow`): `--follow --format json` is
-    // rejected by `selection()`; human follow stays unimplemented.
+    // rejected by `selection()`; human follow runs the Step 13 live
+    // TUI on a TTY (plain live lane when redirected).
     if format != OutputFormat::Jsonl {
         if args.follow {
             let _ = store.close().await;
-            eprintln!(
-                "repo-scan: not yet implemented: query --scan --follow --format human executes \
-                 in the TUI slice; use --format jsonl for now"
-            );
-            return Ok(ExitCode::OperationalFailure);
+            return run_follow_human(cfg, scan_id, args.after.as_deref()).await;
         }
         let code = match snapshot_for_scan(&cfg.state_dir, &scan) {
             Some(snapshot) if snapshot.is_file() => {

@@ -15,6 +15,7 @@ pub mod output;
 pub mod publish;
 pub mod render;
 pub mod stream;
+pub mod tui;
 pub mod validate;
 
 pub use builder::{ReportInputs, ReportPipeline, StreamStats};

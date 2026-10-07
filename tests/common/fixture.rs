@@ -801,3 +801,311 @@ pub fn commit_chain(parent: &Path, name: &str, n: u32) -> (PathBuf, Vec<String>)
     }
     (dir, oids)
 }
+
+// ---------------------------------------------------------------------------
+// Wave3 TUI fixtures (Step 13, cases 24/25): hand-built `Report` values
+// for the TUI view-state + renderer tests (no git binary, no scans).
+// ---------------------------------------------------------------------------
+
+use repo_scan::report::model::{
+    Branch as TuiReportBranch, Checkout as TuiReportCheckout, Coverage as TuiReportCoverage,
+    EncodedName as TuiReportName, Head as TuiReportHead, PathRecord as TuiReportPath,
+    Remote as TuiReportRemote, Repository as TuiReportRepository, Resources as TuiReportResources,
+    Scan as TuiReportScan, Status as TuiReportStatus, Tool as TuiReportTool,
+};
+
+/// Minimal path record with identical display/value text.
+pub fn tui_path(id: &str, display: &str) -> TuiReportPath {
+    TuiReportPath {
+        id: id.to_string(),
+        display: display.to_string(),
+        encoding: "utf8".to_string(),
+        value: display.to_string(),
+        volume_id: None,
+        object_id: None,
+        incarnation: None,
+    }
+}
+
+/// Minimal encoded name with identical display/value text.
+pub fn tui_name(display: &str) -> TuiReportName {
+    TuiReportName {
+        display: display.to_string(),
+        encoding: "utf8".to_string(),
+        value: display.to_string(),
+    }
+}
+
+/// Minimal status observation.
+pub fn tui_status(state: &str, working_state: &str) -> TuiReportStatus {
+    TuiReportStatus {
+        state: state.to_string(),
+        mode: "summary".to_string(),
+        started_at: None,
+        finished_at: None,
+        staged: None,
+        unstaged: None,
+        untracked: None,
+        conflicts: None,
+        working_state: working_state.to_string(),
+        untracked_units: "collapsed_entries".to_string(),
+        submodules: "unknown".to_string(),
+        unknown_fields: vec![],
+        error_ids: vec![],
+    }
+}
+
+/// Empty deterministic report shell (scan `scan-tui-1`, running).
+pub fn tui_empty_report() -> repo_scan::report::model::Report {
+    repo_scan::report::model::Report {
+        schema_version: "1.4.0".to_string(),
+        report_id: "report-tui-1".to_string(),
+        created_at: "2026-10-07T00:00:00Z".to_string(),
+        tool: TuiReportTool {
+            name: "repo-scan".to_string(),
+            version: "0.1.0".to_string(),
+            source_commit: None,
+        },
+        scan: TuiReportScan {
+            id: "scan-tui-1".to_string(),
+            generation: 1,
+            epoch: 1,
+            catalog_revision: 1,
+            target_url: "https://github.com/acme/widgets".to_string(),
+            canonical_url: Some("https://github.com/acme/widgets".to_string()),
+            targets: vec![],
+            matching_policy: "v1".to_string(),
+            scope: "roots".to_string(),
+            state: "running".to_string(),
+            started_at: "2026-10-07T00:00:00Z".to_string(),
+            finished_at: None,
+            superseded_by: None,
+            cached: false,
+            status_mode: "summary".to_string(),
+        },
+        coverage: TuiReportCoverage {
+            filesystem: "incomplete".to_string(),
+            identity: "unproven".to_string(),
+            status: "incomplete".to_string(),
+            directories_complete: 0,
+            tasks_pending: 2,
+            gaps: 0,
+            unresolvable_candidates: 0,
+            scope_boundaries: vec![],
+        },
+        resources: TuiReportResources {
+            profile: "default".to_string(),
+            cpu_target_cores: 1.0,
+            rss_target_bytes: 1,
+            peak_rss_bytes: None,
+            cpu_seconds: None,
+            enumerated_entries: 0,
+            db_transactions: 0,
+            db_sync_calls: None,
+        },
+        volumes: vec![],
+        paths: vec![],
+        roots: vec![],
+        repositories: vec![],
+        checkouts: vec![],
+        branches: vec![],
+        remotes: vec![],
+        storage_links: vec![],
+        aliases: vec![],
+        candidates: vec![],
+        errors: vec![],
+        generated_artifacts: vec![],
+    }
+}
+
+/// Sample report with two groups (`acme/widgets` with two stores,
+/// `acme/gadgets` with one bare store) plus one ungrouped store,
+/// four checkouts (clean, dirty, conflicted, pending), and branches
+/// covering every comparison state the filters need.
+pub fn tui_sample_report() -> repo_scan::report::model::Report {
+    let mut report = tui_empty_report();
+    report.paths = vec![
+        tui_path("p-w1", "/srv/git/widgets"),
+        tui_path("p-w1c", "/home/u/work/widgets"),
+        tui_path("p-w2", "/srv/git/widgets-mirror"),
+        tui_path("p-w2c", "/home/u/work/widgets-mirror"),
+        tui_path("p-g1", "/srv/git/gadgets.git"),
+        tui_path("p-u1", "/srv/git/scratch"),
+        tui_path("p-u1c", "/home/u/work/scratch"),
+    ];
+    report.repositories = vec![
+        TuiReportRepository {
+            id: "repo-w1".to_string(),
+            git_path_id: "p-w1".to_string(),
+            common_path_id: "p-w1".to_string(),
+            bare: Some(false),
+            format: "common".to_string(),
+            object_format: "sha1".to_string(),
+            match_disposition: "confirmed".to_string(),
+            evidence: vec![],
+            observed_at: "2026-10-07T00:00:00Z".to_string(),
+            tool_managed: None,
+            error_ids: vec![],
+        },
+        TuiReportRepository {
+            id: "repo-w2".to_string(),
+            git_path_id: "p-w2".to_string(),
+            common_path_id: "p-w2".to_string(),
+            bare: Some(false),
+            format: "common".to_string(),
+            object_format: "sha1".to_string(),
+            match_disposition: "related".to_string(),
+            evidence: vec![],
+            observed_at: "2026-10-07T00:00:00Z".to_string(),
+            tool_managed: None,
+            error_ids: vec![],
+        },
+        TuiReportRepository {
+            id: "repo-g1".to_string(),
+            git_path_id: "p-g1".to_string(),
+            common_path_id: "p-g1".to_string(),
+            bare: Some(true),
+            format: "common".to_string(),
+            object_format: "sha1".to_string(),
+            match_disposition: "confirmed".to_string(),
+            evidence: vec![],
+            observed_at: "2026-10-07T00:00:00Z".to_string(),
+            tool_managed: None,
+            error_ids: vec![],
+        },
+        TuiReportRepository {
+            id: "repo-u1".to_string(),
+            git_path_id: "p-u1".to_string(),
+            common_path_id: "p-u1".to_string(),
+            bare: Some(false),
+            format: "common".to_string(),
+            object_format: "sha1".to_string(),
+            match_disposition: "nonmatch".to_string(),
+            evidence: vec![],
+            observed_at: "2026-10-07T00:00:00Z".to_string(),
+            tool_managed: None,
+            error_ids: vec![],
+        },
+    ];
+    report.remotes = vec![
+        TuiReportRemote {
+            id: "rem-w1".to_string(),
+            repository_id: "repo-w1".to_string(),
+            checkout_scope_id: None,
+            name: tui_name("origin"),
+            role: "fetch".to_string(),
+            url: "https://github.com/acme/widgets.git".to_string(),
+            canonical_url: Some("https://github.com/acme/widgets".to_string()),
+            observed_at: "2026-10-07T00:00:00Z".to_string(),
+            refresh: None,
+        },
+        TuiReportRemote {
+            id: "rem-w2".to_string(),
+            repository_id: "repo-w2".to_string(),
+            checkout_scope_id: None,
+            name: tui_name("origin"),
+            role: "fetch".to_string(),
+            url: "https://github.com/acme/widgets.git".to_string(),
+            canonical_url: Some("https://github.com/acme/widgets".to_string()),
+            observed_at: "2026-10-07T00:00:00Z".to_string(),
+            refresh: None,
+        },
+        TuiReportRemote {
+            id: "rem-g1".to_string(),
+            repository_id: "repo-g1".to_string(),
+            checkout_scope_id: None,
+            name: tui_name("origin"),
+            role: "fetch".to_string(),
+            url: "https://github.com/acme/gadgets.git".to_string(),
+            canonical_url: Some("https://github.com/acme/gadgets".to_string()),
+            observed_at: "2026-10-07T00:00:00Z".to_string(),
+            refresh: None,
+        },
+    ];
+    let head = |state: &str| TuiReportHead {
+        state: state.to_string(),
+        ref_name: None,
+        oid: None,
+    };
+    report.checkouts = vec![
+        TuiReportCheckout {
+            id: "co-w1".to_string(),
+            repository_id: "repo-w1".to_string(),
+            root_path_id: Some("p-w1c".to_string()),
+            git_path_id: "p-w1".to_string(),
+            kind: "main".to_string(),
+            availability: "present".to_string(),
+            head: head("branch"),
+            status: tui_status("complete", "clean"),
+            observed_at: "2026-10-07T00:00:00Z".to_string(),
+            error_ids: vec![],
+        },
+        TuiReportCheckout {
+            id: "co-w2".to_string(),
+            repository_id: "repo-w2".to_string(),
+            root_path_id: Some("p-w2c".to_string()),
+            git_path_id: "p-w2".to_string(),
+            kind: "main".to_string(),
+            availability: "present".to_string(),
+            head: head("branch"),
+            status: tui_status("complete", "dirty"),
+            observed_at: "2026-10-07T00:00:00Z".to_string(),
+            error_ids: vec![],
+        },
+        TuiReportCheckout {
+            id: "co-g1".to_string(),
+            repository_id: "repo-g1".to_string(),
+            root_path_id: None,
+            git_path_id: "p-g1".to_string(),
+            kind: "main".to_string(),
+            availability: "present".to_string(),
+            head: head("branch"),
+            status: tui_status("complete", "conflicted"),
+            observed_at: "2026-10-07T00:00:00Z".to_string(),
+            error_ids: vec![],
+        },
+        TuiReportCheckout {
+            id: "co-u1".to_string(),
+            repository_id: "repo-u1".to_string(),
+            root_path_id: Some("p-u1c".to_string()),
+            git_path_id: "p-u1".to_string(),
+            kind: "linked".to_string(),
+            availability: "present".to_string(),
+            head: head("unknown"),
+            status: tui_status("pending", "pending"),
+            observed_at: "2026-10-07T00:00:00Z".to_string(),
+            error_ids: vec![],
+        },
+    ];
+    let branch = |id: &str, repo: &str, name: &str, comparison: &str| TuiReportBranch {
+        id: id.to_string(),
+        repository_id: repo.to_string(),
+        checkout_scope_id: None,
+        kind: "local".to_string(),
+        name: tui_name(name),
+        oid: None,
+        symbolic_target: None,
+        upstream: None,
+        state: "valid".to_string(),
+        observed_at: "2026-10-07T00:00:00Z".to_string(),
+        error_ids: vec![],
+        freshness: "unknown".to_string(),
+        freshness_at: None,
+        comparison: comparison.to_string(),
+        ahead: None,
+        behind: None,
+    };
+    report.branches = vec![
+        branch("br-w1-main", "repo-w1", "main", "equal"),
+        branch("br-w2-main", "repo-w2", "main", "ahead"),
+        branch("br-w2-feat", "repo-w2", "feature", "diverged"),
+        branch("br-g1-main", "repo-g1", "main", "behind"),
+        branch("br-u1-main", "repo-u1", "main", "pending"),
+    ];
+    // Counted states carry counts (unknown is never zero).
+    report.branches[1].ahead = Some(3);
+    report.branches[2].ahead = Some(2);
+    report.branches[2].behind = Some(1);
+    report.branches[3].behind = Some(4);
+    report
+}

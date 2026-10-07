@@ -186,8 +186,9 @@ Wave2b deltas (output matrix, branch `work/fast-complete-scan`):
   verified retained snapshot verbatim; `--format human` renders it as
   plain text. `resume --format json|jsonl|human` follows the same
   lanes (explicit wins, else the scan's saved format is restored).
-- `query --scan --follow --format human` stays unimplemented (TUI
-  slice owns it); it exits 1 with a stderr pointer to jsonl.
+- `query --scan --follow --format human` was unimplemented in
+  Wave2b (exit 1); Wave3 implements it (D11): the live TUI on a TTY,
+  the plain live lane when redirected.
 - Live `--report` (case 17): while a scan runs, `--report` holds a
   live snapshot (`scan.state == "running"`, `finished_at == null`,
   report ID `<scan-report-id>-live`) replaced atomically at phase
@@ -316,3 +317,67 @@ file; Wave1c-3 may not touch it).
 Worktree config is read per checkout gitdir
 (`<gitdir>/config.worktree`), not from the common dir — probed against
 git 2.56.0 (a linked worktree ignores the common `config.worktree`).
+
+## D11. Live terminal TUI (Step 13, Wave3, branch `work/fast-complete-scan`)
+
+Interactive live view for explicit `scan --format human` on a TTY
+and `query --scan --follow --format human` (cases 24/25). Lives in
+`src/report/tui.rs` with NO new dependencies (libc termios + ANSI
+directly; supersedes the D8 `src/tui.rs` + new-deps expectation).
+View state and rendering split so tests drive scripted key streams
+against fixture snapshots with no PTY (`tests/tui_impl.rs`).
+
+- Grouped account/org > repository > local store > checkout;
+  aggregate counts render before rows; the header carries
+  phase/elapsed/discoveries/completed/pending/gaps and NEVER a
+  percentage of the unknown discovery total. New locations appear
+  before analysis completes (rows labeled `pending`); rows update
+  in place; cached snapshots show `cached age=<age>` plus
+  `pending-refresh` while analysis is outstanding.
+- Selection and scroll anchor to stable record ids
+  (`group:`/`store:`/`checkout:`/`branch:` + catalog id): live
+  updates never reset either (a vanished id falls to the nearest
+  visible row). Detail (`v`/leaf enter) and help (`h`/`?`) are
+  overlays; `q` quits from anywhere including overlays, esc closes
+  the overlay (or stops the search) and quits when nothing is open.
+- Pinned keys (verbatim in the help overlay and `tests/tui_impl.rs`):
+  up/down or `j`/`k` move; left/right collapse/expand (left also
+  moves to the parent); enter/space expands/collapses a group,
+  store, or checkout with branches and opens detail on a leaf; `/`
+  searches account/repo/path/branch (enter keeps, esc clears); `f`
+  cycles `dirty > conflicted > ahead > behind > diverged > pending
+  > failed > off`; `s` cycles `group > path > state`; `v` opens
+  detail (full paths + state explanations); `h`/`?` help; `q`
+  quit; esc close/quit. Ctrl-C interrupts (scan: bounded save,
+  exit 130; follow: exit 130); stdin EOF quits the view.
+- Filter semantics: `dirty`/`conflicted` match working state;
+  `ahead`/`behind` match branch comparisons (diverged counts for
+  both); `diverged` matches diverged only; `pending` matches rows
+  awaiting analysis; `failed` matches error state, attached error
+  records, or `missing`/`broken`/`inaccessible` availability.
+  Matching leaves render with ancestors for context. Sorts: `group`
+  (canonical hierarchy), `path` (siblings by path/name), `state`
+  (failed, conflicted, dirty, diverged, ahead/behind, pending,
+  clean, rest).
+- Color rides with text labels (never color alone). `scan`
+  `--color auto|always|never` is honored; `query` has no `--color`
+  flag and always uses auto. `NO_COLOR` set or `TERM=dumb`
+  disables color under every mode. Redirected output stays
+  machine-clean: the plain lane reuses `live_text` renders only.
+- Terminal discipline: sane minimum 40x8 (narrower degrades to a
+  truncated header + notice, never panics); size re-queried every
+  redraw (resize-safe); long paths keep the tail with `…`; Unicode
+  column width via an internal width table; control characters
+  escaped via `escape_display`; the RAII guard restores termios +
+  leaves the alternate screen on completion, interruption,
+  failure, and drop. Bounded redraw (~10fps full frames); live
+  catalog row refresh at most every 2 s, main thread only,
+  read-only connection, no per-probe aggregate queries on workers.
+- No daemon/web service. Scan TUI: `q`/esc mid-scan detaches to
+  plain stderr progress (the scan continues); at completion the
+  view browses the exact retained bytes, then the legacy footers
+  print. Follow TUI: folds the journal live, swaps to the retained
+  snapshot at the terminal event, quits to exit 0. Quitting never
+  disturbs the scan or the catalog. `--after` applies to the TUI
+  follow (reset positions drop buffered state); the plain lane
+  ignores it (byte-change renders have no cursor).
