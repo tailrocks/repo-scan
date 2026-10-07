@@ -152,6 +152,122 @@ fn match_pattern_or_literal(pattern: &[u8], value: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// True when at least one kept (non-negative) mapping's destination
+/// covers `tracking` — i.e. this remote's fetch may have written this
+/// tracking ref. Destination-less mappings fetch into `FETCH_HEAD`
+/// only and cover nothing. Attribution, not freshness: the fetch
+/// phase labels only covered refs and leaves every other remote's
+/// refs (and leftovers from narrower configs) to their own verdicts.
+/// Byte-exact, through the actual destination patterns (never a
+/// `refs/remotes/<name>/` prefix, which misses custom destinations
+/// and trips on `origin`/`origin2` boundaries). Like git, `*` crosses
+/// `/`: overlapping destinations genuinely overlap, and both remotes
+/// may claim the ref — last fetch wins, exactly git's own behavior.
+#[must_use]
+pub fn covered_by_positive(positive: &[FetchRefspec], tracking: &[u8]) -> bool {
+    positive
+        .iter()
+        .filter(|s| !s.negative)
+        .filter_map(|s| s.dst.as_deref())
+        .any(|dst| match_pattern_or_literal(dst.as_bytes(), tracking).is_some())
+}
+
+/// Git boolean-true test over raw config bytes, matching
+/// `git config --type=bool` exactly (every edge below probed against
+/// installed git 2.56.0; see `config_bool_matches_git`): exact
+/// case-insensitive word match (`yes`/`on`/`true`, NO whitespace
+/// tolerance), else a C `strtol`-base-0 integer with an optional
+/// single `k`/`m`/`g` suffix (case-insensitive, ×1024^1/2/3 with a
+/// per-step pre-multiply int32-range check). Plain values must fit
+/// int32; anything else is fatal in git ("bad boolean config
+/// value"), reported here as false: the fetch then fails honestly on
+/// git's own error instead of fetching blind. The true-set matches
+/// git exactly — a missed `true` on `remote.*.mirror` would fetch a
+/// mirror into branch tips. (Notably: `2` is true; `"  on"`, `"1 "`,
+/// and `08` are fatal; `0x10` is true; `1g` is true but `7g` is
+/// fatal; `1048576k` is true but `2048m` is fatal; `2147483648` is
+/// fatal.)
+#[must_use]
+pub fn config_bool_is_true(value: &[u8]) -> bool {
+    if value.eq_ignore_ascii_case(b"yes")
+        || value.eq_ignore_ascii_case(b"on")
+        || value.eq_ignore_ascii_case(b"true")
+    {
+        return true;
+    }
+    // Numeric: skip leading C-locale whitespace (git uses isspace,
+    // which includes vertical tab — `trim_ascii` omits it).
+    let mut rest = value;
+    while let Some((&b, tail)) = rest.split_first() {
+        if matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+            rest = tail;
+        } else {
+            break;
+        }
+    }
+    let negative = rest.first() == Some(&b'-');
+    if negative || rest.first() == Some(&b'+') {
+        rest = &rest[1..];
+    }
+    // Optional single size suffix; trailing junk of any other shape
+    // is fatal in git.
+    let mut steps: u32 = 0;
+    if let Some((&last, head)) = rest.split_last() {
+        if matches!(last, b'k' | b'K' | b'm' | b'M' | b'g' | b'G') {
+            steps = match last {
+                b'k' | b'K' => 1,
+                b'm' | b'M' => 2,
+                _ => 3,
+            };
+            rest = head;
+        }
+    }
+    // Base-0 magnitude (saturating: only int32-range values can
+    // return true, so saturation never flips an outcome).
+    let magnitude: i128 = if let Some(hex) = rest
+        .strip_prefix(b"0x")
+        .or_else(|| rest.strip_prefix(b"0X"))
+    {
+        if hex.is_empty() || !hex.iter().all(|b| b.is_ascii_hexdigit()) {
+            return false;
+        }
+        hex.iter().fold(0i128, |acc, b| {
+            acc.saturating_mul(16)
+                .saturating_add((*b as char).to_digit(16).unwrap_or(0) as i128)
+        })
+    } else if rest.len() > 1 && rest.starts_with(b"0") {
+        // Octal (`08` is fatal in git).
+        if !rest.iter().all(|b| matches!(b, b'0'..=b'7')) {
+            return false;
+        }
+        rest.iter().fold(0i128, |acc, b| {
+            acc.saturating_mul(8).saturating_add((b - b'0') as i128)
+        })
+    } else {
+        if rest.is_empty() || !rest.iter().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        rest.iter().fold(0i128, |acc, b| {
+            acc.saturating_mul(10).saturating_add((b - b'0') as i128)
+        })
+    };
+    let mut v: i128 = if negative { -magnitude } else { magnitude };
+    if steps == 0 {
+        // Plain values must fit int32.
+        return v >= i128::from(i32::MIN) && v <= i128::from(i32::MAX) && v != 0;
+    }
+    // Per-step pre-multiply bounds (`i32::MIN / 1024`,
+    // `i32::MAX / 1024` floored); no post-multiply check — `1048576k`
+    // (2^31) is true in git.
+    for _ in 0..steps {
+        if !(-2097152..=2097151).contains(&v) {
+            return false;
+        }
+        v *= 1024;
+    }
+    v != 0
+}
+
 /// True when any negative refspec excludes this upstream ref (exact
 /// bytes). Only entries flagged `negative` apply; anything else in
 /// the slice is ignored.
@@ -319,6 +435,226 @@ mod tests {
         // No fetch lines: git fetches remote HEAD into FETCH_HEAD only.
         let verdict = inspect_remote_fetch(&[], false);
         assert_eq!(verdict, FetchVerdict::Safe);
+    }
+
+    fn parsed(specs: &[&str]) -> Vec<FetchRefspec> {
+        specs
+            .iter()
+            .map(|s| parse_fetch_refspec(s).expect("test refspec parses"))
+            .collect()
+    }
+
+    #[test]
+    fn config_bool_matches_git() {
+        // Every case probed against `git config --type=bool` (git
+        // 2.56.0); the true-set must match exactly — a missed `true`
+        // on `remote.*.mirror` would fetch a mirror into branch tips.
+        for truthy in [
+            "1",
+            "2",
+            "10",
+            "007",
+            "01",
+            "-1",
+            "+1",
+            " 1",
+            "\t1",
+            "\u{b}1",
+            "True",
+            "On",
+            "YES",
+            "Yes",
+            "yes",
+            "TRUE",
+            "true",
+            "ON",
+            "on",
+            "0x10",
+            "0X1",
+            "-0x10",
+            " 0x10",
+            "-0X1",
+            "010",
+            "2147483647",
+            "0x7FFFFFFF",
+            "-2147483648",
+            "-0x80000000",
+            "1k",
+            "1K",
+            "1m",
+            "1M",
+            "1g",
+            "1G",
+            "3m",
+            "0x10k",
+            "2047m",
+            "1048575k",
+            "1048576k",
+            "1048577k",
+            "2097151k",
+            "-2097152k",
+            "1g",
+            "0x1g",
+            " 0x1g",
+            "0X1G",
+            "+0x1g",
+        ] {
+            assert!(
+                config_bool_is_true(truthy.as_bytes()),
+                "{truthy:?} must be true"
+            );
+        }
+        for falsy in [
+            "0",
+            "00",
+            "000",
+            "-0",
+            "+0",
+            "0x0",
+            "no",
+            "NO",
+            "No",
+            "off",
+            "OFF",
+            "Off",
+            "false",
+            "FALSE",
+            "False",
+            "",
+            "   ",
+            "  on",
+            "on ",
+            "  on  ",
+            "1 ",
+            " 1 ",
+            " 0",
+            "onion",
+            "trueish",
+            "yes please",
+            "1.0",
+            "08",
+            "-08",
+            "0b1",
+            "+ 1",
+            "- 0",
+            "0x",
+            "0X",
+            "0x1 ",
+            "7g",
+            "9g",
+            "2g",
+            "3g",
+            "2G",
+            "2048m",
+            "-2049m",
+            "2097152k",
+            "-2097153k",
+            "-3000000k",
+            "-3000000m",
+            "-5g",
+            "2147483648",
+            "-2147483649",
+            "9223372036854775807",
+            "9223372036854775808",
+            "-9223372036854775808",
+            "-9223372036854775809",
+            "99999999999999999999999",
+            "0x7FFFFFFFFFFFFFFF",
+            "0x80000000",
+            "0x8000000000000000",
+            "0xFFFFFFFFFFFFFFFFFFFFFFFF",
+            "-0x80000001",
+            "1t",
+            "1kk",
+            "k",
+            "m",
+            "g",
+            "+",
+            "-",
+            "1x",
+            "12g34",
+            "0xg",
+            "0xg1",
+            "0xx",
+            "0d1",
+            "  12ab",
+            "1_0",
+            "1,0",
+            "xg",
+            "mixedCase",
+        ] {
+            assert!(
+                !config_bool_is_true(falsy.as_bytes()),
+                "{falsy:?} must be false"
+            );
+        }
+        // Non-UTF-8 bytes (config values are byte-exact; git errors
+        // on these): never true.
+        for raw in [
+            b"tru\xff".as_slice(),
+            b"\xff".as_slice(),
+            b"\xfe\xfe".as_slice(),
+        ] {
+            assert!(!config_bool_is_true(raw), "{raw:?} must be false");
+        }
+    }
+
+    #[test]
+    fn coverage_follows_destination_patterns() {
+        let specs = parsed(&["+refs/heads/*:refs/remotes/origin/*"]);
+        assert!(covered_by_positive(&specs, b"refs/remotes/origin/main"));
+        // Another remote's ref: not this fetch's statement.
+        assert!(!covered_by_positive(&specs, b"refs/remotes/upstream/main"));
+        // Local branches are never covered (and never labeled).
+        assert!(!covered_by_positive(&specs, b"refs/heads/main"));
+    }
+
+    #[test]
+    fn coverage_rejects_prefix_collision() {
+        // A slash-less `refs/remotes/origin` prefix test would claim
+        // remote `origin2`'s refs; destination patterns do not.
+        let specs = parsed(&["+refs/heads/*:refs/remotes/origin/*"]);
+        assert!(covered_by_positive(&specs, b"refs/remotes/origin/main"));
+        assert!(!covered_by_positive(&specs, b"refs/remotes/origin2/main"));
+        // Custom destinations attribute through the pattern, not the
+        // remote name.
+        let custom = parsed(&["+refs/heads/*:refs/custom/o/*"]);
+        assert!(covered_by_positive(&custom, b"refs/custom/o/main"));
+        assert!(!covered_by_positive(&custom, b"refs/remotes/o/main"));
+    }
+
+    #[test]
+    fn coverage_star_crosses_slashes_like_git() {
+        // `*` matches `/`: remote `o` with dst `refs/remotes/o/*`
+        // genuinely writes `refs/remotes/o/x/main` when upstream has
+        // branch `x/main` — both remotes may claim it, last fetch
+        // wins, exactly git's own behavior.
+        let specs = parsed(&["+refs/heads/*:refs/remotes/o/*"]);
+        assert!(covered_by_positive(&specs, b"refs/remotes/o/x/main"));
+    }
+
+    #[test]
+    fn coverage_ignores_negatives_and_dst_less() {
+        let specs = parsed(&[
+            "+refs/heads/*:refs/remotes/origin/*",
+            "^refs/heads/secret",
+            "main",
+        ]);
+        // The negative and the FETCH_HEAD-only mapping cover nothing,
+        // but the kept mapping still covers its destination.
+        assert!(covered_by_positive(&specs, b"refs/remotes/origin/main"));
+        let only_negative = parsed(&["^refs/heads/secret"]);
+        assert!(!covered_by_positive(
+            &only_negative,
+            b"refs/remotes/origin/secret"
+        ));
+        let only_dst_less = parsed(&["main"]);
+        assert!(!covered_by_positive(
+            &only_dst_less,
+            b"refs/remotes/origin/main"
+        ));
+        // Non-UTF-8 tracking names match byte-exact.
+        assert!(covered_by_positive(&specs, b"refs/remotes/origin/f\xf6o"));
     }
 
     #[test]

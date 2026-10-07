@@ -490,3 +490,57 @@ fn v3_ref_freshness_labels_and_upsert_preserves() {
         store.close().await.expect("close");
     });
 }
+
+#[test]
+fn v3_ref_oid_reobservation_updates_oid_only() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        let reference = NewRef {
+            id: "ref:aaa:rt:main",
+            instance_id: "git:aaa",
+            checkout_scope_id: None,
+            kind: "remote_tracking",
+            name: b"refs/remotes/origin/main",
+            oid: Some(b"0123456789abcdef0123456789abcdef01234567".as_slice()),
+            algo: Some("sha1"),
+            symbolic_target: None,
+            upstream: None,
+            state: "valid",
+        };
+        store.upsert_ref(&reference, 100).await.expect("upsert");
+        store
+            .label_ref_freshness("ref:aaa:rt:main", "current", 200)
+            .await
+            .expect("label");
+
+        // Hit: oid + observed time move, everything else stays.
+        assert!(store
+            .update_ref_oid(
+                "ref:aaa:rt:main",
+                b"ffffffffffffffffffffffffffffffffffffffff",
+                400
+            )
+            .await
+            .expect("update"));
+        // Miss: no row, no write.
+        assert!(!store
+            .update_ref_oid("ref:missing", b"abcd", 400)
+            .await
+            .expect("update missing"));
+        let refs = store.list_refs("git:aaa").await.expect("list");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            refs[0].oid.as_deref(),
+            Some(b"ffffffffffffffffffffffffffffffffffffffff".as_slice())
+        );
+        assert_eq!(refs[0].observed_at_ms, 400);
+        assert_eq!(refs[0].freshness.as_deref(), Some("current"));
+        assert_eq!(refs[0].freshness_at_ms, Some(200));
+        assert_eq!(refs[0].algo.as_deref(), Some("sha1"));
+        assert_eq!(refs[0].state, "valid");
+        store.close().await.expect("close");
+    });
+}

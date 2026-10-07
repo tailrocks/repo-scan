@@ -26,8 +26,8 @@ use repo_scan::scan_events::{is_terminal_event, Cursor, Envelope, EventType, Op}
 use repo_scan::scheduler::{backoff_for_attempt, Admission, CircuitBreaker, OpClass};
 use repo_scan::store::{
     self, CheckpointCoordinator, CheckpointPolicy, ClaimedTask, CompletionDelta, NewCheckout,
-    NewGitInstance, NewRef, NewRemote, NewScan, NewScanEvent, NewStatus, NewTask, NewVolume,
-    OwnerGuard, ScanEventRow, Store, TaskOutcome, TursoStore, WriterBatch,
+    NewGitInstance, NewRef, NewRemote, NewRemoteRefresh, NewScan, NewScanEvent, NewStatus, NewTask,
+    NewVolume, OwnerGuard, ScanEventRow, Store, TaskOutcome, TursoStore, WriterBatch,
 };
 use repo_scan::telemetry::{live_helper_rss_bytes, FootprintSampler, SamplerInputs};
 use repo_scan::walk::roots::{plan_machine_roots, PlannedRoot, RootPriority};
@@ -1497,8 +1497,11 @@ async fn run_scan_inner(
     let (cursors, claims) = reconcile_event_cursors(&mut events, &store).await?;
     let event_gaps = claims.iter().filter(|c| !c.complete).count() as u64;
 
-    let finished_ms = store::now_ms();
-    let scan_incomplete = outcome.has_gaps() || event_gaps > 0;
+    // Both re-stamp after the optional fetch phase below (fetch
+    // duration belongs to the report window; failed refreshes are
+    // unresolved gaps).
+    let mut finished_ms = store::now_ms();
+    let mut scan_incomplete = outcome.has_gaps() || event_gaps > 0;
     let gen_state = if outcome.interrupted {
         "interrupted"
     } else if scan_incomplete {
@@ -1534,6 +1537,29 @@ async fn run_scan_inner(
         .emit(&store, EventType::InventoryReady, &ready)
         .await?;
     runner.counters.db_transactions += 1;
+    // Optional `--fetch` phase (Step 11): remote refresh runs after
+    // the discovery boundary + local analysis, before report staging,
+    // so staged reports include freshness. Failed refreshes are
+    // unresolved gaps (exit 3); `unsupported` verdicts are examined
+    // terminal states, not gaps; interruption folds into 130 below.
+    if args.fetch {
+        let fetch = run_fetch_phase(&mut runner, &store, started_ms).await?;
+        outcome.interrupted |= fetch.interrupted;
+        scan_incomplete |= fetch.failed > 0;
+        eprintln!(
+            "repo-scan: fetch: {} refreshed, {} failed, {} unsupported, {} resumed-skip{}",
+            fetch.refreshed,
+            fetch.failed,
+            fetch.unsupported,
+            fetch.skipped,
+            if fetch.interrupted {
+                " (interrupted)"
+            } else {
+                ""
+            },
+        );
+        finished_ms = store::now_ms();
+    }
     let discovery_code = if scan_incomplete { 3 } else { 0 };
     // Stage first, publish second through the tested lib pipeline (R3): a
     // failed publication retains the saved snapshot and can be retried
@@ -8376,6 +8402,587 @@ struct EmittedInstance {
     git_path: Vec<u8>,
     common_path: Vec<u8>,
     disposition: String,
+    object_format: String,
+}
+
+/// Per-operation timeout for fetch-phase git spawns (Step 11:
+/// bounded network operations; the spawn envelope group-kills past
+/// it, and the SIGINT-aware cancel scope ends even stuck readers).
+const FETCH_TIMEOUT: Duration = Duration::from_secs(120);
+/// Captured-bytes cap for `git fetch` stderr (fetch can be chatty on
+/// large updates; past the cap the child is killed and the attempt
+/// fails instead of using partial output).
+const FETCH_CAPTURE_CAP: u64 = 1024 * 1024;
+/// Emitted-instance page size for the fetch phase (one row per store:
+/// instance ids key on the canonical common dir).
+const FETCH_PAGE: i64 = 64;
+
+/// Fetch-phase outcome: per-remote terminal counts. `failed` feeds
+/// exit 3 (unresolved gaps); `unsupported` is an examined terminal
+/// state, not a gap; `interrupted` folds into exit 130.
+#[derive(Default)]
+struct FetchOutcome {
+    refreshed: u64,
+    failed: u64,
+    unsupported: u64,
+    skipped: u64,
+    interrupted: bool,
+}
+
+/// One tracking ref to apply after a fetch (owned; crosses the
+/// git-borrow/persist-borrow boundary inside `fetch_one_remote`).
+struct FetchApply {
+    name: Vec<u8>,
+    oid: Vec<u8>,
+    symref: Vec<u8>,
+    /// `ref_state_for` rules over the post-fetch observation (this
+    /// path has no peel data — for-each-ref gives symref targets
+    /// only — and empty oids, i.e. broken refs, are `invalid`).
+    state: &'static str,
+    /// `current`|`stale` label; applied only when the upstream audit
+    /// completed (`label == true` on the attempt).
+    freshness: &'static str,
+}
+
+/// Owned outcome of the git half of one remote refresh: everything
+/// the sync spawn section learned, before any catalog write.
+struct GitAttempt {
+    /// `success`|`failed`|`unsupported`.
+    status: &'static str,
+    /// Scrubbed detail (`None` on clean success).
+    detail: Option<String>,
+    duration_ms: Option<i64>,
+    applies: Vec<FetchApply>,
+    /// False when the upstream audit failed after a successful fetch:
+    /// oids are re-observed but no ref is labeled `current`.
+    label: bool,
+    current: Vec<Vec<u8>>,
+    deleted: Vec<Vec<u8>>,
+    refs_updated: i64,
+}
+
+impl GitAttempt {
+    fn failed(detail: String, duration_ms: i64) -> Self {
+        Self {
+            status: "failed",
+            detail: Some(detail),
+            duration_ms: Some(duration_ms),
+            applies: Vec::new(),
+            label: false,
+            current: Vec::new(),
+            deleted: Vec::new(),
+            refs_updated: 0,
+        }
+    }
+
+    fn unsupported(reason: String, duration_ms: Option<i64>) -> Self {
+        Self {
+            status: "unsupported",
+            detail: Some(reason),
+            duration_ms,
+            applies: Vec::new(),
+            label: false,
+            current: Vec::new(),
+            deleted: Vec::new(),
+            refs_updated: 0,
+        }
+    }
+}
+
+/// Effective-fetch plan for one remote (sync git section).
+enum FetchPlan {
+    /// All configured refspecs verified safe: fetch may proceed.
+    Ready(Vec<String>),
+    /// Do not fetch; the reason records as an `unsupported` refresh.
+    Unsupported(String),
+}
+
+/// Resolve + inspect one remote's effective fetch config (sync git
+/// section; honors includes and worktree scope exactly as git
+/// resolves them). `Err` = config unreadable, the attempt fails. A
+/// remote absent from config yields zero refspecs (a `Ready` plan —
+/// git itself then reports "no such remote" and the attempt fails
+/// honestly).
+fn plan_remote_fetch(
+    git: &git::fallback::FallbackGit,
+    dir: &Path,
+    name: &str,
+) -> Result<FetchPlan, String> {
+    let fetch_key = format!("remote.{name}.fetch");
+    let values = git.git_config_get_all(dir, std::ffi::OsStr::new(&fetch_key), FETCH_TIMEOUT)?;
+    let mirror_key = format!("remote.{name}.mirror");
+    let mirror_vals =
+        git.git_config_get_all(dir, std::ffi::OsStr::new(&mirror_key), FETCH_TIMEOUT)?;
+    // `git config --get-all` yields precedence order; the last value wins.
+    let mirror = mirror_vals
+        .last()
+        .is_some_and(|v| git::refspec::config_bool_is_true(v));
+    let mut refspecs = Vec::with_capacity(values.len());
+    for value in &values {
+        match std::str::from_utf8(value) {
+            Ok(text) => refspecs.push(text.to_string()),
+            Err(_) => {
+                return Ok(FetchPlan::Unsupported(
+                    "fetch refspec is not UTF-8: cannot verify destination".to_string(),
+                ));
+            }
+        }
+    }
+    let borrowed: Vec<&str> = refspecs.iter().map(String::as_str).collect();
+    match git::refspec::inspect_remote_fetch(&borrowed, mirror) {
+        git::refspec::FetchVerdict::Safe => Ok(FetchPlan::Ready(refspecs)),
+        git::refspec::FetchVerdict::Unsupported { reason } => Ok(FetchPlan::Unsupported(reason)),
+    }
+}
+
+/// Run the fetch + post-fetch audit (sync git section; called only
+/// for a `Ready` plan). Snapshot tracking refs, fetch, re-read,
+/// audit upstream via ls-remote, then attribute each post-fetch
+/// tracking ref through this remote's destination patterns
+/// (`git::refspec::covered_by_positive` — never a
+/// `refs/remotes/<name>/` prefix, which misses custom destinations
+/// and trips on `origin`/`origin2` boundaries) and classify it.
+/// Only covered refs
+/// produce applies; another remote's refs are not our statement.
+/// All fresh state returns owned; the caller persists. A failed
+/// upstream audit after a successful fetch still re-observes oids
+/// but labels nothing `current` (`label == false`, status `failed`
+/// so resume retries the audit).
+fn execute_remote_fetch(
+    git: &git::fallback::FallbackGit,
+    dir: &Path,
+    name: &str,
+    refspecs: &[String],
+    started: Instant,
+) -> GitAttempt {
+    let elapsed_ms = || started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+    let pre = match git.git_remote_tracking_refs(dir, FETCH_TIMEOUT) {
+        Ok(refs) => refs,
+        Err(e) => {
+            return GitAttempt::failed(
+                format!(
+                    "cannot read pre-fetch tracking refs: {}",
+                    identity::scrub_text(&e)
+                ),
+                elapsed_ms(),
+            );
+        }
+    };
+    let pre_map: HashMap<&[u8], &[u8]> = pre
+        .iter()
+        .map(|t| (t.name.as_slice(), t.oid.as_slice()))
+        .collect();
+    if let Err(e) = git.git_fetch_remote(
+        dir,
+        std::ffi::OsStr::new(name),
+        FETCH_TIMEOUT,
+        FETCH_CAPTURE_CAP,
+    ) {
+        return GitAttempt::failed(identity::scrub_text(&e), elapsed_ms());
+    }
+    let post = match git.git_remote_tracking_refs(dir, FETCH_TIMEOUT) {
+        Ok(refs) => refs,
+        Err(e) => {
+            return GitAttempt::failed(
+                format!(
+                    "fetch succeeded but post-fetch ref read failed: {}",
+                    identity::scrub_text(&e)
+                ),
+                elapsed_ms(),
+            );
+        }
+    };
+    let mut attempt = GitAttempt {
+        status: "success",
+        detail: None,
+        duration_ms: Some(elapsed_ms()),
+        applies: Vec::new(),
+        label: true,
+        current: Vec::new(),
+        deleted: Vec::new(),
+        refs_updated: 0,
+    };
+    let upstream_set: HashSet<Vec<u8>> = match git.git_ls_remote_refs(
+        dir,
+        std::ffi::OsStr::new(name),
+        FETCH_TIMEOUT,
+    ) {
+        Ok(names) => names.into_iter().collect(),
+        Err(e) => {
+            attempt.status = "failed";
+            attempt.detail = Some(format!(
+                "fetch succeeded but upstream audit failed: {}; oids re-observed, no ref labeled current",
+                identity::scrub_text(&e)
+            ));
+            attempt.label = false;
+            HashSet::new()
+        }
+    };
+    // `Ready` implies every refspec parsed; re-parse infallibly.
+    let parsed: Vec<git::refspec::FetchRefspec> = refspecs
+        .iter()
+        .filter_map(|s| git::refspec::parse_fetch_refspec(s))
+        .collect();
+    debug_assert_eq!(parsed.len(), refspecs.len());
+    let known: HashSet<&[u8]> = post.iter().map(|t| t.name.as_slice()).collect();
+    for observed in &post {
+        if !git::refspec::covered_by_positive(&parsed, &observed.name) {
+            continue;
+        }
+        let freshness = if !attempt.label {
+            "stale"
+        } else {
+            match git::refspec::classify_tracking_ref(
+                &parsed,
+                &parsed,
+                &observed.name,
+                &upstream_set,
+            ) {
+                git::refspec::TrackingVerdict::Current => {
+                    attempt.current.push(observed.name.clone());
+                    "current"
+                }
+                git::refspec::TrackingVerdict::DeletedUpstream => {
+                    attempt.deleted.push(observed.name.clone());
+                    "stale"
+                }
+                git::refspec::TrackingVerdict::Excluded => "stale",
+            }
+        };
+        if pre_map.get(observed.name.as_slice()) != Some(&observed.oid.as_slice()) {
+            attempt.refs_updated += 1;
+        }
+        attempt.applies.push(FetchApply {
+            name: observed.name.clone(),
+            oid: observed.oid.clone(),
+            symref: observed.symref.clone(),
+            state: git::fallback::tracking_ref_state(observed, &known),
+            freshness,
+        });
+    }
+    attempt.duration_ms = Some(elapsed_ms());
+    attempt
+}
+
+/// Lossless name list, one `{name, name_hex}` record per name
+/// mirroring branch records. Empty in, empty out.
+fn name_list_values(names: &[Vec<u8>]) -> Vec<serde_json::Value> {
+    names
+        .iter()
+        .map(|n| {
+            serde_json::json!({
+                "name": String::from_utf8_lossy(n),
+                "name_hex": config::encode_hex(n),
+            })
+        })
+        .collect()
+}
+
+/// Serialized name list for refresh records: `None` when empty.
+fn name_list_json(values: &[serde_json::Value]) -> repo_scan::Result<Option<String>> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+    serde_json::to_string(values)
+        .map(Some)
+        .map_err(|e| repo_scan::Error::Report(e.to_string()))
+}
+
+/// Persist one remote attempt: oid re-observations for covered refs
+/// (UPDATE when the probe already recorded the ref — attribution
+/// preserved — INSERT for fetch-created tracking branches), freshness
+/// labels when the upstream audit completed, the refresh record, and
+/// the `remote_updated` journal event. Ref + refresh writes buffer at
+/// the batch limits; the journal emit commits immediately like
+/// `inventory_ready`.
+#[allow(clippy::too_many_arguments)]
+async fn persist_remote_attempt(
+    runner: &mut Runner,
+    store: &TursoStore,
+    instance_id: &str,
+    common_path: &[u8],
+    object_format: &str,
+    remote_name: &[u8],
+    existing_refs: &HashSet<Vec<u8>>,
+    attempt: &GitAttempt,
+    at_ms: i64,
+) -> repo_scan::Result<()> {
+    for apply in &attempt.applies {
+        let ref_id = format!(
+            "ref:{}:{}",
+            config::encode_hex(common_path),
+            config::encode_hex(&apply.name),
+        );
+        if existing_refs.contains(&apply.name) {
+            let due =
+                TursoStore::buffer_update_ref_oid(&mut runner.batch, &ref_id, &apply.oid, at_ms);
+            flush_if_due(runner, store, due).await?;
+        } else {
+            // Fetch-created tracking branch: insert the row this
+            // observation justifies (store algo from the instance;
+            // tracking refs never carry an upstream).
+            let oid_opt = (!apply.oid.is_empty()).then_some(apply.oid.as_slice());
+            let new_ref = NewRef {
+                id: &ref_id,
+                instance_id,
+                checkout_scope_id: None,
+                kind: "remote_tracking",
+                name: &apply.name,
+                oid: oid_opt,
+                algo: oid_opt.map(|_| object_format),
+                symbolic_target: (!apply.symref.is_empty()).then_some(apply.symref.as_slice()),
+                upstream: None,
+                state: apply.state,
+            };
+            let due = TursoStore::buffer_upsert_ref(&mut runner.batch, &new_ref, at_ms);
+            flush_if_due(runner, store, due).await?;
+        }
+        if attempt.label {
+            let due = TursoStore::buffer_label_ref_freshness(
+                &mut runner.batch,
+                &ref_id,
+                apply.freshness,
+                at_ms,
+            );
+            flush_if_due(runner, store, due).await?;
+        }
+    }
+    let current_values = name_list_values(&attempt.current);
+    let deleted_values = name_list_values(&attempt.deleted);
+    let current_json = name_list_json(&current_values)?;
+    let deleted_json = name_list_json(&deleted_values)?;
+    let refresh = NewRemoteRefresh {
+        store_id: instance_id,
+        remote_name,
+        status: attempt.status,
+        observed_at_ms: at_ms,
+        duration_ms: attempt.duration_ms,
+        refs_updated: attempt.refs_updated,
+        refs_current_json: current_json.as_deref(),
+        refs_deleted_json: deleted_json.as_deref(),
+        detail: attempt.detail.as_deref(),
+    };
+    let due = TursoStore::buffer_record_remote_refresh(&mut runner.batch, &refresh);
+    flush_if_due(runner, store, due).await?;
+    if let Some(journal) = runner.journal.as_mut() {
+        let payload = serde_json::json!({
+            "store_id": instance_id,
+            "rev": at_ms,
+            "remote": String::from_utf8_lossy(remote_name),
+            "remote_hex": config::encode_hex(remote_name),
+            "status": attempt.status,
+            "refs_updated": attempt.refs_updated,
+            "current": current_values,
+            "deleted": deleted_values,
+            "detail": attempt.detail,
+        });
+        journal
+            .emit(store, EventType::RemoteUpdated, &payload)
+            .await?;
+        runner.counters.db_transactions += 1;
+    }
+    Ok(())
+}
+
+/// Refresh one store+remote: resume-skip, config plan, fetch+audit,
+/// persist. All git spawns run inside the `with_wait_cancel` scope
+/// (SIGINT-aware) while the `FallbackGit` borrow is live; the borrow
+/// ends before any `&mut runner` persist below (NLL), so gathering
+/// never overlaps mutation.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_one_remote(
+    runner: &mut Runner,
+    store: &TursoStore,
+    cancel: &git::fallback::WaitCancel,
+    inst: &EmittedInstance,
+    remote_name: &[u8],
+    existing_refs: &HashSet<Vec<u8>>,
+    started_ms: i64,
+    outcome: &mut FetchOutcome,
+) -> repo_scan::Result<()> {
+    // Resume: a `success` recorded during this scan is completed work,
+    // never repeated. `failed` retries; `unsupported` re-verdicts
+    // (re-inspection is local-only and config may have changed).
+    if let Some(prev) = store.get_remote_refresh(&inst.id, remote_name).await? {
+        if prev.status == "success" && prev.observed_at_ms >= started_ms {
+            outcome.skipped += 1;
+            return Ok(());
+        }
+    }
+    // Config keys are built from the remote name; a non-UTF-8 name
+    // cannot resolve effective config. Fail closed (never lossy: a
+    // lossy key could read ANOTHER remote's refspecs and misattribute
+    // the safety verdict).
+    let name_str = match std::str::from_utf8(remote_name) {
+        Ok(name) => name,
+        Err(_) => {
+            let attempt = GitAttempt::unsupported(
+                "remote name is not UTF-8: cannot resolve effective fetch config".to_string(),
+                None,
+            );
+            persist_remote_attempt(
+                runner,
+                store,
+                &inst.id,
+                &inst.common_path,
+                &inst.object_format,
+                remote_name,
+                existing_refs,
+                &attempt,
+                store::now_ms(),
+            )
+            .await?;
+            outcome.unsupported += 1;
+            return Ok(());
+        }
+    };
+    if runner.fallback().is_none() {
+        let attempt =
+            GitAttempt::unsupported("installed git unavailable: cannot fetch".to_string(), None);
+        persist_remote_attempt(
+            runner,
+            store,
+            &inst.id,
+            &inst.common_path,
+            &inst.object_format,
+            remote_name,
+            existing_refs,
+            &attempt,
+            store::now_ms(),
+        )
+        .await?;
+        outcome.unsupported += 1;
+        return Ok(());
+    }
+    let attempt: GitAttempt = {
+        // Checked above; `fallback()` caches, so this never re-probes.
+        let git = runner.fallback().expect("installed git checked above");
+        let dir = config::path_from_bytes(inst.common_path.clone());
+        git::fallback::with_wait_cancel(cancel, || {
+            let started = Instant::now();
+            let elapsed_ms = || started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+            match plan_remote_fetch(git, &dir, name_str) {
+                Err(e) => GitAttempt::failed(
+                    format!(
+                        "cannot read effective fetch config: {}",
+                        identity::scrub_text(&e)
+                    ),
+                    elapsed_ms(),
+                ),
+                Ok(FetchPlan::Unsupported(reason)) => {
+                    GitAttempt::unsupported(reason, Some(elapsed_ms()))
+                }
+                Ok(FetchPlan::Ready(refspecs)) => {
+                    execute_remote_fetch(git, &dir, name_str, &refspecs, started)
+                }
+            }
+        })
+    };
+    persist_remote_attempt(
+        runner,
+        store,
+        &inst.id,
+        &inst.common_path,
+        &inst.object_format,
+        remote_name,
+        existing_refs,
+        &attempt,
+        store::now_ms(),
+    )
+    .await?;
+    match attempt.status {
+        "success" => outcome.refreshed += 1,
+        "failed" => outcome.failed += 1,
+        _ => outcome.unsupported += 1,
+    }
+    Ok(())
+}
+
+/// Refresh every fetch-role remote of one store. Push-only remotes
+/// have no fetch mapping and are never fetched; a store with no
+/// fetch-role remote records nothing (not necessary per Step 11).
+async fn fetch_one_store(
+    runner: &mut Runner,
+    store: &TursoStore,
+    cancel: &git::fallback::WaitCancel,
+    inst: &EmittedInstance,
+    started_ms: i64,
+    outcome: &mut FetchOutcome,
+) -> repo_scan::Result<()> {
+    let remotes = store.list_remotes(&inst.id).await?;
+    if !remotes.iter().any(|r| r.role == "fetch") {
+        return Ok(());
+    }
+    // One ref-name read per fetched store: existing rows take the
+    // UPDATE path (attribution preserved), fetch-created tracking
+    // branches take the INSERT path.
+    let refs = store.list_refs(&inst.id).await?;
+    let existing: HashSet<Vec<u8>> = refs.into_iter().map(|r| r.name).collect();
+    for remote in remotes.iter().filter(|r| r.role == "fetch") {
+        if interrupted() {
+            outcome.interrupted = true;
+            return Ok(());
+        }
+        fetch_one_remote(
+            runner,
+            store,
+            cancel,
+            inst,
+            &remote.name,
+            &existing,
+            started_ms,
+            outcome,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Optional `--fetch` phase (goal Step 11): runs after the
+/// `inventory_ready` boundary and local analysis, before report
+/// staging, so staged reports include freshness. One pass over
+/// emitted stores (instance ids key on the canonical common dir, so
+/// one row is one store — linked worktrees never refetch); per
+/// fetch-role remote: resolve + inspect effective refspecs, fetch on
+/// `Safe`, audit via ls-remote, re-observe oids, label freshness,
+/// record + journal. Sequential: one network operation at a time
+/// (N=1 bounded worker); every spawn carries `FETCH_TIMEOUT` plus
+/// the SIGINT-aware cancel scope, and `interrupted()` is polled
+/// between stores and remotes. Comparison recompute after fetch is a
+/// no-op: branch comparison is not implemented yet (see the
+/// `load_branch_upstreams` analysis path), so freshness labels plus
+/// re-observed oids ARE the fetch output.
+async fn run_fetch_phase(
+    runner: &mut Runner,
+    store: &TursoStore,
+    started_ms: i64,
+) -> repo_scan::Result<FetchOutcome> {
+    let mut outcome = FetchOutcome::default();
+    let cancel = git::fallback::WaitCancel::new(|| INTERRUPTED.load(Ordering::SeqCst), None);
+    let mut offset = 0i64;
+    loop {
+        if interrupted() {
+            outcome.interrupted = true;
+            break;
+        }
+        let page = load_emitted_instances_page(store, FETCH_PAGE, offset).await?;
+        if page.is_empty() {
+            break;
+        }
+        offset += page.len() as i64;
+        for inst in &page {
+            if interrupted() {
+                outcome.interrupted = true;
+                break;
+            }
+            fetch_one_store(runner, store, &cancel, inst, started_ms, &mut outcome).await?;
+        }
+        if outcome.interrupted {
+            break;
+        }
+    }
+    flush_runner_batch(runner, store).await?;
+    Ok(outcome)
 }
 
 /// One page of report-subject instances
@@ -8390,7 +8997,7 @@ async fn load_emitted_instances_page(
     let limit = limit.max(1);
     let offset = offset.max(0);
     let sql = format!(
-        "SELECT id, git_path, common_path, disposition FROM git_instances \
+        "SELECT id, git_path, common_path, disposition, object_format FROM git_instances \
          WHERE disposition != 'nonmatch' ORDER BY id ASC LIMIT {limit} OFFSET {offset}"
     );
     let mut rows = store
@@ -8405,6 +9012,7 @@ async fn load_emitted_instances_page(
             git_path: cell_blob(&row, 1)?,
             common_path: cell_blob(&row, 2)?,
             disposition: cell_text(&row, 3)?,
+            object_format: cell_text(&row, 4)?,
         });
         if out.len() as i64 >= limit {
             break;
