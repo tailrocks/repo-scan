@@ -5890,13 +5890,18 @@ impl TursoStore {
         // turso reports only `busy` when the checkpoint cannot proceed
         // (busy=1, NULL counters), unlike SQLite which reports counts. The
         // counters surface as 0 there; callers key off `busy`.
+        let busy = req_i64(&row, 0)?;
+        let log_frames = opt_i64(&row, 1)?.unwrap_or(0);
+        let checkpointed_frames = opt_i64(&row, 2)?.unwrap_or(0);
+        drop(row);
+        // Drive the PRAGMA statement to completion before dropping it:
+        // the checkpoint guard counts active statements, so a later
+        // probe must never observe this one still in flight.
+        while rows.next().await.map_err(store_err)?.is_some() {}
         Ok((
-            i64_to_u64(req_i64(&row, 0)?, "wal_checkpoint busy")?,
-            i64_to_u64(opt_i64(&row, 1)?.unwrap_or(0), "wal_checkpoint log frames")?,
-            i64_to_u64(
-                opt_i64(&row, 2)?.unwrap_or(0),
-                "wal_checkpoint checkpointed frames",
-            )?,
+            i64_to_u64(busy, "wal_checkpoint busy")?,
+            i64_to_u64(log_frames, "wal_checkpoint log frames")?,
+            i64_to_u64(checkpointed_frames, "wal_checkpoint checkpointed frames")?,
         ))
     }
 
@@ -6006,6 +6011,59 @@ mod tests {
                     .expect("probe gen 2"),
                 "own-generation skew must still be found"
             );
+            store.close().await.expect("close");
+        });
+    }
+
+    /// Wave8d: an active statement on the writer connection turns the
+    /// checkpoint probe into a counted skip, never a scan failure — and
+    /// the classifier recognizes exactly the engine's contention text.
+    #[test]
+    fn checkpoint_contention_skips_and_retries() {
+        use crate::store::checkpoint::{
+            is_checkpoint_contention, CheckpointCoordinator, CheckpointPolicy,
+        };
+        // Classifier contract first (no I/O).
+        assert!(is_checkpoint_contention(&Error::Store(
+            "cannot checkpoint while another statement is active - SQL statements in progress"
+                .to_string()
+        )));
+        assert!(!is_checkpoint_contention(&Error::Store(
+            "disk I/O error".to_string()
+        )));
+        assert!(!is_checkpoint_contention(&Error::Io("boom".to_string())));
+        let rt = runtime();
+        rt.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db = dir.path().join("payload").join("catalog.db");
+            let store = TursoStore::open(&db).await.expect("open");
+            // Hold a statement active on the writer connection: one row
+            // read, cursor never driven to completion.
+            let mut held = store
+                .connection()
+                .query("SELECT value FROM meta LIMIT 2", ())
+                .await
+                .expect("held query");
+            assert!(held.next().await.expect("held row").is_some());
+            let err = store
+                .checkpoint_truncate()
+                .await
+                .expect_err("held statement must block truncate");
+            assert!(is_checkpoint_contention(&err), "unexpected: {err:?}");
+            let mut coordinator = CheckpointCoordinator::new(CheckpointPolicy::default());
+            let outcome = coordinator
+                .maybe_checkpoint(&store)
+                .await
+                .expect("probe contention must skip, not fail");
+            assert!(outcome.is_none());
+            assert_eq!(coordinator.stats().contention_skips, 1);
+            drop(held);
+            // Retry after release proceeds normally (fresh coordinator:
+            // the skipped probe still rate-limits the first one).
+            let mut retry = CheckpointCoordinator::new(CheckpointPolicy::default());
+            let outcome = retry.maybe_checkpoint(&store).await.expect("retry");
+            assert!(outcome.is_some());
+            assert_eq!(retry.stats().contention_skips, 0);
             store.close().await.expect("close");
         });
     }

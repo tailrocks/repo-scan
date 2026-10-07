@@ -5904,7 +5904,14 @@ async fn flush_runner_batch(runner: &mut Runner, store: &TursoStore) -> repo_sca
         }
     }
     if runner.checkpoints.note_ops(applied) {
+        let contention_before = runner.checkpoints.stats().contention_skips;
         let _ = runner.checkpoints.maybe_checkpoint(store).await?;
+        let contention_after = runner.checkpoints.stats().contention_skips;
+        if contention_after != contention_before {
+            eprintln!(
+                "repo-scan: checkpoint skipped: engine reports an active statement (transient; retry next cadence)"
+            );
+        }
     }
     let checks = std::mem::take(&mut runner.pending_alias_checks);
     for check in &checks {
