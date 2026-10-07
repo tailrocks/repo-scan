@@ -1377,6 +1377,7 @@ async fn maybe_publish_live_report(
     root_cursors: Vec<RootCursors>,
     event_note: &str,
     report_dest: &Option<PathBuf>,
+    limits: &config::ResourceLimits,
 ) {
     let Some(dest) = report_dest else {
         return;
@@ -1404,6 +1405,8 @@ async fn maybe_publish_live_report(
         aliases: aliases.to_vec(),
         root_cursors,
         event_note: event_note.to_string(),
+        cpu_target_cores: limits.cpu_target_cores,
+        rss_target_bytes: limits.rss_target_bytes,
     };
     let catalog_rev = store.current_revision().await.unwrap_or(0);
     let dirs_complete = count_dirs_complete(store, generation).await.unwrap_or(0);
@@ -2074,6 +2077,7 @@ async fn run_scan_inner(
             root_cursors_for(&roots, &events, &cursors),
             &live_note,
             &report_dest,
+            &effective,
         )
         .await;
     }
@@ -2132,6 +2136,7 @@ async fn run_scan_inner(
             root_cursors_for(&roots, &events, &cursors),
             &live_note,
             &report_dest,
+            &effective,
         )
         .await;
     }
@@ -2185,6 +2190,7 @@ async fn run_scan_inner(
                 root_cursors_for(&roots, &events, &cursors),
                 &live_note,
                 &report_dest,
+                &effective,
             )
             .await;
         }
@@ -2235,6 +2241,8 @@ async fn run_scan_inner(
         aliases: runner.aliases.clone(),
         root_cursors: root_cursors_for(&roots, &events, &cursors),
         event_note,
+        cpu_target_cores: effective.cpu_target_cores,
+        rss_target_bytes: effective.rss_target_bytes,
     };
     let lib_inputs = build_lib_inputs(
         &store,
@@ -11830,6 +11838,11 @@ struct ScanReportInputs {
     root_cursors: Vec<RootCursors>,
     /// Honest event-history boundary note (R5).
     event_note: String,
+    /// Effective worker budgets under which this snapshot was produced
+    /// (Step 4): this invocation's `config::effective_limits`, not the
+    /// §5 table defaults.
+    cpu_target_cores: f64,
+    rss_target_bytes: u64,
 }
 
 fn truncate_str(text: &str, max_chars: usize) -> String {
@@ -13134,8 +13147,8 @@ async fn build_lib_inputs(
         tasks_pending: inputs.pending,
         scope_boundaries: boundaries,
         profile: String::from("conservative"),
-        cpu_target_cores: 1.0,
-        rss_target_bytes: 268435456,
+        cpu_target_cores: inputs.cpu_target_cores,
+        rss_target_bytes: inputs.rss_target_bytes,
         // RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1: measured run-loop
         // telemetry — never None-after-run.
         peak_rss_bytes: Some(inputs.counters.peak_rss_bytes),

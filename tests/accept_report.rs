@@ -946,3 +946,85 @@ fn report_01_live_report_validates_against_real_json_schema() {
         errors.join("\n")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Step 4: reports record the effective worker limits of the invocation
+// ---------------------------------------------------------------------------
+
+/// `scan --workers 4` reports `resources.cpu_target_cores == 4.0`, and a
+/// default invocation reports `effective_workers(None)` — never the
+/// hardcoded 1.0 legacy value. The RSS target stays the §5 table budget.
+#[test]
+fn report_resources_record_effective_worker_limits() {
+    if !git_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    fixture::normal_clone(&root, "repo");
+    let root_str = root.to_str().expect("utf8").to_string();
+
+    // Explicit `--workers 4`.
+    let state = dir.path().join("state-4");
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            root_str.as_str(),
+            "--report",
+            "report-4.json",
+            "--workers",
+            "4",
+        ],
+        dir.path(),
+        &state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let report = load_json(&dir.path().join("report-4.json"));
+    assert_report_conforms(&report, 0);
+    assert_eq!(
+        report["resources"]["cpu_target_cores"].as_f64(),
+        Some(4.0),
+        "--workers 4 must surface in resources: {report}"
+    );
+    assert_eq!(
+        report["resources"]["profile"].as_str(),
+        Some("conservative")
+    );
+    assert_eq!(
+        report["resources"]["rss_target_bytes"].as_u64(),
+        Some(256 * 1024 * 1024),
+        "rss target stays the §5 table budget: {report}"
+    );
+
+    // Default invocation: platform parallelism, clamped to MAX_WORKERS.
+    let state = dir.path().join("state-default");
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            root_str.as_str(),
+            "--report",
+            "report-default.json",
+        ],
+        dir.path(),
+        &state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let report = load_json(&dir.path().join("report-default.json"));
+    assert_report_conforms(&report, 0);
+    let expected = repo_scan::config::effective_workers(None) as f64;
+    assert_eq!(
+        report["resources"]["cpu_target_cores"].as_f64(),
+        Some(expected),
+        "default workers must surface in resources: {report}"
+    );
+    assert_eq!(
+        report["resources"]["rss_target_bytes"].as_u64(),
+        Some(256 * 1024 * 1024),
+        "rss target stays the §5 table budget: {report}"
+    );
+}
