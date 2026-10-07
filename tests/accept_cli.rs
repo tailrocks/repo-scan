@@ -1831,6 +1831,18 @@ fn coverage_updated_reports_gap_deltas() {
 
 #[test]
 fn case12_no_analysis_before_inventory_ready() {
+    case12_body(&[]);
+}
+
+/// Case 12 under explicit high concurrency: analysis tasks enqueue
+/// during discovery and pend while probes still run — the pooled
+/// drain must still hold every analysis claim behind the boundary.
+#[test]
+fn case12_no_analysis_before_inventory_ready_workers8() {
+    case12_body(&["--workers", "8"]);
+}
+
+fn case12_body(extra: &[&str]) {
     use repo_scan::store::{Store, TursoStore};
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1844,20 +1856,18 @@ fn case12_no_analysis_before_inventory_ready() {
     // of analysis observably run.
     fixture::normal_clone(&root, "repo");
     fixture::linked_worktree(&root);
-    let out = run(
-        &[
-            "scan",
-            URL,
-            "--root",
-            root.to_str().expect("utf8"),
-            "--status",
-            "summary",
-            "--report",
-            "rep.json",
-        ],
-        &cwd,
-        &state,
-    );
+    let mut args = vec![
+        "scan",
+        URL,
+        "--root",
+        root.to_str().expect("utf8"),
+        "--status",
+        "summary",
+        "--report",
+        "rep.json",
+    ];
+    args.extend(extra.iter().copied());
+    let out = run(&args, &cwd, &state);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
     let scan_id = stdout_line(&out, "scan_id");
 
