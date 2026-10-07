@@ -19,7 +19,7 @@ use crate::store::owner::{OwnerGuard, StateRootAnchor};
 use crate::store::writer::WriterBatch;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::time::Duration;
 
 /// Owner-held catalog handle. Only the owner constructs this.
@@ -550,6 +550,59 @@ const TASK_COLUMNS: &str = "id, kind, generation, dir_id, scope_key, expected_re
     state, lease_token, lease_epoch, lease_expires_ms, idempotency_key, \
     retry_after_ms, attempts";
 
+/// Process-wide R06 class-skew verdict (Step 9 fast-claim gate): `0` =
+/// unknown (probe inside the first fast-path claim transaction), `1` =
+/// clear, `2` = present. Upgrades only (`0->1`, `0->2`, `1->2`).
+///
+/// Every `frontier_tasks` insert path marks skewed `(kind, id)` pairs via
+/// [`note_task_class`] *before* the row can commit, and the probe runs
+/// inside the claiming transaction, so under the owner-serialized writer
+/// model `clear` implies no claim-relevant skewed row exists. `present`
+/// only costs the legacy window-query fallback, never correctness.
+static TASK_CLASS_SKEW: AtomicU8 = AtomicU8::new(0);
+
+/// ASCII case-insensitive byte-prefix match: the SQL `id LIKE 'probe:%'`
+/// arms are engine-evaluated (SQLite `LIKE` folds ASCII case), so the
+/// Rust mirror must fold too — byte `starts_with` would miss `PROBE:x`.
+fn like_prefix(id: &str, prefix: &[u8]) -> bool {
+    let bytes = id.as_bytes();
+    bytes.len() >= prefix.len() && bytes[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+/// True when a task's R06 class (first-match over kind OR id-prefix, as
+/// in the claim queries) differs from its kind-only class — i.e. the id
+/// prefix pulls the row into an *earlier* class than its kind. All
+/// in-repo enqueue sites use consistent kind/id pairs, so this is dead
+/// defense in practice; the fast claim path still honors it exactly by
+/// falling back to the window query whenever skew may exist.
+fn task_class_skewed(kind: &str, id: &str) -> bool {
+    match kind {
+        "probe_git" => false,
+        "reconcile" => like_prefix(id, b"probe:"),
+        "enumerate_dir" => like_prefix(id, b"probe:") || like_prefix(id, b"reconcile:"),
+        "status" => {
+            like_prefix(id, b"probe:")
+                || like_prefix(id, b"reconcile:")
+                || like_prefix(id, b"enum:")
+        }
+        _ => {
+            like_prefix(id, b"probe:")
+                || like_prefix(id, b"reconcile:")
+                || like_prefix(id, b"enum:")
+                || like_prefix(id, b"status:")
+        }
+    }
+}
+
+/// Mark a to-be-inserted task's class skew (see [`TASK_CLASS_SKEW`]).
+/// Called before the row can commit; upgrade-only, hence race-safe in
+/// the conservative direction (a spurious `present` only falls back).
+fn note_task_class(kind: &str, id: &str) {
+    if task_class_skewed(kind, id) {
+        TASK_CLASS_SKEW.store(2, Ordering::Relaxed);
+    }
+}
+
 /// A task plus the lease just granted for it.
 #[derive(Debug, Clone)]
 pub struct ClaimedTask {
@@ -773,6 +826,24 @@ impl TursoStore {
         let catalog_id: Option<(u64, u64)> = None;
         Self::apply_pragmas(&conn).await?;
         let schema_version = Self::migrate(&conn).await?;
+        // Step 9 bounded-claim covering index (additive, idempotent): the
+        // per-class fast-claim SELECTs constrain
+        // `(generation, state, kind)` by equality and order by
+        // `(attempts, updated_at_ms, id)`, so each class resolves to one
+        // index range with `LIMIT` short-circuit instead of a whole-queue
+        // window sort. `INTEGER`/`TEXT`-only key per the schema rules. Not
+        // a versioned migration (those live in `schema.rs`, append-only):
+        // `IF NOT EXISTS` converges old and new catalogs without a
+        // version bump, and a first open on a large catalog pays one
+        // index build. Read-only opens never create it (see
+        // `TursoStore::open_read_only`, which does not run this path).
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_claim ON frontier_tasks \
+                (generation, state, kind, attempts, updated_at_ms, id)",
+            (),
+        )
+        .await
+        .map_err(store_err)?;
         let epoch = i64_to_u64(
             Self::with_tx_on(&conn, |tx| async move {
                 let current = Self::read_meta_i64(tx, "epoch").await?.unwrap_or(0);
@@ -1322,6 +1393,9 @@ impl TursoStore {
     /// Returns true when the task was newly inserted.
     pub async fn enqueue_task(&self, task: &NewTask<'_>, now_ms: i64) -> crate::Result<bool> {
         self.forbid_write("enqueue_task")?;
+        // Step 9: mark class skew before the row can commit (conservative
+        // on `OR IGNORE` duplicates — a spurious mark only falls back).
+        note_task_class(task.kind, task.id);
         let rows = self
             .conn
             .execute(
@@ -1535,6 +1609,218 @@ impl TursoStore {
             .await
     }
 
+    /// One R06 class stream: top-`limit` pending rows of one kind in
+    /// window-partition order. Served by `idx_tasks_claim` as a single
+    /// index range with `LIMIT` short-circuit (no whole-queue scan or
+    /// sort).
+    async fn claim_class_top_on(
+        conn: &turso::Connection,
+        generation_i64: i64,
+        kind: &str,
+        limit: usize,
+    ) -> crate::Result<Vec<FrontierTask>> {
+        // Bound literal is interpolated (numeric, owner-controlled) so
+        // the query needs no bound LIMIT support; kind stays a parameter.
+        let sql = format!(
+            "SELECT {TASK_COLUMNS} FROM frontier_tasks WHERE generation = ?1 \
+                AND state = 'pending' AND kind = ?2 \
+                ORDER BY attempts ASC, updated_at_ms ASC, id ASC LIMIT {limit}"
+        );
+        let mut rows = conn
+            .query(sql.as_str(), vec![v_int(generation_i64), v_text(kind)])
+            .await
+            .map_err(store_err)?;
+        let mut tasks = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            tasks.push(FrontierTask::from_row(&row)?);
+        }
+        Ok(tasks)
+    }
+
+    /// True when the generation holds an eligible `retry_wait` row, in
+    /// which case the window query stays authoritative. One indexed
+    /// existence probe (`LIMIT 1`), never a scan-and-sort.
+    async fn retry_eligible_present_on(
+        conn: &turso::Connection,
+        generation: u64,
+        now_ms: i64,
+    ) -> crate::Result<bool> {
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM frontier_tasks WHERE generation = ?1 \
+                    AND state = 'retry_wait' AND retry_after_ms IS NOT NULL \
+                    AND retry_after_ms <= ?2 LIMIT 1",
+                vec![
+                    v_int(u64_to_i64(generation, "task generation")?),
+                    v_int(now_ms),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(rows.next().await.map_err(store_err)?.is_some())
+    }
+
+    /// One-time (per process) skew probe over claim-relevant rows: true
+    /// when a pending/`retry_wait` row's id prefix pulls it into an
+    /// earlier R06 class than its kind (the [`task_class_skewed`] mirror
+    /// in SQL). Runs at most once per process — the verdict is cached in
+    /// [`TASK_CLASS_SKEW`] while every later insert marks itself — inside
+    /// the claiming transaction, so it observes a consistent snapshot.
+    async fn task_class_skew_present_on(conn: &turso::Connection) -> crate::Result<bool> {
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM frontier_tasks WHERE (state = 'pending' OR state = 'retry_wait') \
+                    AND ((kind = 'reconcile' AND id LIKE 'probe:%') \
+                    OR (kind = 'enumerate_dir' \
+                        AND (id LIKE 'probe:%' OR id LIKE 'reconcile:%')) \
+                    OR (kind = 'status' \
+                        AND (id LIKE 'probe:%' OR id LIKE 'reconcile:%' OR id LIKE 'enum:%')) \
+                    OR (kind NOT IN ('probe_git', 'reconcile', 'enumerate_dir', 'status') \
+                        AND (id LIKE 'probe:%' OR id LIKE 'reconcile:%' \
+                        OR id LIKE 'enum:%' OR id LIKE 'status:%'))) LIMIT 1",
+                (),
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(rows.next().await.map_err(store_err)?.is_some())
+    }
+
+    /// Step 9 bounded claim selection: one indexed top-`limit` SELECT per
+    /// R06 class plus a Rust round-robin merge. Returns `None` when the
+    /// legacy window query must run instead (unfiltered claims, eligible
+    /// `retry_wait` rows, possible kind/id class skew, or a multi-kind
+    /// else-class) — identical sequence either way.
+    ///
+    /// Exactness: with no eligible `retry_wait` row and no skew, each
+    /// class stream holds that class's rows in partition order
+    /// (`attempts, updated_at_ms, id`), and the overall `LIMIT` prefix of
+    /// the `(_rn, _cls)` round-robin needs at most `limit` rows from any
+    /// one class — so interleaving per-class top-`limit` streams
+    /// reproduces the window query's sequence row for row. (`_rn` is
+    /// unique within a class, so the window's trailing `id` tiebreak
+    /// never fires.)
+    async fn claim_select_fast(
+        conn: &turso::Connection,
+        generation: u64,
+        kinds: Option<&[&str]>,
+        limit: usize,
+        now_ms: i64,
+    ) -> crate::Result<Option<Vec<FrontierTask>>> {
+        // Unfiltered claims have an unbounded else-class (`kind NOT IN`
+        // over unknown kinds); the window query stays authoritative.
+        // (Production discovery/analysis claims always filter.)
+        let Some(kinds) = kinds else {
+            return Ok(None);
+        };
+        if TASK_CLASS_SKEW.load(Ordering::Relaxed) != 1 {
+            if Self::task_class_skew_present_on(conn).await? {
+                TASK_CLASS_SKEW.store(2, Ordering::Relaxed);
+                return Ok(None);
+            }
+            TASK_CLASS_SKEW.store(1, Ordering::Relaxed);
+        }
+        if Self::retry_eligible_present_on(conn, generation, now_ms).await? {
+            return Ok(None);
+        }
+        let generation_i64 = u64_to_i64(generation, "task generation")?;
+        const NAMED: [&str; 4] = ["probe_git", "reconcile", "enumerate_dir", "status"];
+        let mut streams: Vec<Vec<FrontierTask>> = Vec::with_capacity(5);
+        for class_kind in NAMED {
+            if kinds.contains(&class_kind) {
+                streams
+                    .push(Self::claim_class_top_on(conn, generation_i64, class_kind, limit).await?);
+            } else {
+                streams.push(Vec::new());
+            }
+        }
+        let else_kinds: Vec<&&str> = kinds.iter().filter(|kind| !NAMED.contains(*kind)).collect();
+        streams.push(match else_kinds.as_slice() {
+            [] => Vec::new(),
+            [only] => Self::claim_class_top_on(conn, generation_i64, only, limit).await?,
+            // Multi-kind else-class: the window query stays authoritative.
+            _ => return Ok(None),
+        });
+        let mut tasks = Vec::new();
+        for rn in 0..limit {
+            for stream in &streams {
+                if let Some(task) = stream.get(rn) {
+                    tasks.push(task.clone());
+                    if tasks.len() == limit {
+                        return Ok(Some(tasks));
+                    }
+                }
+            }
+        }
+        Ok(Some(tasks))
+    }
+
+    /// Legacy whole-queue window selection (authoritative fallback for
+    /// [`TursoStore::claim_select_fast`], and the only path for
+    /// unfiltered claims): R06 round-robin interleave over all eligible
+    /// rows of the generation. Unchanged semantics.
+    async fn claim_select_window(
+        conn: &turso::Connection,
+        generation: u64,
+        kinds: Option<&[&str]>,
+        limit: usize,
+        now_ms: i64,
+    ) -> crate::Result<Vec<FrontierTask>> {
+        // Bound literal is interpolated (numeric, owner-controlled) so
+        // the query needs no bound LIMIT support.
+        //
+        // R06: Fair scheduling across task classes (probe, reconcile,
+        // enumerate, status) using round-robin interleaving so discovered
+        // Git repository candidates are scheduled and validated promptly
+        // while directory enumeration continues in parallel/interleaved.
+        let kind_predicate = match kinds {
+            Some(kinds) => {
+                let kind_params: Vec<String> =
+                    (0..kinds.len()).map(|i| format!("?{}", i + 3)).collect();
+                format!("AND kind IN ({})", kind_params.join(", "))
+            }
+            None => String::new(),
+        };
+        let sql = format!(
+            "SELECT {TASK_COLUMNS} FROM ( \
+                SELECT {TASK_COLUMNS}, \
+                    ROW_NUMBER() OVER ( \
+                        PARTITION BY CASE \
+                            WHEN kind = 'probe_git' OR id LIKE 'probe:%' THEN 1 \
+                            WHEN kind = 'reconcile' OR id LIKE 'reconcile:%' THEN 2 \
+                            WHEN kind = 'enumerate_dir' OR id LIKE 'enum:%' THEN 3 \
+                            WHEN kind = 'status' OR id LIKE 'status:%' THEN 4 \
+                            ELSE 5 \
+                        END \
+                        ORDER BY attempts ASC, updated_at_ms ASC, id ASC \
+                    ) AS _rn, \
+                    CASE \
+                        WHEN kind = 'probe_git' OR id LIKE 'probe:%' THEN 1 \
+                        WHEN kind = 'reconcile' OR id LIKE 'reconcile:%' THEN 2 \
+                        WHEN kind = 'enumerate_dir' OR id LIKE 'enum:%' THEN 3 \
+                        WHEN kind = 'status' OR id LIKE 'status:%' THEN 4 \
+                        ELSE 5 \
+                    END AS _cls \
+                FROM frontier_tasks \
+                WHERE generation = ?1 \
+                    AND (state = 'pending' OR (state = 'retry_wait' \
+                    AND retry_after_ms IS NOT NULL AND retry_after_ms <= ?2)) \
+                    {kind_predicate} \
+            ) \
+            ORDER BY _rn ASC, _cls ASC, id ASC LIMIT {limit}",
+        );
+        let generation_i64 = u64_to_i64(generation, "task generation")?;
+        let mut params = vec![v_int(generation_i64), v_int(now_ms)];
+        if let Some(kinds) = kinds {
+            params.extend(kinds.iter().map(|k| v_text((*k).to_string())));
+        }
+        let mut rows = conn.query(sql.as_str(), params).await.map_err(store_err)?;
+        let mut tasks = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            tasks.push(FrontierTask::from_row(&row)?);
+        }
+        Ok(tasks)
+    }
+
     /// Shared generation-scoped claim body. `Some(kinds)` restricts the
     /// claim to those (already allowlisted) kinds; `None` applies no
     /// kind predicate (legacy unfiltered contract).
@@ -1557,59 +1843,17 @@ impl TursoStore {
         let limit = limit.clamp(1, 1024);
         self.with_tx(|conn| async move {
             Self::expire_leases_in_generation_on(conn, generation, now_ms).await?;
-            // Bound literal is interpolated (numeric, owner-controlled) so
-            // the query needs no bound LIMIT support.
-            //
-            // R06: Fair scheduling across task classes (probe, reconcile,
-            // enumerate, status) using round-robin interleaving so discovered
-            // Git repository candidates are scheduled and validated promptly
-            // while directory enumeration continues in parallel/interleaved.
-            let kind_predicate = match kinds {
-                Some(kinds) => {
-                    let kind_params: Vec<String> =
-                        (0..kinds.len()).map(|i| format!("?{}", i + 3)).collect();
-                    format!("AND kind IN ({})", kind_params.join(", "))
-                }
-                None => String::new(),
+            // Step 9: bounded indexed selection first; the window query
+            // stays authoritative whenever the fast path declines
+            // (unfiltered claims, eligible `retry_wait` rows, R06 class
+            // skew, or a multi-kind else-class) — identical sequence
+            // either way. Lease issue below is unchanged.
+            let tasks = match Self::claim_select_fast(conn, generation, kinds, limit, now_ms)
+                .await?
+            {
+                Some(tasks) => tasks,
+                None => Self::claim_select_window(conn, generation, kinds, limit, now_ms).await?,
             };
-            let sql = format!(
-                "SELECT {TASK_COLUMNS} FROM ( \
-                    SELECT {TASK_COLUMNS}, \
-                        ROW_NUMBER() OVER ( \
-                            PARTITION BY CASE \
-                                WHEN kind = 'probe_git' OR id LIKE 'probe:%' THEN 1 \
-                                WHEN kind = 'reconcile' OR id LIKE 'reconcile:%' THEN 2 \
-                                WHEN kind = 'enumerate_dir' OR id LIKE 'enum:%' THEN 3 \
-                                WHEN kind = 'status' OR id LIKE 'status:%' THEN 4 \
-                                ELSE 5 \
-                            END \
-                            ORDER BY attempts ASC, updated_at_ms ASC, id ASC \
-                        ) AS _rn, \
-                        CASE \
-                            WHEN kind = 'probe_git' OR id LIKE 'probe:%' THEN 1 \
-                            WHEN kind = 'reconcile' OR id LIKE 'reconcile:%' THEN 2 \
-                            WHEN kind = 'enumerate_dir' OR id LIKE 'enum:%' THEN 3 \
-                            WHEN kind = 'status' OR id LIKE 'status:%' THEN 4 \
-                            ELSE 5 \
-                        END AS _cls \
-                    FROM frontier_tasks \
-                    WHERE generation = ?1 \
-                        AND (state = 'pending' OR (state = 'retry_wait' \
-                        AND retry_after_ms IS NOT NULL AND retry_after_ms <= ?2)) \
-                        {kind_predicate} \
-                ) \
-                ORDER BY _rn ASC, _cls ASC, id ASC LIMIT {limit}",
-            );
-            let generation_i64 = u64_to_i64(generation, "task generation")?;
-            let mut params = vec![v_int(generation_i64), v_int(now_ms)];
-            if let Some(kinds) = kinds {
-                params.extend(kinds.iter().map(|k| v_text((*k).to_string())));
-            }
-            let mut rows = conn.query(sql.as_str(), params).await.map_err(store_err)?;
-            let mut tasks = Vec::new();
-            while let Some(row) = rows.next().await.map_err(store_err)? {
-                tasks.push(FrontierTask::from_row(&row)?);
-            }
             let mut claimed = Vec::with_capacity(tasks.len());
             for task in &tasks {
                 let token = fresh_token();
@@ -2193,6 +2437,9 @@ impl TursoStore {
         Self::mirror_dir_invalidation(conn, scope_key, next).await?;
         let task_id = format!("reconcile:{scope_key}:{next}");
         let idempotency = format!("idem:{task_id}");
+        // Step 9: class-skew mark (no-op for this consistent pair; kept
+        // so every `frontier_tasks` insert path is covered by construction).
+        note_task_class("reconcile", &task_id);
         conn.execute(
             "INSERT OR IGNORE INTO frontier_tasks (id, kind, generation, dir_id, \
                 scope_key, expected_rev, state, idempotency_key, attempts, \
@@ -4981,6 +5228,10 @@ impl TursoStore {
         // `INTEGER` reads, so they always fit `i64` here; out-of-range
         // input is a caller defect and panics loudly (release builds must
         // fail too, so a `debug_assert`-only guard is not enough).
+        // Step 9: mark class skew at buffer time — strictly before the
+        // flush can commit the row (conservative on `OR IGNORE`
+        // duplicates — a spurious mark only falls back).
+        note_task_class(task.kind, task.id);
         let generation_i64 = u64_to_i64_buf(task.generation, "task generation");
         let expected_rev_i64 = u64_to_i64_buf(task.expected_rev, "task expected_rev");
         batch.push(
