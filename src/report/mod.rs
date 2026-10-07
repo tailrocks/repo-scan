@@ -11,6 +11,7 @@ pub mod builder;
 pub mod encode;
 pub mod live_text;
 pub mod model;
+pub mod output;
 pub mod publish;
 pub mod render;
 pub mod stream;

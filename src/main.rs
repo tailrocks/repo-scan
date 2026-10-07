@@ -43,7 +43,7 @@ use repo_scan::walk::topology::{
 };
 use repo_scan::walk::{ChildKind, ListOptions, WalkItem};
 use std::collections::{HashMap, HashSet};
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
@@ -1233,6 +1233,268 @@ fn failed_records(
     })
 }
 
+/// Journal one `scan_failed` lifecycle event for an emission failure
+/// (Wave2b: last cursor + scrubbed error + resume capability +
+/// resume command travel on the event).
+async fn journal_emission_failed(
+    runner: &mut Runner,
+    store: &TursoStore,
+    cfg: &config::Config,
+    scan_id: &str,
+    err: &str,
+) -> repo_scan::Result<()> {
+    let failed = failed_records(
+        runner.journal.as_ref().expect("scan journal opened above"),
+        err,
+        &cfg.state_dir,
+        scan_id,
+    );
+    runner
+        .journal
+        .as_mut()
+        .expect("scan journal opened above")
+        .emit(store, EventType::ScanFailed, &failed)
+        .await
+}
+
+/// Replay one scan's full journal to stdout as JSONL (Wave2b
+/// `scan`/`resume --format jsonl` tail). The owner store is closed by
+/// now, so this reopens read-only — the same servable-while-locked
+/// path `query --scan` uses. Returns the replayed pipe state:
+/// `Ok(false)` is a broken pipe (quiet stop, catalog untouched).
+async fn scan_jsonl_tail(cfg: &config::Config, scan_id: &str) -> repo_scan::Result<bool> {
+    let db_path = store::owner::catalog_db_path(&cfg.state_dir);
+    let store = TursoStore::open_read_only(&db_path).await?;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    let mut after = None;
+    let mut reset_first = false;
+    let mut terminal_seen = false;
+    let pipe_open = replay_scan_pages(
+        &store,
+        scan_id,
+        &mut after,
+        &mut reset_first,
+        &mut out,
+        &mut terminal_seen,
+    )
+    .await?;
+    let flushed = flush_replay(&mut out)?;
+    let _ = store.close().await;
+    Ok(pipe_open && flushed)
+}
+
+/// Stdout tail for an emission-failed scan (Wave2b output matrix).
+/// The scan row is already `failed` and `scan_failed` is journaled;
+/// the owner store is closed. Human/legacy lanes print the legacy
+/// footers; the json lane prints one JSON error object; the jsonl
+/// lane replays the journal (ending in the `scan_failed` event).
+async fn scan_failure_tail(
+    cfg: &config::Config,
+    scan_id: &str,
+    report_id: &str,
+    snapshot_path: &Path,
+    explicit: Option<repo_scan::cli::OutputFormat>,
+) -> repo_scan::Result<ExitCode> {
+    use repo_scan::cli::OutputFormat;
+    if explicit == Some(OutputFormat::Jsonl) {
+        // Replay errors here are catalog corruption: loud, but the
+        // scan already failed — report the failure either way.
+        match scan_jsonl_tail(cfg, scan_id).await {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!(
+                    "repo-scan: failure replay failed: {}",
+                    identity::scrub_text(&e.to_string())
+                );
+            }
+        }
+        return Ok(ExitCode::OperationalFailure);
+    }
+    if explicit == Some(OutputFormat::Json) {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let object = serde_json::json!({
+            "scan_id": scan_id,
+            "state": "failed",
+            "report_id": report_id,
+        });
+        let line =
+            serde_json::to_string(&object).map_err(|e| repo_scan::Error::Report(e.to_string()))?;
+        let _ = repo_scan::report::output::write_machine_bytes(&mut out, line.as_bytes())?;
+        return Ok(ExitCode::OperationalFailure);
+    }
+    println!("scan_id: {scan_id}");
+    println!("report_id: {report_id}");
+    println!("snapshot: {}", snapshot_path.display());
+    Ok(ExitCode::OperationalFailure)
+}
+
+/// Per-target `matched_repositories` rows for the report envelope
+/// (report 1.1.0 `scan.targets`, empty for `--all`).
+fn report_targets_for(
+    resolved: &ResolvedTargets,
+    matched_counts: &[u64],
+) -> Vec<repo_scan::report::model::ScanTarget> {
+    resolved
+        .targets
+        .iter()
+        .enumerate()
+        .map(
+            |(i, (raw, canonical))| repo_scan::report::model::ScanTarget {
+                raw: raw.clone(),
+                canonical: Some(canonical.clone()),
+                matched_repositories: matched_counts.get(i).copied().unwrap_or(0),
+            },
+        )
+        .collect()
+}
+
+/// Attempt one live `--report` replacement (Wave2b case 17):
+/// best-effort, never fails the scan. Rebuilds happen only at phase
+/// boundaries (never per discovery) and at most once per
+/// [`repo_scan::report::output::LIVE_PUBLISH_MIN_INTERVAL`]; the live
+/// destination is atomically replaced, never retained (live snapshots
+/// are replaceable, completed snapshots are retained bounded).
+#[allow(clippy::too_many_arguments)]
+async fn maybe_publish_live_report(
+    store: &TursoStore,
+    runner: &Runner,
+    cfg: &config::Config,
+    throttle: &mut repo_scan::report::output::LiveThrottle,
+    scan_id: &str,
+    generation: u64,
+    epoch: u64,
+    target: &str,
+    canonical: Option<&str>,
+    targets: Vec<repo_scan::report::model::ScanTarget>,
+    policy: &str,
+    status_mode: StatusMode,
+    started_ms: i64,
+    pending: u64,
+    roots: &[PlannedRoot],
+    aliases: &[ObservedAlias],
+    root_cursors: Vec<RootCursors>,
+    event_note: &str,
+    report_dest: &Option<PathBuf>,
+) {
+    let Some(dest) = report_dest else {
+        return;
+    };
+    if !throttle.admit() {
+        return;
+    }
+    let now_ms = store::now_ms();
+    let inputs = ScanReportInputs {
+        scan_id: scan_id.to_string(),
+        generation,
+        epoch,
+        target_raw: target.to_string(),
+        canonical: canonical.map(str::to_string),
+        targets,
+        scope_policy: policy.to_string(),
+        scan_state: String::from("running"),
+        status_mode,
+        started_ms,
+        finished_ms: now_ms,
+        report_dest: Some(dest.clone()),
+        roots: roots.to_vec(),
+        counters: runner.counters.clone(),
+        pending,
+        aliases: aliases.to_vec(),
+        root_cursors,
+        event_note: event_note.to_string(),
+    };
+    let catalog_rev = store.current_revision().await.unwrap_or(0);
+    let dirs_complete = count_dirs_complete(store, generation).await.unwrap_or(0);
+    let live_id = format!("{}-live", config::report_id_for_scan(scan_id));
+    let lib_inputs = match build_lib_inputs(
+        store,
+        &inputs,
+        &live_id,
+        catalog_rev,
+        dirs_complete,
+        &snapshots_dir(&cfg.state_dir).join(format!("{live_id}.json")),
+    )
+    .await
+    {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            eprintln!(
+                "repo-scan: live report: build skipped: {}",
+                identity::scrub_text(&e.to_string())
+            );
+            return;
+        }
+    };
+    match ReportPipeline::publish_live(
+        store,
+        &lib_inputs,
+        &staging_dir(&cfg.state_dir),
+        dest,
+        &cfg.state_dir,
+    )
+    .await
+    {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!(
+                "repo-scan: live report: publication skipped: {}",
+                identity::scrub_text(&e.to_string())
+            );
+        }
+    }
+}
+
+/// Prune completed snapshots beyond the retention bound (Wave2b case
+/// 17): the newest [`repo_scan::report::output::MAX_RETAINED_SNAPSHOTS`]
+/// files survive, and every snapshot a scan outcome references
+/// survives regardless of age. Pruned files lose their catalog rows
+/// too. Best-effort: never fails the scan.
+async fn prune_old_snapshots(store: &TursoStore, state_dir: &Path) {
+    use repo_scan::report::output::{prune_snapshot_files, MAX_RETAINED_SNAPSHOTS};
+    let outcome_rows: Vec<String> = async {
+        let mut rows = store
+            .connection()
+            .query(
+                "SELECT outcome FROM scan_requests WHERE outcome IS NOT NULL",
+                (),
+            )
+            .await
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            if let turso::Value::Text(text) = row.get_value(0).map_err(store_err)? {
+                out.push(text);
+            }
+        }
+        repo_scan::Result::Ok(out)
+    }
+    .await
+    .unwrap_or_default();
+    let referenced: HashSet<String> = outcome_rows
+        .iter()
+        .filter_map(|o| config::parse_outcome(o).map(|d| d.report_id))
+        .collect();
+    let pruned = prune_snapshot_files(
+        &snapshots_dir(state_dir),
+        &referenced,
+        MAX_RETAINED_SNAPSHOTS,
+    );
+    for id in &pruned {
+        let deleted = store
+            .connection()
+            .execute(
+                "DELETE FROM report_snapshots WHERE id = ?1",
+                vec![turso::Value::Text(id.clone())],
+            )
+            .await;
+        if deleted.is_err() {
+            eprintln!("repo-scan: snapshot prune: cannot delete catalog row for {id}");
+        }
+    }
+}
+
 async fn run_scan(cfg: &config::Config, args: &repo_scan::cli::ScanArgs) -> ExitCode {
     // Goal Step 6: explicit targets XOR --all, validated once; execution
     // resolves the full set and serves it with one filesystem pass.
@@ -1752,6 +2014,40 @@ async fn run_scan_inner(
         .emit(&store, EventType::InventoryReady, &ready)
         .await?;
     runner.counters.db_transactions += 1;
+    // Wave2b live `--report` (case 17): boundary-gated, throttled,
+    // best-effort — never per discovery, never fatal.
+    let mut live_throttle = repo_scan::report::output::LiveThrottle::new();
+    if !outcome.interrupted {
+        let mut live_note = events.note();
+        if event_gaps > 0 {
+            live_note.push_str(&format!(
+                " {event_gaps} volume(s) event-history incomplete \
+                 (traversal covers scope; see event-history-incomplete gaps)."
+            ));
+        }
+        maybe_publish_live_report(
+            &store,
+            &runner,
+            cfg,
+            &mut live_throttle,
+            &scan_id,
+            generation,
+            epoch,
+            &target,
+            canonical.as_deref(),
+            report_targets_for(&resolved, &matched_counts),
+            &policy,
+            args.status,
+            started_ms,
+            outcome.pending,
+            &roots,
+            &runner.aliases,
+            root_cursors_for(&roots, &events, &cursors),
+            &live_note,
+            &report_dest,
+        )
+        .await;
+    }
     // Analysis drain (goal Step 8): detailed Git analysis starts only
     // after the catalog saves `inventory_ready`. Claims analysis kinds
     // (`status`, `analyze_store`) — including tasks probes enqueued
@@ -1779,6 +2075,37 @@ async fn run_scan_inner(
         scan_incomplete = scan_incomplete || analysis.has_gaps();
         finished_ms = store::now_ms();
     }
+    if !outcome.interrupted {
+        let mut live_note = events.note();
+        if event_gaps > 0 {
+            live_note.push_str(&format!(
+                " {event_gaps} volume(s) event-history incomplete \
+                 (traversal covers scope; see event-history-incomplete gaps)."
+            ));
+        }
+        maybe_publish_live_report(
+            &store,
+            &runner,
+            cfg,
+            &mut live_throttle,
+            &scan_id,
+            generation,
+            epoch,
+            &target,
+            canonical.as_deref(),
+            report_targets_for(&resolved, &matched_counts),
+            &policy,
+            args.status,
+            started_ms,
+            outcome.pending,
+            &roots,
+            &runner.aliases,
+            root_cursors_for(&roots, &events, &cursors),
+            &live_note,
+            &report_dest,
+        )
+        .await;
+    }
     // Optional `--fetch` phase (Step 11): remote refresh runs after
     // the discovery boundary + local analysis, before report staging,
     // so staged reports include freshness. Failed refreshes are
@@ -1801,6 +2128,37 @@ async fn run_scan_inner(
             },
         );
         finished_ms = store::now_ms();
+        if !outcome.interrupted {
+            let mut live_note = events.note();
+            if event_gaps > 0 {
+                live_note.push_str(&format!(
+                    " {event_gaps} volume(s) event-history incomplete \
+                     (traversal covers scope; see event-history-incomplete gaps)."
+                ));
+            }
+            maybe_publish_live_report(
+                &store,
+                &runner,
+                cfg,
+                &mut live_throttle,
+                &scan_id,
+                generation,
+                epoch,
+                &target,
+                canonical.as_deref(),
+                report_targets_for(&resolved, &matched_counts),
+                &policy,
+                args.status,
+                started_ms,
+                outcome.pending,
+                &roots,
+                &runner.aliases,
+                root_cursors_for(&roots, &events, &cursors),
+                &live_note,
+                &report_dest,
+            )
+            .await;
+        }
     }
     let discovery_code = if scan_incomplete { 3 } else { 0 };
     // The report's scan verdict covers the whole run (analysis + fetch),
@@ -1835,18 +2193,7 @@ async fn run_scan_inner(
         epoch,
         target_raw: target.clone(),
         canonical: canonical.clone(),
-        targets: resolved
-            .targets
-            .iter()
-            .enumerate()
-            .map(
-                |(i, (raw, canonical))| repo_scan::report::model::ScanTarget {
-                    raw: raw.clone(),
-                    canonical: Some(canonical.clone()),
-                    matched_repositories: matched_counts.get(i).copied().unwrap_or(0),
-                },
-            )
-            .collect(),
+        targets: report_targets_for(&resolved, &matched_counts),
         scope_policy: policy.clone(),
         scan_state: final_state.to_string(),
         status_mode: args.status,
@@ -1869,6 +2216,16 @@ async fn run_scan_inner(
         &snapshot_path,
     )
     .await?;
+    // Wave2b output matrix: an explicit `--format` wins; no explicit
+    // format keeps the legacy terminal/footers behavior. All lanes
+    // stage and retain the same snapshot first (one state model):
+    // human renders it, json prints it, jsonl replays the journal
+    // committed with it. `--report` still publishes the file in every
+    // lane; only the stdout shape changes.
+    let explicit = args.format;
+    let machine_json = explicit == Some(repo_scan::cli::OutputFormat::Json);
+    let machine_jsonl = explicit == Some(repo_scan::cli::OutputFormat::Jsonl);
+    let explicit_human = explicit == Some(repo_scan::cli::OutputFormat::Human);
     let published = match &report_dest {
         Some(dest) => {
             match emit_file_report(&store, &lib_inputs, dest, &cfg.state_dir, finished_ms).await {
@@ -1891,79 +2248,210 @@ async fn run_scan_inner(
                             store::now_ms(),
                         )
                         .await?;
-                    let failed = failed_records(
-                        runner.journal.as_ref().expect("scan journal opened above"),
-                        &err,
-                        &cfg.state_dir,
-                        &scan_id,
-                    );
-                    runner
-                        .journal
-                        .as_mut()
-                        .expect("scan journal opened above")
-                        .emit(&store, EventType::ScanFailed, &failed)
-                        .await?;
+                    journal_emission_failed(&mut runner, &store, cfg, &scan_id, &err).await?;
                     let _ = store.close().await;
-                    println!("scan_id: {scan_id}");
-                    println!("report_id: {report_id}");
-                    println!("snapshot: {}", snapshot_path.display());
-                    return Ok(ExitCode::OperationalFailure);
+                    return scan_failure_tail(cfg, &scan_id, &report_id, &snapshot_path, explicit)
+                        .await;
                 }
             }
         }
         None => {
-            let stdout = std::io::stdout();
-            let mut terminal = stdout.lock();
-            match ReportPipeline::emit_to_terminal(
-                &store,
-                &lib_inputs,
-                &staging_dir(&cfg.state_dir),
-                &snapshots_dir(&cfg.state_dir),
-                finished_ms,
-                &mut terminal,
-            )
-            .await
-            {
-                Ok(_) => true,
-                Err(e) => {
-                    let err = identity::scrub_text(&e.to_string());
-                    eprintln!("repo-scan: terminal report failed: {err}");
-                    store
-                        .update_scan_state(
+            if machine_json {
+                let stdout = std::io::stdout();
+                let mut out = stdout.lock();
+                match ReportPipeline::emit_to_json(
+                    &store,
+                    &lib_inputs,
+                    &staging_dir(&cfg.state_dir),
+                    &snapshots_dir(&cfg.state_dir),
+                    finished_ms,
+                    &mut out,
+                )
+                .await
+                {
+                    Ok(_) => true,
+                    Err(e) => {
+                        let err = identity::scrub_text(&e.to_string());
+                        eprintln!("repo-scan: json report failed: {err}");
+                        store
+                            .update_scan_state(
+                                &scan_id,
+                                &config::scan_state_name("failed", state_roots.as_deref()),
+                                Some(&config::encode_outcome(
+                                    1,
+                                    Some(discovery_code),
+                                    &report_id,
+                                    false,
+                                    Some(generation),
+                                )),
+                                None,
+                                store::now_ms(),
+                            )
+                            .await?;
+                        journal_emission_failed(&mut runner, &store, cfg, &scan_id, &err).await?;
+                        let _ = store.close().await;
+                        return scan_failure_tail(
+                            cfg,
                             &scan_id,
-                            &config::scan_state_name("failed", state_roots.as_deref()),
-                            Some(&config::encode_outcome(
-                                1,
-                                Some(discovery_code),
-                                &report_id,
-                                false,
-                                Some(generation),
-                            )),
-                            None,
-                            store::now_ms(),
+                            &report_id,
+                            &snapshot_path,
+                            explicit,
                         )
-                        .await?;
-                    let failed = failed_records(
-                        runner.journal.as_ref().expect("scan journal opened above"),
-                        &err,
-                        &cfg.state_dir,
-                        &scan_id,
-                    );
-                    runner
-                        .journal
-                        .as_mut()
-                        .expect("scan journal opened above")
-                        .emit(&store, EventType::ScanFailed, &failed)
-                        .await?;
-                    let _ = store.close().await;
-                    println!("scan_id: {scan_id}");
-                    println!("report_id: {report_id}");
-                    println!("snapshot: {}", snapshot_path.display());
-                    return Ok(ExitCode::OperationalFailure);
+                        .await;
+                    }
+                }
+            } else if machine_jsonl {
+                match ReportPipeline::stage_and_retain(
+                    &store,
+                    &lib_inputs,
+                    &staging_dir(&cfg.state_dir),
+                    &snapshots_dir(&cfg.state_dir),
+                    finished_ms,
+                )
+                .await
+                {
+                    Ok(_) => true,
+                    Err(e) => {
+                        let err = identity::scrub_text(&e.to_string());
+                        eprintln!("repo-scan: snapshot staging failed: {err}");
+                        store
+                            .update_scan_state(
+                                &scan_id,
+                                &config::scan_state_name("failed", state_roots.as_deref()),
+                                Some(&config::encode_outcome(
+                                    1,
+                                    Some(discovery_code),
+                                    &report_id,
+                                    false,
+                                    Some(generation),
+                                )),
+                                None,
+                                store::now_ms(),
+                            )
+                            .await?;
+                        journal_emission_failed(&mut runner, &store, cfg, &scan_id, &err).await?;
+                        let _ = store.close().await;
+                        return scan_failure_tail(
+                            cfg,
+                            &scan_id,
+                            &report_id,
+                            &snapshot_path,
+                            explicit,
+                        )
+                        .await;
+                    }
+                }
+            } else if explicit_human {
+                // Explicit human lane: retain, then render the stable
+                // plain text (same snapshot the JSON lane prints).
+                match ReportPipeline::stage_and_retain(
+                    &store,
+                    &lib_inputs,
+                    &staging_dir(&cfg.state_dir),
+                    &snapshots_dir(&cfg.state_dir),
+                    finished_ms,
+                )
+                .await
+                {
+                    Ok(snapshot) => {
+                        let stdout = std::io::stdout();
+                        let mut out = stdout.lock();
+                        print_snapshot_human(&snapshot, &mut out)?;
+                        true
+                    }
+                    Err(e) => {
+                        let err = identity::scrub_text(&e.to_string());
+                        eprintln!("repo-scan: human report failed: {err}");
+                        store
+                            .update_scan_state(
+                                &scan_id,
+                                &config::scan_state_name("failed", state_roots.as_deref()),
+                                Some(&config::encode_outcome(
+                                    1,
+                                    Some(discovery_code),
+                                    &report_id,
+                                    false,
+                                    Some(generation),
+                                )),
+                                None,
+                                store::now_ms(),
+                            )
+                            .await?;
+                        journal_emission_failed(&mut runner, &store, cfg, &scan_id, &err).await?;
+                        let _ = store.close().await;
+                        return scan_failure_tail(
+                            cfg,
+                            &scan_id,
+                            &report_id,
+                            &snapshot_path,
+                            explicit,
+                        )
+                        .await;
+                    }
+                }
+            } else {
+                let stdout = std::io::stdout();
+                let mut terminal = stdout.lock();
+                match ReportPipeline::emit_to_terminal(
+                    &store,
+                    &lib_inputs,
+                    &staging_dir(&cfg.state_dir),
+                    &snapshots_dir(&cfg.state_dir),
+                    finished_ms,
+                    &mut terminal,
+                )
+                .await
+                {
+                    Ok(_) => true,
+                    Err(e) => {
+                        let err = identity::scrub_text(&e.to_string());
+                        eprintln!("repo-scan: terminal report failed: {err}");
+                        store
+                            .update_scan_state(
+                                &scan_id,
+                                &config::scan_state_name("failed", state_roots.as_deref()),
+                                Some(&config::encode_outcome(
+                                    1,
+                                    Some(discovery_code),
+                                    &report_id,
+                                    false,
+                                    Some(generation),
+                                )),
+                                None,
+                                store::now_ms(),
+                            )
+                            .await?;
+                        journal_emission_failed(&mut runner, &store, cfg, &scan_id, &err).await?;
+                        let _ = store.close().await;
+                        return scan_failure_tail(
+                            cfg,
+                            &scan_id,
+                            &report_id,
+                            &snapshot_path,
+                            explicit,
+                        )
+                        .await;
+                    }
                 }
             }
         }
     };
+    // Machine lanes with `--report`: the file is published above; the
+    // stdout document is the retained snapshot bytes (json), the
+    // journal replay after close (jsonl), or the plain render (human).
+    if machine_json && report_dest.is_some() {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        print_snapshot_json(&snapshot_path, &mut out)?;
+    } else if explicit_human && report_dest.is_some() {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        print_snapshot_human(&snapshot_path, &mut out)?;
+    }
+    // Completed snapshots are retained bounded (case 17); referenced
+    // snapshots (including this scan's, once the outcome below binds
+    // it) are never pruned. Best-effort, never fatal.
+    prune_old_snapshots(&store, &cfg.state_dir).await;
     let exit = if outcome.interrupted {
         store
             .update_scan_state(
@@ -2077,6 +2565,17 @@ async fn run_scan_inner(
         .emit(&store, terminal, &terminal_records)
         .await?;
     let _ = store.close().await;
+    // Wave2b success tails: machine lanes already printed (json) or
+    // replay below (jsonl); human lanes print the legacy footers.
+    if machine_jsonl {
+        // A closed consumer ends quietly with the scan's exit code;
+        // replay corruption fails loudly (never a silent tail).
+        let _ = scan_jsonl_tail(cfg, &scan_id).await?;
+        return Ok(exit);
+    }
+    if machine_json {
+        return Ok(exit);
+    }
     println!("scan_id: {scan_id}");
     println!("generation: {generation}");
     println!("report_id: {report_id}");
@@ -8073,7 +8572,12 @@ fn location_found_records(
 const BRANCH_BATCH_CHUNK: usize = 500;
 
 /// One branch record inside a `branch_batch` payload. Byte-exact fields
-/// pair lossy text with hex; oids are hex ASCII already.
+/// pair lossy text with hex; oids are hex ASCII already. Wave2b: every
+/// record also carries the branch-vs-upstream comparison
+/// (`comparison`/`ahead`/`behind`, additive envelope fields) matching
+/// the persisted `refs` row — local branches carry their computed
+/// label, every other kind carries `pending`/null exactly like the
+/// final JSON report does.
 #[allow(clippy::too_many_arguments)]
 fn branch_record_value(
     id: &str,
@@ -8084,6 +8588,9 @@ fn branch_record_value(
     symbolic_target: Option<&[u8]>,
     upstream: Option<&[u8]>,
     state: &str,
+    comparison: &str,
+    ahead: Option<u64>,
+    behind: Option<u64>,
 ) -> serde_json::Value {
     serde_json::json!({
         "id": id,
@@ -8097,6 +8604,9 @@ fn branch_record_value(
         "upstream": upstream.map(|u| String::from_utf8_lossy(u).into_owned()),
         "upstream_hex": upstream.map(config::encode_hex),
         "state": state,
+        "comparison": comparison,
+        "ahead": ahead,
+        "behind": behind,
     })
 }
 
@@ -10254,9 +10764,11 @@ async fn persist_analysis(
         let due = TursoStore::buffer_upsert_ref(&mut runner.batch, &new_ref, now_ms);
         flush_if_due(runner, store, due).await?;
         // Step 10 comparison label (local branches only; the map
-        // holds no entry for other kinds).
-        if persist_comparison {
-            if let Some(comparison) = reads.comparisons.get(&reference.name) {
+        // holds no entry for other kinds). The `branch_batch` record
+        // carries the same triple the row persists (Wave2b), so the
+        // event stream and the final JSON agree branch-by-branch.
+        let (comparison_state, ahead, behind) = match reads.comparisons.get(&reference.name) {
+            Some(comparison) if persist_comparison => {
                 let due = TursoStore::buffer_update_ref_comparison(
                     &mut runner.batch,
                     &ref_id,
@@ -10265,8 +10777,10 @@ async fn persist_analysis(
                     comparison.behind,
                 );
                 flush_if_due(runner, store, due).await?;
+                (comparison.state, comparison.ahead, comparison.behind)
             }
-        }
+            _ => ("pending", None, None),
+        };
         branch_values.push(branch_record_value(
             &ref_id,
             kind,
@@ -10276,6 +10790,9 @@ async fn persist_analysis(
             symbolic,
             upstream.as_deref(),
             state,
+            comparison_state,
+            ahead,
+            behind,
         ));
     }
     // The ref rows above commit with these batches: one `branch_batch`
@@ -11808,7 +12325,10 @@ async fn persist_remote_attempt(
 /// persist. All git spawns run inside the `with_wait_cancel` scope
 /// (SIGINT-aware) while the `FallbackGit` borrow is live; the borrow
 /// ends before any `&mut runner` persist below (NLL), so gathering
-/// never overlaps mutation.
+/// never overlaps mutation. Returns the tracking refs this attempt
+/// observed `current` (Wave2b: the fetch-comparison recompute set) —
+/// `None` when nothing was fetched or the attempt cannot relabel
+/// (resume-skip, unsupported, failed, or a failed upstream audit).
 #[allow(clippy::too_many_arguments)]
 async fn fetch_one_remote(
     runner: &mut Runner,
@@ -11819,14 +12339,14 @@ async fn fetch_one_remote(
     existing_refs: &HashMap<Vec<u8>, String>,
     started_ms: i64,
     outcome: &mut FetchOutcome,
-) -> repo_scan::Result<()> {
+) -> repo_scan::Result<Option<Vec<Vec<u8>>>> {
     // Resume: a `success` recorded during this scan is completed work,
     // never repeated. `failed` retries; `unsupported` re-verdicts
     // (re-inspection is local-only and config may have changed).
     if let Some(prev) = store.get_remote_refresh(&inst.id, remote_name).await? {
         if prev.status == "success" && prev.observed_at_ms >= started_ms {
             outcome.skipped += 1;
-            return Ok(());
+            return Ok(None);
         }
     }
     // Config keys are built from the remote name; a non-UTF-8 name
@@ -11853,7 +12373,7 @@ async fn fetch_one_remote(
             )
             .await?;
             outcome.unsupported += 1;
-            return Ok(());
+            return Ok(None);
         }
     };
     if runner.fallback().is_none() {
@@ -11872,7 +12392,7 @@ async fn fetch_one_remote(
         )
         .await?;
         outcome.unsupported += 1;
-        return Ok(());
+        return Ok(None);
     }
     let attempt: GitAttempt = {
         // Checked above; `fallback()` caches, so this never re-probes.
@@ -11915,7 +12435,14 @@ async fn fetch_one_remote(
         "failed" => outcome.failed += 1,
         _ => outcome.unsupported += 1,
     }
-    Ok(())
+    // Only a labeled success feeds the comparison recompute: failed
+    // audits re-observe oids but label nothing `current`, and
+    // excluded/deleted refs stay `stale` — never a false `current`.
+    if attempt.status == "success" && attempt.label {
+        Ok(Some(attempt.current))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Refresh every fetch-role remote of one store. Push-only remotes
@@ -11940,12 +12467,15 @@ async fn fetch_one_store(
     // branches take the INSERT path.
     let refs = store.list_refs(&inst.id).await?;
     let existing: HashMap<Vec<u8>, String> = refs.into_iter().map(|r| (r.name, r.id)).collect();
+    // Wave2b: union of tracking refs this store's fetches observed
+    // `current` — the comparison-recompute set for this store.
+    let mut current: HashSet<Vec<u8>> = HashSet::new();
     for remote in remotes.iter().filter(|r| r.role == "fetch") {
         if interrupted() {
             outcome.interrupted = true;
             return Ok(());
         }
-        fetch_one_remote(
+        if let Some(names) = fetch_one_remote(
             runner,
             store,
             cancel,
@@ -11955,8 +12485,113 @@ async fn fetch_one_store(
             started_ms,
             outcome,
         )
-        .await?;
+        .await?
+        {
+            current.extend(names);
+        }
     }
+    if !current.is_empty() && !interrupted() {
+        // The recompute reads post-fetch oids from the catalog, so the
+        // buffered ref updates commit before it runs.
+        flush_runner_batch(runner, store).await?;
+        recompute_fetch_comparisons(runner, store, inst, &current).await?;
+    }
+    Ok(())
+}
+
+/// Recompute branch-vs-upstream comparisons after a successful fetch
+/// (Wave2b): every LOCAL branch whose resolved upstream is in
+/// `current` (successfully re-observed by this store's fetch) is
+/// re-compared from the post-fetch catalog oids and relabeled. Only
+/// those branches move: locals tracking excluded, deleted, failed, or
+/// unfetched refs keep their analysis-pass label, and excluded/deleted
+/// refs stay `stale` — no false `current`, no recompute without a
+/// fresh observation. Skipped entirely on pre-v6 catalogs (comparisons
+/// read `pending`/null there).
+async fn recompute_fetch_comparisons(
+    runner: &mut Runner,
+    store: &TursoStore,
+    inst: &EmittedInstance,
+    current: &HashSet<Vec<u8>>,
+) -> repo_scan::Result<()> {
+    if !store.supports_ref_comparison().await? {
+        return Ok(());
+    }
+    let refs = store.list_refs(&inst.id).await?;
+    // Post-fetch tip map from the catalog rows (local tips are
+    // untouched by fetch; upstream tips are the re-observed oids).
+    let mut tips: HashMap<&[u8], (&str, &str)> = HashMap::new();
+    for row in &refs {
+        let (Some(oid), Some(algo)) = (row.oid.as_deref(), row.algo.as_deref()) else {
+            continue;
+        };
+        let Ok(hex) = std::str::from_utf8(oid) else {
+            continue;
+        };
+        tips.insert(row.name.as_slice(), (hex, algo));
+    }
+    let git_dir = config::path_from_bytes(inst.git_path.clone());
+    let common_dir = config::path_from_bytes(inst.common_path.clone());
+    let cache = git::graph::ComparisonCache::new();
+    // The fallback borrow ends before any `&mut runner` buffering
+    // below: compare first (immutable), persist after (mutable).
+    let comparisons: Vec<(String, &'static str, Option<u64>, Option<u64>)> = {
+        let Some(fallback) = runner.fallback() else {
+            return Ok(());
+        };
+        let ctx = git::graph::CompareContext {
+            git_dir: &git_dir,
+            common_dir: &common_dir,
+            store_id: &inst.id,
+            work_tree: None,
+            cache: Some(&cache),
+            fallback: Some(fallback),
+        };
+        let mut out = Vec::new();
+        for row in &refs {
+            if row.kind != "local" {
+                continue;
+            }
+            let Some(upstream) = row.upstream.as_deref() else {
+                continue;
+            };
+            if !current.contains(upstream) {
+                continue;
+            }
+            let local = tips.get(row.name.as_slice()).copied();
+            let (upstream_hex, upstream_algo, upstream_known) = match tips.get(upstream).copied() {
+                Some((hex, algo)) => (Some(hex), Some(algo), true),
+                None => (None, None, false),
+            };
+            let branch_tips = git::graph::BranchTips {
+                local_hex: local.map(|(hex, _)| hex),
+                local_algo: local.map(|(_, algo)| algo),
+                upstream: Some(upstream),
+                upstream_hex,
+                upstream_algo,
+                upstream_known,
+            };
+            let comparison = git::graph::compare_branch(&ctx, &branch_tips);
+            out.push((
+                row.id.clone(),
+                comparison.state,
+                comparison.ahead,
+                comparison.behind,
+            ));
+        }
+        out
+    };
+    for (ref_id, state, ahead, behind) in &comparisons {
+        let due = TursoStore::buffer_update_ref_comparison(
+            &mut runner.batch,
+            ref_id,
+            state,
+            *ahead,
+            *behind,
+        );
+        flush_if_due(runner, store, due).await?;
+    }
+    flush_runner_batch(runner, store).await?;
     Ok(())
 }
 
@@ -11970,11 +12605,11 @@ async fn fetch_one_store(
 /// record + journal. Sequential: one network operation at a time
 /// (N=1 bounded worker); every spawn carries `FETCH_TIMEOUT` plus
 /// the SIGINT-aware cancel scope, and `interrupted()` is polled
-/// between stores and remotes. Comparison recompute after fetch is a
-/// no-op: comparisons persist from the analysis pass
-/// (`compute_branch_comparisons`) and fetch does not refresh them,
-/// so freshness labels plus re-observed oids ARE the fetch output.
-/// A post-fetch comparison may read stale until the next analysis.
+/// between stores and remotes. Wave2b: after each store's fetches,
+/// local branches tracking refs this fetch observed `current` get
+/// their comparison recomputed from the post-fetch oids
+/// ([`recompute_fetch_comparisons`]); every other branch keeps its
+/// analysis-pass label, and excluded/deleted refs stay `stale`.
 async fn run_fetch_phase(
     runner: &mut Runner,
     store: &TursoStore,
@@ -12320,7 +12955,13 @@ async fn build_lib_inputs(
         scope: inputs.scope_policy.clone(),
         scan_state: inputs.scan_state.clone(),
         started_at_ms: inputs.started_ms,
-        finished_at_ms: Some(inputs.finished_ms),
+        // Wave2b live snapshots (`scan_state == "running"`) have no
+        // finish time yet; terminal snapshots always do.
+        finished_at_ms: if inputs.scan_state == "running" {
+            None
+        } else {
+            Some(inputs.finished_ms)
+        },
         superseded_by: None,
         cached: false,
         status_mode: inputs.status_mode,
@@ -12801,6 +13442,105 @@ fn scan_still_running(state: &str) -> bool {
     state == "running" || state.starts_with("running:")
 }
 
+/// Replay committed journal rows as JSONL envelopes, oldest first,
+/// until a short page (the reader caught up to the tip). Shared by
+/// `query --scan` (initial replay + every follow poll) and the
+/// `scan`/`resume --format jsonl` tails: one replay core, one envelope
+/// shape, one state model. Returns `Ok(false)` when the consumer went
+/// away (broken pipe): the writer stops quietly with committed
+/// catalog records untouched.
+async fn replay_scan_pages(
+    store: &TursoStore,
+    scan_id: &str,
+    after: &mut Option<(u64, u64)>,
+    reset_first: &mut bool,
+    out: &mut impl std::io::Write,
+    terminal_seen: &mut bool,
+) -> repo_scan::Result<bool> {
+    loop {
+        let rows =
+            read_scan_events_after_position(store, scan_id, *after, REPLAY_PAGE_ROWS).await?;
+        let short_page = rows.len() < REPLAY_PAGE_ROWS as usize;
+        for row in &rows {
+            let mut env = envelope_for_row(row)?;
+            if *reset_first {
+                env.reset = true;
+                *reset_first = false;
+            }
+            let line =
+                serde_json::to_string(&env).map_err(|e| repo_scan::Error::Report(e.to_string()))?;
+            if !write_jsonl_line(out, &line)? {
+                return Ok(false);
+            }
+            *after = Some((row.catalog_rev, row.event_offset));
+            *terminal_seen |= is_terminal_event(env.event_type);
+        }
+        if short_page {
+            break;
+        }
+    }
+    Ok(true)
+}
+
+/// Flush a JSONL replay writer. `Ok(false)` is a broken pipe (quiet
+/// stop, catalog untouched); any other error fails loudly.
+fn flush_replay(out: &mut impl std::io::Write) -> repo_scan::Result<bool> {
+    match out.flush() {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
+        Err(e) => Err(repo_scan::Error::Io(format!(
+            "cannot flush replay output: {e}"
+        ))),
+    }
+}
+
+/// Print one retained scan snapshot to `out` as a single JSON document
+/// (Wave2b `query --scan --format json`, `resume --format json`): the
+/// verified snapshot bytes verbatim plus one newline — the same state
+/// the human and JSONL lanes read. Returns `Ok(false)` on a broken
+/// pipe (quiet stop).
+fn print_snapshot_json(snapshot: &Path, out: &mut impl std::io::Write) -> repo_scan::Result<bool> {
+    use repo_scan::report::builder::verify_bound_report;
+    use repo_scan::report::publish::BoundStaged;
+    let bound = BoundStaged::open(snapshot)?;
+    verify_bound_report(&bound)?;
+    repo_scan::report::output::write_machine_bytes(out, bound.bytes())
+}
+
+/// Render one retained scan snapshot to `out` as stable plain text
+/// (Wave2b `query --scan --format human`, explicit `scan --format
+/// human`): deterministic, no ANSI, no cursor codes, one
+/// `\n`-terminated line per row. Same snapshot, same totals as JSON.
+fn print_snapshot_human(snapshot: &Path, out: &mut impl std::io::Write) -> repo_scan::Result<()> {
+    use repo_scan::report::builder::verify_bound_report;
+    use repo_scan::report::live_text::render_plain;
+    use repo_scan::report::publish::BoundStaged;
+    let bound = BoundStaged::open(snapshot)?;
+    let report = verify_bound_report(&bound)?;
+    // A closed human consumer ends quietly (like the machine lanes);
+    // any other IO error fails loudly.
+    match out
+        .write_all(render_plain(&report).as_bytes())
+        .and_then(|()| out.flush())
+    {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(repo_scan::Error::from(e)),
+    }
+}
+
+/// Resolve the retained snapshot for a scan row: the outcome's
+/// `report_id` mapped into the snapshots directory. `None` when the
+/// scan never staged (still running, or failed before staging).
+fn snapshot_for_scan(state_dir: &Path, row: &store::ScanRow) -> Option<PathBuf> {
+    let report_id = row
+        .outcome
+        .as_deref()
+        .and_then(config::parse_outcome)
+        .map(|d| d.report_id)?;
+    config::snapshot_path(state_dir, &report_id).ok()
+}
+
 /// Where a scan replay starts (Step 12): an optional strictly-after
 /// `(catalog_rev, event_offset)` position plus whether the first
 /// delivered envelope must carry `reset:true`.
@@ -12982,14 +13722,26 @@ async fn read_scan_events_after_position(
     Ok(out)
 }
 
-/// `query --scan SCAN_ID`: replay the scan's journaled event stream as
-/// JSONL envelopes, oldest first, in `(catalog_rev, event_offset)` order.
-/// `--after CURSOR` resumes strictly after the cursor's position; a
-/// cursor the retained window no longer covers (or that diverges from
-/// the journaled row) replays the retained window from its start with
-/// `reset:true` on the first envelope. `--follow` keeps polling a
-/// running scan until the terminal event, Ctrl-C (exit 130), or a broken
-/// pipe (quiet exit 0). Read-only: no owner lock, no epoch claim,
+/// `query --scan SCAN_ID`: serve one saved scan in the requested lane
+/// (Wave2b output matrix, one state model):
+///
+/// - `--format jsonl` (default when redirected): replay the journaled
+///   event stream as JSONL envelopes, oldest first, in `(catalog_rev,
+///   event_offset)` order. `--after CURSOR` resumes strictly after the
+///   cursor's position; a cursor the retained window no longer covers
+///   (or that diverges from the journaled row) replays the retained
+///   window from its start with `reset:true` on the first envelope.
+///   `--follow` keeps polling a running scan until the terminal event,
+///   Ctrl-C (exit 130), or a broken pipe (quiet exit 0).
+/// - `--format json` (no `--follow`; `--follow --format json` is
+///   rejected by `selection()`): the scan's verified retained snapshot
+///   as one JSON document — the same bytes the human lane renders and
+///   the JSONL lane folds into.
+/// - `--format human` (no `--follow`; human follow stays in the TUI
+///   slice): the retained snapshot as stable plain text.
+///
+/// Machine lanes carry no prose, ANSI, or cursor codes on stdout;
+/// diagnostics go to stderr. Read-only: no owner lock, no epoch claim,
 /// servable while a scan holds the write lock. Unknown scan IDs exit 2
 /// like `resume` on a missing ID.
 async fn run_query_scan_replay(
@@ -12999,45 +13751,27 @@ async fn run_query_scan_replay(
 ) -> repo_scan::Result<ExitCode> {
     use repo_scan::cli::OutputFormat;
     // Explicit format wins; the default is JSONL when redirected, the
-    // live human view on a terminal (human replay: TUI slice).
+    // live human view on a terminal.
     let format = match args.format {
         Some(f) => f,
         None if !std::io::stdout().is_terminal() => OutputFormat::Jsonl,
-        None => {
-            eprintln!(
-                "repo-scan: not yet implemented: query --scan human replay executes in the TUI \
-                 slice; use --format jsonl for now"
-            );
-            return Ok(ExitCode::OperationalFailure);
-        }
+        None => OutputFormat::Human,
     };
-    if format != OutputFormat::Jsonl {
-        // `--follow --format json` never reaches here: `selection()`
-        // rejects it. Plain `--format json` folds the journal into one
-        // snapshot in a later slice.
-        eprintln!(
-            "repo-scan: not yet implemented: query --scan --format json executes in a later \
-             slice; use --format jsonl for now"
-        );
-        return Ok(ExitCode::OperationalFailure);
-    }
     let db_path = store::owner::catalog_db_path(&cfg.state_dir);
     if !db_path.exists() {
-        println!("cached: true");
-        println!("suitable_catalog: false");
-        println!(
-            "note: no catalog at {}; no live verification performed",
+        // Machine discipline: even the degraded answer stays off the
+        // machine lanes — stderr only, empty stdout, exit 3.
+        eprintln!(
+            "repo-scan: cached query: no catalog at {}; no live verification performed",
             db_path.display()
         );
         return Ok(ExitCode::Incomplete);
     }
     let mut store = TursoStore::open_read_only(&db_path).await?;
     if !catalog_bound_to_marker(&store, &cfg.state_dir).await? {
-        println!("cached: true");
-        println!("suitable_catalog: false");
-        println!(
-            "note: catalog at {} is not bound to this tool's ownership marker; \
-             no live verification performed",
+        eprintln!(
+            "repo-scan: cached query: catalog at {} is not bound to this tool's ownership \
+             marker; no live verification performed",
             db_path.display()
         );
         let _ = store.close().await;
@@ -13049,6 +13783,45 @@ async fn run_query_scan_replay(
             "no such scan: {scan_id}"
         )));
     };
+    // Snapshot lanes (never `--follow`): `--follow --format json` is
+    // rejected by `selection()`; human follow stays unimplemented.
+    if format != OutputFormat::Jsonl {
+        if args.follow {
+            let _ = store.close().await;
+            eprintln!(
+                "repo-scan: not yet implemented: query --scan --follow --format human executes \
+                 in the TUI slice; use --format jsonl for now"
+            );
+            return Ok(ExitCode::OperationalFailure);
+        }
+        let code = match snapshot_for_scan(&cfg.state_dir, &scan) {
+            Some(snapshot) if snapshot.is_file() => {
+                let stdout = std::io::stdout();
+                let mut out = std::io::BufWriter::new(stdout.lock());
+                match format {
+                    OutputFormat::Json => {
+                        print_snapshot_json(&snapshot, &mut out)?;
+                    }
+                    _ => {
+                        print_snapshot_human(&snapshot, &mut out)?;
+                    }
+                }
+                // A broken pipe here is a quiet stop (exit 0 either
+                // way); any other flush error fails loudly.
+                let _ = flush_replay(&mut out)?;
+                ExitCode::Success
+            }
+            _ => {
+                eprintln!(
+                    "repo-scan: query: scan {scan_id} has no retained snapshot yet; \
+                     the scan is still running or failed before staging"
+                );
+                ExitCode::Incomplete
+            }
+        };
+        let _ = store.close().await;
+        return Ok(code);
+    }
     let start = match &args.after {
         None => ReplayPosition {
             after: None,
@@ -13072,40 +13845,22 @@ async fn run_query_scan_replay(
     // Initial replay: page through committed rows; a short page (or an
     // empty one) means the reader caught up to the tip.
     let mut terminal_seen = false;
-    loop {
-        let rows =
-            read_scan_events_after_position(&store, scan_id, after, REPLAY_PAGE_ROWS).await?;
-        let short_page = rows.len() < REPLAY_PAGE_ROWS as usize;
-        for row in &rows {
-            let mut env = envelope_for_row(row)?;
-            if reset_first {
-                env.reset = true;
-                reset_first = false;
-            }
-            let line =
-                serde_json::to_string(&env).map_err(|e| repo_scan::Error::Report(e.to_string()))?;
-            if !write_jsonl_line(&mut out, &line)? {
-                let _ = store.close().await;
-                return Ok(ExitCode::Success);
-            }
-            after = Some((row.catalog_rev, row.event_offset));
-            terminal_seen |= is_terminal_event(env.event_type);
-        }
-        if short_page {
-            break;
-        }
+    if !replay_scan_pages(
+        &store,
+        scan_id,
+        &mut after,
+        &mut reset_first,
+        &mut out,
+        &mut terminal_seen,
+    )
+    .await?
+    {
+        let _ = store.close().await;
+        return Ok(ExitCode::Success);
     }
-    match out.flush() {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-            let _ = store.close().await;
-            return Ok(ExitCode::Success);
-        }
-        Err(e) => {
-            return Err(repo_scan::Error::Io(format!(
-                "cannot flush replay output: {e}"
-            )));
-        }
+    if !flush_replay(&mut out)? {
+        let _ = store.close().await;
+        return Ok(ExitCode::Success);
     }
     if !args.follow || terminal_seen {
         let _ = store.close().await;
@@ -13140,34 +13895,22 @@ async fn run_query_scan_replay(
             );
             return Ok(ExitCode::Incomplete);
         }
-        let rows =
-            read_scan_events_after_position(&store, scan_id, after, REPLAY_PAGE_ROWS).await?;
-        for row in &rows {
-            let mut env = envelope_for_row(row)?;
-            if reset_first {
-                env.reset = true;
-                reset_first = false;
-            }
-            let line =
-                serde_json::to_string(&env).map_err(|e| repo_scan::Error::Report(e.to_string()))?;
-            if !write_jsonl_line(&mut out, &line)? {
-                let _ = store.close().await;
-                return Ok(ExitCode::Success);
-            }
-            after = Some((row.catalog_rev, row.event_offset));
-            terminal_seen |= is_terminal_event(env.event_type);
+        if !replay_scan_pages(
+            &store,
+            scan_id,
+            &mut after,
+            &mut reset_first,
+            &mut out,
+            &mut terminal_seen,
+        )
+        .await?
+        {
+            let _ = store.close().await;
+            return Ok(ExitCode::Success);
         }
-        match out.flush() {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                let _ = store.close().await;
-                return Ok(ExitCode::Success);
-            }
-            Err(e) => {
-                return Err(repo_scan::Error::Io(format!(
-                    "cannot flush replay output: {e}"
-                )));
-            }
+        if !flush_replay(&mut out)? {
+            let _ = store.close().await;
+            return Ok(ExitCode::Success);
         }
         if terminal_seen {
             let _ = store.close().await;
@@ -13413,6 +14156,7 @@ async fn run_resume_inner(
     cfg: &config::Config,
     args: &repo_scan::cli::ResumeArgs,
 ) -> repo_scan::Result<ExitCode> {
+    use repo_scan::cli::OutputFormat;
     let (guard, store) = open_owned_with_wait(&cfg.state_dir).await?;
     let Some(row) = store.get_scan(&args.scan_id).await? else {
         let _ = store.close().await;
@@ -13434,6 +14178,54 @@ async fn run_resume_inner(
                     row.id
                 )));
             };
+            let code = match recorded.exit_code {
+                0 => ExitCode::Success,
+                3 => ExitCode::Incomplete,
+                130 => ExitCode::Interrupted,
+                _ => ExitCode::OperationalFailure,
+            };
+            // Wave2b output matrix: explicit `--format` wins, else the
+            // legacy footers. The snapshot lanes read the same
+            // retained bytes the scan lanes wrote.
+            if args.format == Some(OutputFormat::Json) {
+                let snapshot = config::snapshot_path(&cfg.state_dir, &recorded.report_id)?;
+                let stdout = std::io::stdout();
+                let mut out = std::io::BufWriter::new(stdout.lock());
+                print_snapshot_json(&snapshot, &mut out)?;
+                let _ = flush_replay(&mut out)?;
+                let _ = store.close().await;
+                drop(guard);
+                return Ok(code);
+            }
+            if args.format == Some(OutputFormat::Jsonl) {
+                let stdout = std::io::stdout();
+                let mut out = std::io::BufWriter::new(stdout.lock());
+                let mut after = None;
+                let mut reset_first = false;
+                let mut terminal_seen = false;
+                replay_scan_pages(
+                    &store,
+                    &row.id,
+                    &mut after,
+                    &mut reset_first,
+                    &mut out,
+                    &mut terminal_seen,
+                )
+                .await?;
+                let _ = flush_replay(&mut out)?;
+                let _ = store.close().await;
+                drop(guard);
+                return Ok(code);
+            }
+            if args.format == Some(OutputFormat::Human) {
+                if let Some(snapshot) = snapshot_for_scan(&cfg.state_dir, &row) {
+                    if snapshot.is_file() {
+                        let stdout = std::io::stdout();
+                        let mut out = stdout.lock();
+                        print_snapshot_human(&snapshot, &mut out)?;
+                    }
+                }
+            }
             let snapshot = config::snapshot_path(&cfg.state_dir, &recorded.report_id)?;
             println!("scan_id: {}", row.id);
             println!("state: complete (replayed; no new scan started)");
@@ -13441,14 +14233,26 @@ async fn run_resume_inner(
             println!("snapshot: {}", snapshot.display());
             let _ = store.close().await;
             drop(guard);
-            Ok(match recorded.exit_code {
-                0 => ExitCode::Success,
-                3 => ExitCode::Incomplete,
-                130 => ExitCode::Interrupted,
-                _ => ExitCode::OperationalFailure,
-            })
+            Ok(code)
         }
         "superseded" => {
+            // Wave2b: the machine lanes carry one JSON object (no
+            // prose); human keeps the legacy footers.
+            if args.format == Some(OutputFormat::Json) || args.format == Some(OutputFormat::Jsonl) {
+                let stdout = std::io::stdout();
+                let mut out = stdout.lock();
+                let object = serde_json::json!({
+                    "scan_id": row.id,
+                    "state": "superseded",
+                    "successor": row.successor_id.as_deref().unwrap_or("unknown"),
+                });
+                let line = serde_json::to_string(&object)
+                    .map_err(|e| repo_scan::Error::Report(e.to_string()))?;
+                let _ = repo_scan::report::output::write_machine_bytes(&mut out, line.as_bytes())?;
+                let _ = store.close().await;
+                drop(guard);
+                return Ok(ExitCode::Incomplete);
+            }
             println!("scan_id: {}", row.id);
             println!("state: superseded (no target or destination switch performed)");
             println!(
@@ -13471,17 +14275,18 @@ async fn run_resume_inner(
                     let snapshot = config::snapshot_path(&cfg.state_dir, &recorded.report_id)?;
                     if snapshot.exists() {
                         let code =
-                            retry_publication(cfg, &store, &row, recorded, &snapshot).await?;
+                            retry_publication(cfg, &store, &row, recorded, &snapshot, args.format)
+                                .await?;
                         let _ = store.close().await;
                         drop(guard);
                         return Ok(code);
                     }
                 }
             }
-            continue_saved_scan(cfg, guard, store, &row, saved_roots).await
+            continue_saved_scan(cfg, guard, store, &row, saved_roots, args.format).await
         }
         "running" | "interrupted" | "incomplete" => {
-            continue_saved_scan(cfg, guard, store, &row, saved_roots).await
+            continue_saved_scan(cfg, guard, store, &row, saved_roots, args.format).await
         }
         other => {
             let _ = store.close().await;
@@ -13495,12 +14300,15 @@ async fn run_resume_inner(
 }
 
 /// Retry a failed report publication from the retained snapshot bytes.
+/// Wave2b: the tail follows the resume `--format` (machine lanes stay
+/// machine-clean; human keeps the legacy footers).
 async fn retry_publication(
     cfg: &config::Config,
     store: &TursoStore,
     row: &store::ScanRow,
     recorded: &config::DecodedOutcome,
     snapshot: &Path,
+    format: Option<repo_scan::cli::OutputFormat>,
 ) -> repo_scan::Result<ExitCode> {
     let discovery = recorded.discovery_code.unwrap_or(3);
     let dest = row
@@ -13577,6 +14385,36 @@ async fn retry_publication(
             store::now_ms(),
         )
         .await?;
+    if format == Some(repo_scan::cli::OutputFormat::Json) {
+        let stdout = std::io::stdout();
+        let mut out = std::io::BufWriter::new(stdout.lock());
+        print_snapshot_json(snapshot, &mut out)?;
+        let _ = flush_replay(&mut out)?;
+        return Ok(exit);
+    }
+    if format == Some(repo_scan::cli::OutputFormat::Jsonl) {
+        let stdout = std::io::stdout();
+        let mut out = std::io::BufWriter::new(stdout.lock());
+        let mut after = None;
+        let mut reset_first = false;
+        let mut terminal_seen = false;
+        replay_scan_pages(
+            store,
+            &row.id,
+            &mut after,
+            &mut reset_first,
+            &mut out,
+            &mut terminal_seen,
+        )
+        .await?;
+        let _ = flush_replay(&mut out)?;
+        return Ok(exit);
+    }
+    if format == Some(repo_scan::cli::OutputFormat::Human) {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        print_snapshot_human(snapshot, &mut out)?;
+    }
     println!("scan_id: {}", row.id);
     println!("state: {state} (publication retried from saved snapshot; no new scan)");
     println!("report_id: {}", recorded.report_id);
@@ -13588,12 +14426,15 @@ async fn retry_publication(
 
 /// Restore a saved non-terminal request and continue its unfinished work.
 /// Releases ownership first: re-entering the scan loop re-acquires it.
+/// Wave2b: an explicit resume `--format` wins, else the scan's saved
+/// format is restored (D6: resume restores ALL saved options).
 async fn continue_saved_scan(
     cfg: &config::Config,
     guard: OwnerGuard,
     store: TursoStore,
     row: &store::ScanRow,
     saved_roots: Option<Vec<PathBuf>>,
+    format: Option<repo_scan::cli::OutputFormat>,
 ) -> repo_scan::Result<ExitCode> {
     // Redact-on-read (RSF-SEC-TARGET-URL, EXACT-2): rows persisted
     // before the CLI boundary reject may hold credential-bearing targets.
@@ -13656,6 +14497,14 @@ async fn continue_saved_scan(
     // marker as a target and fails with InvalidArgs. Legacy rows
     // (NULL) resume single-target via `url_raw` as before.
     let all = row.all_targets.unwrap_or(false);
+    // Wave2b: explicit resume `--format` wins; otherwise restore the
+    // scan's saved format (legacy/NULL rows resume legacy output).
+    let saved_format = match row.format.as_deref() {
+        Some("human") => Some(repo_scan::cli::OutputFormat::Human),
+        Some("json") => Some(repo_scan::cli::OutputFormat::Json),
+        Some("jsonl") => Some(repo_scan::cli::OutputFormat::Jsonl),
+        _ => None,
+    };
     let args = repo_scan::cli::ScanArgs {
         targets: if all { Vec::new() } else { vec![url] },
         all,
@@ -13664,7 +14513,7 @@ async fn continue_saved_scan(
         force_rescan: false,
         status,
         root,
-        format: None,
+        format: format.or(saved_format),
         // v3: restore the saved `--fetch` request; legacy rows (NULL)
         // resume without a fetch phase.
         fetch: row.fetch.unwrap_or(false),

@@ -757,6 +757,33 @@ pub fn shallow_clone(parent: &Path, name: &str, extra_commits: u32, depth: u32) 
     parent.join(name)
 }
 
+/// Local-path clone of `src` into `dst_parent/name` (Wave2b fetch
+/// tests): `origin` points at the absolute source path, so `git fetch`
+/// / `ls-remote` work fully offline with no network and no URL
+/// rewriting. Returns the clone root.
+pub fn clone_local(src: &Path, dst_parent: &Path, name: &str) -> PathBuf {
+    private_dir_0700(dst_parent).unwrap();
+    let src_arg = src.to_string_lossy().into_owned();
+    git(dst_parent, &["clone", "-q", &src_arg, name]);
+    dst_parent.join(name)
+}
+
+/// Append `n` linear commits to the current branch of `dir` (Wave2b
+/// fetch tests: advance an upstream past a clone, or a clone past its
+/// tracking ref). Returns the new tip OID.
+pub fn advance_main(dir: &Path, prefix: &str, n: u32) -> String {
+    let mut tip = String::new();
+    for i in 0..n {
+        tip = commit_file(
+            dir,
+            &format!("{prefix}{i}.txt"),
+            &format!("{prefix} {i}\n"),
+            &format!("{prefix} {i}"),
+        );
+    }
+    tip
+}
+
 /// Repo with `n` linear commits on `main` (`n >= 1`). Returns the
 /// repo root plus tip OIDs oldest-first (index 0 is the initial
 /// commit). Missing-object tests delete one OID's object file.

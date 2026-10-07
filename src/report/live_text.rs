@@ -6,14 +6,15 @@
 //! on each new snapshot; identical reports render byte-identical text.
 //!
 //! Layout: header line, coverage line, totals line, then detail rows
-//! (repositories, checkouts, candidates, errors) capped at
+//! (repositories, checkouts, branches, candidates, errors) capped at
 //! [`MAX_DETAIL_ROWS`] with a `... (N more)` overflow line.
 
 use crate::report::model::Report;
 use std::collections::HashMap;
 
-/// Maximum detail rows (repositories + checkouts + candidates + errors)
-/// emitted before the `... (N more)` overflow line.
+/// Maximum detail rows (repositories + checkouts + branches +
+/// candidates + errors) emitted before the `... (N more)` overflow
+/// line.
 pub const MAX_DETAIL_ROWS: usize = 200;
 
 /// Replacement character for control characters in display text.
@@ -46,10 +47,13 @@ fn sanitize(text: &str) -> String {
 /// lengths. Detail rows follow in vec order:
 /// `R <id> <format> match=<m> <common display>`,
 /// `C <id> kind=<k> avail=<a> head=<state> status=<state>`,
+/// `B <id> kind=<k> cmp=<comparison> ahead=<a|-> behind=<b|-> <display>`,
 /// `? <id> <disposition> <reason>`,
 /// `! <id> <operation> <category> <message>`.
 /// At most [`MAX_DETAIL_ROWS`] detail rows are emitted; the remainder
-/// collapses into one `... (N more)` line.
+/// collapses into one `... (N more)` line. Every record class the
+/// totals count carries its IDs here (within the cap), so the human
+/// lane joins the Wave2b cross-format ID agreement.
 pub fn render_plain(report: &Report) -> String {
     let mut out = String::new();
 
@@ -114,6 +118,18 @@ pub fn render_plain(report: &Report) -> String {
             sanitize(&checkout.availability),
             sanitize(&checkout.head.state),
             sanitize(&checkout.status.state),
+        ));
+    }
+    for branch in &report.branches {
+        let counts = |n: Option<u64>| n.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
+        rows.push(format!(
+            "B {} kind={} cmp={} ahead={} behind={} {}",
+            sanitize(&branch.id),
+            sanitize(&branch.kind),
+            sanitize(&branch.comparison),
+            counts(branch.ahead),
+            counts(branch.behind),
+            sanitize(&branch.name.display),
         ));
     }
     for candidate in &report.candidates {

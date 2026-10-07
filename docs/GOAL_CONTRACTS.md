@@ -110,6 +110,34 @@ Wave1d deltas (Step 12, branch `work/fast-complete-scan`):
   the reader resumes after its own position. Corrupt `--after` stays a usage
   error (exit 2); pruned/beyond-tip cursors stay snapshots (exit 0).
 
+Wave2b deltas (Steps 6 + 12 output matrix, branch `work/fast-complete-scan`):
+
+- `branch_batch` branch records carry `comparison` / `ahead` / `behind`
+  (additive envelope fields): local branches carry the computed triple
+  persisted on the `refs` row, every other kind carries
+  `pending`/null — exactly the final-JSON rendering. Consumers must
+  treat absent triples as `pending`/null (pre-Wave2b journals).
+- Terminal payloads are pinned: `scan_completed`/`scan_incomplete`
+  carry `counts` (matched_per_target, pending, open_gaps,
+  unresolvable, status_pending, event_gaps) + `generation` +
+  `report_id` + `published` + `resume_cmd`; `scan_interrupted`
+  carries `scan_id` + `cursor` + `generation` + `scope` + `options` +
+  `resume_cmd`; `scan_failed` carries `cursor` (last committed event,
+  null when nothing journaled) + `error` (scrubbed) + `resumable`
+  (always true) + `resume_cmd`.
+- JSONL replay folds into the final JSON inventory (case 15):
+  `repository_found` store IDs, `location_found` checkout IDs,
+  `branch_batch` branch IDs + triples, and `error` IDs reconstruct the
+  same records and totals. Proven in `tests/output_impl.rs`, never by
+  self-comparison.
+- Machine stdout discipline: JSON/JSONL lanes emit serialized bytes
+  only — no prose, no ANSI escapes, no cursor codes, no CR bytes.
+  Diagnostics go to stderr. A broken pipe ends the writer quietly
+  (exit 0 for replays; the scan's own exit for scan tails) with
+  committed catalog records untouched.
+- `--follow --format json` stays rejected (exit 2): JSON supplies one
+  snapshot; followers use human or jsonl.
+
 ## D5. Scope key and scheduling (Steps 7–9)
 
 Scope key = normalized roots + volume identities + exclusions + traversal
@@ -137,6 +165,57 @@ Additive. Existing single-URL/local-path commands keep working.
 - `--fetch` help states exactly which refs/objects change; never moves
   branch tips (unsafe refspec → `unsupported` refresh, no write).
 - `--report` = atomic complete-JSON snapshot destination (Step 12 rules).
+
+Wave2b deltas (output matrix, branch `work/fast-complete-scan`):
+
+- One state model: `scan`, `query --scan`, and `resume` serve all
+  lanes from the same retained snapshot bytes (human renders them,
+  json prints them, jsonl replays the journal committed with them).
+  Totals and record IDs agree across lanes for one scan revision.
+- Explicit `--format` wins; no explicit format keeps the legacy
+  output (readable terminal report or `scan_id:`/`report_id:`/
+  `snapshot:`/`report:` footers). Explicit `scan --format human`
+  renders the stable plain-text lane (`src/report/live_text.rs`:
+  header, coverage, totals, `R`/`C`/`B`/`?`/`!` rows, capped at 200
+  with an overflow line) plus the legacy footers; the default
+  terminal rendering is unchanged.
+- `scan --format json` prints one JSON document (the retained
+  snapshot bytes verbatim); with `--report` the file is also
+  published. `scan --format jsonl` retains the snapshot and replays
+  the scan journal. `query --scan --format json` prints the scan's
+  verified retained snapshot verbatim; `--format human` renders it as
+  plain text. `resume --format json|jsonl|human` follows the same
+  lanes (explicit wins, else the scan's saved format is restored).
+- `query --scan --follow --format human` stays unimplemented (TUI
+  slice owns it); it exits 1 with a stderr pointer to jsonl.
+- Live `--report` (case 17): while a scan runs, `--report` holds a
+  live snapshot (`scan.state == "running"`, `finished_at == null`,
+  report ID `<scan-report-id>-live`) replaced atomically at phase
+  boundaries (post-`inventory_ready`, post-analysis, post-fetch) and
+  at most once per 2 s — never a rebuild per discovery. Every
+  concurrent read is valid JSON from exactly one revision. Live ticks
+  are best-effort (a failed tick logs to stderr, never fails the
+  scan) and are never retained: the destination is the replaceable
+  snapshot. Completed snapshots are retained bounded (newest 32;
+  snapshots named by a scan outcome are never pruned).
+
+Consumer-migration notes (README rewrite is a later wave):
+
+- Consumers parsing default scan stdout (`scan_id:` footers) are
+  unaffected: defaults are byte-compatible with Wave2a.
+- New machine consumers should pass an explicit `--format`:
+  `json` for one inventory document, `jsonl` for the event stream
+  (fold per case 15 to rebuild the inventory, dedupe by `seq`,
+  honor `reset:true` by dropping buffered state).
+- `branch_batch` consumers gain `comparison`/`ahead`/`behind` per
+  branch; absent fields mean `pending`/null (old journals).
+- `query --scan` consumers: `--format json` now serves the retained
+  snapshot (previously "not yet implemented"); the no-catalog and
+  unbound-catalog notes moved from stdout to stderr (exit 3,
+  empty machine stdout).
+- `--report` readers may now observe `running` revisions mid-scan
+  before the terminal revision; every read is still one complete
+  JSON document — atomic replacement, no torn reads.
 
 ## D7. Git semantics (Steps 10–11)
 
@@ -172,6 +251,18 @@ Wave2a deltas (Step 10 branch comparison, branch `work/fast-complete-scan`):
   comparison and read `pending` (comparison never runs for them).
 - `--fetch` does NOT recompute comparisons: post-fetch labels may
   read stale until the next analysis pass.
+
+Wave2b deltas (fetch recompute, branch `work/fast-complete-scan`):
+
+- `--fetch` DOES recompute comparisons (supersedes the Wave2a stale
+  note above): after each store's fetches, every local branch whose
+  resolved upstream the fetch observed `current` is re-compared from
+  the post-fetch catalog oids and relabeled. Only those branches
+  move: branches tracking excluded, deleted-upstream, failed, or
+  unfetched refs keep their analysis-pass label. Only successfully
+  observed refs become `current`; excluded and deleted refs stay
+  `stale` — never a false `current`, never a recompute without a
+  fresh observation. Skipped on pre-v6 catalogs.
 Default probes offline + read-only (no helper exec, fetch, hooks, fsmonitor,
 index writes); porcelain-v2 unmerged records parsed byte-safe (NUL-delimited).
 
