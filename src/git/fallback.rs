@@ -3149,16 +3149,15 @@ mod tests {
         // Executable transports refuse (fail closed, no execution).
         assert!(refused_fetch_scheme("ext::sh -c up").is_some());
         assert!(refused_fetch_scheme("  ext::ssh host  ").is_some());
-        // Helper transports refuse when gix recognizes them; otherwise
-        // they stay unparseable and fail honestly downstream (never
-        // executed by the gate itself).
-        if let Ok(parsed) = gix::url::parse("myhelper::/path".trim()) {
-            let is_helper = matches!(
-                parsed.scheme,
-                gix::url::Scheme::Helper(_) | gix::url::Scheme::HelperUrl(_)
-            );
-            assert_eq!(refused_fetch_scheme("myhelper::/path").is_some(), is_helper);
-        }
+        // Remote-helper transports refuse in both spellings, no
+        // vacuous arm: `<name>::<address>` parses as
+        // `Scheme::Helper` (even `ssh::...`, which names
+        // `git-remote-ssh` rather than the built-in transport) and
+        // unknown `<name>://...` as `Scheme::HelperUrl`.
+        assert!(refused_fetch_scheme("myhelper::/path").is_some());
+        assert!(refused_fetch_scheme("my.helper+v2::addr").is_some());
+        assert!(refused_fetch_scheme("ssh::host/path").is_some());
+        assert!(refused_fetch_scheme("myhelper://host/path").is_some());
         // Ordinary transports pass the gate.
         for ok in [
             "/tmp/upstream",

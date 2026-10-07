@@ -1186,6 +1186,19 @@ fn fetch13_repo_uploadpack_refused_without_execution() {
     }
 }
 
+/// Run the binary with `path_dir` prepended to `PATH` (thread-safe:
+/// the child env carries it, never the test process).
+fn run_with_path(args: &[&str], cwd: &Path, state: &Path, path_dir: &Path) -> std::process::Output {
+    let mut paths = vec![path_dir.to_path_buf()];
+    if let Some(rest) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&rest));
+    }
+    let joined = std::env::join_paths(paths).expect("join PATH");
+    let mut command = cmd(state, cwd);
+    command.env("PATH", joined);
+    command.args(args).output().expect("spawn repo-scan")
+}
+
 /// FETCH-GATE-06: a repo-scope `remote.origin.receivepack` refuses the
 /// fetch (`unsupported`) for symmetry with `uploadpack` — a fetch never
 /// reads it, but a repo overriding pack commands is hostile either way.
@@ -1230,4 +1243,79 @@ fn fetch14_repo_receivepack_refused() {
         detail.contains("remote.origin.receivepack"),
         "refusal names the repo-scope key: {detail}"
     );
+}
+
+/// FETCH-GATE-07: a remote-helper transport URL refuses end to end
+/// (`unsupported`) and NOTHING executes: a fake `git-remote-*` helper
+/// on `PATH` would create the sentinel if git ever spawned it, so the
+/// sentinel's absence proves the gate stopped the fetch before any
+/// transport ran.
+#[test]
+fn fetch15_helper_transport_refused_without_execution() {
+    let tmp = fixture::scratch_root("fetch15");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+
+    let (upstream, _) = seed_upstream(&root, "upstream");
+    let clone = clone_from(&root, &upstream, "clone");
+    let sentinel = tmp.path().join("SENTINEL-helper");
+    let bin = tmp.path().join("fakebin");
+    repo_scan::privacy::private_dir_0700(&bin).expect("mkdir");
+    let helper = bin.join("git-remote-rsfetch15");
+    repo_scan::privacy::private_write_0600(
+        &helper,
+        format!("#!/bin/sh\ntouch \"{}\"\n", sentinel.display()).as_bytes(),
+    )
+    .expect("write helper");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    fixture::git(
+        &clone,
+        &["remote", "set-url", "origin", "rsfetch15::/ignored/address"],
+    );
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run_with_path(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+        &bin,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "usable scan result: {}",
+        stderr_text(&out)
+    );
+    assert!(
+        !sentinel.exists(),
+        "remote-helper transport must never execute during a gated scan"
+    );
+    let report = load_json(&report_path);
+    let refresh = remote(&report, "origin", "fetch");
+    assert_eq!(refresh["refresh"]["status"].as_str(), Some("unsupported"));
+    let detail = origin_refresh_detail(&state).unwrap_or_default();
+    assert!(
+        detail.contains("remote-helper"),
+        "refusal names the executable transport: {detail}"
+    );
+    for b in report["branches"].as_array().expect("branches") {
+        assert_ne!(
+            b["freshness"].as_str(),
+            Some("current"),
+            "refused refresh labels nothing current: {}",
+            b["name"]["value"]
+        );
+    }
 }

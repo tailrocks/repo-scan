@@ -117,12 +117,12 @@ Gate record: `docs/GATE_DECISION.md` (do not edit).
   `:440`, `allows_path` at `:513`) pins every enumeration and Git probe to
   descriptor-relative opens under the declared roots; swapped/out-of-scope
   paths park with a gap and persist nothing
-  (`park_on_identity_change` at `src/main.rs:8122`, fence verify at
-  `src/main.rs:7895`). Tests: `tests/sec_fence.rs:40,57`,
+  (`park_on_identity_change` at `src/main.rs:8318`, fence verify at
+  `src/main.rs:8091`). Tests: `tests/sec_fence.rs:40,57`,
   `tests/sec_probe_fence.rs:35`.
 - **Lossless planner keys.** `scope_key_for_dir/git` carry exact path bytes,
   so distinct byte paths never collide and planner keys agree 1:1 with
-  scheduler scopes (`src/config.rs:529,534`, `parse_scope_key` at `:545`).
+  scheduler scopes (`src/config.rs:548,563`, `parse_scope_key` at `:577`).
   Tests: `tests/sec_keys.rs:29`,
   `tests/sec_bounds.rs:13`.
 - **Publish path.** Staging + snapshot retention + atomic publication with a
@@ -130,7 +130,7 @@ Gate record: `docs/GATE_DECISION.md` (do not edit).
   `open_nofollow` at `:258`, `check_destination_inner` at `:411`); staged
   input is opened `O_NOFOLLOW`, byte-capped, and quarantined on failure.
   Tests: `tests/sec_publish.rs:33,77,95,109,288`,
-  `tests/accept_report.rs:593,656,704`.
+  `tests/accept_report.rs:593,661,711`.
 - **Audit gate.** Dependency audit/deny policy is CI-enforced and
   regression-tested (`docs/AUDIT_GATE.md`, `tests/sec_audit_gate.rs:20`).
 

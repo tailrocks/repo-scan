@@ -923,6 +923,15 @@ fn resume_multi_target_scan_keeps_full_target_set() {
 /// candidates but must not re-emit their coverage delta — one
 /// `unresolvable_added` transition per id per scan, across the crash.
 /// (Repeat persists upsert fresh evidence; only the delta dedupes.)
+///
+/// The trigger is a reconcile re-probe, not a bare resume (a bare
+/// resume reuses the bound generation with nothing to redo, so the
+/// single-delta assert passed vacuously): run 1 ends incomplete (chmod
+/// gap) with the delta journaled; `cache invalidate` on the
+/// unresolvable repo schedules a reconcile re-probe; resume
+/// re-persists the same instance id in a fresh process. The completed
+/// `:r` probe task proves the re-persist path executed — without the
+/// production dedupe the journal would carry the id twice.
 #[cfg(unix)]
 #[test]
 fn resume_rediscovery_does_not_reemit_unresolvable_delta() {
@@ -976,17 +985,52 @@ fn resume_rediscovery_does_not_reemit_unresolvable_delta() {
         stderr_text(&out)
     );
     let scan_id = stdout_line(&out, "scan_id");
+
+    // Invalidate the unresolvable repo: the resume below must re-probe
+    // it (a fresh `:r`-suffixed probe task) in the same generation.
+    let out = run(
+        &[
+            "cache",
+            "invalidate",
+            "--root",
+            noremote.to_str().expect("utf8"),
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+
     let out = run(
         &["resume", scan_id.as_str(), "--format", "human"],
         tmp.path(),
         &state,
     );
     assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr_text(&out));
+    assert_eq!(stdout_line(&out, "scan_id"), scan_id, "resume keeps the id");
 
     let rt = runtime();
     rt.block_on(async {
         let db = state.join("payload").join("catalog.db");
         let store = TursoStore::open(&db).await.expect("reopen");
+        // Trigger evidence: exactly one reconcile re-probe ran and
+        // completed for the unresolvable repo's git scope. A fresh
+        // process carries no in-memory probe dedupe, so this probe
+        // necessarily re-persisted the same instance id — the dedupe
+        // gate below either suppressed its delta or it did not.
+        let git_scope = repo_scan::config::scope_key_for_git(&noremote);
+        let reprobes = sql_text_pairs(
+            &store,
+            "SELECT id, state FROM frontier_tasks WHERE id LIKE 'probe:%:r%'",
+        )
+        .await;
+        assert_eq!(reprobes.len(), 1, "one reconcile re-probe: {reprobes:?}");
+        assert_eq!(reprobes[0].1, "complete", "re-probe ran: {:?}", reprobes[0]);
+        let scopes = sql_text_col(
+            &store,
+            "SELECT scope_key FROM frontier_tasks WHERE id LIKE 'probe:%:r%'",
+        )
+        .await;
+        assert_eq!(scopes, vec![git_scope], "re-probe targets the repo");
         let mut after = 0u64;
         let mut added = Vec::new();
         loop {
@@ -1015,7 +1059,11 @@ fn resume_rediscovery_does_not_reemit_unresolvable_delta() {
                 break;
             }
         }
-        assert_eq!(added.len(), 1, "one transition across resume: {added:?}");
+        assert_eq!(
+            added.len(),
+            1,
+            "one transition across the reconcile re-probe: {added:?}"
+        );
         store.close().await.expect("close");
     });
 }
