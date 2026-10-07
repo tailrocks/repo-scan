@@ -40,7 +40,9 @@ use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(test)]
+use std::sync::Mutex;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Set by the SIGINT handler; the scan loop polls it between tasks and
@@ -6682,11 +6684,13 @@ enum CollectOutcome {
 // worker thread runs the collection, and it fires only for the armed path
 // spelling so concurrent scans in other tests never trip it.
 #[cfg(test)]
-static MID_INSPECTION_HOOK: OnceLock<Mutex<Option<(PathBuf, Box<dyn FnOnce() + Send>)>>> =
-    OnceLock::new();
+type MidInspectionSlot = Mutex<Option<(PathBuf, Box<dyn FnOnce() + Send>)>>;
 
 #[cfg(test)]
-fn mid_inspection_slot() -> &'static Mutex<Option<(PathBuf, Box<dyn FnOnce() + Send>)>> {
+static MID_INSPECTION_HOOK: OnceLock<MidInspectionSlot> = OnceLock::new();
+
+#[cfg(test)]
+fn mid_inspection_slot() -> &'static MidInspectionSlot {
     MID_INSPECTION_HOOK.get_or_init(|| Mutex::new(None))
 }
 
