@@ -52,6 +52,27 @@ const KIND_ENUM: &str = "enumerate_dir";
 const KIND_PROBE: &str = "probe_git";
 const KIND_STATUS: &str = "status";
 const KIND_RECONCILE: &str = "reconcile";
+const KIND_ANALYZE: &str = "analyze_store";
+
+/// Drain phase (goal Step 8): discovery claims enumeration, probes,
+/// and reconciliation only; analysis kinds (`status`, `analyze_store`)
+/// wait for the post-`inventory_ready` drain. Enqueue sites stay
+/// unrestricted — execution is gated at claim time, so pre-boundary
+/// enqueues (probe-scheduled status/analysis) simply wait their turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainPhase {
+    Discovery,
+    Analysis,
+}
+
+impl DrainPhase {
+    fn kinds(self) -> &'static [&'static str] {
+        match self {
+            DrainPhase::Discovery => &[KIND_ENUM, KIND_PROBE, KIND_RECONCILE],
+            DrainPhase::Analysis => &[KIND_ANALYZE, KIND_STATUS],
+        }
+    }
+}
 
 /// Tasks claimed per scheduler round (far below the 1,024 prefetch cap).
 const CLAIM_BATCH: usize = 16;
@@ -1368,6 +1389,7 @@ async fn run_scan_inner(
         primary_canonical,
         args.status,
         &scan_id,
+        DrainPhase::Discovery,
     )
     .await?;
     // Post-traversal recount (goal Step 6): the pre-traversal classify saw an
@@ -1394,6 +1416,7 @@ async fn run_scan_inner(
                 primary_canonical,
                 args.status,
                 &scan_id,
+                DrainPhase::Discovery,
             )
             .await?;
             outcome.interrupted |= union_next.interrupted;
@@ -1470,6 +1493,7 @@ async fn run_scan_inner(
             primary_canonical,
             args.status,
             &scan_id,
+            DrainPhase::Discovery,
         )
         .await?;
         outcome.interrupted |= next.interrupted;
@@ -1537,6 +1561,33 @@ async fn run_scan_inner(
         .emit(&store, EventType::InventoryReady, &ready)
         .await?;
     runner.counters.db_transactions += 1;
+    // Analysis drain (goal Step 8): detailed Git analysis starts only
+    // after the catalog saves `inventory_ready`. Claims analysis kinds
+    // (`status`, `analyze_store`) — including tasks probes enqueued
+    // pre-boundary, which waited their turn. Interruption folds into
+    // 130 below; residue folds into the final exit, never the already
+    // journaled discovery verdict above.
+    if !outcome.interrupted {
+        let analysis = run_until_boundary(
+            &mut runner,
+            &store,
+            epoch,
+            generation,
+            run_rev,
+            primary_canonical,
+            args.status,
+            &scan_id,
+            DrainPhase::Analysis,
+        )
+        .await?;
+        outcome.interrupted |= analysis.interrupted;
+        outcome.pending = analysis.pending;
+        outcome.open_gaps = analysis.open_gaps;
+        outcome.unresolvable = analysis.unresolvable;
+        outcome.status_pending = analysis.status_pending;
+        scan_incomplete = scan_incomplete || analysis.has_gaps();
+        finished_ms = store::now_ms();
+    }
     // Optional `--fetch` phase (Step 11): remote refresh runs after
     // the discovery boundary + local analysis, before report staging,
     // so staged reports include freshness. Failed refreshes are
@@ -3651,6 +3702,7 @@ async fn run_until_boundary(
     canonical: &str,
     status_mode: StatusMode,
     scan_id: &str,
+    phase: DrainPhase,
 ) -> repo_scan::Result<RunOutcome> {
     loop {
         if interrupted() {
@@ -3662,8 +3714,16 @@ async fn run_until_boundary(
         // this run's traversal generation, so a resumed or force-rescan
         // run never drains another generation's work and claimed tasks
         // stay visible to that generation's `pending_count` boundary.
+        // Phase gating (goal Step 8): only this phase's kinds claim.
         let claimed = store
-            .claim_tasks_in_generation(generation, epoch, CLAIM_BATCH, LEASE_TTL_MS, now)
+            .claim_tasks_in_generation_kinds(
+                generation,
+                epoch,
+                CLAIM_BATCH,
+                LEASE_TTL_MS,
+                now,
+                phase.kinds(),
+            )
             .await?;
         runner.counters.db_transactions += 1;
         if claimed.is_empty() {
@@ -3849,10 +3909,25 @@ async fn run_until_boundary(
     runner.counters.db_sync_calls = store_stats
         .transactions
         .saturating_add(store_stats.checkpoints);
-    let pending = store.pending_count(generation).await?;
+    // Phase-scoped boundary accounting (goal Step 8): the discovery
+    // outcome counts discovery kinds only. Analysis kinds have not
+    // started yet, so they contribute neither `pending` (which would
+    // poison the `inventory_ready` verdict) nor `status_pending`
+    // (zero by construction pre-boundary). The analysis drain is the
+    // last task drain, so its `pending` counts ALL kinds: analysis
+    // residue plus any discovery stragglers a post-boundary
+    // invalidation scheduled (those stay pending honestly instead of
+    // executing out of phase).
+    let pending = match phase {
+        DrainPhase::Discovery => store.pending_count_kinds(generation, phase.kinds()).await?,
+        DrainPhase::Analysis => store.pending_count(generation).await?,
+    };
     let open_gaps = count_open_errors(store).await?;
     let unresolvable = count_unresolvable(store).await?;
-    let status_pending = count_status_pending(store, generation).await?;
+    let status_pending = match phase {
+        DrainPhase::Discovery => 0,
+        DrainPhase::Analysis => count_status_pending(store, generation).await?,
+    };
     Ok(RunOutcome {
         interrupted: interrupted(),
         pending,
@@ -13040,6 +13115,9 @@ async fn test_run_boundary_with(
     status_mode: StatusMode,
     scan_id: &str,
 ) -> repo_scan::Result<TestRunStats> {
+    // Test harness drains both phases like the scan path: discovery to
+    // its boundary, then analysis — preserving "drain everything"
+    // semantics for unit tests.
     let outcome = run_until_boundary(
         runner,
         store,
@@ -13049,8 +13127,28 @@ async fn test_run_boundary_with(
         canonical,
         status_mode,
         scan_id,
+        DrainPhase::Discovery,
     )
     .await?;
+    let analysis = run_until_boundary(
+        runner,
+        store,
+        epoch,
+        generation,
+        run_rev,
+        canonical,
+        status_mode,
+        scan_id,
+        DrainPhase::Analysis,
+    )
+    .await?;
+    let outcome = RunOutcome {
+        interrupted: outcome.interrupted || analysis.interrupted,
+        pending: analysis.pending,
+        open_gaps: analysis.open_gaps,
+        unresolvable: analysis.unresolvable,
+        status_pending: analysis.status_pending,
+    };
     let stats = store.stats();
     let now_sys = SystemTime::now();
     let mut breakers_open: Vec<String> = runner

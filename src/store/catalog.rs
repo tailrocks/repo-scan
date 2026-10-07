@@ -1497,13 +1497,56 @@ impl TursoStore {
         ttl_ms: i64,
         now_ms: i64,
     ) -> crate::Result<Vec<ClaimedTask>> {
+        self.claim_tasks_in_generation_kinds(
+            generation,
+            epoch,
+            limit,
+            ttl_ms,
+            now_ms,
+            &[
+                "enumerate_dir",
+                "probe_git",
+                "status",
+                "reconcile",
+                "analyze_store",
+            ],
+        )
+        .await
+    }
+
+    /// Durably claim up to `limit` eligible tasks of one traversal
+    /// `generation` for `epoch`, restricted to `kinds` (phase gating,
+    /// goal Step 8: the discovery drain claims enumeration/probe/
+    /// reconcile only; analysis kinds wait for the post-`inventory_ready`
+    /// drain). Empty `kinds` claims nothing. Kind strings are matched
+    /// against an allowlist and bound as parameters, never interpolated.
+    pub async fn claim_tasks_in_generation_kinds(
+        &self,
+        generation: u64,
+        epoch: u64,
+        limit: usize,
+        ttl_ms: i64,
+        now_ms: i64,
+        kinds: &[&str],
+    ) -> crate::Result<Vec<ClaimedTask>> {
         // Fix10 probes before the owner gate (see `claim_tasks`).
         u64_to_i64(generation, "task generation")?;
         u64_to_i64(epoch, "lease epoch")?;
         now_ms.checked_add(ttl_ms).ok_or_else(|| {
             Error::Store(format!("lease expiry {now_ms} + {ttl_ms} overflows i64"))
         })?;
-        self.check_owner_epoch(epoch, "claim_tasks_in_generation")?;
+        self.check_owner_epoch(epoch, "claim_tasks_in_generation_kinds")?;
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        for kind in kinds {
+            if !matches!(
+                *kind,
+                "enumerate_dir" | "probe_git" | "status" | "reconcile" | "analyze_store"
+            ) {
+                return Err(Error::Store(format!("unknown task kind: {kind}")));
+            }
+        }
         let limit = limit.clamp(1, 1024);
         self.with_tx(|conn| async move {
             Self::expire_leases_in_generation_on(conn, generation, now_ms).await?;
@@ -1514,6 +1557,8 @@ impl TursoStore {
             // enumerate, status) using round-robin interleaving so discovered
             // Git repository candidates are scheduled and validated promptly
             // while directory enumeration continues in parallel/interleaved.
+            let kind_params: Vec<String> =
+                (0..kinds.len()).map(|i| format!("?{}", i + 3)).collect();
             let sql = format!(
                 "SELECT {TASK_COLUMNS} FROM ( \
                     SELECT {TASK_COLUMNS}, \
@@ -1538,14 +1583,15 @@ impl TursoStore {
                     WHERE generation = ?1 \
                         AND (state = 'pending' OR (state = 'retry_wait' \
                         AND retry_after_ms IS NOT NULL AND retry_after_ms <= ?2)) \
+                        AND kind IN ({}) \
                 ) \
-                ORDER BY _rn ASC, _cls ASC, id ASC LIMIT {limit}"
+                ORDER BY _rn ASC, _cls ASC, id ASC LIMIT {limit}",
+                kind_params.join(", ")
             );
             let generation_i64 = u64_to_i64(generation, "task generation")?;
-            let mut rows = conn
-                .query(sql.as_str(), vec![v_int(generation_i64), v_int(now_ms)])
-                .await
-                .map_err(store_err)?;
+            let mut params = vec![v_int(generation_i64), v_int(now_ms)];
+            params.extend(kinds.iter().map(|k| v_text((*k).to_string())));
+            let mut rows = conn.query(sql.as_str(), params).await.map_err(store_err)?;
             let mut tasks = Vec::new();
             while let Some(row) = rows.next().await.map_err(store_err)? {
                 tasks.push(FrontierTask::from_row(&row)?);
@@ -2183,13 +2229,39 @@ impl TursoStore {
     /// Tasks in `generation` that still need scheduler action (any
     /// non-terminal state), for run-boundary accounting.
     pub async fn pending_count(&self, generation: u64) -> crate::Result<u64> {
+        self.pending_count_kinds(
+            generation,
+            &[
+                "enumerate_dir",
+                "probe_git",
+                "status",
+                "reconcile",
+                "analyze_store",
+            ],
+        )
+        .await
+    }
+
+    /// Incomplete-task count for one generation restricted to `kinds`
+    /// (phase gating, goal Step 8: the discovery boundary counts
+    /// enumeration/probe/reconcile only — analysis kinds have not
+    /// started yet, so counting them would poison the verdict).
+    pub async fn pending_count_kinds(&self, generation: u64, kinds: &[&str]) -> crate::Result<u64> {
+        if kinds.is_empty() {
+            return Ok(0);
+        }
+        let kind_params: Vec<String> = (0..kinds.len()).map(|i| format!("?{}", i + 2)).collect();
+        let sql = format!(
+            "SELECT COUNT(*) FROM frontier_tasks WHERE generation = ?1 \
+                AND state NOT IN ('complete', 'unsupported', 'cancelled', 'superseded') \
+                AND kind IN ({})",
+            kind_params.join(", ")
+        );
+        let mut params = vec![v_int(u64_to_i64(generation, "task generation")?)];
+        params.extend(kinds.iter().map(|k| v_text((*k).to_string())));
         let mut rows = self
             .conn
-            .query(
-                "SELECT COUNT(*) FROM frontier_tasks WHERE generation = ?1 \
-                    AND state NOT IN ('complete', 'unsupported', 'cancelled', 'superseded')",
-                vec![v_int(u64_to_i64(generation, "task generation")?)],
-            )
+            .query(sql.as_str(), params)
             .await
             .map_err(store_err)?;
         match rows.next().await.map_err(store_err)? {
