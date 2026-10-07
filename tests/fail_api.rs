@@ -197,6 +197,8 @@ fn seed_catalog(store: &TursoStore, now: i64) {
                     staged: Some(1),
                     unstaged: Some(2),
                     untracked: Some(3),
+                    conflicts: Some(0),
+                    working_state: "dirty",
                     untracked_units: "collapsed_entries",
                     submodules: "checked",
                     unknown_fields: "[]",

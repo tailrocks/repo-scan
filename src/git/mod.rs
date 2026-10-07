@@ -169,6 +169,9 @@ pub struct StatusObservation {
     pub unstaged: Option<u64>,
     /// Untracked count in the mode's units.
     pub untracked: Option<u64>,
+    /// Distinct unmerged (conflicted) paths; `None` when the backend
+    /// could not determine it (metadata mode, unreadable index).
+    pub conflicts: Option<u64>,
     /// Fields the backend could not determine.
     pub unknown_fields: Vec<String>,
     /// Input fingerprints (head id, index mtime+size) for instability retry.
@@ -357,6 +360,64 @@ fn with_scope_declaration(mut observation: StatusObservation) -> StatusObservati
             .push(ISOLATED_SCOPE_DECLARATION.to_string());
     }
     observation
+}
+
+/// Distinct unmerged paths in the open repo's index (Step 10).
+///
+/// Entries at stage 1/2/3 share one path per conflicted file, so paths
+/// deduplicate through a set. Read-only; `Err` carries the
+/// `unknown_fields` note and the caller records `conflicts: None`.
+fn unmerged_paths(repo: &gix::Repository) -> Result<std::collections::BTreeSet<Vec<u8>>, String> {
+    let index = repo
+        .index_or_empty()
+        .map_err(|e| format!("conflicts-unknown: cannot open index for stage scan: {e}"))?;
+    let mut paths = std::collections::BTreeSet::new();
+    for entry in index.entries() {
+        if !matches!(entry.stage(), gix::index::entry::Stage::Unconflicted) {
+            paths.insert(entry.path(&index).to_vec());
+        }
+        if paths.len() as u64 > STATUS_ITEM_CAP {
+            return Err(format!(
+                "conflicts-unknown: unmerged-path cap ({STATUS_ITEM_CAP}) reached; count is partial"
+            ));
+        }
+    }
+    Ok(paths)
+}
+
+/// Byte view of a bstr path for unmerged-set membership.
+fn path_bytes<T: AsRef<[u8]> + ?Sized>(path: &T) -> &[u8] {
+    path.as_ref()
+}
+
+/// Step 10 working-state vocabulary for one status observation.
+///
+/// `conflicted` wins on definite evidence (any unmerged path), then the
+/// observation markers (`unstable`, `not_applicable` for bare stores,
+/// `partial` for truncated counts), then the counts: any positive count
+/// is `dirty`, all-known-zero is `clean`, anything else (metadata mode,
+/// unreadable index) is `unknown` — never `clean`.
+pub fn working_state_of(obs: &StatusObservation) -> &'static str {
+    if obs.conflicts.is_some_and(|n| n > 0) {
+        return "conflicted";
+    }
+    if obs.unknown_fields.iter().any(|f| f.contains("unstable")) {
+        return "unstable";
+    }
+    if obs.unknown_fields.iter().any(|f| f.contains("no-worktree")) {
+        return "not_applicable";
+    }
+    if obs.unknown_fields.iter().any(|f| f.contains("truncat")) {
+        return "partial";
+    }
+    let counts = [obs.staged, obs.unstaged, obs.untracked, obs.conflicts];
+    if counts.iter().any(|c| c.is_some_and(|n| n > 0)) {
+        return "dirty";
+    }
+    if counts.iter().all(|c| *c == Some(0)) {
+        return "clean";
+    }
+    "unknown"
 }
 
 /// Bounded pre-scan for executable filter drivers (EXACT-2 defect 1).
@@ -816,6 +877,7 @@ impl GixInspector {
                 staged: None,
                 unstaged: None,
                 untracked: None,
+                conflicts: None,
                 unknown_fields: Vec::new(),
                 fingerprints,
             }));
@@ -826,6 +888,7 @@ impl GixInspector {
                 staged: None,
                 unstaged: None,
                 untracked: None,
+                conflicts: None,
                 unknown_fields: vec![
                     "no-worktree: bare or worktree-less repository; status not applicable"
                         .to_string(),
@@ -873,6 +936,7 @@ impl GixInspector {
             counts.staged = retry.staged;
             counts.unstaged = retry.unstaged;
             counts.untracked = retry.untracked;
+            counts.conflicts = retry.conflicts;
             counts.unknown_fields.extend(retry.unknown_fields);
         } else {
             counts.fingerprints = after;
@@ -909,6 +973,22 @@ impl GixInspector {
         let mut unstaged = 0u64;
         let mut untracked = 0u64;
         let mut unknown_fields = Vec::new();
+        // gix status items carry no conflict variant: unmerged index
+        // entries surface as ordinary TreeIndex/IndexWorktree changes,
+        // so the unmerged set is read first and its paths are excluded
+        // from staged/unstaged tallies (Step 10 count separation). When
+        // the set itself is unreadable the tallies stay unfiltered and
+        // `conflicts` reads `None` (never a guessed zero).
+        let (unmerged, conflicts) = match unmerged_paths(repo) {
+            Ok(set) => {
+                let count = Some(set.len() as u64);
+                (set, count)
+            }
+            Err(note) => {
+                unknown_fields.push(note);
+                (std::collections::BTreeSet::new(), None)
+            }
+        };
         let mut item_errors = 0u32;
         for (tallied, item) in iter.enumerate() {
             if tallied as u64 >= STATUS_ITEM_CAP {
@@ -918,13 +998,36 @@ impl GixInspector {
                 break;
             }
             match item {
-                Ok(gix::status::Item::TreeIndex(_)) => staged += 1,
+                Ok(gix::status::Item::TreeIndex(change)) => {
+                    if !unmerged.contains(path_bytes(change.location())) {
+                        staged += 1;
+                    }
+                }
                 Ok(gix::status::Item::IndexWorktree(
-                    gix::status::index_worktree::Item::Modification { .. },
-                ))
-                | Ok(gix::status::Item::IndexWorktree(
-                    gix::status::index_worktree::Item::Rewrite { .. },
-                )) => unstaged += 1,
+                    gix::status::index_worktree::Item::Modification { rela_path, .. },
+                )) => {
+                    if !unmerged.contains(path_bytes(&rela_path)) {
+                        unstaged += 1;
+                    }
+                }
+                Ok(gix::status::Item::IndexWorktree(
+                    gix::status::index_worktree::Item::Rewrite { source, .. },
+                )) => {
+                    let unmerged_source = match &source {
+                        gix::status::index_worktree::RewriteSource::RewriteFromIndex {
+                            source_rela_path,
+                            ..
+                        } => unmerged.contains(path_bytes(source_rela_path)),
+                        // Copy sources originate in the directory walk
+                        // (untracked side); unmerged paths never appear.
+                        gix::status::index_worktree::RewriteSource::CopyFromDirectoryEntry {
+                            ..
+                        } => false,
+                    };
+                    if !unmerged_source {
+                        unstaged += 1;
+                    }
+                }
                 Ok(gix::status::Item::IndexWorktree(
                     gix::status::index_worktree::Item::DirectoryContents { .. },
                 )) => untracked += 1,
@@ -944,6 +1047,7 @@ impl GixInspector {
             staged: Some(staged),
             unstaged: Some(unstaged),
             untracked: Some(untracked),
+            conflicts,
             unknown_fields,
             fingerprints: Vec::new(),
         })

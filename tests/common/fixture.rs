@@ -377,6 +377,53 @@ pub fn dirty_variants(parent: &Path, name: &str) -> DirtyLayout {
     }
 }
 
+/// Clone with an unresolved two-file merge conflict (Step 10 case 10):
+/// `file.txt` and `file2.txt` both conflict between `main` and `side`,
+/// so the independent reference (`git ls-files -u`) lists 6 stage
+/// entries collapsing to 2 conflicted paths. Returns the workdir.
+pub fn conflict_clone(parent: &Path, name: &str) -> PathBuf {
+    let dir = normal_clone(parent, name);
+    commit_file(&dir, "file.txt", "base\n", "base file");
+    commit_file(&dir, "file2.txt", "base2\n", "base file2");
+    git(&dir, &["checkout", "-q", "-b", "side"]);
+    commit_file(&dir, "file.txt", "side\n", "side file");
+    commit_file(&dir, "file2.txt", "side2\n", "side file2");
+    git(&dir, &["checkout", "-q", "main"]);
+    commit_file(&dir, "file.txt", "main\n", "main file");
+    commit_file(&dir, "file2.txt", "main2\n", "main file2");
+    // The merge MUST fail with conflicts; `git()` asserts success, so
+    // this one spawn carries the same hermetic env but allows the
+    // conflict exit status.
+    let output = Command::new("git")
+        .current_dir(&dir)
+        .env("GIT_CONFIG_GLOBAL", null_device())
+        .env("GIT_CONFIG_SYSTEM", null_device())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .arg("-c")
+        .arg("user.name=repo-scan-fixture")
+        .arg("-c")
+        .arg("user.email=fixture@example.invalid")
+        .arg("-c")
+        .arg("commit.gpgsign=false")
+        .arg("merge")
+        .arg("side")
+        .output()
+        .unwrap_or_else(|e| panic!("spawn git merge in {}: {e}", dir.display()));
+    assert!(
+        !output.status.success(),
+        "merge must conflict in {}",
+        dir.display()
+    );
+    let unmerged = git_str(&dir, &["ls-files", "-u"]);
+    assert_eq!(
+        unmerged.lines().count(),
+        6,
+        "3 stages x 2 files expected: {unmerged}"
+    );
+    assert!(unmerged.contains("file.txt") && unmerged.contains("file2.txt"));
+    dir
+}
+
 /// Read a file to string; panics with the path on failure.
 pub fn read_to_string(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))

@@ -8,8 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Report schema version. Must equal `schemas/report-v1.2.schema.json`.
-pub const SCHEMA_VERSION: &str = "1.2.0";
+/// Report schema version. Must equal `schemas/report-v1.3.schema.json`.
+pub const SCHEMA_VERSION: &str = "1.3.0";
 
 /// Tool name recorded in every envelope.
 pub const TOOL_NAME: &str = "repo-scan";
@@ -272,6 +272,11 @@ fn default_branch_freshness() -> String {
     String::from("unknown")
 }
 
+/// Default working state for pre-1.3 snapshots.
+fn default_working_state() -> String {
+    String::from("unknown")
+}
+
 /// Working-state observation. Cross-field rules: `metadata` mode has null
 /// counts and `untracked_units: not_requested`; `summary` uses
 /// `collapsed_entries`; `full` uses `files`. Unknown counts stay null even
@@ -289,6 +294,16 @@ pub struct Status {
     pub staged: Option<u64>,
     pub unstaged: Option<u64>,
     pub untracked: Option<u64>,
+    /// Distinct unmerged paths (report 1.3.0, Step 10); `None` when
+    /// unknown and in pre-1.3 snapshots.
+    #[serde(default)]
+    pub conflicts: Option<u64>,
+    /// Step 10 working-state vocabulary (report 1.3.0): `clean`,
+    /// `dirty`, `conflicted`, `pending`, `partial`, `unstable`,
+    /// `unknown`, `error`, or `not_applicable`. Pre-1.3 snapshots
+    /// default to `unknown`.
+    #[serde(default = "default_working_state")]
+    pub working_state: String,
     /// `collapsed_entries`, `files`, or `not_requested`.
     pub untracked_units: String,
     /// `checked`, `not_requested`, or `unknown`.

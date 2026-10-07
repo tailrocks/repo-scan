@@ -497,6 +497,8 @@ fn store_rejects_out_of_range_task_values() {
             staged: None,
             unstaged: None,
             untracked: None,
+            conflicts: None,
+            working_state: "unknown",
             untracked_units: "entries",
             submodules: "none",
             unknown_fields: "[]",

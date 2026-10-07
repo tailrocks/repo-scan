@@ -35,9 +35,14 @@ freshness stay separate properties.
 - Report `1.1.0` → `1.2.0` (additive, Step 11: branch `freshness` /
   `freshness_at`, remote `refresh` summary; no field removed/renamed;
   pre-1.2 snapshots deserialize with `unknown` / `None`).
+- Report `1.2.0` → `1.3.0` (additive, Step 10: status `conflicts` /
+  `working_state` vocabulary; no field removed/renamed; pre-1.3
+  snapshots deserialize with `None` / `unknown`).
 - NEW scan-event stream schema `1.0.0` (JSONL).
 - Catalog migration v2: `github_groups`, `scan_events` journal,
   `scan_requests` multi-target columns, full scope key (D5). v1 data migrates.
+- Catalog migration v5: `status_observations.conflicts` /
+  `working_state` (Step 10); legacy rows read `NULL` (unknown).
 - Reason for new IDs: only `github_groups` and `scan_events` IDs are new;
   both are new entities, so no stability break.
 

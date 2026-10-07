@@ -175,6 +175,8 @@ fn seed_catalog(store: &TursoStore, now: i64) -> (i64, i64) {
                     staged: Some(1),
                     unstaged: Some(2),
                     untracked: Some(3),
+                    conflicts: Some(0),
+                    working_state: "dirty",
                     untracked_units: "collapsed_entries",
                     submodules: "checked",
                     unknown_fields: "[]",
@@ -330,9 +332,11 @@ fn status_cross_field_rules() {
             mode: "metadata".to_string(),
             started_at: None,
             finished_at: None,
-            staged: Some(0),
+            staged: None,
             unstaged: None,
             untracked: None,
+            conflicts: Some(0),
+            working_state: "unknown".to_string(),
             untracked_units: "not_requested".to_string(),
             submodules: "not_requested".to_string(),
             unknown_fields: Vec::new(),
@@ -357,6 +361,8 @@ fn status_cross_field_rules() {
             staged: None,
             unstaged: None,
             untracked: None,
+            conflicts: None,
+            working_state: "pending".to_string(),
             untracked_units: "files".to_string(),
             submodules: "unknown".to_string(),
             unknown_fields: Vec::new(),
@@ -381,6 +387,8 @@ fn status_cross_field_rules() {
             staged: None,
             unstaged: None,
             untracked: None,
+            conflicts: None,
+            working_state: "pending".to_string(),
             untracked_units: "files".to_string(),
             submodules: "unknown".to_string(),
             unknown_fields: Vec::new(),
@@ -803,7 +811,7 @@ fn caller_owned_sections_stream() {
 fn schema_validator() -> jsonschema::Validator {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/schemas/report-v1.2.schema.json"
+        "/schemas/report-v1.3.schema.json"
     );
     let bytes = std::fs::read(path).expect("read shipped schema");
     let schema: serde_json::Value = serde_json::from_slice(&bytes).expect("schema parses");

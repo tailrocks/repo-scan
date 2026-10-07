@@ -256,6 +256,8 @@ mod tests {
                 staged: None,
                 unstaged: None,
                 untracked: None,
+                conflicts: None,
+                working_state: "pending".to_string(),
                 untracked_units: "collapsed_entries".to_string(),
                 submodules: "unknown".to_string(),
                 unknown_fields: vec![],

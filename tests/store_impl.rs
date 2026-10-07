@@ -29,7 +29,7 @@ fn round_trip_persists_across_reopen() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = db_in(&dir);
         let store = TursoStore::open(&db).await.expect("open");
-        assert_eq!(store.schema_version().expect("version"), 4);
+        assert_eq!(store.schema_version().expect("version"), 5);
         assert!(store.epoch() >= 1);
 
         let proof = store.durability_proof().await.expect("proof");
@@ -199,6 +199,8 @@ fn round_trip_persists_across_reopen() {
             staged: Some(1),
             unstaged: Some(2),
             untracked: Some(3),
+            conflicts: Some(0),
+            working_state: "dirty",
             untracked_units: "collapsed_entries",
             submodules: "not_requested",
             unknown_fields: "[]",

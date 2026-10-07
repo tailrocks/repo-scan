@@ -709,7 +709,7 @@ async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Res
             .query(
                 "SELECT checkout_id, mode, state, started_ms, finished_ms, staged, \
                     unstaged, untracked, untracked_units, submodules, unknown_fields, \
-                    observed_rev FROM status_observations \
+                    observed_rev, conflicts, working_state FROM status_observations \
                     ORDER BY checkout_id ASC, observed_rev DESC",
                 (),
             )
@@ -733,6 +733,10 @@ async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Res
                     staged: opt_i64(&row, 5)?.map(|v| v.max(0) as u64),
                     unstaged: opt_i64(&row, 6)?.map(|v| v.max(0) as u64),
                     untracked: opt_i64(&row, 7)?.map(|v| v.max(0) as u64),
+                    conflicts: opt_i64(&row, 12)?.map(|v| v.max(0) as u64),
+                    // Report 1.3.0: NULL (legacy pre-v5 rows) reads
+                    // `unknown`, never a guessed state.
+                    working_state: opt_text(&row, 13)?.unwrap_or_else(|| "unknown".to_string()),
                     untracked_units: req_text(&row, 8)?,
                     submodules: req_text(&row, 9)?,
                     unknown_fields: parse_string_array(&req_text(&row, 10)?),
@@ -926,9 +930,9 @@ async fn verify_error_ids(
 }
 
 fn default_status(mode: StatusMode) -> Status {
-    let (state, submodules) = match mode {
-        StatusMode::Metadata => ("not_requested", "not_requested"),
-        _ => ("pending", "unknown"),
+    let (state, submodules, working_state) = match mode {
+        StatusMode::Metadata => ("not_requested", "not_requested", "unknown"),
+        _ => ("pending", "unknown", "pending"),
     };
     Status {
         state: state.to_string(),
@@ -938,6 +942,8 @@ fn default_status(mode: StatusMode) -> Status {
         staged: None,
         unstaged: None,
         untracked: None,
+        conflicts: None,
+        working_state: working_state.to_string(),
         untracked_units: untracked_units_for(mode).to_string(),
         submodules: submodules.to_string(),
         unknown_fields: Vec::new(),

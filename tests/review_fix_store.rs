@@ -311,6 +311,8 @@ fn r10_buffered_scan_writes_commit_in_one_tx() {
                 staged: Some(0),
                 unstaged: Some(0),
                 untracked: Some(0),
+                conflicts: Some(0),
+                working_state: "clean",
                 untracked_units: "collapsed_entries",
                 submodules: "not_requested",
                 unknown_fields: "[]",

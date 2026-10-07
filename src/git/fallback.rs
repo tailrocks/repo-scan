@@ -628,7 +628,7 @@ impl FallbackGit {
         git_dir: &Path,
         work_tree: Option<&Path>,
         collapsed: bool,
-    ) -> crate::Result<(u64, u64, u64)> {
+    ) -> crate::Result<(u64, u64, u64, u64)> {
         if !self.capabilities.porcelain_v2 {
             return Err(crate::Error::Git(format!(
                 "{}installed git ({}) lacks status --porcelain=v2",
@@ -666,6 +666,7 @@ impl FallbackGit {
         let mut staged = 0u64;
         let mut unstaged = 0u64;
         let mut untracked_count = 0u64;
+        let mut conflicts = 0u64;
         for line in text.lines() {
             match line.as_bytes().first() {
                 Some(b'1') | Some(b'2') => {
@@ -683,11 +684,16 @@ impl FallbackGit {
                         unstaged += 1;
                     }
                 }
+                // Porcelain-v2 unmerged records (Step 10): one `u` line
+                // per conflicted path. Counted ONLY as conflicts — never
+                // staged/unstaged — so conflict-only checkouts read
+                // `conflicted`, not `dirty` or `clean`.
+                Some(b'u') => conflicts += 1,
                 Some(b'?') => untracked_count += 1,
                 _ => {}
             }
         }
-        Ok((staged, unstaged, untracked_count))
+        Ok((staged, unstaged, untracked_count, conflicts))
     }
 
     /// Object format via config (defaults to sha1 when unset).
@@ -2621,10 +2627,10 @@ mod tests {
         let repo = tempfile::tempdir().expect("repo");
         let git_dir = repo.path().join("repo.git");
         std::fs::create_dir(&git_dir).expect("git dir");
-        let (staged, unstaged, untracked) = found
+        let (staged, unstaged, untracked, conflicts) = found
             .status_counts(&git_dir, Some(repo.path()), true)
             .expect("global drivers neutralize, never refuse");
-        assert_eq!((staged, unstaged, untracked), (1, 1, 1));
+        assert_eq!((staged, unstaged, untracked, conflicts), (1, 1, 1, 0));
         assert!(!marker.exists(), "marker helper must never execute");
         // argv/env proof: exactly the guard + status spawns logged, both
         // isolated, both carrying the status argv.

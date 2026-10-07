@@ -7,7 +7,8 @@
 
 use repo_scan::git::fallback::FallbackGit;
 use repo_scan::git::{
-    CandidateKind, CheckoutKind, GitInspect, GixInspector, HeadState, WorktreeAvailability,
+    working_state_of, CandidateKind, CheckoutKind, GitInspect, GixInspector, HeadState,
+    StatusObservation, WorktreeAvailability,
 };
 use repo_scan::identity::{
     classify_remote, classify_remotes, github_host_matches, is_github_host, normalize_github_url,
@@ -329,6 +330,200 @@ fn status_counts_match_git_semantics() {
     );
 }
 
+/// One working-state expectation: staged/unstaged/untracked/conflicts
+/// counts, unknown-field markers, and the expected state word.
+type WorkingStateCase<'a> = (
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    &'a [&'a str],
+    &'a str,
+);
+
+#[test]
+fn working_state_vocabulary_table() {
+    let cases: &[WorkingStateCase<'_>] = &[
+        (Some(0), Some(0), Some(0), Some(0), &[], "clean"),
+        (Some(1), Some(0), Some(0), Some(0), &[], "dirty"),
+        (Some(0), Some(2), Some(0), Some(0), &[], "dirty"),
+        (Some(0), Some(0), Some(3), Some(0), &[], "dirty"),
+        // Conflict-only: conflicts never read as dirty or clean.
+        (Some(0), Some(0), Some(0), Some(1), &[], "conflicted"),
+        (Some(1), Some(1), Some(1), Some(2), &[], "conflicted"),
+        // Metadata mode (all null) is unknown, never clean.
+        (None, None, None, None, &[], "unknown"),
+        (Some(0), Some(0), Some(0), None, &[], "unknown"),
+        // Observation markers beat counts (except definite conflicts).
+        (
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            &["unstable: HEAD/index changed during the probe"],
+            "unstable",
+        ),
+        (
+            Some(1),
+            Some(0),
+            Some(0),
+            Some(0),
+            &["unstable: HEAD/index changed during the probe"],
+            "unstable",
+        ),
+        (
+            None,
+            None,
+            None,
+            None,
+            &["no-worktree: bare or worktree-less repository; status not applicable"],
+            "not_applicable",
+        ),
+        (
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            &["truncated: item cap reached; counts are partial"],
+            "partial",
+        ),
+        // Definite conflicts win even over markers.
+        (
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(1),
+            &["unstable: HEAD/index changed during the probe"],
+            "conflicted",
+        ),
+    ];
+    for (staged, unstaged, untracked, conflicts, markers, expected) in cases {
+        let obs = StatusObservation {
+            mode: StatusMode::Summary,
+            staged: *staged,
+            unstaged: *unstaged,
+            untracked: *untracked,
+            conflicts: *conflicts,
+            unknown_fields: markers.iter().map(|s| s.to_string()).collect(),
+            fingerprints: Vec::new(),
+        };
+        assert_eq!(
+            working_state_of(&obs),
+            *expected,
+            "staged={staged:?} unstaged={unstaged:?} untracked={untracked:?} \
+             conflicts={conflicts:?} markers={markers:?}"
+        );
+    }
+}
+
+#[test]
+fn conflict_counts_match_git_reference() {
+    let Some(git_bin) = git_or_skip() else {
+        eprintln!("skip: no installed git");
+        return;
+    };
+    let scratch = tempfile::tempdir().expect("scratch");
+    let home = scratch.path().join("home");
+    let work = init_with_commit(&git_bin, scratch.path());
+    // Clean baseline first: zero conflicts on both backends.
+    let inspector = GixInspector::new();
+    let instance = inspector.open_exact(&work).expect("open");
+    let baseline = inspector
+        .status(&instance, StatusMode::Summary)
+        .expect("baseline");
+    assert_eq!(baseline.conflicts, Some(0));
+    assert_eq!(working_state_of(&baseline), "clean");
+
+    // Two files conflict between main and side (3 index stages each).
+    for name in ["file.txt", "file2.txt"] {
+        repo_scan::privacy::private_write_0600(&work.join(name), "base\n".as_bytes())
+            .expect("base");
+    }
+    let mut args = ID.to_vec();
+    args.extend(["add", "file.txt", "file2.txt"]);
+    git(&git_bin, &home, &work, &args);
+    let mut args = ID.to_vec();
+    args.extend(["commit", "-m", "base files"]);
+    git(&git_bin, &home, &work, &args);
+    let mut args = ID.to_vec();
+    args.extend(["checkout", "-b", "side"]);
+    git(&git_bin, &home, &work, &args);
+    for name in ["file.txt", "file2.txt"] {
+        repo_scan::privacy::private_write_0600(&work.join(name), "side\n".as_bytes())
+            .expect("side");
+    }
+    let mut args = ID.to_vec();
+    args.extend(["commit", "-am", "side files"]);
+    git(&git_bin, &home, &work, &args);
+    let mut args = ID.to_vec();
+    args.extend(["checkout", "main"]);
+    git(&git_bin, &home, &work, &args);
+    for name in ["file.txt", "file2.txt"] {
+        repo_scan::privacy::private_write_0600(&work.join(name), "main\n".as_bytes())
+            .expect("main");
+    }
+    let mut args = ID.to_vec();
+    args.extend(["commit", "-am", "main files"]);
+    git(&git_bin, &home, &work, &args);
+    // The merge MUST fail with conflicts; the `git()` helper asserts
+    // success, so this one spawn repeats its hermetic env inline.
+    let mut cmd = Command::new(&git_bin);
+    cmd.args(ID)
+        .args(["merge", "side"])
+        .current_dir(&work)
+        .env("HOME", &home)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE");
+    let merge = cmd.output().expect("spawn git merge");
+    assert!(!merge.status.success(), "merge must conflict");
+
+    // Independent reference: installed git sees 6 unmerged stage
+    // entries (3 stages x 2 files) and two porcelain-v2 `u` lines.
+    let mut args = ID.to_vec();
+    args.extend(["ls-files", "-u"]);
+    let unmerged = Command::new(&git_bin)
+        .args(&args)
+        .current_dir(&work)
+        .env("HOME", &home)
+        .output()
+        .expect("ls-files")
+        .stdout;
+    assert_eq!(String::from_utf8_lossy(&unmerged).lines().count(), 6);
+
+    // gix backend: 6 stage entries collapse to 2 conflicted paths,
+    // excluded from staged/unstaged tallies (count separation).
+    let instance = inspector.open_exact(&work).expect("reopen");
+    let summary = inspector
+        .status(&instance, StatusMode::Summary)
+        .expect("summary");
+    assert_eq!(summary.staged, Some(0));
+    assert_eq!(summary.unstaged, Some(0));
+    assert_eq!(summary.untracked, Some(0));
+    assert_eq!(summary.conflicts, Some(2));
+    assert_eq!(working_state_of(&summary), "conflicted");
+
+    // Installed-git backend: the two `u` lines count as conflicts
+    // only — never staged/unstaged.
+    let fallback = FallbackGit::probe(&git_bin).expect("probe explicit git");
+    let (staged, unstaged, untracked, conflicts) = fallback
+        .status_counts(&work.join(".git"), Some(&work), true)
+        .expect("fallback status");
+    assert_eq!((staged, unstaged, untracked, conflicts), (0, 0, 0, 2));
+    let obs = StatusObservation {
+        mode: StatusMode::Summary,
+        staged: Some(staged),
+        unstaged: Some(unstaged),
+        untracked: Some(untracked),
+        conflicts: Some(conflicts),
+        unknown_fields: Vec::new(),
+        fingerprints: Vec::new(),
+    };
+    assert_eq!(working_state_of(&obs), "conflicted");
+}
+
 #[test]
 fn invalid_candidate_rejected() {
     let scratch = tempfile::tempdir().expect("scratch");
@@ -439,10 +634,10 @@ fn fallback_probes_and_reads_refs() {
         HeadState::Branch { ref_name, .. } => assert_eq!(ref_name, b"refs/heads/main"),
         other => panic!("expected branch, got {other:?}"),
     }
-    let (staged, unstaged, untracked) = fallback
+    let (staged, unstaged, untracked, conflicts) = fallback
         .status_counts(&git_dir, Some(&work), true)
         .expect("fallback status");
-    assert_eq!((staged, unstaged, untracked), (0, 0, 0));
+    assert_eq!((staged, unstaged, untracked, conflicts), (0, 0, 0, 0));
 }
 
 #[test]

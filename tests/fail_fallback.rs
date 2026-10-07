@@ -128,7 +128,7 @@ fn fallback01_repo_selected_code_never_executes() {
     let counts = fallback
         .status_counts(&git_dir_b, Some(&repo_b), true)
         .expect("unfiltered status serves");
-    assert_eq!(counts, (0, 0, 0));
+    assert_eq!(counts, (0, 0, 0, 0));
     assert!(
         !marker_fs.exists(),
         "fsmonitor hook must be neutralized, including via includes"

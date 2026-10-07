@@ -748,3 +748,30 @@ fn read01_scan_leaves_repos_and_locks_untouched() {
         "scan must never fetch"
     );
 }
+
+/// Conflict-only checkout reports `conflicted` with a separate conflict
+/// count (Step 10 case 10): the two unmerged paths never read as staged,
+/// unstaged, dirty, or clean.
+#[test]
+fn status10_conflict_only_reports_conflicted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("ws");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    fixture::conflict_clone(&root, "conflicted");
+
+    let state = dir.path().join("state");
+    let report_path = dir.path().join("rep.json");
+    let out = scan(&root, &state, &report_path, &["--status", "summary"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let report = read_report(&report_path);
+    let paths = path_map(&report);
+    let repo = repo_by_path(&report, &paths, "conflicted");
+    assert_eq!(repo["match"].as_str(), Some("confirmed"));
+    let status = &checkout_for(&report, repo_id(repo))["status"];
+    assert_eq!(status["state"].as_str(), Some("complete"));
+    assert_eq!(status["staged"].as_u64(), Some(0));
+    assert_eq!(status["unstaged"].as_u64(), Some(0));
+    assert_eq!(status["untracked"].as_u64(), Some(0));
+    assert_eq!(status["conflicts"].as_u64(), Some(2));
+    assert_eq!(status["working_state"].as_str(), Some("conflicted"));
+}

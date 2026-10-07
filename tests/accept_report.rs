@@ -1,5 +1,5 @@
 //! Report acceptance (REPORT-01, REPORT-02): every CLI-emitted report
-//! structurally matches `schemas/report-v1.2.schema.json`, and publication is
+//! structurally matches `schemas/report-v1.3.schema.json`, and publication is
 //! atomic with honest retry semantics.
 //!
 //! REPORT-01: scan real tempdir fixtures through the built binary with
@@ -67,7 +67,7 @@ fn load_json(path: &Path) -> serde_json::Value {
 fn schema_doc() -> serde_json::Value {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/schemas/report-v1.2.schema.json"
+        "/schemas/report-v1.3.schema.json"
     );
     load_json(Path::new(path))
 }
@@ -77,7 +77,7 @@ fn schema_doc() -> serde_json::Value {
 // ---------------------------------------------------------------------------
 
 /// Minimal JSON-Schema evaluator over the constructs the shipped
-/// `report-v1.2.schema.json` uses: `$ref`, `type` (incl. unions), `const`,
+/// `report-v1.3.schema.json` uses: `$ref`, `type` (incl. unions), `const`,
 /// `enum`, `required`, `properties`, `additionalProperties: false`,
 /// `items`, `anyOf`, `allOf`, `if`/`then`, `minLength`/`maxLength`,
 /// `minimum`/`exclusiveMinimum`. `pattern`/`format` need a regex engine

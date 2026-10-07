@@ -2797,6 +2797,11 @@ pub struct StatusRow {
     pub unstaged: Option<i64>,
     /// Untracked entries, when known.
     pub untracked: Option<i64>,
+    /// Distinct unmerged paths, when known (v5; `None` also covers
+    /// legacy rows and metadata mode).
+    pub conflicts: Option<i64>,
+    /// Step 10 working-state vocabulary (v5; `None` on legacy rows).
+    pub working_state: Option<String>,
     /// Untracked count units.
     pub untracked_units: String,
     /// Submodule coverage.
@@ -2823,6 +2828,8 @@ impl StatusRow {
             staged: opt_i64(row, 6)?,
             unstaged: opt_i64(row, 7)?,
             untracked: opt_i64(row, 8)?,
+            conflicts: opt_i64(row, 15)?,
+            working_state: opt_text(row, 16)?,
             untracked_units: req_text(row, 9)?,
             submodules: req_text(row, 10)?,
             unknown_fields: req_text(row, 11)?,
@@ -2852,6 +2859,10 @@ pub struct NewStatus<'a> {
     pub unstaged: Option<i64>,
     /// Untracked entries.
     pub untracked: Option<i64>,
+    /// Distinct unmerged paths, when known (v5).
+    pub conflicts: Option<i64>,
+    /// Step 10 working-state vocabulary (v5).
+    pub working_state: &'a str,
     /// Untracked count units.
     pub untracked_units: &'a str,
     /// Submodule coverage.
@@ -3821,8 +3832,9 @@ impl TursoStore {
                 "INSERT OR IGNORE INTO status_observations (checkout_id, mode, state, \
                     started_ms, finished_ms, staged, unstaged, untracked, \
                     untracked_units, submodules, unknown_fields, input_fingerprint, \
-                    observed_rev, observed_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, \
-                    ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    observed_rev, observed_at_ms, conflicts, working_state) \
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, \
+                    ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 vec![
                     v_text(status.checkout_id),
                     v_text(status.mode),
@@ -3838,6 +3850,8 @@ impl TursoStore {
                     v_opt_blob(status.input_fingerprint.map(<[u8]>::to_vec)),
                     v_int(u64_to_i64(status.observed_rev, "status observed_rev")?),
                     v_int(observed_ms),
+                    v_opt_int(status.conflicts),
+                    v_text(status.working_state),
                 ],
             )
             .await
@@ -3852,7 +3866,8 @@ impl TursoStore {
             .query(
                 "SELECT id, checkout_id, mode, state, started_ms, finished_ms, staged, \
                     unstaged, untracked, untracked_units, submodules, unknown_fields, \
-                    input_fingerprint, observed_rev, observed_at_ms \
+                    input_fingerprint, observed_rev, observed_at_ms, conflicts, \
+                    working_state \
                     FROM status_observations WHERE checkout_id = ?1 \
                     ORDER BY observed_rev DESC",
                 vec![v_text(checkout_id)],
@@ -5257,8 +5272,9 @@ impl TursoStore {
             "INSERT OR IGNORE INTO status_observations (checkout_id, mode, state, \
                 started_ms, finished_ms, staged, unstaged, untracked, \
                 untracked_units, submodules, unknown_fields, input_fingerprint, \
-                observed_rev, observed_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, \
-                ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                observed_rev, observed_at_ms, conflicts, working_state) \
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, \
+                ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             vec![
                 v_text(status.checkout_id),
                 v_text(status.mode),
@@ -5274,6 +5290,8 @@ impl TursoStore {
                 v_opt_blob(status.input_fingerprint.map(<[u8]>::to_vec)),
                 v_int(observed_rev_i64),
                 v_int(observed_ms),
+                v_opt_int(status.conflicts),
+                v_text(status.working_state),
             ],
         )
     }

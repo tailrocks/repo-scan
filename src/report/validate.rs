@@ -764,6 +764,24 @@ pub fn validate_status(status: &Status, context: &str, problems: &mut Vec<String
         &["checked", "not_requested", "unknown"],
         problems,
     );
+    // Report 1.3.0 Step 10 vocabulary. Pre-1.3 snapshots deserialize
+    // `working_state` as `unknown` (model default), which validates.
+    check_enum(
+        &format!("{context} working_state"),
+        &status.working_state,
+        &[
+            "clean",
+            "dirty",
+            "conflicted",
+            "pending",
+            "partial",
+            "unstable",
+            "unknown",
+            "error",
+            "not_applicable",
+        ],
+        problems,
+    );
     check_opt_time(
         &format!("{context} started_at"),
         &status.started_at,
@@ -776,7 +794,11 @@ pub fn validate_status(status: &Status, context: &str, problems: &mut Vec<String
     );
     match status.mode.as_str() {
         "metadata" => {
-            if status.staged.is_some() || status.unstaged.is_some() || status.untracked.is_some() {
+            if status.staged.is_some()
+                || status.unstaged.is_some()
+                || status.untracked.is_some()
+                || status.conflicts.is_some()
+            {
                 problems.push(format!("{context}: metadata mode must have null counts"));
             }
             if status.untracked_units != "not_requested" {

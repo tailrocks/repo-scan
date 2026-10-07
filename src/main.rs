@@ -9293,6 +9293,8 @@ async fn persist_status(
                 None,
                 None,
                 None,
+                None,
+                "unknown",
                 status_units(target.mode),
                 "unknown",
                 &[error],
@@ -9325,6 +9327,8 @@ async fn persist_status(
                         None,
                         None,
                         None,
+                        None,
+                        "unknown",
                         status_units(target.mode),
                         submodules,
                         &["status unsupported in both backends".to_string()],
@@ -9336,6 +9340,7 @@ async fn persist_status(
                 }
                 Some(obs) => {
                     let state = status_state_of(&obs);
+                    let working_state = git::working_state_of(&obs);
                     record_status_row(
                         runner,
                         store,
@@ -9346,6 +9351,8 @@ async fn persist_status(
                         obs.staged.map(|c| c.min(i64::MAX as u64) as i64),
                         obs.unstaged.map(|c| c.min(i64::MAX as u64) as i64),
                         obs.untracked.map(|c| c.min(i64::MAX as u64) as i64),
+                        obs.conflicts.map(|c| c.min(i64::MAX as u64) as i64),
+                        working_state,
                         status_units(target.mode),
                         submodules,
                         &obs.unknown_fields,
@@ -9418,6 +9425,8 @@ async fn prepare_status(
             None,
             None,
             None,
+            None,
+            "unknown",
             "not_requested",
             "not_requested",
             &[],
@@ -9521,7 +9530,7 @@ fn fallback_status_counts(
     cause: &repo_scan::Error,
 ) -> Option<git::StatusObservation> {
     let fallback = ctx.fallback()?;
-    let (staged, unstaged, untracked) = fallback
+    let (staged, unstaged, untracked, conflicts) = fallback
         .status_counts(
             &instance.git_dir,
             instance.work_dir.as_deref(),
@@ -9533,6 +9542,7 @@ fn fallback_status_counts(
         staged: Some(staged),
         unstaged: Some(unstaged),
         untracked: Some(untracked),
+        conflicts: Some(conflicts),
         // F-note1: the fallback spawn runs under the same empty
         // global/system config isolation as the gix path, so it carries
         // the same inspected-scope declaration.
@@ -9555,6 +9565,8 @@ async fn record_status_row(
     staged: Option<i64>,
     unstaged: Option<i64>,
     untracked: Option<i64>,
+    conflicts: Option<i64>,
+    working_state: &str,
     units: &str,
     submodules: &str,
     unknown_fields: &[String],
@@ -9575,6 +9587,8 @@ async fn record_status_row(
         staged,
         unstaged,
         untracked,
+        conflicts,
+        working_state,
         untracked_units: units,
         submodules,
         unknown_fields: &unknown_json,
