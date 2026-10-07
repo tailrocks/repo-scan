@@ -1489,6 +1489,10 @@ impl TursoStore {
     /// exhausted. Lease expiry for this generation runs first, inside the
     /// same transaction; other generations' leases are untouched.
     /// Leases last `ttl_ms` from `now_ms`. Bounded: at most 1,024 claims.
+    /// Durably claim up to `limit` eligible tasks of one traversal
+    /// `generation` for `epoch`, across all task kinds (legacy
+    /// unfiltered contract; phase gating uses
+    /// [`TursoStore::claim_tasks_in_generation_kinds`]).
     pub async fn claim_tasks_in_generation(
         &self,
         generation: u64,
@@ -1497,21 +1501,8 @@ impl TursoStore {
         ttl_ms: i64,
         now_ms: i64,
     ) -> crate::Result<Vec<ClaimedTask>> {
-        self.claim_tasks_in_generation_kinds(
-            generation,
-            epoch,
-            limit,
-            ttl_ms,
-            now_ms,
-            &[
-                "enumerate_dir",
-                "probe_git",
-                "status",
-                "reconcile",
-                "analyze_store",
-            ],
-        )
-        .await
+        self.claim_tasks_in_generation_inner(generation, epoch, limit, ttl_ms, now_ms, None)
+            .await
     }
 
     /// Durably claim up to `limit` eligible tasks of one traversal
@@ -1529,13 +1520,6 @@ impl TursoStore {
         now_ms: i64,
         kinds: &[&str],
     ) -> crate::Result<Vec<ClaimedTask>> {
-        // Fix10 probes before the owner gate (see `claim_tasks`).
-        u64_to_i64(generation, "task generation")?;
-        u64_to_i64(epoch, "lease epoch")?;
-        now_ms.checked_add(ttl_ms).ok_or_else(|| {
-            Error::Store(format!("lease expiry {now_ms} + {ttl_ms} overflows i64"))
-        })?;
-        self.check_owner_epoch(epoch, "claim_tasks_in_generation_kinds")?;
         if kinds.is_empty() {
             return Ok(Vec::new());
         }
@@ -1547,6 +1531,36 @@ impl TursoStore {
                 return Err(Error::Store(format!("unknown task kind: {kind}")));
             }
         }
+        self.claim_tasks_in_generation_inner(
+            generation,
+            epoch,
+            limit,
+            ttl_ms,
+            now_ms,
+            Some(kinds),
+        )
+        .await
+    }
+
+    /// Shared generation-scoped claim body. `Some(kinds)` restricts the
+    /// claim to those (already allowlisted) kinds; `None` applies no
+    /// kind predicate (legacy unfiltered contract).
+    async fn claim_tasks_in_generation_inner(
+        &self,
+        generation: u64,
+        epoch: u64,
+        limit: usize,
+        ttl_ms: i64,
+        now_ms: i64,
+        kinds: Option<&[&str]>,
+    ) -> crate::Result<Vec<ClaimedTask>> {
+        // Fix10 probes before the owner gate (see `claim_tasks`).
+        u64_to_i64(generation, "task generation")?;
+        u64_to_i64(epoch, "lease epoch")?;
+        now_ms.checked_add(ttl_ms).ok_or_else(|| {
+            Error::Store(format!("lease expiry {now_ms} + {ttl_ms} overflows i64"))
+        })?;
+        self.check_owner_epoch(epoch, "claim_tasks_in_generation_kinds")?;
         let limit = limit.clamp(1, 1024);
         self.with_tx(|conn| async move {
             Self::expire_leases_in_generation_on(conn, generation, now_ms).await?;
@@ -1557,8 +1571,15 @@ impl TursoStore {
             // enumerate, status) using round-robin interleaving so discovered
             // Git repository candidates are scheduled and validated promptly
             // while directory enumeration continues in parallel/interleaved.
-            let kind_params: Vec<String> =
-                (0..kinds.len()).map(|i| format!("?{}", i + 3)).collect();
+            let kind_predicate = match kinds {
+                Some(kinds) => {
+                    let kind_params: Vec<String> = (0..kinds.len())
+                        .map(|i| format!("?{}", i + 3))
+                        .collect();
+                    format!("AND kind IN ({})", kind_params.join(", "))
+                }
+                None => String::new(),
+            };
             let sql = format!(
                 "SELECT {TASK_COLUMNS} FROM ( \
                     SELECT {TASK_COLUMNS}, \
@@ -1583,14 +1604,15 @@ impl TursoStore {
                     WHERE generation = ?1 \
                         AND (state = 'pending' OR (state = 'retry_wait' \
                         AND retry_after_ms IS NOT NULL AND retry_after_ms <= ?2)) \
-                        AND kind IN ({}) \
+                        {kind_predicate} \
                 ) \
                 ORDER BY _rn ASC, _cls ASC, id ASC LIMIT {limit}",
-                kind_params.join(", ")
             );
             let generation_i64 = u64_to_i64(generation, "task generation")?;
             let mut params = vec![v_int(generation_i64), v_int(now_ms)];
-            params.extend(kinds.iter().map(|k| v_text((*k).to_string())));
+            if let Some(kinds) = kinds {
+                params.extend(kinds.iter().map(|k| v_text((*k).to_string())));
+            }
             let mut rows = conn.query(sql.as_str(), params).await.map_err(store_err)?;
             let mut tasks = Vec::new();
             while let Some(row) = rows.next().await.map_err(store_err)? {
