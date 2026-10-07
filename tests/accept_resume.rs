@@ -575,3 +575,262 @@ fn resume02_incomplete_scan_keeps_old_findings() {
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
     assert_eq!(stdout_line(&out, "matches"), "2");
 }
+
+/// All journaled event types for a scan, oldest first (paged replay).
+async fn journal_types(store: &TursoStore, scan_id: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut after = 0u64;
+    loop {
+        let rows = store
+            .read_scan_events(scan_id, after, 500)
+            .await
+            .expect("read journal");
+        if rows.is_empty() {
+            break;
+        }
+        for row in &rows {
+            after = after.max(row.seq);
+            out.push(row.event_type.clone());
+        }
+        if rows.len() < 500 {
+            break;
+        }
+    }
+    out
+}
+
+fn count_type(types: &[String], want: &str) -> usize {
+    types.iter().filter(|t| t.as_str() == want).count()
+}
+
+/// BOUNDARY-M7 leg 1: a resumed run that fails emission again must not
+/// append a second `scan_failed` (contract D4: exactly one terminal per
+/// scan). Failing publication, deleted snapshot (forces the continue leg
+/// instead of the snapshot retry), still-failing destination on resume:
+/// exit stays 1, the first terminal stands, and the boundary is not
+/// re-emitted either.
+#[cfg(unix)]
+#[test]
+fn resume_refail_journals_no_second_terminal() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct Restore<'a> {
+        path: &'a Path,
+    }
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.path, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    fixture::normal_clone(&root, "repo");
+    let rodir = tmp.path().join("rodir");
+    repo_scan::privacy::private_dir_0700(&rodir).expect("mkdir");
+    let dest = rodir.join("rep.json");
+    std::fs::set_permissions(&rodir, std::fs::Permissions::from_mode(0o555)).expect("chmod 555");
+    let _restore = Restore { path: &rodir };
+    // Probe: a privileged user can still write; without a real failure
+    // this test cannot set up its precondition.
+    if repo_scan::privacy::private_write_0600(&rodir.join(".probe"), b"x").is_ok() {
+        let _ = std::fs::remove_file(rodir.join(".probe"));
+        eprintln!("resume_refail: destination dir is writable (privileged user); skipping");
+        return;
+    }
+
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            dest.to_str().expect("utf8"),
+            "--format",
+            "human",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "publication failure is operational failure; stderr: {}",
+        stderr_text(&out)
+    );
+    let scan_id = stdout_line(&out, "scan_id");
+    let report_id = stdout_line(&out, "report_id");
+    let snapshot = repo_scan::config::snapshot_path(&state, &report_id).expect("snapshot path");
+    assert!(snapshot.is_file(), "snapshot staged before the failure");
+    std::fs::remove_file(&snapshot).expect("delete snapshot");
+
+    // Resume with the destination still failing: the missing snapshot
+    // forces the continue leg (full re-run), whose emission fails again.
+    let out = run(
+        &["resume", scan_id.as_str(), "--format", "human"],
+        tmp.path(),
+        &state,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "second publication failure stays operational; stderr: {}",
+        stderr_text(&out)
+    );
+    assert!(
+        stderr_text(&out).contains("terminal already journaled"),
+        "resume says the terminal stands: {}",
+        stderr_text(&out)
+    );
+
+    let rt = runtime();
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("reopen");
+        let row = store
+            .get_scan(&scan_id)
+            .await
+            .expect("get")
+            .expect("scan row");
+        assert!(
+            row.state.starts_with("failed"),
+            "live verdict stays failed: {}",
+            row.state
+        );
+        let types = journal_types(&store, &scan_id).await;
+        assert_eq!(count_type(&types, "scan_started"), 1, "{types:?}");
+        assert_eq!(count_type(&types, "inventory_ready"), 1, "{types:?}");
+        assert_eq!(count_type(&types, "scan_failed"), 1, "{types:?}");
+        assert_eq!(count_type(&types, "scan_completed"), 0, "{types:?}");
+        assert_eq!(count_type(&types, "scan_incomplete"), 0, "{types:?}");
+        assert_eq!(count_type(&types, "scan_interrupted"), 0, "{types:?}");
+        store.close().await.expect("close");
+    });
+}
+
+/// BOUNDARY-M7 leg 2: resume of an incomplete scan replays each
+/// lifecycle row once — one `scan_started`, one `inventory_ready`, one
+/// terminal — and inspect completes over the resumed journal.
+#[cfg(unix)]
+#[test]
+fn resume_incomplete_replays_lifecycle_once_and_inspect_completes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct Restore<'a> {
+        path: &'a Path,
+    }
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.path, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    fixture::normal_clone(&root, "repo");
+    let blocked = root.join("blocked");
+    repo_scan::privacy::private_dir_0700(&blocked).expect("mkdir");
+    repo_scan::privacy::private_write_0600(&blocked.join("secret.txt"), b"x").expect("write");
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o0)).expect("chmod 000");
+    let _restore = Restore { path: &blocked };
+    if std::fs::read_dir(&blocked).is_ok() {
+        eprintln!("resume_incomplete_replay: chmod 000 ineffective (privileged user); skipping");
+        return;
+    }
+
+    let report = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report.to_str().expect("utf8"),
+            "--format",
+            "human",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "permission gap is usable-but-incomplete; stderr: {}",
+        stderr_text(&out)
+    );
+    let scan_id = stdout_line(&out, "scan_id");
+
+    let out = run(
+        &["resume", scan_id.as_str(), "--format", "human"],
+        tmp.path(),
+        &state,
+    );
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr_text(&out));
+    assert_eq!(stdout_line(&out, "scan_id"), scan_id);
+
+    let rt = runtime();
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("reopen");
+        let types = journal_types(&store, &scan_id).await;
+        assert_eq!(count_type(&types, "scan_started"), 1, "{types:?}");
+        assert_eq!(count_type(&types, "inventory_ready"), 1, "{types:?}");
+        assert_eq!(count_type(&types, "scan_incomplete"), 1, "{types:?}");
+        assert_eq!(count_type(&types, "scan_completed"), 0, "{types:?}");
+        assert_eq!(count_type(&types, "scan_failed"), 0, "{types:?}");
+        assert_eq!(count_type(&types, "scan_interrupted"), 0, "{types:?}");
+        store.close().await.expect("close");
+    });
+
+    // Both legs verified in output: the JSONL inspect replay carries
+    // each lifecycle row exactly once, and a follow over the resumed
+    // (terminal-bearing) journal completes instead of hanging.
+    let replay = run(
+        &["query", "--scan", &scan_id, "--format", "jsonl"],
+        tmp.path(),
+        &state,
+    );
+    assert_eq!(
+        replay.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&replay)
+    );
+    let lines: Vec<serde_json::Value> = String::from_utf8_lossy(&replay.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each line is valid JSON"))
+        .collect();
+    let line_types: Vec<String> = lines
+        .iter()
+        .map(|v| v["type"].as_str().expect("type").to_string())
+        .collect();
+    assert_eq!(count_type(&line_types, "scan_started"), 1, "{line_types:?}");
+    assert_eq!(
+        count_type(&line_types, "inventory_ready"),
+        1,
+        "{line_types:?}"
+    );
+    assert_eq!(
+        count_type(&line_types, "scan_incomplete"),
+        1,
+        "{line_types:?}"
+    );
+
+    let follow = run(
+        &["query", "--scan", &scan_id, "--follow", "--format", "jsonl"],
+        tmp.path(),
+        &state,
+    );
+    assert_eq!(
+        follow.status.code(),
+        Some(0),
+        "follow over a resumed journal completes; stderr: {}",
+        stderr_text(&follow)
+    );
+}

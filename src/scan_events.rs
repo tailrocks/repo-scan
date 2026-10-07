@@ -126,6 +126,20 @@ pub fn is_terminal_event(t: EventType) -> bool {
     )
 }
 
+/// Name-string form of [`is_terminal_event`] for journal-prefix replay
+/// (stored rows carry the event name, not the enum).
+#[must_use]
+pub fn is_terminal_name(name: &str) -> bool {
+    [
+        EventType::ScanCompleted,
+        EventType::ScanIncomplete,
+        EventType::ScanInterrupted,
+        EventType::ScanFailed,
+    ]
+    .iter()
+    .any(|t| t.name() == name)
+}
+
 /// One scan-event envelope (contract D4).
 ///
 /// Wire shape is `{schema_version, scan_id, seq, catalog_rev, type, op,

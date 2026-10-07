@@ -4,10 +4,14 @@
 //! each fairly. Likely locations are seeded for early useful results but
 //! never substitute for complete scope: `/tmp`, `/private/tmp`, the
 //! effective user home, `/private/var/folders`, and configured Cargo
-//! locations are priorities, and a large ordinary root must not starve the
-//! temporary locations indefinitely (hence round-robin scheduling across
-//! roots). Nothing is excluded by directory name (`target`, `.cargo`,
-//! `.cache`, `node_modules`, `.git` are all in scope).
+//! locations are priorities. Scheduling order: seeds first, then mounts in
+//! plan order; the scheduler enqueues one enumeration task per root in
+//! that order and claims FIFO within each task class with R06
+//! class-interleaved claims, so a large tree under one root cannot starve
+//! the others indefinitely — every root's tasks eventually claim (a stuck
+//! scope becomes a gap, never a silent skip). Nothing is excluded by
+//! directory name (`target`, `.cargo`, `.cache`, `node_modules`, `.git`
+//! are all in scope).
 
 use crate::platform::{MountPoint, VolumeId};
 use std::path::{Path, PathBuf};
@@ -146,50 +150,6 @@ fn volume_dev(md: &std::fs::Metadata) -> u64 {
 #[cfg(not(unix))]
 fn volume_dev(_md: &std::fs::Metadata) -> u64 {
     0
-}
-
-/// Round-robin cursor over the planned roots. The scheduler pulls roots
-/// through [`RootPlan::next`] so a huge tree under one root cannot starve
-/// the others — each root gets interleaved directory tasks.
-#[derive(Debug)]
-pub struct RootPlan {
-    roots: Vec<PlannedRoot>,
-    cursor: usize,
-}
-
-impl RootPlan {
-    /// Plan over these roots in the given order.
-    pub fn new(roots: Vec<PlannedRoot>) -> Self {
-        Self { roots, cursor: 0 }
-    }
-
-    /// Next root in round-robin order, or `None` when the plan is empty.
-    // Not `Iterator::next`: the borrowed item cannot be an `Item` type, and
-    // the cursor cycles forever rather than terminating.
-    #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Option<&PlannedRoot> {
-        if self.roots.is_empty() {
-            return None;
-        }
-        let root = &self.roots[self.cursor % self.roots.len()];
-        self.cursor = self.cursor.wrapping_add(1);
-        Some(root)
-    }
-
-    /// Number of planned roots.
-    pub fn len(&self) -> usize {
-        self.roots.len()
-    }
-
-    /// True when the plan holds no roots.
-    pub fn is_empty(&self) -> bool {
-        self.roots.is_empty()
-    }
-
-    /// All planned roots in plan order.
-    pub fn roots(&self) -> &[PlannedRoot] {
-        &self.roots
-    }
 }
 
 #[cfg(test)]

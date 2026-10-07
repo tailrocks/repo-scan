@@ -254,7 +254,7 @@ fn absolutize_once(path: &Path) -> crate::Result<PathBuf> {
 
 /// Lexical `.`/`..` cleanup that never touches the filesystem (so it works
 /// for not-yet-existing destinations and never follows symlinks).
-fn clean_absolute(path: &Path) -> PathBuf {
+pub fn clean_absolute(path: &Path) -> PathBuf {
     use std::path::Component;
     let mut out = PathBuf::new();
     for component in path.components() {

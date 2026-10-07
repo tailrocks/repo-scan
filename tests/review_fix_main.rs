@@ -414,6 +414,60 @@ fn r7_alias_records() {
     assert!(found, "link -> target alias: {aliases:?}");
 }
 
+/// BOUNDARY-m11: file symlinks alias nothing — unlike directory links
+/// (which record a `symlink` row), a file link records no alias row
+/// however far its target sits (distance-independent: an adjacent link
+/// and a cross-tree link behave identically).
+#[cfg(unix)]
+#[test]
+fn file_symlink_records_no_alias_at_any_distance() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).unwrap();
+    let real = fixture::normal_clone(&root, "real");
+    fixture::git(&real, &["remote", "set-url", "origin", URL_A]);
+    // Control: directory link records a `symlink` alias row.
+    std::os::unix::fs::symlink(&real, root.join("alias")).unwrap();
+    // Near file link (adjacent: same directory as its target).
+    let near = root.join("near.txt");
+    repo_scan::privacy::private_write_0600(&near, b"near").unwrap();
+    std::os::unix::fs::symlink(&near, root.join("near-link")).unwrap();
+    // Far file link (cross-tree: nested deep, target at the root).
+    let deep = root.join("deep").join("a").join("b");
+    repo_scan::privacy::private_dir_0700(&deep).unwrap();
+    std::os::unix::fs::symlink(&near, deep.join("far-link")).unwrap();
+
+    let state = tmp.path().join("state");
+    let rep = tmp.path().join("rep.json");
+    let out = scan(&state, URL_A, &[&root], &rep, &["--status", "metadata"]);
+    assert_eq!(out.status.code(), Some(0), "scan: {out:?}");
+    let report = read_json(&rep);
+    let aliases = report["aliases"].as_array().expect("aliases");
+    let paths = report["paths"].as_array().expect("paths");
+    let by_id: std::collections::HashMap<&str, &str> = paths
+        .iter()
+        .filter_map(|p| Some((p["id"].as_str()?, p["value"].as_str()?)))
+        .collect();
+    let mut dir_link = false;
+    for alias in aliases {
+        let path = by_id
+            .get(alias["path_id"].as_str().unwrap_or(""))
+            .unwrap_or(&"");
+        let target = by_id
+            .get(alias["target_path_id"].as_str().unwrap_or(""))
+            .unwrap_or(&"");
+        assert!(
+            !path.contains("near-link") && !path.contains("far-link"),
+            "file link records no alias row: {path} -> {target}"
+        );
+        if path.contains("alias") && target.contains("real") {
+            dir_link = true;
+            assert_eq!(alias["kind"].as_str(), Some("symlink"));
+        }
+    }
+    assert!(dir_link, "control dir link aliases: {aliases:?}");
+}
+
 /// R9: the per-operation no-progress watchdog trips past its bounded grace
 /// and only past it.
 #[test]
@@ -906,4 +960,115 @@ fn round3_c1_db_identity_seam_binds_store_open() {
     );
     // The marker stays: nothing was ever bound.
     assert!(payload.join("owner.marker").is_file());
+}
+
+/// BOUNDARY-m10: the pending lanes union on one definition — terminal
+/// `unsupported` counts in neither. Five status tasks driven to
+/// `pending`, `retry_wait`, `unavailable`, `unsupported`, `complete`:
+/// both `pending_count` and the status lane count exactly the three
+/// actionable ones.
+#[test]
+fn status_pending_unions_with_pending_count_on_terminal_states() {
+    use repo_scan::model::TaskState;
+    use repo_scan::store::{now_ms, TaskOutcome};
+
+    runtime().block_on(async {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        let epoch = store.epoch();
+        let now = now_ms();
+        let generation = store
+            .create_generation("roots", "running", None, now)
+            .await
+            .expect("generation");
+        for id in [
+            "st-pending",
+            "st-retry",
+            "st-unavail",
+            "st-unsupported",
+            "st-done",
+        ] {
+            store
+                .enqueue_task(
+                    &NewTask {
+                        id,
+                        kind: "status",
+                        generation,
+                        dir_id: None,
+                        scope_key: "dir:m10",
+                        expected_rev: 0,
+                        idempotency_key: Box::leak(format!("idem:{id}").into_boxed_str()),
+                    },
+                    now,
+                )
+                .await
+                .expect("enqueue");
+        }
+        // Claim once; `st-pending` is released back to pending, the
+        // rest complete into their terminal states.
+        let claimed = store
+            .claim_tasks(epoch, 8, 60_000, now)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 5);
+        let token = |id: &str| {
+            claimed
+                .iter()
+                .find(|c| c.task.id == id)
+                .expect("claimed row")
+                .token
+        };
+        store
+            .release_claim("st-pending", token("st-pending"), epoch, now_ms())
+            .await
+            .expect("release");
+        for (id, outcome) in [
+            (
+                "st-retry",
+                TaskOutcome::Retry {
+                    category: String::from("transient"),
+                    detail: String::from("m10"),
+                    retry_after_ms: now + 60_000,
+                },
+            ),
+            (
+                "st-unavail",
+                TaskOutcome::Parked {
+                    state: TaskState::Unavailable,
+                    reason: String::from("m10"),
+                },
+            ),
+            (
+                "st-unsupported",
+                TaskOutcome::Parked {
+                    state: TaskState::Unsupported,
+                    reason: String::from("m10"),
+                },
+            ),
+            ("st-done", TaskOutcome::Complete),
+        ] {
+            store
+                .complete_task(id, token(id), epoch, &outcome, now_ms())
+                .await
+                .expect("complete");
+        }
+
+        // Both lanes count exactly the actionable three (pending,
+        // retry_wait, unavailable); terminal unsupported/complete count
+        // in neither.
+        assert_eq!(
+            store.pending_count(generation).await.expect("pending"),
+            3,
+            "pending_count lane"
+        );
+        assert_eq!(
+            main_under_test::test_count_status_pending(&store, generation)
+                .await
+                .expect("status pending"),
+            3,
+            "status lane unions with pending_count"
+        );
+        store.close().await.expect("close");
+    });
 }

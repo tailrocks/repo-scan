@@ -23,8 +23,8 @@ use repo_scan::report::builder::{
     ReportInputs as LibReportInputs, ReportPipeline, RootInput, StorageLinkInput,
 };
 use repo_scan::scan_events::{
-    classify_cursor, is_progress_coalescible, is_terminal_event, retention_cutoff, Cursor,
-    Envelope, EventType, Op, ResumeAction, MAX_RETAINED_SCAN_EVENTS,
+    classify_cursor, is_progress_coalescible, is_terminal_event, is_terminal_name,
+    retention_cutoff, Cursor, Envelope, EventType, Op, ResumeAction, MAX_RETAINED_SCAN_EVENTS,
 };
 use repo_scan::scheduler::{backoff_for_attempt, Admission, CircuitBreaker, OpClass, Permit};
 #[cfg(test)]
@@ -38,14 +38,13 @@ use repo_scan::store::{
 use repo_scan::telemetry::{live_helper_rss_bytes, FootprintSampler, SamplerInputs};
 use repo_scan::walk::roots::{plan_machine_roots, PlannedRoot, RootPriority};
 use repo_scan::walk::topology::{
-    resolve_symlink, DirStat, FenceError, FenceOpen, PhysicalDirId, PinnedDir, ResolveError,
-    ScopeFence, Topology,
+    resolve_symlink, DirStat, FenceError, FenceOpen, PinnedDir, ResolveError, ScopeFence,
 };
 use repo_scan::walk::{ChildKind, ListOptions, WalkItem};
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::Mutex;
 use std::sync::{Arc, OnceLock};
@@ -71,6 +70,40 @@ const KIND_ANALYZE: &str = "analyze_store";
 enum DrainPhase {
     Discovery,
     Analysis,
+}
+
+/// Step 8 order proof (D3): set once the generation's `inventory_ready`
+/// commits. Analysis read entries ([`observed_refs`], [`observed_head`],
+/// [`compute_branch_comparisons`], [`collect_status_reads`]) audit
+/// against it — any start while the boundary is open counts in
+/// [`PRE_BOUNDARY_ANALYSIS_READS`] and the terminal payload carries the
+/// total, so case 12 asserts on read starts, not journal order alone.
+/// Process-lifetime is scan-lifetime (one command per process); resume
+/// is a fresh process with a fresh boundary.
+static BOUNDARY_CLOSED: AtomicBool = AtomicBool::new(false);
+/// Analysis reads started before `inventory_ready` committed (must stay
+/// zero; see [`BOUNDARY_CLOSED`]).
+static PRE_BOUNDARY_ANALYSIS_READS: AtomicU64 = AtomicU64::new(0);
+
+/// Audit one analysis read start against the Step 8 boundary: counts
+/// (and loudly reports) starts while the boundary is still open. Called
+/// at the entry of every analysis read — refs, head, graph comparison,
+/// and status takes — which all run behind the Analysis drain gate.
+fn audit_analysis_read_start(site: &'static str) {
+    if !BOUNDARY_CLOSED.load(Ordering::SeqCst) {
+        PRE_BOUNDARY_ANALYSIS_READS.fetch_add(1, Ordering::SeqCst);
+        eprintln!(
+            "repo-scan: boundary violation: analysis read ({site}) started before inventory_ready"
+        );
+    }
+}
+
+/// Terminal-payload boundary audit value (D4): total pre-boundary
+/// analysis read starts (zero on every healthy scan).
+fn boundary_audit_value() -> serde_json::Value {
+    serde_json::json!({
+        "pre_boundary_analysis_reads": PRE_BOUNDARY_ANALYSIS_READS.load(Ordering::SeqCst),
+    })
 }
 
 impl DrainPhase {
@@ -795,6 +828,16 @@ struct ScanJournal {
     /// newest) survives per scan and replay order always matches seq
     /// order).
     progress_seq: Option<u64>,
+    /// Seq of the journaled `inventory_ready` row, if any (replay-once:
+    /// a resumed run never re-emits the boundary event; a run killed
+    /// before the boundary still emits it because the prefix lacks it).
+    ready_seq: Option<u64>,
+    /// Seq of the journaled terminal row, if any (contract D4:
+    /// exactly one terminal per scan — a resumed run never appends a
+    /// second, so followers stop at the first and inspect completes;
+    /// the scan row carries the live verdict while a stale journal
+    /// terminal may stand, same as a retried publication).
+    terminal_seq: Option<u64>,
     /// Highest seq known pruned by retention (heuristic for the
     /// over-bound check; the `COUNT(*)` confirm is authoritative).
     pruned_through: u64,
@@ -810,6 +853,8 @@ impl ScanJournal {
         let mut emitted_checkouts = HashSet::new();
         let mut emitted_branch_stores = HashSet::new();
         let mut progress_seq = None;
+        let mut ready_seq = None;
+        let mut terminal_seq = None;
         loop {
             let rows = store.read_scan_events(scan_id, max_seq, 500).await?;
             let short = rows.len() < 500;
@@ -822,6 +867,12 @@ impl ScanJournal {
                 last_off = row.event_offset;
                 if row.event_type == EventType::DiscoveryProgress.name() {
                     progress_seq = Some(row.seq);
+                }
+                if row.event_type == EventType::InventoryReady.name() {
+                    ready_seq = Some(row.seq);
+                }
+                if is_terminal_name(&row.event_type) {
+                    terminal_seq = Some(row.seq);
                 }
                 let id_key = match row.event_type.as_str() {
                     "repository_found" => Some((&mut emitted_stores, "store_id")),
@@ -857,10 +908,24 @@ impl ScanJournal {
             emitted_checkouts,
             emitted_branch_stores,
             progress_seq,
+            ready_seq,
+            terminal_seq,
             // Retention prunes a contiguous prefix, so everything below
             // the retained minimum is gone; a fresh journal starts at 1.
             pruned_through: min_seq.map(|m| m.saturating_sub(1)).unwrap_or(0),
         })
+    }
+
+    /// True when the journaled prefix already carries a terminal row
+    /// (replay-once: a resumed run must not append a second terminal).
+    fn has_terminal(&self) -> bool {
+        self.terminal_seq.is_some()
+    }
+
+    /// True when the journaled prefix already carries `inventory_ready`
+    /// (replay-once: a resumed run must not re-emit the boundary).
+    fn has_ready(&self) -> bool {
+        self.ready_seq.is_some()
     }
 
     /// Cursor of the last committed event, for `scan_interrupted` /
@@ -921,6 +986,12 @@ impl ScanJournal {
             records: &bytes,
         };
         store.append_scan_event(&event).await?;
+        if event_type == EventType::InventoryReady {
+            self.ready_seq = Some(seq);
+        }
+        if is_terminal_event(event_type) {
+            self.terminal_seq = Some(seq);
+        }
         Ok(())
     }
 
@@ -1235,6 +1306,7 @@ fn failed_records(
         "error": err,
         "resumable": true,
         "resume_cmd": resume_cmd_for(state_dir, scan_id),
+        "boundary_audit": boundary_audit_value(),
     })
 }
 
@@ -1248,6 +1320,22 @@ async fn journal_emission_failed(
     scan_id: &str,
     err: &str,
 ) -> repo_scan::Result<()> {
+    // Lifecycle emits commit immediately: drain first so no lower-seq
+    // buffered event commits after (or drops behind) `scan_failed`.
+    drain_runner_batch(runner, store).await?;
+    // Replay-once (contract D4: exactly one terminal per scan): a
+    // resumed run that fails again must not append a second
+    // `scan_failed` — the first terminal stands, the scan row carries
+    // the live `failed` state, and the exit code is unchanged.
+    if runner
+        .journal
+        .as_ref()
+        .expect("scan journal opened above")
+        .has_terminal()
+    {
+        eprintln!("repo-scan: emission failed again ({err}); terminal already journaled");
+        return Ok(());
+    }
     let failed = failed_records(
         runner.journal.as_ref().expect("scan journal opened above"),
         err,
@@ -2064,13 +2152,29 @@ async fn run_scan_inner(
             "event_history": event_gaps,
         },
     });
-    runner
+    // Lifecycle emits commit immediately: drain first so no lower-seq
+    // buffered event commits after `inventory_ready`.
+    drain_runner_batch(&mut runner, &store).await?;
+    // Replay-once: a resumed run never re-emits the boundary event —
+    // the prefix already carries it. A run killed before the boundary
+    // still emits it here because the prefix lacks it.
+    if !runner
         .journal
-        .as_mut()
+        .as_ref()
         .expect("scan journal opened above")
-        .emit(&store, EventType::InventoryReady, &ready)
-        .await?;
-    runner.counters.db_transactions += 1;
+        .has_ready()
+    {
+        runner
+            .journal
+            .as_mut()
+            .expect("scan journal opened above")
+            .emit(&store, EventType::InventoryReady, &ready)
+            .await?;
+        runner.counters.db_transactions += 1;
+    }
+    // Step 8 order proof: the boundary is committed — analysis reads
+    // may start from here. Set before the analysis drain below.
+    BOUNDARY_CLOSED.store(true, Ordering::SeqCst);
     // Wave2b live `--report` (case 17): boundary-gated, throttled,
     // best-effort — never per discovery, never fatal.
     let mut live_throttle = repo_scan::report::output::LiveThrottle::new();
@@ -2589,9 +2693,15 @@ async fn run_scan_inner(
         ExitCode::Success
     };
     // Terminal journal (D4): same predicates as the verdict above, so the
-    // journaled class can never disagree with the scan row. Completed and
-    // incomplete scans carry final counts + resume command; interrupted
-    // scans carry the scan id, cursor, and saved scope/options.
+    // journaled class agrees with the scan row on a fresh run. Completed
+    // and incomplete scans carry final counts + resume command;
+    // interrupted scans carry the scan id, cursor, and saved scope/options.
+    // Replay-once: exactly one terminal is journaled per scan. A resumed
+    // run whose prefix already carries a terminal (interrupted/failed/
+    // incomplete first run) emits no second one — the first terminal
+    // stands and the scan row carries the live verdict (same standing
+    // rule as a retried publication, which journals nothing). The row
+    // update, exit code, and tails below are unaffected by the skip.
     let (terminal, terminal_records) = if outcome.interrupted {
         (
             EventType::ScanInterrupted,
@@ -2617,6 +2727,7 @@ async fn run_scan_inner(
                     "fetch": args.fetch,
                 },
                 "resume_cmd": resume_cmd_for(&cfg.state_dir, &scan_id),
+                "boundary_audit": boundary_audit_value(),
             }),
         )
     } else {
@@ -2639,15 +2750,26 @@ async fn run_scan_inner(
                 "report_id": &report_id,
                 "published": published,
                 "resume_cmd": resume_cmd_for(&cfg.state_dir, &scan_id),
+                "boundary_audit": boundary_audit_value(),
             }),
         )
     };
-    runner
+    // Lifecycle emits commit immediately: drain first so the terminal
+    // event commits last and no buffered tail drops at Runner drop.
+    drain_runner_batch(&mut runner, &store).await?;
+    if !runner
         .journal
-        .as_mut()
+        .as_ref()
         .expect("scan journal opened above")
-        .emit(&store, terminal, &terminal_records)
-        .await?;
+        .has_terminal()
+    {
+        runner
+            .journal
+            .as_mut()
+            .expect("scan journal opened above")
+            .emit(&store, terminal, &terminal_records)
+            .await?;
+    }
     let _ = store.close().await;
     // Wave6 success tails: machine lanes already printed (json) or
     // replay below (jsonl, including the redirected default); human
@@ -3040,6 +3162,13 @@ async fn upsert_volumes(
 /// Seed one enumeration task per planned root. Tasks are idempotent
 /// (`INSERT OR IGNORE`), so reseeding a reused generation is a no-op for
 /// already reconciled roots and only adds genuinely new scope.
+/// Enqueue one enumeration task per planned root, in plan order
+/// (seeds first, then mounts). Claims pop FIFO within each task class
+/// with R06 class-interleaved rounds, so roots share the scheduler:
+/// a huge tree under one root cannot starve the others (every root's
+/// tasks eventually claim; stuck scopes become gaps). There is no
+/// root-level round-robin cursor — plan order plus FIFO claims is the
+/// whole fairness mechanism.
 async fn seed_root_tasks(
     store: &TursoStore,
     runner: &mut Runner,
@@ -4316,8 +4445,13 @@ struct PendingAliasCheck {
     at_ms: i64,
 }
 
-/// Owner-side run state: admission gates, per-volume breakers, topology
-/// guard, and one lazily discovered installed-git fallback.
+/// Owner-side run state: admission gates, per-volume breakers, and one
+/// lazily discovered installed-git fallback. Enumeration dedupe is
+/// durable, not in-memory: tasks key on physical identity
+/// (`enum:{generation}:d{dev}:i{ino}`) with idempotent enqueue, and the
+/// `directories` identity index is the dedupe authority — there is no
+/// in-memory seen-set guard (a write-only one was removed; it observed
+/// every enumeration but nothing ever read the outcome).
 struct Runner {
     admission: Admission,
     /// Shared mirror of admission memory pressure for worker-owned
@@ -4325,7 +4459,6 @@ struct Runner {
     /// `set_pressure`; `Admission` itself stays single-threaded).
     pressure: Arc<AtomicBool>,
     breakers: HashMap<String, CircuitBreaker>,
-    topology: Topology,
     /// Descriptor-relative traversal fence (finding 12): `Some` on every
     /// production scan (built from the planned roots in `run_scan_inner`);
     /// `None` only on unit-test runners, which keep the legacy open.
@@ -4426,7 +4559,6 @@ impl Runner {
             admission: Admission::new(limits.clone()),
             pressure: Arc::new(AtomicBool::new(false)),
             breakers: HashMap::new(),
-            topology: Topology::new(),
             fence: None,
             inspector: git::GixInspector::new(),
             fallback: Arc::new(OnceLock::new()),
@@ -4808,6 +4940,14 @@ async fn apply_watchdog_with_scope(
 /// (only future backoffs, parked scopes, or nothing), or SIGINT arrives.
 /// Every completion goes through the store's epoch/lease/revision guards.
 #[allow(clippy::too_many_arguments)]
+/// Drain one phase until no task is claimable, then report the residue.
+/// Claims only see `pending` rows and `retry_wait` rows whose backoff has
+/// elapsed — a trailing retry (backoff still in the future, nothing else
+/// runnable) ends the drain WITHOUT waiting: the run reports the residue
+/// as pending (exit 3 with `resume_cmd`) and the resume re-runs the drain
+/// once the backoff has elapsed. Retries are resume-driven by design —
+/// the drain never sleeps for backoff eligibility (backoffs run to 300 s;
+/// sleeping would stall scans behind the longest tail).
 async fn run_until_boundary(
     runner: &mut Runner,
     store: &TursoStore,
@@ -5669,6 +5809,24 @@ async fn flush_runner_batch(runner: &mut Runner, store: &TursoStore) -> repo_sca
     Ok(applied)
 }
 
+/// Drain the writer batch COMPLETELY: one [`flush_runner_batch`]
+/// commits the held ops, but completion classification
+/// ([`journal_observed_delta`]) and the deferred alias checks re-buffer
+/// gap/journal rows behind it — a single shot returns with residue. A
+/// lifecycle emit over that residue would commit a HIGHER seq before
+/// the buffered LOWER-seq events commit (or before a no-fetch run
+/// drops them at Runner drop), breaking journal completeness and
+/// seq/commit-order agreement. Loops until empty; terminates because
+/// each flush drains the batch and the re-buffered tail is one-shot
+/// (pending completions/checks are taken, overflow flags latch).
+async fn drain_runner_batch(runner: &mut Runner, store: &TursoStore) -> repo_scan::Result<u64> {
+    let mut total = 0;
+    while !runner.batch.is_empty() {
+        total += flush_runner_batch(runner, store).await?;
+    }
+    Ok(total)
+}
+
 /// Flush when a `buffer_*` call reports a spec §5 limit
 /// (RSF-AC461500-609D-4D55-991E-09C60D382D67).
 async fn flush_if_due(runner: &mut Runner, store: &TursoStore, due: bool) -> repo_scan::Result<()> {
@@ -5927,19 +6085,20 @@ fn note_probed_git_id(
     Ok(false)
 }
 
-/// Per-volume breaker key for a scope key (paths stat their volume;
-/// anything unstattable shares the `unknown` bucket).
-fn breaker_key_for_task(scope_key: &str) -> String {
+/// Per-volume breaker key for a scope key (paths key by owning-device
+/// volume through the bounded identity-I/O lane; anything unstattable
+/// shares the `unknown` bucket). `pub` for the `fail_gaps` harness.
+pub fn breaker_key_for_task(scope_key: &str) -> String {
     let path = match config::parse_scope_key(scope_key) {
         Some(config::ScopeRef::Dir(p) | config::ScopeRef::Git(p)) => p,
         Some(config::ScopeRef::Status(_)) | None => return String::from("status"),
     };
-    match std::fs::symlink_metadata(&path) {
-        Ok(md) => {
-            let (dev, _) = dir_identity(&md);
-            format!("dev:{dev}")
-        }
-        Err(_) => String::from("unknown"),
+    // Bounded per-claim stat (RSF-TOPOLOGY-ADMISSION): the coordinator
+    // never blocks past the identity-I/O budget on a hung path, and an
+    // unstattable scope shares the `unknown` bucket explicitly.
+    match repo_scan::walk::topology::bounded_volume_dev(&path) {
+        Some(dev) => format!("dev:{dev}"),
+        None => String::from("unknown"),
     }
 }
 
@@ -6898,8 +7057,6 @@ struct EnumChild {
 /// only admission touch left is the pressure abort, which stays as feed
 /// control through the shared pressure mirror.)
 struct EnumScan {
-    dev: u64,
-    ino: u64,
     volume_tag: String,
     dir_id: i64,
     ino_str: String,
@@ -7099,8 +7256,6 @@ fn collect_enum_reads(
         });
     }
     Ok(EnumCollected::Scan(EnumScan {
-        dev,
-        ino,
         volume_tag,
         dir_id,
         ino_str,
@@ -7142,11 +7297,6 @@ async fn persist_enumeration(
             error: e,
         } => fail_list_open(runner, store, claimed, dir_id, generation, path, now_ms, &e).await,
         EnumCollected::Scan(scan) => {
-            runner.topology.observe(PhysicalDirId {
-                dev: scan.dev,
-                ino: scan.ino,
-                namespace: scan.volume_tag.clone(),
-            });
             let now = scan.now_ms;
             let due = TursoStore::buffer_dir_upsert(
                 &mut runner.batch,
@@ -7446,6 +7596,16 @@ async fn enqueue_symlink_target(
 ) -> repo_scan::Result<()> {
     match resolve_symlink(link_path) {
         Ok(target) => {
+            // m11: file symlinks alias NOTHING — only directory links
+            // produce alias rows (`symlink`, plus deferred `same_object`
+            // when the target schedules under another spelling). The
+            // scanner inventories directories, so a file link is not
+            // alternate-spelling work, has no scheduled task to share
+            // results with, and records no row however far its target
+            // sits (distance-independent: an adjacent link and a
+            // cross-tree link behave identically). Cycles, depth
+            // overflow, and unresolvable chains still gap below —
+            // those describe the LINK, not an alias of its target.
             if !matches!(target.kind, ChildKind::Directory) {
                 return Ok(());
             }
@@ -10278,6 +10438,7 @@ fn observed_head(
     ctx: &ReadContext,
     instance: &git::GitInstance,
 ) -> repo_scan::Result<git::HeadState> {
+    audit_analysis_read_start("observed_head");
     match ctx.inspector.head(instance) {
         Ok(head) => Ok(head),
         Err(e) if git::is_unsupported_error(&e) => {
@@ -10307,6 +10468,7 @@ fn observed_refs(
     // One pass: refs + per-item errors share a single open+traversal
     // (`refs_with_errors`); the fallback leg contributes refs only
     // (installed git skips invalid refs, covered by the note).
+    audit_analysis_read_start("observed_refs");
     match ctx.inspector.refs_with_errors(instance) {
         Ok((refs, errors)) => Ok((refs, errors)),
         Err(e) if git::is_unsupported_error(&e) => {
@@ -10558,6 +10720,7 @@ fn compute_branch_comparisons(
     upstreams: &HashMap<Vec<u8>, Vec<u8>>,
     cache: &git::graph::ComparisonCache,
 ) -> HashMap<Vec<u8>, git::graph::Comparison> {
+    audit_analysis_read_start("compare_branch");
     let mut oids: HashMap<&[u8], (&str, &str)> = HashMap::new();
     // Presence set: EVERY iterated ref name, including OID-less ones
     // (unpeeled symbolic, dangling, broken-but-returned). `upstream_known`
@@ -11148,12 +11311,26 @@ struct StatusTarget {
 /// Read-half outcome of one status task (Step 8 worker seam): full
 /// observations plus every terminal mid-read condition, all as data.
 /// The writer applies rows/gaps/retries via [`persist_status`].
+/// One manifested submodule with no inspectable local git data (M8):
+/// the worktree carries no `.git` entry and no git dir exists, so
+/// traversal never probed it — yet without a gap the parent would
+/// report `complete` with `submodules: checked` (false negative on
+/// scope). The writer records each as a `submodule-uninspected` gap.
+struct UninspectedSubmodule {
+    /// Manifested worktree path, lexically cleaned (may not exist, and
+    /// may escape the worktree — see `reason`).
+    path: PathBuf,
+    /// Why no inspection happened.
+    reason: &'static str,
+}
+
 enum StatusReadOutcome {
     Observed {
         started_ms: i64,
         finished_ms: i64,
         submodules: &'static str,
         observation: Option<git::StatusObservation>,
+        uninspected_submodules: Vec<UninspectedSubmodule>,
     },
     UnsupportedOpen {
         error: String,
@@ -11185,6 +11362,62 @@ struct StatusCollected {
     outcome: StatusReadOutcome,
 }
 
+/// Partition manifested submodules into verified vs uninspected (M8).
+/// Submodule worktrees are covered by traversal ONLY — discovery
+/// descends into the worktree and probes its `.git` entry (or the
+/// modules store under the parent's git dir); the manifest is never a
+/// discovery source. Status runs post-`inventory_ready`, so on-disk
+/// evidence now implies a probe was attempted (a checkout row or a
+/// probe gap — both loud). A manifest entry with neither is
+/// manifested-but-never-inspected and must gap loudly.
+///
+/// Checks are `symlink_metadata` (never follow) so a hostile manifest
+/// cannot redirect a content read; the manifested worktree path must
+/// stay lexically within the workdir (escapes gap — inspecting outside
+/// scope is refused). The git dir is evidence-only (existence): an
+/// external git dir is still on-disk git data traversal covers
+/// scope-wide. Workdir-less (bare) parents skip verification: their
+/// manifest paths cannot anchor, and bare parents check out no
+/// submodules.
+fn uninspected_submodules(
+    work_dir: Option<&Path>,
+    observations: &[git::SubmoduleObservation],
+) -> Vec<UninspectedSubmodule> {
+    let Some(work_dir) = work_dir else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for obs in observations {
+        // The inspector anchors worktree paths at the workdir; clean
+        // lexically (no filesystem access) before containing.
+        let anchored = config::clean_absolute(&obs.path);
+        if !anchored.starts_with(work_dir) {
+            out.push(UninspectedSubmodule {
+                path: anchored,
+                reason:
+                    "manifested path escapes the parent worktree; refused to inspect outside scope",
+            });
+            continue;
+        }
+        let dot_git = std::fs::symlink_metadata(anchored.join(".git")).is_ok();
+        let git_dir = obs.git_dir.as_ref().is_some_and(|dir| {
+            let abs = if dir.is_absolute() {
+                dir.clone()
+            } else {
+                work_dir.join(dir)
+            };
+            std::fs::symlink_metadata(config::clean_absolute(&abs)).is_ok()
+        });
+        if !dot_git && !git_dir {
+            out.push(UninspectedSubmodule {
+                path: anchored,
+                reason: "no local git data (no .git entry, no git dir); never inspected",
+            });
+        }
+    }
+    out
+}
+
 /// Read half of status ([`prepare_status`]/[`finish_status`]): fence verify, open, guarded blocking
 /// status call, fallback counts, submodule coverage, and post-run
 /// re-verification. Applies no catalog writes — lease renewal moved to
@@ -11195,6 +11428,7 @@ fn collect_status_reads(
     target: &StatusTarget,
     deadline: &OpDeadline,
 ) -> repo_scan::Result<StatusCollected> {
+    audit_analysis_read_start("status_interruptible");
     let git_path = &target.git_path;
     let mode = target.mode;
     // Status fence (pre-run): same verify-run-reverify envelope as probes.
@@ -11338,10 +11572,17 @@ fn collect_status_reads(
     let finished = store::now_ms();
     // Submodule coverage (R16): examined through the inspector alongside
     // the status probe — `checked` when the submodule relationships were
-    // actually read, `unknown` when they could not be.
-    let submodules = match ctx.inspector.submodules(&instance, &ctx.ssh_aliases) {
-        Ok(_) => "checked",
-        Err(_) => "unknown",
+    // actually read, `unknown` when they could not be. The manifest is
+    // reconciled against on-disk evidence (M8): traversal is the only
+    // submodule discovery source, so entries with no evidence were never
+    // inspected and gap loudly in the writer instead of reporting
+    // `checked` + `complete` (false negative on scope).
+    let (submodules, uninspected) = match ctx.inspector.submodules(&instance, &ctx.ssh_aliases) {
+        Ok(observations) => (
+            "checked",
+            uninspected_submodules(instance.work_dir.as_deref(), &observations),
+        ),
+        Err(_) => ("unknown", Vec::new()),
     };
     // XSEC-01: one more read stage done — poll before recording.
     if !poll.ok_now() {
@@ -11368,6 +11609,7 @@ fn collect_status_reads(
         finished_ms: finished,
         submodules,
         observation,
+        uninspected_submodules: uninspected,
     }))
 }
 
@@ -11458,7 +11700,33 @@ async fn persist_status(
             finished_ms,
             submodules,
             observation,
+            uninspected_submodules,
         } => {
+            // M8: manifested-but-never-inspected submodules gap loudly —
+            // the status task itself still completes (the parent WAS
+            // inspected); the gaps keep coverage honest instead.
+            for uninspected in &uninspected_submodules {
+                let id = format!(
+                    "gap:submodule-uninspected:{}:{}",
+                    config::encode_hex(&config::path_as_bytes(&target.git_path)),
+                    config::encode_hex(&config::path_as_bytes(&uninspected.path)),
+                );
+                let due = buffer_record_error(
+                    runner,
+                    &id,
+                    &config::scope_key_for_dir(&uninspected.path),
+                    "submodule-uninspected",
+                    &format!(
+                        "manifested submodule at {} of {}: {}; traversal covers submodule worktrees only when their git data is on disk",
+                        uninspected.path.display(),
+                        target.git_path.display(),
+                        uninspected.reason,
+                    ),
+                    None,
+                    target.now_ms,
+                )?;
+                flush_if_due(runner, store, due).await?;
+            }
             let is_unsupported = observation.is_none();
             match observation {
                 None => {
@@ -11779,11 +12047,19 @@ async fn count_unresolvable(store: &TursoStore) -> repo_scan::Result<u64> {
     .await
 }
 
+/// Status tasks still needing scheduler action (m10): the same terminal
+/// exclusion as `TursoStore::pending_count`, so both lanes union on one
+/// pending definition when they share a task. `unsupported` is terminal
+/// ([`TaskState::is_terminal`]) — counting it here forced exit 3 forever
+/// for work no resume can advance. Dropping it from the lane stays
+/// honest: the `unsupported` status ROW still forces
+/// `coverage.status=incomplete` (R3 row truth); only the exit verdict
+/// stops demanding action that cannot exist.
 async fn count_status_pending(store: &TursoStore, generation: u64) -> repo_scan::Result<u64> {
     count_query(
         store,
         "SELECT COUNT(*) FROM frontier_tasks WHERE generation = ?1 AND kind = 'status' \
-         AND state NOT IN ('complete', 'cancelled', 'superseded')",
+         AND state NOT IN ('complete', 'unsupported', 'cancelled', 'superseded')",
         vec![turso::Value::Integer(i64::try_from(generation).map_err(
             |_| repo_scan::Error::Store(format!("task generation {generation} exceeds i64 range")),
         )?)],
@@ -12715,6 +12991,9 @@ async fn persist_remote_attempt(
     };
     let due = TursoStore::buffer_record_remote_refresh(&mut runner.batch, &refresh);
     flush_if_due(runner, store, due).await?;
+    // The `remote_updated` emit commits immediately like a lifecycle
+    // event: drain first so it never commits over lower-seq residue.
+    drain_runner_batch(runner, store).await?;
     if let Some(journal) = runner.journal.as_mut() {
         let payload = serde_json::json!({
             "store_id": instance_id,
@@ -17676,6 +17955,16 @@ pub fn test_watchdog_exceeded(grace_secs: u64, elapsed: Duration) -> bool {
     let watchdog = Watchdog::new(Duration::from_secs(grace_secs));
     let now = Instant::now();
     watchdog.exceeded(now - elapsed, now)
+}
+
+/// Status-lane pending count (m10): exposes [`count_status_pending`] for
+/// the lane-union regression test.
+#[cfg(test)]
+pub async fn test_count_status_pending(
+    store: &TursoStore,
+    generation: u64,
+) -> repo_scan::Result<u64> {
+    count_status_pending(store, generation).await
 }
 
 /// Explicit lease release (R4): returns transactions counted.

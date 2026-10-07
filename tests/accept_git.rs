@@ -1244,3 +1244,119 @@ fn status10_conflict_only_reports_conflicted() {
     assert_eq!(status["conflicts"].as_u64(), Some(2));
     assert_eq!(status["working_state"].as_str(), Some("conflicted"));
 }
+
+/// Checkout rows by kind for submodule assertions.
+fn checkouts_by_kind(report: &Value) -> HashMap<&str, &Value> {
+    report["checkouts"]
+        .as_array()
+        .expect("checkouts array")
+        .iter()
+        .map(|c| (c["kind"].as_str().expect("kind"), c))
+        .collect()
+}
+
+/// BOUNDARY-M8 parity leg: a healthy submodule is traversal-covered —
+/// the worktree `.git` file probes a `kind=submodule` checkout row, the
+/// parent manifest reconciles clean, and the scan reports `complete`
+/// with `submodules: checked` and zero gaps (no false gap).
+#[test]
+fn submodule_healthy_traversal_covered_reports_complete() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("ws");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    let (parent, _) = fixture::submodule_repo(&root);
+
+    let state = dir.path().join("state");
+    let report_path = dir.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            parent.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--format",
+            "human",
+        ],
+        &root,
+        &state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let report = read_report(&report_path);
+    assert_eq!(report["scan"]["state"].as_str(), Some("complete"));
+    assert_eq!(report["coverage"]["gaps"].as_u64(), Some(0));
+    assert!(
+        report["errors"].as_array().expect("errors").is_empty(),
+        "no gaps: {}",
+        report["errors"]
+    );
+    let kinds = checkouts_by_kind(&report);
+    let sub = kinds.get("submodule").expect("submodule checkout row");
+    assert_eq!(sub["status"]["state"].as_str(), Some("complete"));
+    assert_eq!(sub["status"]["submodules"].as_str(), Some("checked"));
+    let main = kinds.get("main").expect("parent checkout row");
+    assert_eq!(main["status"]["state"].as_str(), Some("complete"));
+    assert_eq!(main["status"]["submodules"].as_str(), Some("checked"));
+}
+
+/// BOUNDARY-M8 false-negative leg: a manifested submodule with no local
+/// git data (worktree `.git` removed, modules store destroyed) was never
+/// inspected — the scan must report `incomplete` with a loud
+/// `submodule-uninspected` gap naming it, never silent `complete`.
+#[test]
+fn submodule_manifested_absent_gaps_loudly() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("ws");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    let (parent, sub) = fixture::submodule_repo(&root);
+    // Destroy all local git data for the submodule; the manifest still
+    // names it. Modules store mirrors the worktree rel path.
+    std::fs::remove_file(sub.join(".git")).expect("remove gitfile");
+    let rel = sub.strip_prefix(&parent).expect("sub under parent");
+    std::fs::remove_dir_all(parent.join(".git").join("modules").join(rel))
+        .expect("remove modules store");
+
+    let state = dir.path().join("state");
+    let report_path = dir.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            parent.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--format",
+            "human",
+        ],
+        &root,
+        &state,
+    );
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr_text(&out));
+    let report = read_report(&report_path);
+    assert_eq!(report["scan"]["state"].as_str(), Some("incomplete"));
+    assert!(
+        report["coverage"]["gaps"].as_u64().unwrap_or(0) >= 1,
+        "gap counted: {}",
+        report["coverage"]
+    );
+    let errors = report["errors"].as_array().expect("errors");
+    let gap = errors
+        .iter()
+        .find(|e| e["category"].as_str() == Some("submodule-uninspected"))
+        .expect("submodule-uninspected gap");
+    assert!(
+        gap["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("vendor/sub"),
+        "gap names the submodule: {gap}"
+    );
+    // The parent itself was inspected (status complete); the gap — not a
+    // status failure — carries the uninspected scope.
+    let kinds = checkouts_by_kind(&report);
+    let main = kinds.get("main").expect("parent checkout row");
+    assert_eq!(main["status"]["state"].as_str(), Some("complete"));
+    assert!(!kinds.contains_key("submodule"), "no phantom submodule row");
+}

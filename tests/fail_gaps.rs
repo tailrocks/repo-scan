@@ -12,7 +12,9 @@ use repo_scan::events::{
     volume_scope_key, EventBatch, EventCursorId, BATCH_ERROR_CATEGORY, CLAIM_ERROR_CATEGORY,
 };
 use repo_scan::store::{now_ms, Store, TursoStore};
-use repo_scan::walk::topology::{bounded_dir_identity, ScopeFence};
+use repo_scan::walk::topology::{
+    bounded_dir_identity, bounded_volume_dev, identity_io_calls, ScopeFence,
+};
 use std::path::PathBuf;
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -204,6 +206,33 @@ fn identity_unknown_persists_gap_without_failopen_fallback() {
         // Bounded stat: identity for live paths, unknown for dead ones.
         assert!(bounded_dir_identity(&sub).is_some());
         assert_eq!(bounded_dir_identity(&missing), None);
+        assert!(bounded_volume_dev(&sub).is_some());
+        assert_eq!(bounded_volume_dev(&missing), None);
+
+        // M5 routing pin: coordinator stats flow through the bounded
+        // identity-I/O lane (admission + timeout), never direct
+        // unbounded `metadata` — every call advances the lane counter.
+        let before = identity_io_calls();
+        assert!(bounded_dir_identity(&sub).is_some());
+        assert!(bounded_volume_dev(&sub).is_some());
+        assert_eq!(
+            identity_io_calls(),
+            before + 2,
+            "both resolve lanes are bounded"
+        );
+
+        // Per-claim breaker keying rides the same lane: live scopes key
+        // by volume, unstattable scopes share `unknown` explicitly.
+        let live_key =
+            main_under_test::breaker_key_for_task(&repo_scan::config::scope_key_for_dir(&sub));
+        assert!(
+            live_key.starts_with("dev:"),
+            "live scope keys by volume, got {live_key}"
+        );
+        assert_eq!(
+            main_under_test::breaker_key_for_task(&repo_scan::config::scope_key_for_dir(&missing)),
+            "unknown"
+        );
 
         // Enum IDs: explicit unknown marker (stable, never `:path:`).
         let unknown = main_under_test::enum_task_id_for_path(generation, &missing);

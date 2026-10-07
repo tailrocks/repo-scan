@@ -851,7 +851,12 @@ impl GixInspector {
         })
     }
 
-    /// Submodule relationships (path/URL/gitdir) for follow-up discovery.
+    /// Submodule relationships (path/URL/gitdir) for manifest-vs-traversal
+    /// reconciliation. Submodule worktrees are discovered by traversal
+    /// ONLY (descent + `.git`-entry probe) — never from this manifest —
+    /// so the status read reconciles each entry against on-disk evidence
+    /// and gaps manifested-but-never-inspected entries instead of
+    /// silently reporting them `checked` (M8).
     pub fn submodules(
         &self,
         instance: &GitInstance,

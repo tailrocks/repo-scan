@@ -85,14 +85,19 @@ record/error events never silently dropped (durable replay or backpressure).
 | `coverage_updated` | replace | gaps/candidates delta |
 | `error` | add | ErrorRecord |
 | `remote_updated` | replace | per-store remote op: success/failure/time/ref coverage |
-| `scan_completed`/`scan_incomplete` | add | final counts + resume cmd |
-| `scan_interrupted` | add | scan id, cursor, saved scope/options |
-| `scan_failed` | add | last cursor, error, resume capability |
+| `scan_completed`/`scan_incomplete` | add | final counts + resume cmd + boundary audit |
+| `scan_interrupted` | add | scan id, cursor, saved scope/options + boundary audit |
+| `scan_failed` | add | last cursor, error, resume capability + boundary audit |
 
 Cursor: opaque; `scan seq` + `(catalog_rev, event offset)`. Snapshot cursor
 = exact end of included changes. Events sent only after their Catalog
 transaction commits. Cursor outside retention → fresh snapshot + `reset:true`.
 Duplicates: same `(seq)` re-delivery is idempotent; consumers dedupe by seq.
+Replay-once: exactly one terminal (`scan_completed`/`scan_incomplete`/
+`scan_interrupted`/`scan_failed`) and exactly one `inventory_ready` are
+journaled per scan — a resumed run never re-emits either (the first
+terminal stands; the scan row carries the live verdict, and followers
+stop at the first terminal so inspect completes).
 
 Wave1d deltas (Step 12, branch `work/fast-complete-scan`):
 
@@ -120,11 +125,17 @@ Wave2b deltas (Steps 6 + 12 output matrix, branch `work/fast-complete-scan`):
 - Terminal payloads are pinned: `scan_completed`/`scan_incomplete`
   carry `counts` (matched_per_target, pending, open_gaps,
   unresolvable, status_pending, event_gaps) + `generation` +
-  `report_id` + `published` + `resume_cmd`; `scan_interrupted`
-  carries `scan_id` + `cursor` + `generation` + `scope` + `options` +
-  `resume_cmd`; `scan_failed` carries `cursor` (last committed event,
-  null when nothing journaled) + `error` (scrubbed) + `resumable`
-  (always true) + `resume_cmd`.
+  `report_id` + `published` + `resume_cmd` + `boundary_audit`;
+  `scan_interrupted` carries `scan_id` + `cursor` + `generation` +
+  `scope` + `options` + `resume_cmd` + `boundary_audit`; `scan_failed`
+  carries `cursor` (last committed event, null when nothing journaled)
+  + `error` (scrubbed) + `resumable` (always true) + `resume_cmd` +
+  `boundary_audit`. `boundary_audit` is
+  `{pre_boundary_analysis_reads}` — the Step 8 order-proof counter
+  (zero on every healthy scan): analysis read entries (refs, head,
+  graph comparison, status) audit against the committed
+  `inventory_ready`, so case 12 asserts on read starts, not journal
+  order alone.
 - JSONL replay folds into the final JSON inventory (case 15):
   `repository_found` store IDs, `location_found` checkout IDs,
   `branch_batch` branch IDs + triples, and `error` IDs reconstruct the

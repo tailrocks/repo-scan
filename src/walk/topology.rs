@@ -8,7 +8,7 @@
 //! removal or `realpath` alone (firmlinks would collapse incorrectly).
 
 use super::{ChildKind, EntryMetadata};
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 #[cfg(unix)]
 use std::ffi::{c_char, CString, OsString};
 #[cfg(unix)]
@@ -33,16 +33,6 @@ pub struct PhysicalDirId {
     pub ino: u64,
     /// Mount or snapshot namespace (mount path or volume UUID).
     pub namespace: String,
-}
-
-/// Outcome of observing one physical directory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObserveOutcome {
-    /// First observation: schedule enumeration.
-    New,
-    /// Already observed in this namespace: record the alias, do not
-    /// re-enumerate.
-    Duplicate,
 }
 
 /// Schedule-time identity/provenance token (PG-01 support).
@@ -140,80 +130,6 @@ impl ScheduleProvenance {
             ino,
             path,
         })
-    }
-}
-
-/// Maximum entries retained by the in-memory [`Topology`] guard (R2
-/// bound, spec §5: no in-memory set of every path/identity). Past the cap
-/// the oldest entry is evicted (FIFO), so memory stays flat on a full
-/// machine scan regardless of distinct-directory count.
-pub const TOPOLOGY_SEEN_CAP: usize = 4096;
-
-/// Process-local cycle/dedupe guard for in-flight traversal.
-///
-/// This is the cheap in-memory guard against symlink cycles and firmlink
-/// double-scheduling within one owner process. Durable deduplication state
-/// lives in the store (directories table keyed by physical identity); this
-/// guard never replaces it and is rebuilt from durable state on restart.
-///
-/// The guard retains at most [`TOPOLOGY_SEEN_CAP`] identities (FIFO
-/// eviction). Re-walk cost of eviction: an identity evicted and observed
-/// again reports [`ObserveOutcome::New`] instead of `Duplicate`, so a
-/// caller that schedules on `New` may re-enumerate that directory — a
-/// bounded duplicate, never a missed directory and never unbounded
-/// memory. A catalog-backed visited set was rejected for this layer:
-/// [`Topology::observe`] is synchronous while the store is async, and the
-/// sole production call site (`exec_enumerate`) already upserts through
-/// the durable `directories` identity index, which remains the dedupe
-/// authority.
-#[derive(Debug, Default)]
-pub struct Topology {
-    seen: HashSet<PhysicalDirId>,
-    order: VecDeque<PhysicalDirId>,
-}
-
-impl Topology {
-    /// Empty guard.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Observe one physical directory, reporting whether it is new.
-    ///
-    /// Past [`TOPOLOGY_SEEN_CAP`] retained identities the oldest entry is
-    /// evicted first; an evicted identity observed again reports `New`
-    /// (bounded re-walk, documented on [`Topology`]).
-    pub fn observe(&mut self, id: PhysicalDirId) -> ObserveOutcome {
-        if self.seen.contains(&id) {
-            return ObserveOutcome::Duplicate;
-        }
-        while self.seen.len() >= TOPOLOGY_SEEN_CAP {
-            match self.order.pop_front() {
-                Some(oldest) => {
-                    self.seen.remove(&oldest);
-                }
-                None => break,
-            }
-        }
-        self.order.push_back(id.clone());
-        self.seen.insert(id);
-        ObserveOutcome::New
-    }
-
-    /// True when this physical directory is currently retained.
-    pub fn contains(&self, id: &PhysicalDirId) -> bool {
-        self.seen.contains(id)
-    }
-
-    /// Number of physical directories currently retained (at most
-    /// [`TOPOLOGY_SEEN_CAP`]).
-    pub fn len(&self) -> usize {
-        self.seen.len()
-    }
-
-    /// True when nothing is currently retained.
-    pub fn is_empty(&self) -> bool {
-        self.seen.is_empty()
     }
 }
 
@@ -379,6 +295,16 @@ pub const IDENTITY_IO_TIMEOUT: Duration = Duration::from_secs(1);
 /// no owner [`Admission`](crate::scheduler::admission::Admission) handle).
 static IDENTITY_IO_LIVE: AtomicUsize = AtomicUsize::new(0);
 
+/// Process-lifetime bounded identity-I/O calls (routing telemetry: every
+/// coordinator stat flows through [`bounded_identity_io`], so this
+/// advances once per resolve attempt whatever the outcome).
+static IDENTITY_IO_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Total bounded identity-I/O calls so far (see [`IDENTITY_IO_CALLS`]).
+pub fn identity_io_calls() -> u64 {
+    IDENTITY_IO_CALLS.load(Ordering::Relaxed) as u64
+}
+
 /// Run blocking identity I/O (`canonicalize`/`metadata`) on a worker
 /// thread with bounded admission plus a timeout. `None` means the slot
 /// wait expired, the worker timed out, or the spawn failed: the caller
@@ -388,6 +314,7 @@ fn bounded_identity_io<T>(op: impl FnOnce() -> T + Send + 'static) -> Option<T>
 where
     T: Send + 'static,
 {
+    IDENTITY_IO_CALLS.fetch_add(1, Ordering::Relaxed);
     let start = Instant::now();
     let admitted = loop {
         let live = IDENTITY_IO_LIVE.load(Ordering::Relaxed);
@@ -437,15 +364,37 @@ where
 }
 
 /// Bounded physical identity for one coordinator path (R7 alias sharing:
-/// follows symlinks). `None` on stat failure: the caller persists
-/// unknown/gap instead of silently substituting a path-derived identity.
-/// Avoids spawning dedicated OS threads for simple path/identity checks (R07).
+/// follows symlinks). Runs through [`bounded_identity_io`] (cap-2
+/// admission plus a 1 s timeout): `None` on stat failure, slot refusal,
+/// or timeout — the caller persists unknown/gap instead of silently
+/// substituting a path-derived identity. A hung path never stalls the
+/// coordinator past the budget.
 #[cfg(unix)]
 pub fn bounded_dir_identity(path: &Path) -> Option<(u64, u64)> {
-    std::fs::metadata(path).ok().map(|md| {
-        let meta = super::fs_entry_metadata(&md);
-        (meta.dev, meta.ino)
+    let owned = path.to_path_buf();
+    bounded_identity_io(move || {
+        std::fs::metadata(&owned).ok().map(|md| {
+            let meta = super::fs_entry_metadata(&md);
+            (meta.dev, meta.ino)
+        })
     })
+    .flatten()
+}
+
+/// Bounded owning-volume device for one coordinator path (per-claim
+/// breaker keying). Like [`bounded_dir_identity`] but never follows
+/// symlinks (`symlink_metadata`): the link itself keys the breaker, so a
+/// hung link target cannot stall the resolve. `None` (stat failure,
+/// refusal, timeout) keys the shared `unknown` bucket.
+#[cfg(unix)]
+pub fn bounded_volume_dev(path: &Path) -> Option<u64> {
+    let owned = path.to_path_buf();
+    bounded_identity_io(move || {
+        std::fs::symlink_metadata(&owned)
+            .ok()
+            .map(|md| super::fs_entry_metadata(&md).dev)
+    })
+    .flatten()
 }
 
 /// Non-unix targets have no stable `(dev, ino)` identity, so coordinator
@@ -453,6 +402,13 @@ pub fn bounded_dir_identity(path: &Path) -> Option<(u64, u64)> {
 /// path-derived fallback that splits or shares tasks unpredictably).
 #[cfg(not(unix))]
 pub fn bounded_dir_identity(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// Non-unix twin of [`bounded_volume_dev`]: no stable device numbers,
+/// so breaker keying always lands in the shared `unknown` bucket.
+#[cfg(not(unix))]
+pub fn bounded_volume_dev(_path: &Path) -> Option<u64> {
     None
 }
 

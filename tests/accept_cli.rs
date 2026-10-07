@@ -1632,6 +1632,120 @@ fn error_events_journal_completion_gaps() {
     });
 }
 
+/// Boundary B1: a gappy no-fetch scan journals COMPLETELY and IN ORDER.
+/// Lifecycle emits (`inventory_ready`, terminal) commit immediately,
+/// so the writer batch must drain before each — otherwise lower-seq
+/// gap events commit after the terminal event (or drop at Runner
+/// drop). Asserts contiguous seqs, the terminal event last and alone,
+/// every buffered event ordered before it, and every open catalog gap
+/// row joined from a journaled error event (nothing dropped).
+#[test]
+fn gappy_scan_journal_complete_and_ordered() {
+    use repo_scan::store::{Store, TursoStore};
+    use std::collections::HashSet;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct Restore<'a> {
+        path: &'a Path,
+    }
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.path, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let env = Env::new();
+    let blocked = env.fixture.join("blocked");
+    repo_scan::privacy::private_dir_0700(&blocked).expect("mkdir");
+    repo_scan::privacy::private_write_0600(&blocked.join("secret.txt"), b"x").expect("write");
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o0)).expect("chmod 000");
+    let _restore = Restore { path: &blocked };
+    if std::fs::read_dir(&blocked).is_ok() {
+        eprintln!("gappy_scan_journal_complete_and_ordered: chmod 000 ineffective; skipping");
+        return;
+    }
+
+    let out = env.scan(&["--report", "rep.json"], &env.cwd_a);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "permission gap is usable-but-incomplete; stderr: {}",
+        stderr_text(&out)
+    );
+    let scan_id = stdout_line(&out, "scan_id");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let db = env.state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        let rows = store
+            .read_scan_events(&scan_id, 0, 10_000)
+            .await
+            .expect("read");
+        assert!(!rows.is_empty(), "journal is non-empty");
+        // Completeness: seqs contiguous from 1 (no dropped tail).
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row.seq, (i + 1) as u64, "seqs contiguous from 1");
+        }
+        // Order agreement: exactly one terminal, committed last; the
+        // boundary precedes it; every gap event precedes the terminal.
+        let is_terminal = |t: &str| {
+            matches!(
+                t,
+                "scan_completed" | "scan_incomplete" | "scan_interrupted" | "scan_failed"
+            )
+        };
+        let terminals: Vec<u64> = rows
+            .iter()
+            .filter(|r| is_terminal(r.event_type.as_str()))
+            .map(|r| r.seq)
+            .collect();
+        assert_eq!(terminals.len(), 1, "exactly one terminal event");
+        assert_eq!(
+            rows.last().expect("last").seq,
+            terminals[0],
+            "terminal event committed last"
+        );
+        let ready = rows
+            .iter()
+            .find(|r| r.event_type == "inventory_ready")
+            .expect("inventory_ready journaled");
+        assert!(
+            ready.seq < terminals[0],
+            "boundary commits before the terminal"
+        );
+        let errors: Vec<_> = rows.iter().filter(|r| r.event_type == "error").collect();
+        assert!(!errors.is_empty(), "gap journaled at least one error event");
+        for row in &errors {
+            assert!(
+                row.seq < terminals[0],
+                "gap event seq {} commits before the terminal",
+                row.seq
+            );
+        }
+        // Join the other way: every open gap row has a journaled error
+        // event (no committed gap silently missing its event).
+        let journaled: HashSet<String> = errors
+            .iter()
+            .map(|r| {
+                let v: serde_json::Value = serde_json::from_slice(&r.records).expect("error json");
+                v["id"].as_str().expect("event id").to_string()
+            })
+            .collect();
+        let open_rows = store.list_open_error_ids().await.expect("open ids");
+        assert!(!open_rows.is_empty(), "world holds open gaps");
+        for id in &open_rows {
+            assert!(
+                journaled.contains(id),
+                "open gap {id} has a journaled error event"
+            );
+        }
+        store.close().await.expect("close");
+    });
+}
+
 /// Persisted refs are journaled as `branch_batch` events: one `add` batch
 /// per store (chunked at 500), carrying every ref the installed `git`
 /// reports with matching oids, ordered after the store's
@@ -1964,6 +2078,126 @@ fn case12_body(extra: &[&str]) {
         }
         assert!(saw_batch, "branch analysis journaled branch_batch");
         assert!(saw_updated, "status analysis journaled location_updated");
+        // Read-entry order proof (D3): the terminal payload carries the
+        // audited pre-boundary analysis read starts — zero, because
+        // every analysis read runs behind the Analysis drain gate.
+        // Journal order alone cannot prove this (reads could run early
+        // and persist late).
+        let terminal = rows
+            .iter()
+            .find(|r| {
+                matches!(
+                    r.event_type.as_str(),
+                    "scan_completed" | "scan_incomplete" | "scan_interrupted" | "scan_failed"
+                )
+            })
+            .expect("terminal event journaled");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&terminal.records).expect("terminal json");
+        assert_eq!(
+            payload["boundary_audit"]["pre_boundary_analysis_reads"].as_u64(),
+            Some(0),
+            "zero analysis reads started before inventory_ready"
+        );
+        store.close().await.expect("close");
+    });
+}
+
+/// Case 12 with `--fetch`: the remote leg (`remote_updated`) is
+/// non-vacuous here — a file-remote clone really fetches — and the
+/// fetch-phase events sort after the boundary with zero pre-boundary
+/// analysis read starts.
+#[test]
+fn case12_no_analysis_before_inventory_ready_fetch() {
+    use repo_scan::store::{Store, TursoStore};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let cwd = dir.path().join("cwd");
+    repo_scan::privacy::private_dir_0700(&cwd).expect("mkdir");
+    let root = dir.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    // File-remote world (never network): the clone's fetch really runs.
+    let upstream = fixture::normal_clone(&root, "upstream");
+    let clone = root.join("clone");
+    fixture::git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            upstream.to_str().expect("utf8"),
+            clone.to_str().expect("utf8"),
+        ],
+    );
+    fixture::linked_worktree(&root);
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            root.to_str().expect("utf8"),
+            "--status",
+            "summary",
+            "--report",
+            "rep.json",
+            "--format",
+            "human",
+            "--fetch",
+        ],
+        &cwd,
+        &state,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "usable scan result: {}",
+        stderr_text(&out)
+    );
+    let scan_id = stdout_line(&out, "scan_id");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        let rows = store
+            .read_scan_events(&scan_id, 0, 1_000)
+            .await
+            .expect("read");
+        let ready: Vec<_> = rows
+            .iter()
+            .filter(|r| r.event_type == "inventory_ready")
+            .collect();
+        assert_eq!(ready.len(), 1, "exactly one boundary event");
+        let boundary = ready[0].seq;
+        let mut saw_remote = false;
+        for row in &rows {
+            if row.event_type == "remote_updated" {
+                saw_remote = true;
+            }
+            assert!(
+                row.event_type != "remote_updated" || row.seq > boundary,
+                "remote_updated at seq {} sorts after inventory_ready at {boundary}",
+                row.seq
+            );
+        }
+        assert!(saw_remote, "fetch phase journaled remote_updated");
+        let terminal = rows
+            .iter()
+            .find(|r| {
+                matches!(
+                    r.event_type.as_str(),
+                    "scan_completed" | "scan_incomplete" | "scan_interrupted" | "scan_failed"
+                )
+            })
+            .expect("terminal event journaled");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&terminal.records).expect("terminal json");
+        assert_eq!(
+            payload["boundary_audit"]["pre_boundary_analysis_reads"].as_u64(),
+            Some(0),
+            "zero analysis reads started before inventory_ready"
+        );
         store.close().await.expect("close");
     });
 }

@@ -113,22 +113,26 @@ Gate record: `docs/GATE_DECISION.md` (do not edit).
 
 ## Shipped hardening (not in the Phase-1 sketch)
 
-- **Traversal fence.** `ScopeFence` (`src/walk/topology.rs:240`, built at
-  `:250`) pins every enumeration and Git probe to descriptor-relative opens
-  under the declared roots; swapped/out-of-scope paths park with a gap and
-  persist nothing (`src/main.rs:3840-3898`). Tests: `tests/sec_fence.rs:40,57`,
+- **Traversal fence.** `ScopeFence` (`src/walk/topology.rs:425`, built at
+  `:440`, `allows_path` at `:513`) pins every enumeration and Git probe to
+  descriptor-relative opens under the declared roots; swapped/out-of-scope
+  paths park with a gap and persist nothing
+  (`park_on_identity_change` at `src/main.rs:8122`, fence verify at
+  `src/main.rs:7895`). Tests: `tests/sec_fence.rs:40,57`,
   `tests/sec_probe_fence.rs:35`.
 - **Lossless planner keys.** `scope_key_for_dir/git` carry exact path bytes,
   so distinct byte paths never collide and planner keys agree 1:1 with
-  scheduler scopes (`src/main.rs:1627-1628`). Tests: `tests/sec_keys.rs:29`,
+  scheduler scopes (`src/config.rs:529,534`, `parse_scope_key` at `:545`).
+  Tests: `tests/sec_keys.rs:29`,
   `tests/sec_bounds.rs:13`.
 - **Publish path.** Staging + snapshot retention + atomic publication with a
-  sha256/byte-count receipt (`src/report/publish.rs:256,411,706`); staged
+  sha256/byte-count receipt (`PublishReceipt` at `src/report/publish.rs:874`,
+  `open_nofollow` at `:258`, `check_destination_inner` at `:411`); staged
   input is opened `O_NOFOLLOW`, byte-capped, and quarantined on failure.
-  Tests: `tests/sec_publish.rs:33,77,95,109,285`,
-  `tests/accept_report.rs:589,656,704`.
+  Tests: `tests/sec_publish.rs:33,77,95,109,288`,
+  `tests/accept_report.rs:593,656,704`.
 - **Audit gate.** Dependency audit/deny policy is CI-enforced and
-  regression-tested (`docs/AUDIT_GATE.md`, `tests/sec_audit_gate.rs:13`).
+  regression-tested (`docs/AUDIT_GATE.md`, `tests/sec_audit_gate.rs:20`).
 
 ## Data flow (steady state)
 
