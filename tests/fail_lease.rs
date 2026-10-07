@@ -353,3 +353,44 @@ fn r04_slow_mount_renewal_before_ttl_lapses() {
         store.close().await.expect("close");
     });
 }
+
+/// R4 pre-persist gate: an enumeration whose lease a rival reclaimed
+/// between claim and execution retries under `lease-lost` and persists
+/// nothing — the stale collection never reaches the catalog. The
+/// `lease-lost` category (not the in-loop `enumerate-error`) proves the
+/// pre-persist gate tripped; exactly one incomplete task (the still-leased
+/// self) proves no child rows were enqueued.
+#[test]
+fn store_stale_enum_lease_retries_before_persist() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = db_in(&dir);
+        let store = TursoStore::open(&db).await.expect("open");
+        let generation = store
+            .create_generation("roots", "running", None, now_ms())
+            .await
+            .expect("generation");
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("child")).unwrap();
+        let outcome = main_under_test::test_enumerate_stale_outcome(
+            &store,
+            std::slice::from_ref(&root),
+            generation,
+            &root,
+        )
+        .await
+        .expect("stale enum");
+        match outcome {
+            StoreOutcome::Retry {
+                category, detail, ..
+            } => {
+                assert_eq!(category, "lease-lost");
+                assert!(detail.contains("before persisting enumeration"), "{detail}");
+            }
+            other => panic!("stale enum must retry, got {other:?}"),
+        }
+        assert_eq!(store.pending_count(generation).await.expect("pending"), 1);
+        store.close().await.unwrap();
+    });
+}

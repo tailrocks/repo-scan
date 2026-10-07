@@ -5570,6 +5570,22 @@ async fn exec_enumerate(
     let result = collect_enum_reads(&ctx, store, claimed, &path, deadline, &mut renewals).await;
     runner.counters.db_transactions += renewals;
     let collected = result?;
+    // R4 heartbeat: re-verify the lease before the first buffered write —
+    // listing after the last in-loop renewal may have consumed the window.
+    // Observations under a lost lease are discarded and the scope retries
+    // with a fresh lease (same pre-persist gate as probe/analysis/status).
+    if !renew_claim_lease(store, &mut runner.counters.db_transactions, claimed).await? {
+        return retry_on_lease_lost(
+            runner,
+            store,
+            claimed,
+            &format!(
+                "lease lost before persisting enumeration of {}; observations discarded",
+                path.display()
+            ),
+        )
+        .await;
+    }
     persist_enumeration(runner, store, generation, claimed, &path, collected).await
 }
 
@@ -6641,6 +6657,64 @@ async fn test_probe_outcome_impl(
     .await?;
     // Production flushes the writer batch before completing the task; the
     // hook does the same so "persists nothing" assertions are airtight.
+    flush_runner_batch(&mut runner, store).await?;
+    Ok(outcome)
+}
+
+/// Execute one enumeration task whose lease a rival reclaimed between
+/// claim and execution (R4 pre-persist gate proof): the collection runs
+/// against the stale claim, the gate finds the lease gone, and the scope
+/// retries with a fresh lease having persisted nothing. The rival path
+/// mirrors production expiry + reclaim (same-owner second claim, new
+/// token), so `fail_task` sees a live leased row, not a terminal one.
+#[cfg(test)]
+pub async fn test_enumerate_stale_outcome(
+    store: &TursoStore,
+    fence_roots: &[PathBuf],
+    generation: u64,
+    scope_path: &Path,
+) -> repo_scan::Result<TaskOutcome> {
+    let mut runner = Runner::new(&config::ResourceLimits::default());
+    runner.fence = Some(ScopeFence::build(fence_roots));
+    let scope_key = config::scope_key_for_dir(scope_path);
+    let id = enum_task_id_for_path(generation, scope_path);
+    let expected_rev = store.scope_rev(&scope_key).await?;
+    let idempotency = format!("idem:{id}");
+    let task = NewTask {
+        id: &id,
+        kind: KIND_ENUM,
+        generation,
+        dir_id: None,
+        scope_key: &scope_key,
+        expected_rev,
+        idempotency_key: &idempotency,
+    };
+    store.enqueue_task(&task, store::now_ms()).await?;
+    let epoch = store.epoch();
+    let claimed = store
+        .claim_tasks(epoch, 16, LEASE_TTL_MS, store::now_ms())
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            repo_scan::Error::Store(String::from("stale enum hook: claim returned no task"))
+        })?;
+    // Rival reclaim: expire past the 60 s TTL, claim again (new token).
+    store.expire_leases(store::now_ms() + 61_000).await?;
+    let rival = store
+        .claim_tasks(epoch, 16, LEASE_TTL_MS, store::now_ms())
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            repo_scan::Error::Store(String::from("stale enum hook: rival claim found no task"))
+        })?;
+    assert_ne!(
+        rival.token, claimed.token,
+        "rival reclaim must mint a new token"
+    );
+    let deadline = OpDeadline::new(Duration::from_secs(OP_DEADLINE_SECS));
+    let outcome = exec_enumerate(&mut runner, store, generation, &claimed, &deadline).await?;
     flush_runner_batch(&mut runner, store).await?;
     Ok(outcome)
 }
@@ -8835,6 +8909,23 @@ async fn exec_status(
     let result = collect_status_reads(&ctx, store, claimed, &target, deadline, &mut renewals).await;
     runner.counters.db_transactions += renewals;
     let collected = result?;
+    // R4 heartbeat: re-verify the lease before the first buffered write —
+    // a status stage may have consumed the window without tripping the
+    // in-collect heartbeats. Observations under a lost lease are discarded
+    // and the scope retries with a fresh lease (same pre-persist gate as
+    // probe/analysis/enumeration).
+    if !renew_claim_lease(store, &mut runner.counters.db_transactions, claimed).await? {
+        return retry_on_lease_lost(
+            runner,
+            store,
+            claimed,
+            &format!(
+                "lease lost before persisting status of {}; observation discarded",
+                target.git_path.display()
+            ),
+        )
+        .await;
+    }
     persist_status(runner, store, claimed, collected).await
 }
 
