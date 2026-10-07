@@ -748,6 +748,7 @@ struct ScanJournal {
     last_seq: Option<u64>,
     emitted_stores: HashSet<String>,
     emitted_checkouts: HashSet<String>,
+    emitted_branch_stores: HashSet<String>,
 }
 
 impl ScanJournal {
@@ -757,6 +758,7 @@ impl ScanJournal {
         let mut last_off = 0u64;
         let mut emitted_stores = HashSet::new();
         let mut emitted_checkouts = HashSet::new();
+        let mut emitted_branch_stores = HashSet::new();
         loop {
             let rows = store.read_scan_events(scan_id, max_seq, 500).await?;
             let short = rows.len() < 500;
@@ -767,6 +769,7 @@ impl ScanJournal {
                 let id_key = match row.event_type.as_str() {
                     "repository_found" => Some((&mut emitted_stores, "store_id")),
                     "location_found" => Some((&mut emitted_checkouts, "checkout_id")),
+                    "branch_batch" => Some((&mut emitted_branch_stores, "store_id")),
                     _ => None,
                 };
                 if let Some((set, key)) = id_key {
@@ -795,6 +798,7 @@ impl ScanJournal {
             last_seq: if max_seq == 0 { None } else { Some(max_seq) },
             emitted_stores,
             emitted_checkouts,
+            emitted_branch_stores,
         })
     }
 
@@ -947,6 +951,33 @@ impl ScanJournal {
             event_offset: off,
             event_type: EventType::Error.name(),
             op: EventType::Error.op().name(),
+            reset: false,
+            records,
+        };
+        Ok(Some(TursoStore::buffer_scan_event(batch, &event)?))
+    }
+
+    /// Buffer one `branch_batch` into the writer batch: it commits
+    /// atomically with the ref rows it describes. First batch per store is
+    /// `add`; a re-persisted store (retry, resume re-run) resends as
+    /// `replace` (D4 `add/replace` cell), ordered by the payload `rev`.
+    /// Always `Some(should_flush)`.
+    fn buffer_branch_batch(
+        &mut self,
+        batch: &mut WriterBatch,
+        store_id: &str,
+        records: &[u8],
+    ) -> repo_scan::Result<Option<bool>> {
+        let first = self.emitted_branch_stores.insert(store_id.to_string());
+        let op = if first { Op::Add } else { Op::Replace };
+        let (seq, off) = self.assign();
+        let event = NewScanEvent {
+            scan_id: &self.scan_id,
+            seq,
+            catalog_rev: self.rev,
+            event_offset: off,
+            event_type: EventType::BranchBatch.name(),
+            op: op.name(),
             reset: false,
             records,
         };
@@ -6359,6 +6390,75 @@ fn location_found_records(
     serde_json::to_vec(&records).map_err(|e| repo_scan::Error::Report(e.to_string()))
 }
 
+/// Maximum branch records per `branch_batch` event (Step 12: bounded
+/// batches — a store with thousands of refs journals several events).
+const BRANCH_BATCH_CHUNK: usize = 500;
+
+/// One branch record inside a `branch_batch` payload. Byte-exact fields
+/// pair lossy text with hex; oids are hex ASCII already.
+#[allow(clippy::too_many_arguments)]
+fn branch_record_value(
+    id: &str,
+    kind: &str,
+    name: &[u8],
+    oid: Option<&[u8]>,
+    algo: Option<&str>,
+    symbolic_target: Option<&[u8]>,
+    upstream: Option<&[u8]>,
+    state: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "kind": kind,
+        "name": String::from_utf8_lossy(name),
+        "name_hex": config::encode_hex(name),
+        "oid": oid.map(|o| String::from_utf8_lossy(o).into_owned()),
+        "algo": algo,
+        "symbolic_target": symbolic_target.map(|t| String::from_utf8_lossy(t).into_owned()),
+        "symbolic_target_hex": symbolic_target.map(config::encode_hex),
+        "upstream": upstream.map(|u| String::from_utf8_lossy(u).into_owned()),
+        "upstream_hex": upstream.map(config::encode_hex),
+        "state": state,
+    })
+}
+
+/// `branch_batch` records (D4): store id, the observation `rev`
+/// (`observed_at_ms`, orders re-sends), chunk position, and the branch
+/// records.
+fn branch_batch_records(
+    store_id: &str,
+    rev: i64,
+    batch_index: usize,
+    batch_count: usize,
+    branches: &[serde_json::Value],
+) -> repo_scan::Result<Vec<u8>> {
+    let records = serde_json::json!({
+        "store_id": store_id,
+        "rev": rev,
+        "batch_index": batch_index,
+        "batch_count": batch_count,
+        "branches": branches,
+    });
+    serde_json::to_vec(&records).map_err(|e| repo_scan::Error::Report(e.to_string()))
+}
+
+/// Buffer a `branch_batch` chunk (same journaling contract as
+/// [`journal_repository_found`]).
+async fn journal_branch_batch(
+    runner: &mut Runner,
+    store: &TursoStore,
+    store_id: &str,
+    records: &[u8],
+) -> repo_scan::Result<()> {
+    let Some(journal) = runner.journal.as_mut() else {
+        return Ok(());
+    };
+    if let Some(due) = journal.buffer_branch_batch(&mut runner.batch, store_id, records)? {
+        flush_if_due(runner, store, due).await?;
+    }
+    Ok(())
+}
+
 /// Buffer a `repository_found` when this runner journals (production
 /// scans); unit-test runners (`journal: None`) persist without journaling.
 async fn journal_repository_found(
@@ -6903,6 +7003,7 @@ async fn persist_probe(
     // probe; absent/unreadable config yields no upstreams, never fake ones.
     let branch_upstreams = reads.branch_upstreams;
     let known: HashSet<&[u8]> = refs.iter().map(|r| r.name.as_slice()).collect();
+    let mut branch_values = Vec::with_capacity(refs.len());
     for reference in &refs {
         let name_text = String::from_utf8_lossy(&reference.name);
         let kind = if name_text.starts_with("refs/heads/") {
@@ -6929,6 +7030,7 @@ async fn persist_probe(
             }
         };
         let upstream = upstream_for_ref(&branch_upstreams, &reference.name);
+        let state = ref_state_for(reference, &known);
         let new_ref = NewRef {
             id: &ref_id,
             instance_id: &instance_id,
@@ -6939,10 +7041,30 @@ async fn persist_probe(
             algo,
             symbolic_target: symbolic,
             upstream: upstream.as_deref(),
-            state: ref_state_for(reference, &known),
+            state,
         };
         let due = TursoStore::buffer_upsert_ref(&mut runner.batch, &new_ref, now_ms);
         flush_if_due(runner, store, due).await?;
+        branch_values.push(branch_record_value(
+            &ref_id,
+            kind,
+            &reference.name,
+            oid,
+            algo,
+            symbolic,
+            upstream.as_deref(),
+            state,
+        ));
+    }
+    // The ref rows above commit with these batches: one `branch_batch`
+    // event per 500 refs, all sharing this observation's `rev`.
+    if !branch_values.is_empty() {
+        let chunks: Vec<&[serde_json::Value]> = branch_values.chunks(BRANCH_BATCH_CHUNK).collect();
+        let batch_count = chunks.len();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let records = branch_batch_records(&instance_id, now_ms, index, batch_count, chunk)?;
+            journal_branch_batch(runner, store, &instance_id, &records).await?;
+        }
     }
     for broken in &reads.ref_errors {
         let due = buffer_record_error(
