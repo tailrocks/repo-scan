@@ -538,6 +538,7 @@ async fn instance_matches_local_target(
 async fn reclassify_for_target(
     store: &TursoStore,
     canonical: &str,
+    ssh_aliases: &HashMap<String, String>,
     counters: &mut RunCounters,
 ) -> repo_scan::Result<u64> {
     // RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1: chunked pages, one
@@ -608,7 +609,7 @@ async fn reclassify_for_target(
                     )],
                 )
             } else {
-                identity::classify_remotes(canonical, borrowed)
+                identity::classify_remotes_with(canonical, borrowed, ssh_aliases)
             };
             if disposition == identity::MatchDisposition::Confirmed {
                 confirmed += 1;
@@ -655,6 +656,7 @@ async fn reclassify_for_target(
 async fn reclassify_for_targets(
     store: &TursoStore,
     canonicals: &[String],
+    ssh_aliases: &HashMap<String, String>,
     counters: &mut RunCounters,
 ) -> repo_scan::Result<Vec<u64>> {
     let mut matched = vec![0u64; canonicals.len()];
@@ -711,8 +713,11 @@ async fn reclassify_for_targets(
                         ));
                         continue;
                     }
-                    let (verdict, verdict_lines) =
-                        identity::classify_remotes(canonical, borrowed.iter().copied());
+                    let (verdict, verdict_lines) = identity::classify_remotes_with(
+                        canonical,
+                        borrowed.iter().copied(),
+                        ssh_aliases,
+                    );
                     if verdict == identity::MatchDisposition::Confirmed {
                         matched[i] += 1;
                     }
@@ -1827,9 +1832,23 @@ async fn run_scan_inner(
     // Per-target dispositions before traversal and staging (R1): status
     // refresh, probes, and the report all classify this scan's target.
     let mut matched_counts = if resolved.is_set() {
-        reclassify_for_targets(&store, &resolved.canonicals(), &mut runner.counters).await?
+        reclassify_for_targets(
+            &store,
+            &resolved.canonicals(),
+            &runner.ssh_aliases,
+            &mut runner.counters,
+        )
+        .await?
     } else {
-        vec![reclassify_for_target(&store, primary_canonical, &mut runner.counters).await?]
+        vec![
+            reclassify_for_target(
+                &store,
+                primary_canonical,
+                &runner.ssh_aliases,
+                &mut runner.counters,
+            )
+            .await?,
+        ]
     };
     enqueue_status_refresh(&store, &mut runner, generation, run_rev, now).await?;
     // Pre-existing stores schedule branch/HEAD analysis here; stores
@@ -1889,9 +1908,13 @@ async fn run_scan_inner(
     // count query suffices and no rewrite churn is added.
     if !outcome.interrupted {
         if resolved.is_set() {
-            matched_counts =
-                reclassify_for_targets(&store, &resolved.canonicals(), &mut runner.counters)
-                    .await?;
+            matched_counts = reclassify_for_targets(
+                &store,
+                &resolved.canonicals(),
+                &runner.ssh_aliases,
+                &mut runner.counters,
+            )
+            .await?;
             enqueue_status_refresh(&store, &mut runner, generation, run_rev, store::now_ms())
                 .await?;
             let union_next = run_until_boundary(
@@ -2702,7 +2725,9 @@ fn resolve_target_identity(input: &str) -> repo_scan::Result<(String, String)> {
                 canonical_path.display()
             ))
         })?;
-        let remotes = inspector.remotes(&instance).unwrap_or_default();
+        let remotes = inspector
+            .remotes(&instance, &identity::load_ssh_aliases())
+            .unwrap_or_default();
         let origin_remote = remotes
             .iter()
             .find(|r| r.name == b"origin" && r.role == git::RemoteRole::Fetch)
@@ -4310,6 +4335,10 @@ struct Runner {
     /// read contexts: discovery runs at most once per run, on first
     /// need, from either side (P3a; replaces the `&mut`-gated probe).
     fallback: Arc<OnceLock<Option<git::fallback::FallbackGit>>>,
+    /// Scan-loaded `~/.ssh/config` alias map, shared with worker read
+    /// contexts: loaded once per scan, threaded through probe remotes
+    /// and classify — never re-read per remote.
+    ssh_aliases: Arc<HashMap<String, String>>,
     counters: RunCounters,
     /// Pathname aliases observed this run (R7), emitted as `Alias` records.
     /// Insert-deduped via `alias_seen` (RSF-751/AC46/F06D): memory holds
@@ -4401,6 +4430,7 @@ impl Runner {
             fence: None,
             inspector: git::GixInspector::new(),
             fallback: Arc::new(OnceLock::new()),
+            ssh_aliases: Arc::new(identity::load_ssh_aliases()),
             counters: RunCounters::default(),
             aliases: Vec::new(),
             alias_seen: HashSet::new(),
@@ -4441,6 +4471,7 @@ impl Runner {
         ReadContext {
             fence: self.fence.clone(),
             inspector: self.inspector,
+            ssh_aliases: Arc::clone(&self.ssh_aliases),
             fallback: Arc::clone(&self.fallback),
             watchdog_grace: self.watchdog.grace,
             pressure: Arc::clone(&self.pressure),
@@ -4473,6 +4504,9 @@ struct ReadContext {
     fence: Option<ScopeFence>,
     /// Git inspector (zero-size `Copy` handle).
     inspector: git::GixInspector,
+    /// Scan-loaded SSH alias map (shared with the coordinator; loaded
+    /// once per scan at `Runner` construction).
+    ssh_aliases: Arc<HashMap<String, String>>,
     /// Lazily discovered installed-git fallback (shared with the
     /// coordinator; discovery runs at most once per run).
     fallback: Arc<OnceLock<Option<git::fallback::FallbackGit>>>,
@@ -8421,6 +8455,7 @@ struct ProbeReads {
     relationship: &'static str,
     work_present: Option<bool>,
     worktrees: Vec<git::WorktreeObservation>,
+    worktrees_note: Option<String>,
     config_dep_count: usize,
 }
 
@@ -8605,7 +8640,7 @@ fn collect_probe_reads(
         .filter(|key| *key != (0, 0));
     let config_dep_count = ctx.inspector.config_dependencies(instance).len();
     let mut remotes_note = None;
-    let remotes = match ctx.inspector.remotes(instance) {
+    let remotes = match ctx.inspector.remotes(instance, &ctx.ssh_aliases) {
         Ok(remotes) => remotes,
         Err(e) if git::is_unsupported_error(&e) => {
             remotes_note = Some(format!("remotes unsupported, treated as no remotes: {e}"));
@@ -8640,7 +8675,26 @@ fn collect_probe_reads(
         return Ok(CollectOutcome::IdentityChanged);
     }
     let work_present = instance.work_dir.as_ref().map(|root| root.exists());
-    let worktrees = ctx.inspector.worktrees(instance).unwrap_or_default();
+    // Mirrors the remotes read above: an unreadable registry is a read
+    // failure (retry, then park with a gap), never silent "no
+    // worktrees" — swallowing would drop linked checkouts from
+    // inventory without a trace.
+    let mut worktrees_note = None;
+    let worktrees = match ctx.inspector.worktrees(instance) {
+        Ok(worktrees) => worktrees,
+        Err(e) if git::is_unsupported_error(&e) => {
+            worktrees_note = Some(format!(
+                "worktrees unsupported, treated as no worktrees: {e}"
+            ));
+            Vec::new()
+        }
+        Err(e) => {
+            return Err(repo_scan::Error::Git(format!(
+                "worktrees unreadable for {}: {e}",
+                path.display()
+            )));
+        }
+    };
     if !poll.ok_throttled() {
         return Ok(CollectOutcome::IdentityChanged);
     }
@@ -8660,6 +8714,7 @@ fn collect_probe_reads(
         relationship,
         work_present,
         worktrees,
+        worktrees_note,
         config_dep_count,
     })))
 }
@@ -9094,7 +9149,7 @@ async fn persist_probe(
                 let (disposition, _) = if is_target_repo {
                     (identity::MatchDisposition::Confirmed, vec![])
                 } else {
-                    identity::classify_remotes(canonical, borrowed)
+                    identity::classify_remotes_with(canonical, borrowed, &runner.ssh_aliases)
                 };
                 // The store is already known (first sight journaled it);
                 // this spelling only adds its checkout location.
@@ -9146,6 +9201,9 @@ async fn persist_probe(
     if let Some(note) = reads.remotes_note {
         evidence.push(note);
     }
+    if let Some(note) = reads.worktrees_note {
+        evidence.push(note);
+    }
     let pairs: Vec<(String, String)> = remotes
         .iter()
         .map(|r| {
@@ -9186,7 +9244,7 @@ async fn persist_probe(
             )],
         )
     } else {
-        identity::classify_remotes(canonical, borrowed)
+        identity::classify_remotes_with(canonical, borrowed, &runner.ssh_aliases)
     };
     evidence.append(&mut match_evidence);
     let evidence_json =
@@ -10103,8 +10161,11 @@ fn resolve_all_upstreams(
 /// itself. Otherwise the first positive fetch refspec (config order)
 /// whose source matches the merge ref maps it to the local tracking ref
 /// — with no fallback when that target is missing and no default when
-/// the remote carries no fetch lines (all probed). The mapped ref must
-/// exist in the same observation; anything else yields no upstream.
+/// the remote carries no fetch lines (all probed). Garbage (unparseable
+/// or non-UTF-8) and negative/destination-less refspecs SKIP to the next
+/// line — probed: installed git resolves past a garbage-first or
+/// negative-first fetch list to the later valid refspec. The mapped ref
+/// must exist in the same observation; anything else yields no upstream.
 fn resolve_branch_upstream(
     cfg: &UpstreamConfig,
     branch: &[u8],
@@ -10242,15 +10303,18 @@ fn observed_refs(
     ctx: &ReadContext,
     instance: &git::GitInstance,
     evidence: &mut Vec<String>,
-) -> repo_scan::Result<Vec<git::RefObservation>> {
-    match ctx.inspector.refs(instance) {
-        Ok(refs) => Ok(refs),
+) -> repo_scan::Result<(Vec<git::RefObservation>, Vec<String>)> {
+    // One pass: refs + per-item errors share a single open+traversal
+    // (`refs_with_errors`); the fallback leg contributes refs only
+    // (installed git skips invalid refs, covered by the note).
+    match ctx.inspector.refs_with_errors(instance) {
+        Ok((refs, errors)) => Ok((refs, errors)),
         Err(e) if git::is_unsupported_error(&e) => {
             if let Some(fallback) = ctx.fallback() {
                 match fallback.refs(&instance.git_dir, instance.work_dir.as_deref()) {
                     Ok(refs) => {
                         evidence.push(String::from("refs via installed-git fallback"));
-                        return Ok(refs);
+                        return Ok((refs, Vec::new()));
                     }
                     Err(fe) => {
                         eprintln!(
@@ -10263,7 +10327,7 @@ fn observed_refs(
             evidence.push(format!(
                 "refs unsupported, preserved without observations: {e}"
             ));
-            Ok(Vec::new())
+            Ok((Vec::new(), Vec::new()))
         }
         Err(e) => Err(e),
     }
@@ -10420,7 +10484,7 @@ fn collect_analysis_reads(
     // at the first-seen git dir, exactly the read the discovery probe
     // used to make — one execution instead of one per checkout.
     let mut refs_notes = Vec::new();
-    let refs =
+    let (refs, ref_errors) =
         git::fallback::with_wait_cancel(&cancel, || observed_refs(ctx, instance, &mut refs_notes))?;
     if !poll.ok_now() {
         return Ok(AnalysisOutcome::IdentityChanged);
@@ -10428,7 +10492,6 @@ fn collect_analysis_reads(
     if deadline.expired() {
         return Ok(AnalysisOutcome::TimedOut);
     }
-    let ref_errors = ctx.inspector.reference_errors(instance);
     let branch_upstreams = load_branch_upstreams(instance, checkouts, &refs);
     // Branch comparisons (Step 10): local branches against their
     // resolved full upstream refs, sharing one per-store result
@@ -10496,7 +10559,13 @@ fn compute_branch_comparisons(
     cache: &git::graph::ComparisonCache,
 ) -> HashMap<Vec<u8>, git::graph::Comparison> {
     let mut oids: HashMap<&[u8], (&str, &str)> = HashMap::new();
+    // Presence set: EVERY iterated ref name, including OID-less ones
+    // (unpeeled symbolic, dangling, broken-but-returned). `upstream_known`
+    // keys off this set — never off `oids` — so an existing-but-OID-less
+    // upstream compares as `error`, not `upstream_missing`.
+    let mut names: HashSet<&[u8]> = HashSet::new();
     for reference in refs {
+        names.insert(reference.name.as_slice());
         match &reference.target {
             git::RefTarget::Object(oid) => {
                 oids.insert(
@@ -10534,10 +10603,10 @@ fn compute_branch_comparisons(
         let local = oids.get(reference.name.as_slice()).copied();
         let (upstream_hex, upstream_algo, upstream_known) = match upstream.as_deref() {
             None => (None, None, false),
-            Some(name) => match oids.get(name).copied() {
-                Some((hex, algo)) => (Some(hex), Some(algo), true),
-                None => (None, None, false),
-            },
+            Some(name) => {
+                let (hex, algo) = oids.get(name).copied().unzip();
+                (hex, algo, names.contains(name))
+            }
         };
         let tips = git::graph::BranchTips {
             local_hex: local.map(|(hex, _)| hex),
@@ -11270,7 +11339,7 @@ fn collect_status_reads(
     // Submodule coverage (R16): examined through the inspector alongside
     // the status probe — `checked` when the submodule relationships were
     // actually read, `unknown` when they could not be.
-    let submodules = match ctx.inspector.submodules(&instance) {
+    let submodules = match ctx.inspector.submodules(&instance, &ctx.ssh_aliases) {
         Ok(_) => "checked",
         Err(_) => "unknown",
     };
@@ -11613,19 +11682,25 @@ fn fallback_status_counts(
             mode == StatusMode::Summary,
         )
         .ok()?;
+    // Same inspected-scope declarations as the gix leg (the fallback
+    // spawn runs under the same empty global/system config isolation),
+    // plus the sparse coverage declaration when enabled.
+    let mut unknown_fields = vec![
+        format!("counts via installed-git fallback ({cause})"),
+        git::ISOLATED_SCOPE_DECLARATION.to_string(),
+    ];
+    if let Some(note) =
+        git::sparse_checkout_note(git::sparse_config_enabled(&instance.git_dir), instance)
+    {
+        unknown_fields.push(note);
+    }
     Some(git::StatusObservation {
         mode,
         staged: Some(staged),
         unstaged: Some(unstaged),
         untracked: Some(untracked),
         conflicts: Some(conflicts),
-        // F-note1: the fallback spawn runs under the same empty
-        // global/system config isolation as the gix path, so it carries
-        // the same inspected-scope declaration.
-        unknown_fields: vec![
-            format!("counts via installed-git fallback ({cause})"),
-            git::ISOLATED_SCOPE_DECLARATION.to_string(),
-        ],
+        unknown_fields,
         fingerprints: Vec::new(),
     })
 }
@@ -12208,11 +12283,27 @@ enum FetchPlan {
 /// remote absent from config yields zero refspecs (a `Ready` plan —
 /// git itself then reports "no such remote" and the attempt fails
 /// honestly).
+///
+/// Three gates, all before any transport spawn: refspec destinations,
+/// the EFFECTIVE fetch URL per configured URL (`ls-remote --get-url`
+/// applies `insteadOf` exactly as a fetch would; `ext::` and
+/// remote-helper transports refuse — they execute repo-chosen local
+/// commands), and executable config origins (repo-scope
+/// `credential.helper`, `core.sshCommand`, or `include.*` chains
+/// refuse — operator system/global definers keep working).
 fn plan_remote_fetch(
     git: &git::fallback::FallbackGit,
     dir: &Path,
     name: &str,
 ) -> Result<FetchPlan, String> {
+    // Remote-name flag gate: the name travels positionally to
+    // fetch/ls-remote/get-url argv, where a leading dash would parse as
+    // a flag (`--upload-pack=` executes). Refuse without spawning.
+    if name.starts_with('-') {
+        return Ok(FetchPlan::Unsupported(
+            "remote name starts with `-`: cannot pass to git safely".to_string(),
+        ));
+    }
     let fetch_key = format!("remote.{name}.fetch");
     let values = git.git_config_get_all(dir, std::ffi::OsStr::new(&fetch_key), FETCH_TIMEOUT)?;
     let mirror_key = format!("remote.{name}.mirror");
@@ -12235,8 +12326,129 @@ fn plan_remote_fetch(
     }
     let borrowed: Vec<&str> = refspecs.iter().map(String::as_str).collect();
     match git::refspec::inspect_remote_fetch(&borrowed, mirror) {
-        git::refspec::FetchVerdict::Safe => Ok(FetchPlan::Ready(refspecs)),
-        git::refspec::FetchVerdict::Unsupported { reason } => Ok(FetchPlan::Unsupported(reason)),
+        git::refspec::FetchVerdict::Safe => {}
+        git::refspec::FetchVerdict::Unsupported { reason } => {
+            return Ok(FetchPlan::Unsupported(reason));
+        }
+    }
+    if let Err(gate) = plan_fetch_transport(git, dir, name) {
+        return gate.into();
+    }
+    if let Err(gate) = plan_fetch_exec_config(git, dir) {
+        return gate.into();
+    }
+    Ok(FetchPlan::Ready(refspecs))
+}
+
+/// Transport gate: resolve EVERY configured fetch URL to its effective
+/// URL and refuse executable transports. `Err` = resolution failed
+/// (no execution happened; the fetch would fail the same way, so the
+/// attempt reports `failed`). Empty URL list = absent/url-less remote:
+/// fall through — git reports "no such remote"/"no url" honestly.
+fn plan_fetch_transport(
+    git: &git::fallback::FallbackGit,
+    dir: &Path,
+    name: &str,
+) -> Result<(), FetchGate> {
+    let url_key = format!("remote.{name}.url");
+    let urls = git
+        .git_config_get_all(dir, std::ffi::OsStr::new(&url_key), FETCH_TIMEOUT)
+        .map_err(FetchGate::Failed)?;
+    for url in &urls {
+        let raw = match std::str::from_utf8(url) {
+            Ok(text) => text,
+            Err(_) => {
+                return Err(FetchGate::refused(
+                    "remote URL is not UTF-8: cannot verify transport",
+                ));
+            }
+        };
+        if raw.starts_with('-') {
+            return Err(FetchGate::refused(
+                "remote URL starts with `-`: cannot resolve safely",
+            ));
+        }
+        let effective = git
+            .git_ls_remote_get_url(dir, std::ffi::OsStr::new(raw), FETCH_TIMEOUT)
+            .map_err(|e| FetchGate::Failed(format!("cannot resolve effective fetch URL: {e}")))?;
+        if gix::url::parse(effective.trim()).is_err() {
+            return Err(FetchGate::Failed(format!(
+                "effective fetch URL is not a Git URL: {}",
+                identity::scrub_text(&effective)
+            )));
+        }
+        if let Some(reason) = git::fallback::refused_fetch_scheme(&effective) {
+            return Err(FetchGate::Unsupported(reason));
+        }
+    }
+    Ok(())
+}
+
+/// Executable-config gate: refuse repo-scope `credential.helper`,
+/// `core.sshCommand`, and `include.*`/`includeif.*` chains (a
+/// repo-scope include would hide the true definer of the other two,
+/// so any repo-scope include refuses too). Operator system/global
+/// definers are outside the repo and keep working. `Err` on unreadable
+/// config (the attempt fails); unparseable origin rows refuse.
+fn plan_fetch_exec_config(git: &git::fallback::FallbackGit, dir: &Path) -> Result<(), FetchGate> {
+    let listed = git
+        .git_config_list_origins(dir, FETCH_TIMEOUT)
+        .map_err(|e| FetchGate::Failed(format!("cannot list effective config origins: {e}")))?;
+    let mut rows: Vec<&[u8]> = listed.split(|b| *b == b'\n').collect();
+    // Every row ends with `\n`; drop that one trailing empty.
+    if rows.last().is_some_and(|row| row.is_empty()) {
+        rows.pop();
+    }
+    for row in rows {
+        let origin = match git::fallback::parse_config_origin_line(row) {
+            Err(_) => {
+                return Err(FetchGate::refused(
+                    "effective config has an uninterpretable origin row: \
+                     cannot verify executable config",
+                ));
+            }
+            Ok(None) => continue,
+            Ok(Some(origin)) => origin,
+        };
+        let key = origin.key.as_str();
+        let gated = key == "credential.helper"
+            || key == "core.sshcommand"
+            || key.starts_with("include.")
+            || key.starts_with("includeif.");
+        if !gated {
+            continue;
+        }
+        if let Some(file) = origin.file.as_deref() {
+            if git::fallback::config_origin_within_repo(file, dir) {
+                return Err(FetchGate::refused(format!(
+                    "repo-scope `{key}` would run repo-chosen commands during fetch; refusing"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Outcome of a fetch-plan gate: refusal (the attempt records
+/// `unsupported`, nothing executed) or failure (config unreadable, the
+/// attempt records `failed`).
+enum FetchGate {
+    Unsupported(String),
+    Failed(String),
+}
+
+impl FetchGate {
+    fn refused(reason: impl Into<String>) -> Self {
+        Self::Unsupported(reason.into())
+    }
+}
+
+impl From<FetchGate> for Result<FetchPlan, String> {
+    fn from(gate: FetchGate) -> Self {
+        match gate {
+            FetchGate::Unsupported(reason) => Ok(FetchPlan::Unsupported(reason)),
+            FetchGate::Failed(e) => Err(e),
+        }
     }
 }
 
@@ -12723,7 +12935,12 @@ async fn recompute_fetch_comparisons(
     // Post-fetch tip map from the catalog rows (local tips are
     // untouched by fetch; upstream tips are the re-observed oids).
     let mut tips: HashMap<&[u8], (&str, &str)> = HashMap::new();
+    // Presence set mirrors `compute_branch_comparisons`: an upstream row
+    // that exists but carries no OID compares as `error`, never
+    // `upstream_missing` (only a truly absent row is missing).
+    let mut names: HashSet<&[u8]> = HashSet::new();
     for row in &refs {
+        names.insert(row.name.as_slice());
         let (Some(oid), Some(algo)) = (row.oid.as_deref(), row.algo.as_deref()) else {
             continue;
         };
@@ -12761,10 +12978,8 @@ async fn recompute_fetch_comparisons(
                 continue;
             }
             let local = tips.get(row.name.as_slice()).copied();
-            let (upstream_hex, upstream_algo, upstream_known) = match tips.get(upstream).copied() {
-                Some((hex, algo)) => (Some(hex), Some(algo), true),
-                None => (None, None, false),
-            };
+            let (upstream_hex, upstream_algo) = tips.get(upstream).copied().unzip();
+            let upstream_known = names.contains(upstream);
             let branch_tips = git::graph::BranchTips {
                 local_hex: local.map(|(hex, _)| hex),
                 local_algo: local.map(|(_, algo)| algo),

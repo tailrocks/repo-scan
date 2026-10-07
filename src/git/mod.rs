@@ -192,7 +192,13 @@ pub trait GitInspect: Send + Sync {
     /// Effective fetch/push remotes with roles, rewrites safely applied,
     /// credentials redacted. SSH aliases that need ssh-config resolution
     /// surface as `unresolvable_identity`, never a connection.
-    fn remotes(&self, instance: &GitInstance) -> crate::Result<Vec<RemoteObservation>>;
+    /// `ssh_aliases` is the scan-loaded `~/.ssh/config` map (loaded once
+    /// per scan, threaded through — never re-read per remote).
+    fn remotes(
+        &self,
+        instance: &GitInstance,
+        ssh_aliases: &std::collections::HashMap<String, String>,
+    ) -> crate::Result<Vec<RemoteObservation>>;
 
     /// All refs incl. packed; broken refs surface as per-item errors.
     /// Reftable stores route to the installed-git fallback or `unsupported`.
@@ -347,6 +353,80 @@ pub const SUBMODULE_RECURSION_GAP: &str = "submodule-recursion-unisolated";
 /// matches none of the `unstable`/`no-worktree`/`truncat` state-mapping
 /// substrings, so the report state is unaffected.
 pub const ISOLATED_SCOPE_DECLARATION: &str = "isolated-config-scope: only repository-local git config and attributes were consulted; user/system/global scope (core.excludesFile, global gitattributes, filter drivers) was ignored and no content conversion ran";
+
+/// Sparse-checkout declaration for the status path (spec "declare
+/// what was inspected"): when sparsity is enabled, counts cover the
+/// materialized worktree only — excluded paths never verify against
+/// the worktree (their staged state still counts: the index is not
+/// sparse). Returns the `unknown_fields` line, or `None` when sparsity
+/// is off. Deliberately matches none of the `working_state_of` /
+/// `status_state_of` state-mapping substrings: counts agree with
+/// installed `git status` exactly (pinned by the sparse parity test),
+/// so the state is unaffected — the note declares coverage scope.
+///
+/// `sparse_enabled` is the isolated-effective `core.sparseCheckout`
+/// flag (exactly what status traverses under); the patterns file is
+/// evidence only (`info/sparse-checkout` under the worktree admin dir
+/// first, the common dir second). A lone match-all (`/*`) or an empty
+/// file means the worktree is effectively full and declares so.
+pub fn sparse_checkout_note(sparse_enabled: bool, instance: &GitInstance) -> Option<String> {
+    if !sparse_enabled {
+        return None;
+    }
+    let mut candidates = vec![
+        instance.git_dir.join("info").join("sparse-checkout"),
+        instance.common_dir.join("info").join("sparse-checkout"),
+    ];
+    candidates.sort();
+    candidates.dedup();
+    let mut saw_file = false;
+    let mut effective: Vec<String> = Vec::new();
+    for candidate in &candidates {
+        let Some(bytes) = read_bounded_bytes(candidate, MAX_GIT_CONTROL_BYTES) else {
+            continue;
+        };
+        saw_file = true;
+        effective.extend(
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(str::to_string),
+        );
+    }
+    if !saw_file {
+        return Some(
+            "sparse-checkout: core.sparseCheckout is enabled but no readable \
+             info/sparse-checkout patterns file was found; counts cover the \
+             materialized worktree only"
+                .to_string(),
+        );
+    }
+    if effective.is_empty() || (effective.len() == 1 && effective[0] == "/*") {
+        return Some(
+            "sparse-checkout: core.sparseCheckout is enabled with match-all-only \
+             patterns; the worktree is effectively full"
+                .to_string(),
+        );
+    }
+    Some(format!(
+        "sparse-checkout: core.sparseCheckout is enabled with {} sparse pattern(s); \
+         counts cover the materialized worktree only — excluded paths are not \
+         worktree-verified",
+        effective.len()
+    ))
+}
+
+/// Isolated-effective `core.sparseCheckout` flag for one git dir (the
+/// same config scope the status path traverses under). `false` on any
+/// failure: an unopenable store cannot be proven sparse, and the gix
+/// leg (which owns an open repo) reads the flag from its own snapshot
+/// instead — this serves the installed-git fallback leg only.
+pub fn sparse_config_enabled(git_dir: &std::path::Path) -> bool {
+    open_repo_isolated(git_dir)
+        .map(|repo| repo.config_snapshot().boolean("core.sparseCheckout") == Some(true))
+        .unwrap_or(false)
+}
 
 /// Attach [`ISOLATED_SCOPE_DECLARATION`] to a status observation,
 /// exactly once (idempotent across the instability-retry merge).
@@ -772,7 +852,11 @@ impl GixInspector {
     }
 
     /// Submodule relationships (path/URL/gitdir) for follow-up discovery.
-    pub fn submodules(&self, instance: &GitInstance) -> crate::Result<Vec<SubmoduleObservation>> {
+    pub fn submodules(
+        &self,
+        instance: &GitInstance,
+        ssh_aliases: &std::collections::HashMap<String, String>,
+    ) -> crate::Result<Vec<SubmoduleObservation>> {
         let repo = open_repo(&instance.git_dir)?;
         let Some(iter) = repo.submodules().map_err(|e| git_err(e.to_string()))? else {
             return Ok(Vec::new());
@@ -793,7 +877,7 @@ impl GixInspector {
                     let full = url.to_bstring().to_string();
                     (
                         Some(crate::identity::redact_remote_url(&full)),
-                        crate::identity::normalize_github_url(&full),
+                        crate::identity::normalize_github_url_with(&full, ssh_aliases),
                     )
                 }
                 Err(_) => (None, None),
@@ -809,26 +893,61 @@ impl GixInspector {
         Ok(out)
     }
 
+    /// Refs plus per-item errors in ONE open + ONE traversal (the
+    /// `refs` + `reference_errors` pair in a single pass): parseable
+    /// refs return as observations, invalid ones as evidence strings —
+    /// never skipped silently (spec §9). [`GitInspect::refs`] and
+    /// [`GixInspector::reference_errors`] both delegate here, so the
+    /// analysis path collects once.
+    pub fn refs_with_errors(
+        &self,
+        instance: &GitInstance,
+    ) -> crate::Result<(Vec<RefObservation>, Vec<String>)> {
+        let repo = open_repo(&instance.git_dir)?;
+        let platform = repo
+            .references()
+            .map_err(|e| map_ref_store_error(&e.to_string(), "ref store"))?;
+        let iter = platform
+            .all()
+            .map_err(|e| map_ref_store_error(&e.to_string(), "ref iteration"))?;
+        // LooseThenPacked covers packed refs.
+        let mut out = Vec::new();
+        let mut errors = Vec::new();
+        for item in iter {
+            let reference = match item {
+                Ok(reference) => reference,
+                Err(e) => {
+                    errors.push(format!("invalid ref: {e}"));
+                    continue;
+                }
+            };
+            let raw = reference.detach();
+            let name = BString::from(raw.name).as_bytes().to_vec();
+            let target = match raw.target {
+                gix::refs::Target::Object(oid) => RefTarget::Object(oid_from_oid(&oid)),
+                gix::refs::Target::Symbolic(name) => {
+                    RefTarget::Symbolic(BString::from(name).as_bytes().to_vec())
+                }
+            };
+            out.push(RefObservation {
+                name,
+                target,
+                peeled: raw.peeled.as_ref().map(|oid| oid_from_oid(oid)),
+            });
+        }
+        Ok((out, errors))
+    }
+
     /// Per-item reference errors (broken refs) as evidence strings.
     ///
-    /// [`GitInspect::refs`] returns the parseable refs; this companion
-    /// preserves the invalid ones for the report `errors` channel instead
-    /// of silently dropping them (spec §9).
+    /// Convenience over [`GixInspector::refs_with_errors`] discarding
+    /// the observations; a whole-store failure surfaces as one
+    /// evidence string instead of `Err`.
     pub fn reference_errors(&self, instance: &GitInstance) -> Vec<String> {
-        let repo = match open_repo(&instance.git_dir) {
-            Ok(repo) => repo,
-            Err(e) => return vec![format!("open failed: {e}")],
-        };
-        let platform = match repo.references() {
-            Ok(platform) => platform,
-            Err(e) => return vec![format!("ref store unavailable: {e}")],
-        };
-        let iter = match platform.all() {
-            Ok(iter) => iter,
-            Err(e) => return vec![format!("ref iteration unavailable: {e}")],
-        };
-        iter.filter_map(|item| item.err().map(|e| format!("invalid ref: {e}")))
-            .collect()
+        match self.refs_with_errors(instance) {
+            Ok((_, errors)) => errors,
+            Err(e) => vec![format!("ref store unavailable: {e}")],
+        }
     }
 
     /// Configuration files consulted for an instance (spec §8 evidence).
@@ -941,6 +1060,16 @@ impl GixInspector {
             counts.unknown_fields.extend(retry.unknown_fields);
         } else {
             counts.fingerprints = after;
+        }
+        // Sparse coverage declaration (pushed once, after the retry
+        // merge): counts cover the materialized worktree only. Reads
+        // the flag from this open repo's own isolated snapshot —
+        // exactly the config scope the traversal above ran under.
+        if let Some(note) = sparse_checkout_note(
+            repo.config_snapshot().boolean("core.sparseCheckout") == Some(true),
+            instance,
+        ) {
+            counts.unknown_fields.push(note);
         }
         Ok(with_scope_declaration(counts))
     }
@@ -1105,7 +1234,11 @@ impl GitInspect for GixInspector {
         })
     }
 
-    fn remotes(&self, instance: &GitInstance) -> crate::Result<Vec<RemoteObservation>> {
+    fn remotes(
+        &self,
+        instance: &GitInstance,
+        ssh_aliases: &std::collections::HashMap<String, String>,
+    ) -> crate::Result<Vec<RemoteObservation>> {
         let repo = open_repo(&instance.git_dir)?;
         let mut out = Vec::new();
         for name in repo.remote_names() {
@@ -1148,7 +1281,10 @@ impl GitInspect for GixInspector {
                         name: name.as_bytes().to_vec(),
                         role,
                         url: crate::identity::redact_remote_url(&full),
-                        canonical_url: crate::identity::normalize_github_url(&full),
+                        canonical_url: crate::identity::normalize_github_url_with(
+                            &full,
+                            ssh_aliases,
+                        ),
                     });
                 }
             }
@@ -1157,36 +1293,7 @@ impl GitInspect for GixInspector {
     }
 
     fn refs(&self, instance: &GitInstance) -> crate::Result<Vec<RefObservation>> {
-        let repo = open_repo(&instance.git_dir)?;
-        let platform = repo
-            .references()
-            .map_err(|e| map_ref_store_error(&e.to_string(), "ref store"))?;
-        let iter = platform
-            .all()
-            .map_err(|e| map_ref_store_error(&e.to_string(), "ref iteration"))?;
-        let mut out = Vec::new();
-        for item in iter {
-            // LooseThenPacked covers packed refs; per-item errors are
-            // preserved via `reference_errors`, never skipped silently.
-            let reference = match item {
-                Ok(reference) => reference,
-                Err(_) => continue,
-            };
-            let raw = reference.detach();
-            let name = BString::from(raw.name).as_bytes().to_vec();
-            let target = match raw.target {
-                gix::refs::Target::Object(oid) => RefTarget::Object(oid_from_oid(&oid)),
-                gix::refs::Target::Symbolic(name) => {
-                    RefTarget::Symbolic(BString::from(name).as_bytes().to_vec())
-                }
-            };
-            out.push(RefObservation {
-                name,
-                target,
-                peeled: raw.peeled.as_ref().map(|oid| oid_from_oid(oid)),
-            });
-        }
-        Ok(out)
+        self.refs_with_errors(instance).map(|(refs, _)| refs)
     }
 
     fn head(&self, instance: &GitInstance) -> crate::Result<HeadState> {

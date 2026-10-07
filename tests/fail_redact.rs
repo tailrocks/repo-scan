@@ -634,7 +634,9 @@ fn retest_submodule_url_strictly_redacted() {
     assert!(on_disk.contains(canary_tail), "taint planted");
     let inspector = GixInspector::new();
     let instance = inspector.open_exact(&sup).expect("open super");
-    let observations = inspector.submodules(&instance).expect("submodules");
+    let observations = inspector
+        .submodules(&instance, &repo_scan::identity::load_ssh_aliases())
+        .expect("submodules");
     for observation in &observations {
         if let Some(url) = &observation.url {
             assert!(!url.contains(canary_user), "{url}");

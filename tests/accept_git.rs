@@ -788,6 +788,63 @@ fn upstream10_custom_fetch_refspec_resolves_full_ref() {
     );
 }
 
+/// GIT-m2: garbage-first and negative-first fetch refspecs SKIP to the
+/// later valid refspec — pinned against installed git, which resolves
+/// past them (probed: `rev-parse --symbolic-full-name` succeeds).
+#[test]
+fn upstream10_garbage_first_refspec_skips_to_valid() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("ws");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    let repo = fixture::normal_clone(&root, "garbage");
+    let head = fixture::git_str(&repo, &["rev-parse", "HEAD"]);
+    fixture::git(&repo, &["update-ref", "refs/remotes/origin/main", &head]);
+    fixture::git(&repo, &["config", "--unset-all", "remote.origin.fetch"]);
+    fixture::git(
+        &repo,
+        &["config", "--add", "remote.origin.fetch", "garbage!!!"],
+    );
+    fixture::git(
+        &repo,
+        &[
+            "config",
+            "--add",
+            "remote.origin.fetch",
+            "^refs/heads/secret",
+        ],
+    );
+    fixture::git(
+        &repo,
+        &[
+            "config",
+            "--add",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
+    fixture::git(&repo, &["config", "branch.main.remote", "origin"]);
+    fixture::git(&repo, &["config", "branch.main.merge", "refs/heads/main"]);
+    // Independent oracle: installed git skips both junk lines.
+    let expected = fixture::git_str(
+        &repo,
+        &["rev-parse", "--symbolic-full-name", "main@{upstream}"],
+    );
+    assert_eq!(expected, "refs/remotes/origin/main");
+    let state = dir.path().join("state");
+    let report_path = dir.path().join("rep.json");
+    let out = scan(&root, &state, &report_path, &["--status", "metadata"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let report = read_report(&report_path);
+    let paths = path_map(&report);
+    let repo_row = repo_by_path(&report, &paths, "garbage");
+    assert_eq!(repo_row["match"].as_str(), Some("confirmed"));
+    let main = branch_named(&report, repo_id(repo_row), "refs/heads/main");
+    assert_eq!(
+        main["upstream"]["value"].as_str(),
+        Some("refs/remotes/origin/main")
+    );
+}
+
 /// A local upstream (`remote = .`) resolves to the local merge ref itself
 /// (Step 10).
 #[test]
@@ -811,6 +868,54 @@ fn upstream10_local_dot_resolves_merge_ref() {
     assert_eq!(repo_row["match"].as_str(), Some("confirmed"));
     let main = branch_named(&report, repo_id(repo_row), "refs/heads/main");
     assert_eq!(main["upstream"]["value"].as_str(), Some(expected.as_str()));
+}
+
+/// GIT-m1: an upstream that EXISTS but carries no OID (an unpeeled
+/// symbolic tracking ref) compares as `error` — never
+/// `upstream_missing`, which is reserved for truly absent refs.
+/// `refs/remotes/origin/HEAD` exists and resolves, but gix returns it
+/// without a peel, so no OID comparison is possible.
+#[test]
+fn upstream10_oid_less_present_upstream_compares_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("ws");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    let repo = fixture::normal_clone(&root, "symref");
+    let head = fixture::git_str(&repo, &["rev-parse", "HEAD"]);
+    fixture::git(&repo, &["update-ref", "refs/remotes/origin/main", &head]);
+    fixture::git(
+        &repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    fixture::git(&repo, &["config", "branch.main.remote", "origin"]);
+    fixture::git(&repo, &["config", "branch.main.merge", "refs/heads/HEAD"]);
+    // The upstream ref exists and resolves (installed-git oracle).
+    assert_eq!(
+        fixture::git_str(&repo, &["rev-parse", "refs/remotes/origin/HEAD"]),
+        head
+    );
+    let state = dir.path().join("state");
+    let report_path = dir.path().join("rep.json");
+    let out = scan(&root, &state, &report_path, &["--status", "metadata"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let report = read_report(&report_path);
+    let paths = path_map(&report);
+    let repo_row = repo_by_path(&report, &paths, "symref");
+    assert_eq!(repo_row["match"].as_str(), Some("confirmed"));
+    let main = branch_named(&report, repo_id(repo_row), "refs/heads/main");
+    assert_eq!(
+        main["upstream"]["value"].as_str(),
+        Some("refs/remotes/origin/HEAD")
+    );
+    assert_eq!(
+        main["comparison"].as_str(),
+        Some("error"),
+        "present-but-OID-less upstream is error, not upstream_missing"
+    );
 }
 
 /// Branch stanzas living in an `include.path` file resolve (Step 10).
@@ -970,6 +1075,147 @@ fn upstream10_unresolvable_yields_null() {
             main["upstream"]
         );
     }
+}
+
+/// GIT-M1: an unreadable worktree registry is a probe READ failure
+/// (retry, then park with a gap) — never silent "no worktrees".
+/// Swallowing would drop linked checkouts from inventory without a
+/// trace; the gap detail names the registry.
+#[test]
+fn worktree_registry_unreadable_parks_with_gap() {
+    use repo_scan::store::{Store, TursoStore};
+    use std::os::unix::fs::PermissionsExt;
+
+    struct Restore<'a> {
+        path: &'a Path,
+    }
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.path, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("ws");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    let (main, _wt) = fixture::linked_worktree(&root);
+    let registry = main.join(".git").join("worktrees");
+    assert!(registry.is_dir(), "linked worktree registers");
+    std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o0)).expect("chmod 000");
+    let _restore = Restore { path: &registry };
+    if std::fs::read_dir(&registry).is_ok() {
+        eprintln!("worktree_registry_unreadable_parks_with_gap: chmod 000 ineffective; skipping");
+        return;
+    }
+
+    let state = dir.path().join("state");
+    let report_path = dir.path().join("rep.json");
+    let out = scan(&root, &state, &report_path, &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "unreadable registry parks with gaps, never silent success; stderr: {}",
+        stderr_text(&out)
+    );
+    let report = read_report(&report_path);
+    assert_eq!(report["scan"]["state"].as_str(), Some("incomplete"));
+    assert!(report["coverage"]["gaps"].as_u64().expect("gaps") > 0);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        let mut rows = store
+            .connection()
+            .query("SELECT detail FROM errors WHERE open = 1", ())
+            .await
+            .expect("query gaps");
+        let mut saw_worktree = false;
+        while let Some(row) = rows.next().await.expect("next") {
+            if let turso::Value::Text(detail) = row.get_value(0).expect("v0") {
+                saw_worktree |= detail.contains("worktree");
+            }
+        }
+        store.close().await.expect("close");
+        assert!(saw_worktree, "a gap names the unreadable worktree registry");
+    });
+}
+
+/// GIT-M2: sparse checkouts declare their coverage scope AND keep
+/// git-exact counts. The excluded-path staged change is the parity pin:
+/// installed `git status` is the independent oracle (porcelain `M `
+/// row), and the scan's staged count must agree — while
+/// `unknown_fields` carries the `sparse-checkout` declaration (counts
+/// cover the materialized worktree only). A non-sparse control repo in
+/// the same world carries no such note.
+#[test]
+fn status11_sparse_checkout_declares_scope_with_git_parity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("ws");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    let sparse = fixture::normal_clone(&root, "sparse");
+    fixture::commit_file(&sparse, "keep/a.txt", "a\n", "keep file");
+    fixture::commit_file(&sparse, "skip/b.txt", "b\n", "skip file");
+    fixture::git(&sparse, &["sparse-checkout", "init", "--cone"]);
+    fixture::git(&sparse, &["sparse-checkout", "set", "keep"]);
+    assert!(
+        !sparse.join("skip").exists(),
+        "excluded path is not materialized"
+    );
+    // Stage a change inside the EXCLUDED path (disable, edit, stage,
+    // re-sparsify): the index is not sparse, so both git and the scan
+    // must count it staged.
+    fixture::git(&sparse, &["sparse-checkout", "disable"]);
+    fixture::commit_file(&sparse, "skip/b.txt", "b\nmodified\n", "modify excluded");
+    fixture::git(&sparse, &["reset", "--quiet", "HEAD~1"]);
+    fixture::git(&sparse, &["add", "--", "skip/b.txt"]);
+    fixture::git(&sparse, &["sparse-checkout", "set", "keep"]);
+    // Independent oracle: installed git sees exactly one staged path.
+    assert_eq!(
+        fixture::git_str(&sparse, &["status", "--porcelain"]),
+        "M  skip/b.txt",
+        "oracle: one staged excluded-path change"
+    );
+    let plain = fixture::normal_clone(&root, "plain");
+
+    let state = dir.path().join("state");
+    let report_path = dir.path().join("rep.json");
+    let out = scan(&root, &state, &report_path, &["--status", "summary"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let report = read_report(&report_path);
+    let paths = path_map(&report);
+
+    let repo = repo_by_path(&report, &paths, "sparse");
+    assert_eq!(repo["match"].as_str(), Some("confirmed"));
+    let status = &checkout_for(&report, repo_id(repo))["status"];
+    assert_eq!(status["state"].as_str(), Some("complete"));
+    assert_eq!(status["staged"].as_u64(), Some(1), "parity with git status");
+    assert_eq!(status["unstaged"].as_u64(), Some(0));
+    assert_eq!(status["untracked"].as_u64(), Some(0));
+    assert_eq!(status["conflicts"].as_u64(), Some(0));
+    let unknown = status["unknown_fields"]
+        .as_array()
+        .expect("unknown_fields array");
+    assert!(
+        unknown
+            .iter()
+            .any(|f| f.as_str().is_some_and(|s| s.contains("sparse-checkout"))),
+        "sparse coverage declared: {unknown:?}"
+    );
+
+    let control = repo_by_path(&report, &paths, "plain");
+    assert!(plain.is_dir());
+    let control_unknown = checkout_for(&report, repo_id(control))["status"]["unknown_fields"]
+        .as_array()
+        .expect("control unknown_fields array");
+    assert!(
+        !control_unknown
+            .iter()
+            .any(|f| f.as_str().is_some_and(|s| s.contains("sparse-checkout"))),
+        "non-sparse repo carries no sparse note: {control_unknown:?}"
+    );
 }
 
 /// Conflict-only checkout reports `conflicted` with a separate conflict

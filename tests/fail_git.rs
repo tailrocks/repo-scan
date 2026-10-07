@@ -898,7 +898,9 @@ fn includes_disabled_with_explicit_gap() {
 
     let inspector = GixInspector::new();
     let instance = inspector.open_exact(&repo).expect("open with include");
-    let remotes = inspector.remotes(&instance).expect("remotes");
+    let remotes = inspector
+        .remotes(&instance, &repo_scan::identity::load_ssh_aliases())
+        .expect("remotes");
     assert!(
         remotes.iter().all(|r| r.name != b"smuggled"),
         "included remote must not leak: {remotes:?}"

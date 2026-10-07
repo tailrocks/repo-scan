@@ -1932,7 +1932,20 @@ fn is_ascii_hex(bytes: &[u8]) -> bool {
 
 /// [`oid_from_hex`] over raw bytes: `None` unless ASCII hex.
 fn oid_from_ascii_hex(algorithm: &str, hex: &[u8]) -> Option<Oid> {
-    if !is_ascii_hex(hex) {
+    // Even-length ASCII hex of exactly the algorithm's digest width:
+    // abbreviated or overlong output is malformed (branch oid `None`,
+    // detached `Unknown`, ref row skipped at the call sites).
+    if !is_ascii_hex(hex) || !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let expected = match algorithm {
+        "sha1" => 40,
+        "sha256" => 64,
+        // Defensive: callers normalize to sha1/sha256; anything else
+        // cannot verify a length, so fail closed.
+        _ => return None,
+    };
+    if hex.len() != expected {
         return None;
     }
     std::str::from_utf8(hex)
@@ -2173,6 +2186,132 @@ impl FallbackGit {
         }
         Err(String::from_utf8_lossy(&out.stderr).into_owned())
     }
+
+    /// Resolve one remote URL (or remote name) to its EFFECTIVE fetch
+    /// URL via `git ls-remote --get-url`: pure local config resolution,
+    /// no transport runs, but `url.<base>.insteadOf` rewrites apply
+    /// exactly as a fetch would see them. The caller gates the result
+    /// (executable transports refuse) BEFORE any network spawn. Returns
+    /// the first output line trimmed; the `Err` detail is unscrubbed
+    /// stderr — scrub before persisting.
+    pub fn git_ls_remote_get_url(
+        &self,
+        dir: &Path,
+        url_or_remote: &std::ffi::OsStr,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let mut cmd = self.fetch_command(dir)?;
+        cmd.arg("ls-remote").arg("--get-url").arg(url_or_remote);
+        let out = spawn_enveloped(&mut cmd, true, timeout, MAX_CAPTURE_BYTES)?;
+        if out.truncated {
+            return Err("git ls-remote --get-url output exceeded capture cap".to_string());
+        }
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+        }
+        let line = out.stdout.split(|b| *b == b'\n').next().unwrap_or_default();
+        Ok(String::from_utf8_lossy(line).trim().to_owned())
+    }
+
+    /// Dump the effective config with per-value origins
+    /// (`--show-origin --list`): one `file:<path>\t<key>=<value>` or
+    /// `command line:\t<key>=<value>` row per value. The fetch gate
+    /// parses this to refuse repo-scope executable config
+    /// (`credential.helper`, `core.sshCommand`) and repo-scope
+    /// `include.*` chains (which would hide the true definer). The
+    /// `Err` detail is unscrubbed stderr — scrub before persisting.
+    pub fn git_config_list_origins(
+        &self,
+        dir: &Path,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, String> {
+        let mut cmd = self.fetch_command(dir)?;
+        cmd.arg("config").arg("--show-origin").arg("--list");
+        let out = spawn_enveloped(&mut cmd, true, timeout, MAX_CAPTURE_BYTES)?;
+        if out.truncated {
+            return Err("git config --list output exceeded capture cap".to_string());
+        }
+        if !out.status.success() {
+            return Err(format!(
+                "git config --list failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(out.stdout)
+    }
+}
+
+/// One `--show-origin` config row: the defining file (empty for
+/// `command line:` rows, which are this process's own `-c` flags) plus
+/// the lowercase key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigOrigin {
+    /// Defining file exactly as git printed it (`None` for `command
+    /// line:` rows). May be relative (resolved against the spawn cwd).
+    pub file: Option<String>,
+    /// Lowercase config key (`credential.helper`, ...).
+    pub key: String,
+}
+
+/// Parse one `git config --show-origin --list` row. `Ok(None)` is a
+/// `command line:` row (our own `-c` flags — trusted, skipped).
+/// `Err` is an unparseable row: the caller fails closed.
+pub fn parse_config_origin_line(line: &[u8]) -> Result<Option<ConfigOrigin>, String> {
+    let err = || "git config origin row is not `<origin>\\t<key>=<value>`".to_string();
+    let tab = line.iter().position(|b| *b == b'\t').ok_or_else(err)?;
+    let (origin, rest) = (&line[..tab], &line[tab + 1..]);
+    let origin = std::str::from_utf8(origin).map_err(|_| err())?;
+    let rest = std::str::from_utf8(rest).map_err(|_| err())?;
+    let (key, _) = rest.split_once('=').ok_or_else(err)?;
+    if origin == "command line:" {
+        return Ok(None);
+    }
+    let file = origin.strip_prefix("file:").ok_or_else(err)?;
+    Ok(Some(ConfigOrigin {
+        file: Some(file.to_string()),
+        key: key.to_lowercase(),
+    }))
+}
+
+/// True when a `--show-origin` file path resolves inside `git_dir`
+/// (the `--git-dir` the config was read through): repo-scope config,
+/// including `config`, `config.worktree`, and anything they include
+/// from inside the store. Relative origins resolve against the
+/// current directory (the spawn inherits it). ANY resolution failure
+/// fails closed (`true`): an origin git read but we cannot place is
+/// treated as repo-scope.
+pub fn config_origin_within_repo(origin_file: &str, git_dir: &Path) -> bool {
+    let origin_path = Path::new(origin_file);
+    let abs = if origin_path.is_absolute() {
+        origin_path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(origin_path),
+            Err(_) => return true,
+        }
+    };
+    match (std::fs::canonicalize(&abs), std::fs::canonicalize(git_dir)) {
+        (Ok(origin), Ok(dir)) => origin.starts_with(&dir),
+        // Unresolvable either side: fail closed.
+        _ => true,
+    }
+}
+
+/// Fetch-transport gate over one EFFECTIVE remote URL (post-`insteadOf`
+/// resolution): `ext::` and remote-helper transports execute local
+/// commands chosen by repo config, so they refuse with a reason;
+/// everything else parses-or-fails downstream. Returns `Some(reason)`
+/// on refusal, `None` when the URL may proceed to the scheme-agnostic
+/// fetch. Unparseable URLs are NOT refused here (git itself fails them
+/// honestly without executing anything — the caller reports `failed`).
+pub fn refused_fetch_scheme(effective_url: &str) -> Option<String> {
+    let parsed = gix::url::parse(effective_url.trim()).ok()?;
+    let transport = match parsed.scheme {
+        gix::url::Scheme::Ext => Some("ext::"),
+        gix::url::Scheme::Helper(_) | gix::url::Scheme::HelperUrl(_) => Some("remote-helper"),
+        _ => None,
+    };
+    transport.map(|t| format!("remote URL uses executable {t} transport; refusing to fetch"))
 }
 
 /// One remote-tracking ref observed via `for-each-ref` (exact bytes).
@@ -3003,5 +3142,120 @@ mod tests {
             .fetch_command(dir.path())
             .expect_err("swapped binary refused");
         assert!(err.contains("identity changed"), "{err}");
+    }
+
+    #[test]
+    fn fetch_scheme_gate_refuses_exec_transports_only() {
+        // Executable transports refuse (fail closed, no execution).
+        assert!(refused_fetch_scheme("ext::sh -c up").is_some());
+        assert!(refused_fetch_scheme("  ext::ssh host  ").is_some());
+        // Helper transports refuse when gix recognizes them; otherwise
+        // they stay unparseable and fail honestly downstream (never
+        // executed by the gate itself).
+        if let Ok(parsed) = gix::url::parse("myhelper::/path".trim()) {
+            let is_helper = matches!(
+                parsed.scheme,
+                gix::url::Scheme::Helper(_) | gix::url::Scheme::HelperUrl(_)
+            );
+            assert_eq!(refused_fetch_scheme("myhelper::/path").is_some(), is_helper);
+        }
+        // Ordinary transports pass the gate.
+        for ok in [
+            "/tmp/upstream",
+            "file:///tmp/upstream",
+            "https://github.com/o/r.git",
+            "http://host/r.git",
+            "git://host/r.git",
+            "git@github.com:o/r.git",
+            "ssh://git@github.com/o/r.git",
+        ] {
+            assert_eq!(refused_fetch_scheme(ok), None, "{ok}");
+        }
+        // Unparseable URLs are NOT gate refusals: git fails them
+        // honestly without executing anything.
+        assert_eq!(refused_fetch_scheme(":::"), None);
+    }
+
+    #[test]
+    fn config_origin_line_parses_show_origin_rows() {
+        let row = parse_config_origin_line(b"file:/tmp/r/.git/config\tcredential.helper=store")
+            .expect("parse")
+            .expect("file row");
+        assert_eq!(row.file.as_deref(), Some("/tmp/r/.git/config"));
+        assert_eq!(row.key, "credential.helper");
+        // Keys lowercase (`core.sshCommand` -> `core.sshcommand`).
+        let row = parse_config_origin_line(b"file:/x\tcore.sshCommand=ssh")
+            .expect("parse")
+            .expect("file row");
+        assert_eq!(row.key, "core.sshcommand");
+        // Our own `-c` flags skip.
+        assert_eq!(
+            parse_config_origin_line(b"command line:\tcore.pager=cat"),
+            Ok(None)
+        );
+        // Anything else fails closed.
+        assert!(parse_config_origin_line(b"file:/x\tnokey").is_err());
+        assert!(parse_config_origin_line(b"no-tab-here").is_err());
+        assert!(parse_config_origin_line(b"stdin:\tkey=value").is_err());
+        assert!(parse_config_origin_line(b"").is_err());
+    }
+
+    #[test]
+    fn oid_from_ascii_hex_requires_algo_correct_length() {
+        let sha1 = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
+        let sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        // Exact widths accept.
+        assert!(oid_from_ascii_hex("sha1", sha1.as_bytes()).is_some());
+        assert!(oid_from_ascii_hex("sha256", sha256.as_bytes()).is_some());
+        // Cross-algo widths refuse (a sha256 hex is not a sha1 oid).
+        assert!(oid_from_ascii_hex("sha1", sha256.as_bytes()).is_none());
+        assert!(oid_from_ascii_hex("sha256", sha1.as_bytes()).is_none());
+        // Abbreviated, odd, overlong, empty, and non-hex refuse.
+        assert!(oid_from_ascii_hex("sha1", b"da39a3e").is_none());
+        assert!(oid_from_ascii_hex("sha1", &sha1.as_bytes()[..39]).is_none());
+        assert!(oid_from_ascii_hex("sha1", format!("{sha1}00").as_bytes()).is_none());
+        assert!(oid_from_ascii_hex("sha1", b"").is_none());
+        assert!(oid_from_ascii_hex("sha1", b"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_none());
+        // Unknown algorithms fail closed (callers normalize, defensive).
+        assert!(oid_from_ascii_hex("sha257", sha1.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn config_origin_containment_is_prefix_and_fail_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git_dir = dir.path().join("r.git");
+        std::fs::create_dir_all(&git_dir).expect("mkdir");
+        let config = git_dir.join("config");
+        std::fs::write(&config, b"[core]\n").expect("write");
+        let outside = dir.path().join("other");
+        std::fs::write(&outside, b"x").expect("write");
+        // Inside the store: repo scope.
+        assert!(config_origin_within_repo(
+            config.to_str().expect("utf8"),
+            &git_dir
+        ));
+        // Outside: operator scope.
+        assert!(!config_origin_within_repo(
+            outside.to_str().expect("utf8"),
+            &git_dir
+        ));
+        // Sibling-prefix trap (`r.git2` must not match `r.git`).
+        let sibling = dir.path().join("r.git2");
+        std::fs::create_dir_all(&sibling).expect("mkdir");
+        let sibling_config = sibling.join("config");
+        std::fs::write(&sibling_config, b"x").expect("write");
+        assert!(!config_origin_within_repo(
+            sibling_config.to_str().expect("utf8"),
+            &git_dir
+        ));
+        // Unresolvable either side: fail closed.
+        assert!(config_origin_within_repo(
+            dir.path().join("vanished").to_str().expect("utf8"),
+            &git_dir
+        ));
+        assert!(config_origin_within_repo(
+            config.to_str().expect("utf8"),
+            &dir.path().join("no-git-dir")
+        ));
     }
 }

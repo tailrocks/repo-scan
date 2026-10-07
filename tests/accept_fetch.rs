@@ -101,12 +101,12 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("runtime")
 }
 
-async fn refresh_rows(store: &TursoStore) -> Vec<(String, String, String, i64)> {
+async fn refresh_rows(store: &TursoStore) -> Vec<(String, String, String, i64, Option<String>)> {
     let mut out = Vec::new();
     let mut rows = store
         .connection()
         .query(
-            "SELECT store_id, remote_name, status, observed_at_ms FROM remote_refreshes",
+            "SELECT store_id, remote_name, status, observed_at_ms, detail FROM remote_refreshes",
             (),
         )
         .await
@@ -128,9 +128,29 @@ async fn refresh_rows(store: &TursoStore) -> Vec<(String, String, String, i64)> 
             turso::Value::Integer(n) => n,
             other => panic!("expected integer, got {other:?}"),
         };
-        out.push((id, name, status, observed));
+        let detail = match row.get_value(4).expect("v4") {
+            turso::Value::Text(text) => Some(text),
+            turso::Value::Null => None,
+            other => panic!("expected text/null, got {other:?}"),
+        };
+        out.push((id, name, status, observed, detail));
     }
     out
+}
+
+/// Scrubbed `detail` of the single `origin` refresh row (gate tests:
+/// the report carries status only; the reason lives in the catalog).
+fn origin_refresh_detail(state: &Path) -> Option<String> {
+    let rt = runtime();
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open catalog");
+        let rows = refresh_rows(&store).await;
+        store.close().await.expect("close");
+        assert_eq!(rows.len(), 1, "single-clone world keeps one row: {rows:?}");
+        assert_eq!(rows[0].1, "origin");
+        rows[0].4.clone()
+    })
 }
 
 /// FETCH-E2E-01: a behind tracking ref advances to the upstream tip,
@@ -738,7 +758,7 @@ fn fetch07_kill_mid_fetch_resume_skips_completed_retries_pending() {
             "killed scan stays resumable: {scan_state}"
         );
         let mut pre = Vec::new();
-        for (store_id, name, status, observed) in refresh_rows(&store).await {
+        for (store_id, name, status, observed, _detail) in refresh_rows(&store).await {
             assert_eq!(name, "origin");
             if status == "success" {
                 pre.push((store_id, observed));
@@ -787,7 +807,7 @@ fn fetch07_kill_mid_fetch_resume_skips_completed_retries_pending() {
         for (store_id, observed) in &pre_success {
             let row = rows
                 .iter()
-                .find(|(id, _, _, _)| id == store_id)
+                .find(|(id, _, _, _, _)| id == store_id)
                 .unwrap_or_else(|| panic!("pre-kill family {store_id} lost its row"));
             assert_eq!(row.2, "success", "skipped family keeps success");
             assert_eq!(
@@ -795,7 +815,7 @@ fn fetch07_kill_mid_fetch_resume_skips_completed_retries_pending() {
                 "skipped family row is byte-identical (no re-fetch)"
             );
         }
-        let failed = rows.iter().filter(|(_, _, s, _)| s == "failed").count();
+        let failed = rows.iter().filter(|(_, _, s, _, _)| s == "failed").count();
         assert_eq!(
             failed,
             FAMILIES - pre_success.len(),
@@ -888,4 +908,205 @@ fn fetch08_second_scan_refetches_and_picks_up_new_commits() {
         assert_eq!(rows.len(), 1, "single family keeps one row: {rows:?}");
         assert_eq!(rows[0].2, "success");
     });
+}
+
+/// FETCH-GATE-01: an `ext::` remote URL refuses at plan time
+/// (`unsupported`) and NOTHING executes: the sentinel the ext command
+/// would create must not exist after the scan.
+#[test]
+fn fetch09_ext_transport_refused_without_execution() {
+    let tmp = fixture::scratch_root("fetch09");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+
+    let (upstream, _) = seed_upstream(&root, "upstream");
+    let clone = clone_from(&root, &upstream, "clone");
+    let sentinel = tmp.path().join("SENTINEL-ext");
+    let ext_url = format!("ext::touch {}", sentinel.to_str().expect("utf8"));
+    fixture::git(&clone, &["remote", "set-url", "origin", &ext_url]);
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "usable scan result: {}",
+        stderr_text(&out)
+    );
+    assert!(
+        !sentinel.exists(),
+        "ext:: command must never execute during a gated scan"
+    );
+    let report = load_json(&report_path);
+    let refresh = remote(&report, "origin", "fetch");
+    assert_eq!(refresh["refresh"]["status"].as_str(), Some("unsupported"));
+    let detail = origin_refresh_detail(&state).unwrap_or_default();
+    assert!(
+        detail.contains("ext::"),
+        "refusal names the executable transport: {detail}"
+    );
+    for b in report["branches"].as_array().expect("branches") {
+        assert_ne!(
+            b["freshness"].as_str(),
+            Some("current"),
+            "refused refresh labels nothing current: {}",
+            b["name"]["value"]
+        );
+    }
+}
+
+/// FETCH-GATE-02: a repo-scope `url.insteadOf` rewriting a plain file
+/// URL to `ext::` is caught on the EFFECTIVE url (`unsupported`, zero
+/// execution) — gating the configured string alone would miss it.
+#[test]
+fn fetch10_insteadof_to_ext_refused_without_execution() {
+    let tmp = fixture::scratch_root("fetch10");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+
+    let (upstream, _) = seed_upstream(&root, "upstream");
+    let clone = clone_from(&root, &upstream, "clone");
+    let sentinel = tmp.path().join("SENTINEL-insteadof");
+    let ext_url = format!("ext::touch {}", sentinel.to_str().expect("utf8"));
+    fixture::git(
+        &clone,
+        &[
+            "config",
+            &format!("url.{ext_url}.insteadOf"),
+            upstream.to_str().expect("utf8"),
+        ],
+    );
+    // Sanity: git itself resolves the rewrite (the gate sees this).
+    assert_eq!(
+        fixture::git_str(&clone, &["ls-remote", "--get-url", "origin"]),
+        ext_url
+    );
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "usable scan result: {}",
+        stderr_text(&out)
+    );
+    assert!(
+        !sentinel.exists(),
+        "rewritten ext:: command must never execute"
+    );
+    let report = load_json(&report_path);
+    let refresh = remote(&report, "origin", "fetch");
+    assert_eq!(refresh["refresh"]["status"].as_str(), Some("unsupported"));
+}
+
+/// FETCH-GATE-03: a repo-scope `credential.helper` refuses the fetch
+/// (`unsupported`) even though the file transport itself would
+/// succeed — the helper would execute repo-chosen code at fetch time.
+#[test]
+fn fetch11_repo_credential_helper_refused() {
+    let tmp = fixture::scratch_root("fetch11");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+
+    let (upstream, _) = seed_upstream(&root, "upstream");
+    let clone = clone_from(&root, &upstream, "clone");
+    fixture::git(
+        &clone,
+        &["config", "credential.helper", "canary-helper-fetch11"],
+    );
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "usable scan result: {}",
+        stderr_text(&out)
+    );
+    let report = load_json(&report_path);
+    let refresh = remote(&report, "origin", "fetch");
+    assert_eq!(refresh["refresh"]["status"].as_str(), Some("unsupported"));
+    let detail = origin_refresh_detail(&state).unwrap_or_default();
+    assert!(
+        detail.contains("credential.helper"),
+        "refusal names the repo-scope key: {detail}"
+    );
+}
+
+/// FETCH-GATE-04: a repo-scope `core.sshCommand` refuses the fetch
+/// (`unsupported`): the ssh override would execute repo-chosen code.
+#[test]
+fn fetch12_repo_ssh_command_refused() {
+    let tmp = fixture::scratch_root("fetch12");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+
+    let (upstream, _) = seed_upstream(&root, "upstream");
+    let clone = clone_from(&root, &upstream, "clone");
+    fixture::git(&clone, &["config", "core.sshCommand", "canary-ssh-fetch12"]);
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "usable scan result: {}",
+        stderr_text(&out)
+    );
+    let report = load_json(&report_path);
+    let refresh = remote(&report, "origin", "fetch");
+    assert_eq!(refresh["refresh"]["status"].as_str(), Some("unsupported"));
+    let detail = origin_refresh_detail(&state).unwrap_or_default();
+    assert!(
+        detail.contains("core.sshcommand"),
+        "refusal names the repo-scope key: {detail}"
+    );
 }

@@ -104,6 +104,12 @@ fn normal_checkout_opens_with_branch_head() {
     let refs = inspector.refs(&validated.instance).expect("refs");
     assert!(refs.iter().any(|r| r.name == b"refs/heads/main"));
     assert!(inspector.reference_errors(&validated.instance).is_empty());
+    // One-pass twin agrees with the split pair on a healthy store.
+    let (refs2, errors2) = inspector
+        .refs_with_errors(&validated.instance)
+        .expect("refs_with_errors");
+    assert_eq!(refs.len(), refs2.len());
+    assert!(errors2.is_empty());
     assert_eq!(
         inspector.checkout_kind(&validated.instance).expect("kind"),
         CheckoutKind::Main
@@ -112,6 +118,47 @@ fn normal_checkout_opens_with_branch_head() {
         .worktrees(&validated.instance)
         .expect("worktrees")
         .is_empty());
+}
+
+/// GIT-m3: a garbage loose ref is preserved as a per-item error while
+/// its valid siblings still observe — and the one-pass
+/// `refs_with_errors` agrees exactly with the `refs` /
+/// `reference_errors` pair (single traversal, no skew between them).
+#[test]
+fn broken_loose_ref_preserved_as_error_with_valid_siblings() {
+    let Some(git_bin) = git_or_skip() else {
+        eprintln!("skip: no installed git");
+        return;
+    };
+    let scratch = tempfile::tempdir().expect("scratch");
+    let work = init_with_commit(&git_bin, scratch.path());
+    repo_scan::privacy::private_write_0600(
+        &work.join(".git").join("refs").join("heads").join("broken"),
+        b"not-an-oid\n",
+    )
+    .expect("plant broken ref");
+    let inspector = GixInspector::new();
+    let validated = inspector.validate(&work).expect("validate checkout");
+
+    let (refs, errors) = inspector
+        .refs_with_errors(&validated.instance)
+        .expect("refs_with_errors");
+    assert!(
+        refs.iter().any(|r| r.name == b"refs/heads/main"),
+        "valid siblings still observe"
+    );
+    assert!(
+        !errors.is_empty(),
+        "broken ref preserved as an error, never skipped silently"
+    );
+    assert!(
+        errors.iter().all(|e| e.contains("invalid ref")),
+        "error channel shape: {errors:?}"
+    );
+    // Split-pair agreement: identical observations, identical errors.
+    let split_refs = inspector.refs(&validated.instance).expect("refs");
+    assert_eq!(split_refs.len(), refs.len());
+    assert_eq!(inspector.reference_errors(&validated.instance), errors);
 }
 
 #[test]
@@ -554,7 +601,9 @@ fn remotes_observed_with_roles_and_canonical_urls() {
 
     let inspector = GixInspector::new();
     let instance = inspector.open_exact(&work).expect("open");
-    let remotes = inspector.remotes(&instance).expect("remotes");
+    let remotes = inspector
+        .remotes(&instance, &repo_scan::identity::load_ssh_aliases())
+        .expect("remotes");
     assert_eq!(remotes.len(), 2, "fetch + push roles");
     for remote in &remotes {
         assert_eq!(remote.name, b"origin");
@@ -607,7 +656,9 @@ fn insteadof_rewrite_applied_without_helpers() {
 
     let inspector = GixInspector::new();
     let instance = inspector.open_exact(&work).expect("open");
-    let remotes = inspector.remotes(&instance).expect("remotes");
+    let remotes = inspector
+        .remotes(&instance, &repo_scan::identity::load_ssh_aliases())
+        .expect("remotes");
     assert!(
         remotes
             .iter()
@@ -913,6 +964,48 @@ fn credential_redaction_table() {
         redact_credentials("git@github.com:o/r.git"),
         "<redacted>@github.com:o/r.git",
         "RS-PRIV-10: scp-like user redacts (token-as-username is indistinguishable)"
+    );
+}
+
+/// GIT-m5: the threaded alias map decides SSH identity — the `_with`
+/// chain honors a caller-supplied map without touching `HOME`, an
+/// empty map resolves nothing, and the legacy entry points delegate
+/// (threaded fresh-load equals the direct call).
+#[test]
+fn ssh_alias_threaded_map_decides_without_file_read() {
+    use repo_scan::identity::{
+        classify_remote_with, github_host_matches_with, normalize_github_url_with,
+        resolve_ssh_alias, resolve_ssh_alias_with,
+    };
+    let aliases = parse_ssh_config("Host gh\n  HostName github.com\n");
+    // Threaded map: alias resolves to GitHub on SSH transports.
+    assert_eq!(
+        resolve_ssh_alias_with("gh", &aliases).as_deref(),
+        Some("github.com")
+    );
+    assert!(github_host_matches_with("gh", true, &aliases));
+    assert!(!github_host_matches_with("gh", false, &aliases));
+    assert_eq!(
+        normalize_github_url_with("gh:owner/repo.git", &aliases).as_deref(),
+        Some("https://github.com/owner/repo")
+    );
+    let (disposition, _) = classify_remote_with(
+        "https://github.com/owner/repo",
+        "gh:owner/repo.git",
+        "fetch",
+        &aliases,
+    );
+    assert_eq!(disposition, MatchDisposition::Confirmed);
+    // Empty map: the same inputs resolve nothing (no file consulted).
+    let empty = parse_ssh_config("# nothing\n");
+    assert_eq!(resolve_ssh_alias_with("gh", &empty), None);
+    assert!(!github_host_matches_with("gh", true, &empty));
+    assert_eq!(normalize_github_url_with("gh:owner/repo.git", &empty), None);
+    // Legacy entry points delegate to the threaded chain.
+    let fresh = repo_scan::identity::load_ssh_aliases();
+    assert_eq!(
+        resolve_ssh_alias("github.com"),
+        resolve_ssh_alias_with("github.com", &fresh)
     );
 }
 
