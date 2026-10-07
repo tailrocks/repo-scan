@@ -25,6 +25,11 @@ struct Shape {
     repo_every: usize,
     deep_levels: usize,
     wide_single_files: usize,
+    /// Wave4a extras: deep-nested store chain, many-branch count,
+    /// many-file count.
+    extra_deep: usize,
+    extra_branches: usize,
+    extra_files: usize,
     min_dirs: u64,
     min_files: u64,
     min_stores: usize,
@@ -39,6 +44,9 @@ fn shape() -> Shape {
             repo_every: 6,
             deep_levels: 5,
             wide_single_files: 50,
+            extra_deep: 5,
+            extra_branches: 3,
+            extra_files: 20,
             min_dirs: 20,
             min_files: 100,
             min_stores: 15,
@@ -51,6 +59,9 @@ fn shape() -> Shape {
             repo_every: 500,
             deep_levels: 300,
             wide_single_files: 30_000,
+            extra_deep: 60,
+            extra_branches: 50,
+            extra_files: 20_000,
             min_dirs: 100_000,
             min_files: 1_000_000,
             min_stores: 200,
@@ -308,6 +319,40 @@ fn main() {
     fs::create_dir_all(&unborn).expect("unborn");
     support::git(&unborn, &["init", "-q"]);
     expected.push(rel(&unborn));
+    // Wave4a extras: deep-nested store, many-branch store, many-file store.
+    let extra = ws.join("extra");
+    fs::create_dir_all(&extra).expect("extra");
+    counts.dirs.fetch_add(1, Ordering::Relaxed);
+    let mut nest = extra.join("deepnest");
+    fs::create_dir_all(&nest).expect("deepnest");
+    counts.dirs.fetch_add(1, Ordering::Relaxed);
+    for i in 1..=sh.extra_deep {
+        nest = nest.join(format!("d{i}"));
+        fs::create_dir_all(&nest).expect("nest level");
+    }
+    counts
+        .dirs
+        .fetch_add(sh.extra_deep as u64, Ordering::Relaxed);
+    let bottom = nest.join("bottom");
+    seed_remote_repo(&bottom, "bench-special", "deep-bottom");
+    expected.push(rel(&bottom));
+    let manybranch = extra.join("manybranch");
+    seed_remote_repo(&manybranch, "bench-special", "manybranch");
+    for br in 1..=sh.extra_branches {
+        support::git(&manybranch, &["branch", &format!("feat-{br}")]);
+    }
+    expected.push(rel(&manybranch));
+    let manyfile = extra.join("manyfile");
+    seed_remote_repo(&manyfile, "bench-special", "manyfile");
+    for i in 0..sh.extra_files {
+        write_file(&manyfile.join(format!("m{i:05}.dat")), b"many\n");
+    }
+    counts
+        .files
+        .fetch_add(sh.extra_files as u64, Ordering::Relaxed);
+    support::git(&manyfile, &["add", "-A"]);
+    support::git(&manyfile, &["commit", "-q", "-m", "manyfiles"]);
+    expected.push(rel(&manyfile));
 
     // --- Manifest + minimums. ---
     let dirs = counts.dirs.load(Ordering::Relaxed);
@@ -333,6 +378,7 @@ fn main() {
             "wide/: 400x250 leaves, 10 files each, every 500th leaf a git store",
             "deep/: 300-level chain; wide_single/: 30000 files in one dir",
             "special/: nested pair, 2 bare, worktree family (main+3), submodule pair, node_modules/hidden/cache/tmp, 5 branchy, dirty, unborn",
+            "extra/: deepnest (60-level chain, store at bottom), manybranch (50 branches), manyfile (20000 files)",
             "recall: scans find one more store than listed (the embedded submodule clone at super/sub)",
             ".git internals are NOT in tracked counts; find(1) totals will exceed them",
         ],
