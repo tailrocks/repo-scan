@@ -1379,6 +1379,10 @@ async fn run_scan_inner(
         vec![reclassify_for_target(&store, primary_canonical, &mut runner.counters).await?]
     };
     enqueue_status_refresh(&store, &mut runner, generation, run_rev, now).await?;
+    // Pre-existing stores schedule branch/HEAD analysis here; stores
+    // discovered this run schedule from their probe persist. Claims
+    // gate execution to the post-boundary drain.
+    enqueue_analysis_refresh(&store, &mut runner, generation, run_rev, now).await?;
 
     let mut outcome = run_until_boundary(
         &mut runner,
@@ -1612,6 +1616,18 @@ async fn run_scan_inner(
         finished_ms = store::now_ms();
     }
     let discovery_code = if scan_incomplete { 3 } else { 0 };
+    // The report's scan verdict covers the whole run (analysis + fetch),
+    // not just the discovery boundary: `gen_state` above stays the
+    // discovery verdict for the generation row and the `inventory_ready`
+    // event, but a scan that exits 3 must not stage a file claiming
+    // `complete` (Step 15.18/FETCH-E2E-07).
+    let final_state = if outcome.interrupted {
+        "interrupted"
+    } else if scan_incomplete {
+        "incomplete"
+    } else {
+        "complete"
+    };
     // Stage first, publish second through the tested lib pipeline (R3): a
     // failed publication retains the saved snapshot and can be retried
     // without repeating discovery.
@@ -1645,7 +1661,7 @@ async fn run_scan_inner(
             )
             .collect(),
         scope_policy: policy.clone(),
-        scan_state: gen_state.to_string(),
+        scan_state: final_state.to_string(),
         status_mode: args.status,
         started_ms,
         finished_ms,
@@ -2365,6 +2381,76 @@ async fn enqueue_status_task(
     let task = NewTask {
         id: &id,
         kind: KIND_STATUS,
+        generation,
+        dir_id: None,
+        scope_key: &scope_key,
+        expected_rev,
+        idempotency_key: &idempotency,
+    };
+    let due = TursoStore::buffer_enqueue_task(&mut runner.batch, &task, now_ms);
+    flush_if_due(runner, store, due).await?;
+    Ok(())
+}
+
+/// Enqueue branch/HEAD analysis for every known local store (goal Step
+/// 8/10): shared refs read once per store, HEAD per checkout. Mirrors
+/// the status refresh: pre-existing instances enqueue here, instances
+/// discovered this run enqueue from their probe persist. Task ids are
+/// idempotent per run (`analyze:{instance}:{run_rev}`), so the repeat
+/// enqueue is safe; claims gate execution to the post-`inventory_ready`
+/// drain, so calling this pre-traversal only schedules, never starts,
+/// analysis.
+async fn enqueue_analysis_refresh(
+    store: &TursoStore,
+    runner: &mut Runner,
+    generation: u64,
+    run_rev: u64,
+    now_ms: i64,
+) -> repo_scan::Result<()> {
+    let mut rows = store
+        .connection()
+        .query("SELECT id, common_path FROM git_instances", ())
+        .await
+        .map_err(|e| repo_scan::Error::Store(e.to_string()))?;
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| repo_scan::Error::Store(e.to_string()))?
+    {
+        let instance_id = cell_text(&row, 0)?;
+        let common = cell_blob(&row, 1)?;
+        enqueue_analysis_task(
+            store,
+            runner,
+            generation,
+            run_rev,
+            &instance_id,
+            &config::path_from_bytes(common),
+            now_ms,
+        )
+        .await?;
+    }
+    flush_runner_batch(runner, store).await?;
+    Ok(())
+}
+
+async fn enqueue_analysis_task(
+    store: &TursoStore,
+    runner: &mut Runner,
+    generation: u64,
+    run_rev: u64,
+    instance_id: &str,
+    common_dir: &Path,
+    now_ms: i64,
+) -> repo_scan::Result<()> {
+    let scope_key = config::scope_key_for_git(common_dir);
+    let id = format!("analyze:{instance_id}:{run_rev}");
+    let idempotency = format!("idem:{id}");
+    let expected_rev = store.scope_rev(&scope_key).await?;
+    // RSF-AC461500-609D-4D55-991E-09C60D382D67: buffered enqueue.
+    let task = NewTask {
+        id: &id,
+        kind: KIND_ANALYZE,
         generation,
         dir_id: None,
         scope_key: &scope_key,
@@ -3749,7 +3835,7 @@ async fn run_until_boundary(
             }
             let class = match item.task.kind.as_str() {
                 KIND_ENUM | KIND_RECONCILE => OpClass::Enumerate,
-                KIND_PROBE | KIND_STATUS => OpClass::GitProbe,
+                KIND_PROBE | KIND_STATUS | KIND_ANALYZE => OpClass::GitProbe,
                 _ => OpClass::Other,
             };
             let Some(permit) = runner.admission.try_acquire(class) else {
@@ -4682,6 +4768,7 @@ async fn execute_task(
             .await?
         }
         KIND_STATUS => exec_status(runner, store, status_mode, claimed, deadline).await?,
+        KIND_ANALYZE => exec_analysis(runner, store, claimed, deadline).await?,
         other => {
             let detail = format!("unknown task kind: {other}");
             let due = buffer_record_error(
@@ -5575,6 +5662,17 @@ impl ProbeSchedule {
             provenance: ProbeProvenance::Relationship,
         }
     }
+
+    /// Schedule for an analysis task: store rows always derive from Git
+    /// observations (same shape as [`ProbeSchedule::status_legacy`]), so
+    /// relationship routing stays available; the pin/re-verify envelope
+    /// still binds execution.
+    fn analysis_legacy() -> Self {
+        Self {
+            identity: None,
+            provenance: ProbeProvenance::Relationship,
+        }
+    }
 }
 
 /// Parse the schedule suffix off a probe task id:
@@ -6370,14 +6468,12 @@ struct ProbeReads {
     common_identity: Option<(u64, u64)>,
     remotes: Vec<git::RemoteObservation>,
     remotes_note: Option<String>,
-    head: git::HeadState,
+    // Discovery-only reads: identity, paths, remotes, worktrees.
+    // Branch/HEAD analysis (refs, upstreams, HEAD) moved to the
+    // post-`inventory_ready` analyze task (F2).
     relationship: &'static str,
     work_present: Option<bool>,
     worktrees: Vec<git::WorktreeObservation>,
-    refs: Vec<git::RefObservation>,
-    refs_notes: Vec<String>,
-    ref_errors: Vec<String>,
-    branch_upstreams: HashMap<String, Vec<u8>>,
     config_dep_count: usize,
 }
 
@@ -6466,22 +6562,8 @@ async fn collect_probe_reads(
     if deadline.expired() {
         return Ok(CollectOutcome::TimedOut);
     }
-    // RSF-FALLBACK-HELPER-SECURITY(5): refs/head fallbacks inherit the
-    // task deadline and SIGINT (mirrors the status path); cancellation
-    // ends even stuck readers instead of hanging the probe task.
-    let task_deadline = *deadline;
-    let cancel = git::fallback::WaitCancel::new(
-        move || INTERRUPTED.load(Ordering::SeqCst) || task_deadline.expired(),
-        None,
-    );
-    let head = git::fallback::with_wait_cancel(&cancel, || observed_head(runner, instance))?;
-    if !poll.ok_throttled() {
-        return Ok(CollectOutcome::IdentityChanged);
-    }
-    // R4 heartbeat at this yield point (see above).
-    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
-        return Ok(CollectOutcome::LeaseLost);
-    }
+    // F2: HEAD/refs reads moved to the post-`inventory_ready` analyze
+    // task; discovery probes keep only identity/relationship reads.
     let relationship = match runner.inspector.checkout_kind(instance) {
         Ok(git::CheckoutKind::Main) => "main",
         Ok(git::CheckoutKind::Linked) => "linked",
@@ -6507,32 +6589,19 @@ async fn collect_probe_reads(
     if deadline.expired() {
         return Ok(CollectOutcome::TimedOut);
     }
-    let mut refs_notes = Vec::new();
-    let refs = git::fallback::with_wait_cancel(&cancel, || {
-        observed_refs(runner, instance, &mut refs_notes)
-    })?;
+    // Final unthrottled identity check: after the hook and every fast
+    // local stage, confirm the directory is still the lease's target.
     if !poll.ok_now() {
         return Ok(CollectOutcome::IdentityChanged);
     }
-    // R4 heartbeat at this yield point (see above).
-    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
-        return Ok(CollectOutcome::LeaseLost);
-    }
-    let ref_errors = runner.inspector.reference_errors(instance);
-    let branch_upstreams = load_branch_upstreams(&instance.common_dir);
     Ok(CollectOutcome::Reads(Box::new(ProbeReads {
         incarnation,
         common_identity,
         remotes,
         remotes_note,
-        head,
         relationship,
         work_present,
         worktrees,
-        refs,
-        refs_notes,
-        ref_errors,
-        branch_upstreams,
         config_dep_count,
     })))
 }
@@ -6886,8 +6955,10 @@ async fn persist_probe(
                     return Ok(());
                 }
                 let first_instance_id = format!("git:{}", config::encode_hex(&first));
-                let head = reads.head;
-                let (head_state, head_ref, head_oid, head_algo) = head_columns(&head);
+                // Discovery records checkout presence only; HEAD resolves in
+                // the Analysis phase (analyze task, post-`inventory_ready`).
+                let (head_state, head_ref, head_oid, head_algo): HeadColumns =
+                    ("unknown", None, None, None);
                 let relationship = reads.relationship;
                 let checkout_hex = config::encode_hex(&git_bytes);
                 let main_checkout_id = format!("co:{checkout_hex}");
@@ -7132,8 +7203,9 @@ async fn persist_probe(
         }
     }
 
-    let head = reads.head;
-    let (head_state, head_ref, head_oid, head_algo) = head_columns(&head);
+    // Discovery records checkout presence only; HEAD resolves in the
+    // Analysis phase (analyze task, post-`inventory_ready`).
+    let (head_state, head_ref, head_oid, head_algo): HeadColumns = ("unknown", None, None, None);
     let relationship = reads.relationship;
     let checkout_hex = config::encode_hex(&git_bytes);
     let main_checkout_id = format!("co:{checkout_hex}");
@@ -7246,87 +7318,19 @@ async fn persist_probe(
         }
     }
 
-    let refs = reads.refs;
-    evidence.extend(reads.refs_notes);
-    // Upstream tracking evidence from the repo config (R16), read once per
-    // probe; absent/unreadable config yields no upstreams, never fake ones.
-    let branch_upstreams = reads.branch_upstreams;
-    let known: HashSet<&[u8]> = refs.iter().map(|r| r.name.as_slice()).collect();
-    let mut branch_values = Vec::with_capacity(refs.len());
-    for reference in &refs {
-        let name_text = String::from_utf8_lossy(&reference.name);
-        let kind = if name_text.starts_with("refs/heads/") {
-            "local"
-        } else if name_text.starts_with("refs/remotes/") {
-            "remote_tracking"
-        } else {
-            "other"
-        };
-        let ref_id = format!(
-            "ref:{}:{}",
-            config::encode_hex(&common_bytes),
-            config::encode_hex(&reference.name),
-        );
-        let (oid, algo, symbolic) = match &reference.target {
-            git::RefTarget::Object(o) => (Some(o.hex.as_bytes()), Some(o.algorithm.as_str()), None),
-            git::RefTarget::Symbolic(target) => {
-                let (peeled_oid, peeled_algo) = reference
-                    .peeled
-                    .as_ref()
-                    .map(|o| (Some(o.hex.as_bytes()), Some(o.algorithm.as_str())))
-                    .unwrap_or((None, None));
-                (peeled_oid, peeled_algo, Some(target.as_slice()))
-            }
-        };
-        let upstream = upstream_for_ref(&branch_upstreams, &reference.name);
-        let state = ref_state_for(reference, &known);
-        let new_ref = NewRef {
-            id: &ref_id,
-            instance_id: &instance_id,
-            checkout_scope_id: None,
-            kind,
-            name: &reference.name,
-            oid,
-            algo,
-            symbolic_target: symbolic,
-            upstream: upstream.as_deref(),
-            state,
-        };
-        let due = TursoStore::buffer_upsert_ref(&mut runner.batch, &new_ref, now_ms);
-        flush_if_due(runner, store, due).await?;
-        branch_values.push(branch_record_value(
-            &ref_id,
-            kind,
-            &reference.name,
-            oid,
-            algo,
-            symbolic,
-            upstream.as_deref(),
-            state,
-        ));
-    }
-    // The ref rows above commit with these batches: one `branch_batch`
-    // event per 500 refs, all sharing this observation's `rev`.
-    if !branch_values.is_empty() {
-        let chunks: Vec<&[serde_json::Value]> = branch_values.chunks(BRANCH_BATCH_CHUNK).collect();
-        let batch_count = chunks.len();
-        for (index, chunk) in chunks.iter().enumerate() {
-            let records = branch_batch_records(&instance_id, now_ms, index, batch_count, chunk)?;
-            journal_branch_batch(runner, store, &instance_id, &records).await?;
-        }
-    }
-    for broken in &reads.ref_errors {
-        let due = buffer_record_error(
-            runner,
-            &format!("ref-err:{instance_id}:{}", fnv1a_hex(broken.as_bytes())),
-            &config::scope_key_for_git(path),
-            "invalid-ref",
-            broken,
-            None,
-            now_ms,
-        )?;
-        flush_if_due(runner, store, due).await?;
-    }
+    // Branch/HEAD analysis runs post-boundary (F2): the analyze task reads
+    // refs, upstreams, and per-checkout HEAD after `inventory_ready`; its
+    // claim gate holds it out of the discovery drain.
+    enqueue_analysis_task(
+        store,
+        runner,
+        generation,
+        run_rev,
+        &instance_id,
+        &instance.common_dir,
+        now_ms,
+    )
+    .await?;
 
     // Detailed working state only for matching candidates (spec §9).
     if matches!(
@@ -7627,6 +7631,500 @@ impl StatusGuard {
         }
         self.changed.load(Ordering::SeqCst)
     }
+}
+
+/// Per-store branch/HEAD reads (goal Step 8 analysis leg, Step 10):
+/// shared references read once per local store, HEAD separately per
+/// checkout, plus upstream config and ref errors. Collected only in
+/// the post-`inventory_ready` drain — never during discovery.
+struct AnalysisReads {
+    refs: Vec<git::RefObservation>,
+    refs_notes: Vec<String>,
+    ref_errors: Vec<String>,
+    branch_upstreams: HashMap<String, Vec<u8>>,
+    /// `(checkout_id, HEAD)` per checkout of the store.
+    heads: Vec<(String, git::HeadState)>,
+}
+
+/// Outcome of [`collect_analysis_reads`]: full reads, or an abandon
+/// signal with probe-identical meaning (park/retry, persist nothing).
+enum AnalysisOutcome {
+    Reads(AnalysisReads),
+    IdentityChanged,
+    TimedOut,
+    LeaseLost,
+}
+
+/// Collect one store's analysis reads with DURING-inspection identity
+/// polls (XSEC-01), lease heartbeats (R4), and deadline checks
+/// (SR-STATE-01) between stages — the probe collection discipline,
+/// analysis stages only. Buffers nothing: abandonment drops every
+/// observation.
+#[allow(clippy::too_many_arguments)]
+async fn collect_analysis_reads(
+    runner: &mut Runner,
+    store: &TursoStore,
+    claimed: &ClaimedTask,
+    instance: &git::GitInstance,
+    checkouts: &[store::CheckoutRow],
+    object_format: &str,
+    is_bare: bool,
+    poll: &mut IdentityPoll,
+    deadline: &OpDeadline,
+) -> repo_scan::Result<AnalysisOutcome> {
+    if deadline.expired() {
+        return Ok(AnalysisOutcome::TimedOut);
+    }
+    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+        return Ok(AnalysisOutcome::LeaseLost);
+    }
+    let task_deadline = *deadline;
+    let cancel = git::fallback::WaitCancel::new(
+        move || INTERRUPTED.load(Ordering::SeqCst) || task_deadline.expired(),
+        None,
+    );
+    // Shared refs, once per store (Step 10): the store instance points
+    // at the first-seen git dir, exactly the read the discovery probe
+    // used to make — one execution instead of one per checkout.
+    let mut refs_notes = Vec::new();
+    let refs = git::fallback::with_wait_cancel(&cancel, || {
+        observed_refs(runner, instance, &mut refs_notes)
+    })?;
+    if !poll.ok_now() {
+        return Ok(AnalysisOutcome::IdentityChanged);
+    }
+    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+        return Ok(AnalysisOutcome::LeaseLost);
+    }
+    if deadline.expired() {
+        return Ok(AnalysisOutcome::TimedOut);
+    }
+    let ref_errors = runner.inspector.reference_errors(instance);
+    let branch_upstreams = load_branch_upstreams(&instance.common_dir);
+    if !poll.ok_throttled() {
+        return Ok(AnalysisOutcome::IdentityChanged);
+    }
+    // HEAD separately per checkout (Step 10): each checkout's own git
+    // dir observes its own HEAD. A checkout that went unreadable since
+    // discovery keeps `unknown` (its row is simply not merged); the
+    // store analysis still completes for the rest.
+    let mut heads = Vec::with_capacity(checkouts.len());
+    for checkout in checkouts {
+        if deadline.expired() {
+            return Ok(AnalysisOutcome::TimedOut);
+        }
+        let git_dir = config::path_from_bytes(checkout.git_path.clone());
+        let work_dir = checkout
+            .root_path
+            .as_ref()
+            .map(|bytes| config::path_from_bytes(bytes.clone()));
+        let checkout_instance = git::GitInstance {
+            git_dir,
+            common_dir: instance.common_dir.clone(),
+            work_dir,
+            is_bare,
+            object_format: object_format.to_string(),
+        };
+        let head =
+            git::fallback::with_wait_cancel(&cancel, || observed_head(runner, &checkout_instance))?;
+        heads.push((checkout.id.clone(), head));
+        if !poll.ok_throttled() {
+            return Ok(AnalysisOutcome::IdentityChanged);
+        }
+    }
+    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+        return Ok(AnalysisOutcome::LeaseLost);
+    }
+    Ok(AnalysisOutcome::Reads(AnalysisReads {
+        refs,
+        refs_notes,
+        ref_errors,
+        branch_upstreams,
+        heads,
+    }))
+}
+
+/// Execute one store-analysis task: the probe execution discipline
+/// (fence, lease, identity polls, deadline, error mapping) with
+/// analysis reads only. The instance row must exist (discovery
+/// persisted it); a missing row completes with an explicit gap.
+async fn exec_analysis(
+    runner: &mut Runner,
+    store: &TursoStore,
+    claimed: &ClaimedTask,
+    deadline: &OpDeadline,
+) -> repo_scan::Result<TaskOutcome> {
+    let Some(config::ScopeRef::Git(path)) = config::parse_scope_key(&claimed.task.scope_key) else {
+        return Ok(TaskOutcome::Parked {
+            state: TaskState::Unsupported,
+            reason: format!("malformed git scope key: {}", claimed.task.scope_key),
+        });
+    };
+    let now = store::now_ms();
+    let gap_id = format!(
+        "analyze:{}",
+        config::encode_hex(&config::path_as_bytes(&path))
+    );
+    let Some(instance_id) = parse_analysis_instance(&claimed.task.id) else {
+        return Ok(TaskOutcome::Parked {
+            state: TaskState::Unsupported,
+            reason: format!("malformed analysis task id: {}", claimed.task.id),
+        });
+    };
+    // Analysis ids carry no PG-01 schedule suffix; the store row is a Git
+    // observation, so relationship routing applies (as for status).
+    let schedule = ProbeSchedule::analysis_legacy();
+    let pinned: Option<PinnedDir> =
+        match verify_probe_path(runner.fence.as_ref(), "analyze", &path, &schedule) {
+            ProbeFence::Unfenced => None,
+            ProbeFence::Pinned(pinned) | ProbeFence::Relationship(pinned) => Some(pinned),
+            ProbeFence::Refused { state, reason } => {
+                return Ok(TaskOutcome::Parked { state, reason });
+            }
+            ProbeFence::StatFailed(e) => {
+                return fail_stat_open(runner, store, claimed, &path, &e).await;
+            }
+        };
+    if deadline.expired() {
+        return Ok(park_on_timeout(&format!(
+            "timeout-abandoned: analysis of {} exceeded the {OP_DEADLINE_SECS}s execution \
+             budget; no Git reads ran",
+            path.display()
+        )));
+    }
+    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+        return retry_on_lease_lost(
+            runner,
+            store,
+            claimed,
+            &format!(
+                "lease lost before analysis of {}; retrying with a fresh lease",
+                path.display()
+            ),
+        )
+        .await;
+    }
+    let Some(instance_row) = store.get_git_instance(&instance_id).await? else {
+        let due = buffer_record_error(
+            runner,
+            &gap_id,
+            &claimed.task.scope_key,
+            "unknown-instance",
+            &format!("analysis task names unknown instance {instance_id}; dropping"),
+            None,
+            now,
+        )?;
+        flush_if_due(runner, store, due).await?;
+        return Ok(TaskOutcome::Complete);
+    };
+    let common_dir = config::path_from_bytes(instance_row.common_path.clone());
+    let validated = match runner.inspector.validate(&common_dir) {
+        Ok(validated) => validated,
+        Err(e) => {
+            let category = if git::is_unsupported_error(&e) {
+                "unsupported-git-format"
+            } else {
+                "analysis-failed"
+            };
+            let due = buffer_record_error(
+                runner,
+                &gap_id,
+                &claimed.task.scope_key,
+                category,
+                &e.to_string(),
+                None,
+                now,
+            )?;
+            flush_if_due(runner, store, due).await?;
+            return Ok(TaskOutcome::Complete);
+        }
+    };
+    let mut poll = IdentityPoll::new(runner.fence.as_ref(), &path, pinned.as_ref());
+    if !poll.ok_now() {
+        return Ok(park_on_identity_change("analyze", &path));
+    }
+    let checkouts = list_store_checkouts(store, &instance_id).await?;
+    let reads = match collect_analysis_reads(
+        runner,
+        store,
+        claimed,
+        &validated.instance,
+        &checkouts,
+        &instance_row.object_format,
+        instance_row.bare.unwrap_or(false),
+        &mut poll,
+        deadline,
+    )
+    .await
+    {
+        Ok(AnalysisOutcome::Reads(reads)) => reads,
+        Ok(AnalysisOutcome::IdentityChanged) => {
+            return Ok(park_on_identity_change("analyze", &path));
+        }
+        Ok(AnalysisOutcome::TimedOut) => {
+            return Ok(park_on_timeout(&format!(
+                "timeout-abandoned: analysis of {} exceeded the {OP_DEADLINE_SECS}s execution \
+                 budget during Git reads; observations discarded",
+                path.display()
+            )));
+        }
+        Ok(AnalysisOutcome::LeaseLost) => {
+            return retry_on_lease_lost(
+                runner,
+                store,
+                claimed,
+                &format!(
+                    "lease lost during analysis of {}; observations discarded",
+                    path.display()
+                ),
+            )
+            .await;
+        }
+        Err(repo_scan::Error::Git(detail)) => {
+            return fail_task(
+                runner,
+                store,
+                claimed,
+                ExecFail {
+                    category: String::from("analysis-read-error"),
+                    detail,
+                },
+            )
+            .await;
+        }
+        Err(e) => return Err(e),
+    };
+    if !poll.ok_now() {
+        return Ok(park_on_identity_change("analyze", &path));
+    }
+    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+        return retry_on_lease_lost(
+            runner,
+            store,
+            claimed,
+            &format!(
+                "lease lost before persisting analysis of {}; observations discarded",
+                path.display()
+            ),
+        )
+        .await;
+    }
+    match persist_analysis(
+        runner,
+        store,
+        &instance_id,
+        &instance_row,
+        reads,
+        &path,
+        now,
+    )
+    .await
+    {
+        Ok(()) => {
+            let due = buffer_resolve_error(runner, &gap_id, store::now_ms())?;
+            flush_if_due(runner, store, due).await?;
+            Ok(TaskOutcome::Complete)
+        }
+        Err(repo_scan::Error::Git(detail)) => {
+            fail_task(
+                runner,
+                store,
+                claimed,
+                ExecFail {
+                    category: String::from("analysis-persist-error"),
+                    detail,
+                },
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Instance id from an analysis task id (`analyze:{instance}:{run}`).
+/// The instance id itself contains `:` (`git:{hex}`), so the run
+/// revision splits off the right.
+fn parse_analysis_instance(task_id: &str) -> Option<String> {
+    let rest = task_id.strip_prefix("analyze:")?;
+    let (instance_id, _run_rev) = rest.rsplit_once(':')?;
+    if instance_id.is_empty() {
+        return None;
+    }
+    Some(instance_id.to_string())
+}
+
+/// Checkout rows for one store, id-ordered for deterministic analysis.
+async fn list_store_checkouts(
+    store: &TursoStore,
+    instance_id: &str,
+) -> repo_scan::Result<Vec<store::CheckoutRow>> {
+    let mut out = Vec::new();
+    let mut rows = store
+        .connection()
+        .query(
+            "SELECT id FROM checkouts WHERE instance_id = ?1 ORDER BY id ASC",
+            vec![turso::Value::Text(instance_id.to_string())],
+        )
+        .await
+        .map_err(store_err)?;
+    while let Some(row) = rows.next().await.map_err(store_err)? {
+        let id = cell_text(&row, 0)?;
+        if let Some(checkout) = store.get_checkout(&id).await? {
+            out.push(checkout);
+        }
+    }
+    Ok(out)
+}
+
+/// Persist one store's analysis: shared ref rows (upserted by the
+/// canonical ref id, so re-analysis refreshes instead of duplicating),
+/// one `branch_batch` journal per 500 refs, ref-error gaps, refs-note
+/// evidence merged onto the instance row, and per-checkout HEAD merges
+/// (full-row upsert carrying the discovery-persisted columns forward).
+async fn persist_analysis(
+    runner: &mut Runner,
+    store: &TursoStore,
+    instance_id: &str,
+    instance_row: &store::GitInstanceRow,
+    reads: AnalysisReads,
+    path: &Path,
+    now_ms: i64,
+) -> repo_scan::Result<()> {
+    // Ref-id rule: ids key on the canonical common dir, whose hex the
+    // instance id already embeds (`git:{hex}`).
+    let canonical_hex = instance_id
+        .strip_prefix("git:")
+        .map(str::to_string)
+        .unwrap_or_else(|| config::encode_hex(&instance_row.common_path));
+    let known: HashSet<&[u8]> = reads.refs.iter().map(|r| r.name.as_slice()).collect();
+    let mut branch_values = Vec::with_capacity(reads.refs.len());
+    for reference in &reads.refs {
+        let name_text = String::from_utf8_lossy(&reference.name);
+        let kind = if name_text.starts_with("refs/heads/") {
+            "local"
+        } else if name_text.starts_with("refs/remotes/") {
+            "remote_tracking"
+        } else {
+            "other"
+        };
+        let ref_id = format!(
+            "ref:{}:{}",
+            canonical_hex,
+            config::encode_hex(&reference.name),
+        );
+        let (oid, algo, symbolic) = match &reference.target {
+            git::RefTarget::Object(o) => (Some(o.hex.as_bytes()), Some(o.algorithm.as_str()), None),
+            git::RefTarget::Symbolic(target) => {
+                let (peeled_oid, peeled_algo) = reference
+                    .peeled
+                    .as_ref()
+                    .map(|o| (Some(o.hex.as_bytes()), Some(o.algorithm.as_str())))
+                    .unwrap_or((None, None));
+                (peeled_oid, peeled_algo, Some(target.as_slice()))
+            }
+        };
+        let upstream = upstream_for_ref(&reads.branch_upstreams, &reference.name);
+        let state = ref_state_for(reference, &known);
+        let new_ref = NewRef {
+            id: &ref_id,
+            instance_id,
+            checkout_scope_id: None,
+            kind,
+            name: &reference.name,
+            oid,
+            algo,
+            symbolic_target: symbolic,
+            upstream: upstream.as_deref(),
+            state,
+        };
+        let due = TursoStore::buffer_upsert_ref(&mut runner.batch, &new_ref, now_ms);
+        flush_if_due(runner, store, due).await?;
+        branch_values.push(branch_record_value(
+            &ref_id,
+            kind,
+            &reference.name,
+            oid,
+            algo,
+            symbolic,
+            upstream.as_deref(),
+            state,
+        ));
+    }
+    // The ref rows above commit with these batches: one `branch_batch`
+    // event per 500 refs, all sharing this observation's `rev`.
+    if !branch_values.is_empty() {
+        let chunks: Vec<&[serde_json::Value]> = branch_values.chunks(BRANCH_BATCH_CHUNK).collect();
+        let batch_count = chunks.len();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let records = branch_batch_records(instance_id, now_ms, index, batch_count, chunk)?;
+            journal_branch_batch(runner, store, instance_id, &records).await?;
+        }
+    }
+    for broken in &reads.ref_errors {
+        let due = buffer_record_error(
+            runner,
+            &format!("ref-err:{instance_id}:{}", fnv1a_hex(broken.as_bytes())),
+            &config::scope_key_for_git(path),
+            "invalid-ref",
+            broken,
+            None,
+            now_ms,
+        )?;
+        flush_if_due(runner, store, due).await?;
+    }
+    // Refs notes join the instance evidence (deduplicated: re-analysis
+    // must not stack the same note every run).
+    if !reads.refs_notes.is_empty() {
+        let mut evidence: Vec<String> =
+            serde_json::from_str(&instance_row.evidence_json).unwrap_or_default();
+        for note in &reads.refs_notes {
+            if !evidence.contains(note) {
+                evidence.push(note.clone());
+            }
+        }
+        let evidence_json = serde_json::to_string(&evidence)
+            .map_err(|e| repo_scan::Error::Report(e.to_string()))?;
+        store
+            .connection()
+            .execute(
+                "UPDATE git_instances SET evidence = ?1 WHERE id = ?2",
+                vec![
+                    turso::Value::Text(evidence_json),
+                    turso::Value::Text(instance_id.to_string()),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        runner.counters.db_transactions += 1;
+    }
+    // Per-checkout HEAD merge: discovery persisted the row (HEAD
+    // `unknown`); analysis carries every column forward with fresh
+    // HEAD observations.
+    for (checkout_id, head) in &reads.heads {
+        let Some(row) = store.get_checkout(checkout_id).await? else {
+            continue;
+        };
+        let (head_state, head_ref, head_oid, head_algo) = head_columns(head);
+        let merged = NewCheckout {
+            id: &row.id,
+            instance_id: &row.instance_id,
+            root_path: row.root_path.as_deref(),
+            git_path: &row.git_path,
+            relationship: &row.relationship,
+            availability: &row.availability,
+            head_state,
+            head_ref: head_ref.as_deref(),
+            head_oid: head_oid.as_deref(),
+            head_algo: head_algo.as_deref(),
+        };
+        let due = if row.root_path.is_none() {
+            TursoStore::buffer_insert_checkout_if_absent(&mut runner.batch, &merged, now_ms)
+        } else {
+            TursoStore::buffer_upsert_checkout(&mut runner.batch, &merged, now_ms)
+        };
+        flush_if_due(runner, store, due).await?;
+    }
+    Ok(())
 }
 
 /// Inspect one matching checkout's working state at the requested mode.
