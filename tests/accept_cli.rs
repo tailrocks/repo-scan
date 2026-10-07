@@ -1357,7 +1357,10 @@ fn github_groups_link_stores_to_canonical_identities() {
         }
         assert_eq!(up_members.len(), 2, "upstream edges: fetch + push");
         let up_store = &up_members[0].instance_id;
-        assert_eq!(store_clone.get(up_store).map(String::as_str), Some("clone-c"));
+        assert_eq!(
+            store_clone.get(up_store).map(String::as_str),
+            Some("clone-c")
+        );
         assert!(up_members.iter().all(|m| &m.instance_id == up_store));
         let up_pairs: HashSet<(String, String)> = up_members
             .iter()
@@ -1392,6 +1395,104 @@ fn github_groups_link_stores_to_canonical_identities() {
             }
             assert_eq!(found, &expect, "{clone} event groups");
         }
+        store.close().await.expect("close");
+    });
+}
+
+#[test]
+fn location_updated_marks_status_completion() {
+    use repo_scan::store::{Store, TursoStore};
+
+    // One dirty checkout (staged + unstaged + collapsed untracked, proven
+    // by STATUS-01). Expected counts come from `git status --porcelain=v1`
+    // parsed here, never from the scanner's own rows.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let cwd = dir.path().join("cwd");
+    repo_scan::privacy::private_dir_0700(&cwd).expect("mkdir");
+    let root = dir.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    let layout = fixture::dirty_variants(&root, "dirty");
+    let (mut staged, mut unstaged, mut untracked) = (0u64, 0u64, 0u64);
+    // Raw bytes, not git_str: trimming would eat the first line's leading
+    // space and miscount unstaged as staged.
+    let porcelain = fixture::git(&layout.repo, &["status", "--porcelain=v1"]);
+    for line in String::from_utf8_lossy(&porcelain).lines() {
+        let xy = line.as_bytes();
+        assert!(xy.len() >= 3, "porcelain line: {line}");
+        match (xy[0], xy[1]) {
+            (b'?', b'?') => untracked += 1,
+            (x, y) => {
+                if x != b' ' {
+                    staged += 1;
+                }
+                if y != b' ' {
+                    unstaged += 1;
+                }
+            }
+        }
+    }
+    assert_eq!((staged, unstaged, untracked), (1, 1, 3), "fixture is dirty");
+
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            root.to_str().expect("utf8"),
+            "--status",
+            "summary",
+            "--report",
+            "rep.json",
+        ],
+        &cwd,
+        &state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let scan_id = stdout_line(&out, "scan_id");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        let rows = store
+            .read_scan_events(&scan_id, 0, 1_000)
+            .await
+            .expect("read");
+        let updated: Vec<_> = rows
+            .iter()
+            .filter(|r| r.event_type == "location_updated")
+            .collect();
+        assert_eq!(updated.len(), 1, "one update per completed status");
+        let row = updated[0];
+        assert_eq!(row.op, "replace", "D4 op for location_updated");
+        let v: serde_json::Value = serde_json::from_slice(&row.records).expect("json");
+        assert_eq!(v["mode"].as_str(), Some("summary"));
+        assert_eq!(v["status_state"].as_str(), Some("complete"));
+        assert_eq!(v["staged"].as_u64(), Some(staged), "staged matches git");
+        assert_eq!(
+            v["unstaged"].as_u64(),
+            Some(unstaged),
+            "unstaged matches git"
+        );
+        assert_eq!(
+            v["untracked"].as_u64(),
+            Some(untracked),
+            "untracked matches git"
+        );
+        assert!(v["rev"].as_u64().is_some(), "observation rev carried");
+        // The update names the found checkout/store and lands after its
+        // location_found.
+        let found = rows
+            .iter()
+            .find(|r| r.event_type == "location_found")
+            .expect("location_found");
+        let f: serde_json::Value = serde_json::from_slice(&found.records).expect("json");
+        assert_eq!(v["checkout_id"], f["checkout_id"]);
+        assert_eq!(v["store_id"], f["store_id"]);
+        assert!(row.seq > found.seq, "update follows its found event");
         store.close().await.expect("close");
     });
 }

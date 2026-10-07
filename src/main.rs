@@ -905,6 +905,30 @@ impl ScanJournal {
         };
         Ok(Some(TursoStore::buffer_scan_event(batch, &event)?))
     }
+
+    /// Buffer one `location_updated` into the writer batch: it commits
+    /// atomically with the status row that caused it. Unlike the found
+    /// events there is no emitted-set dedupe — `replace` replays
+    /// idempotently, so a retried status task re-emitting identical
+    /// content converges to the same end state. Always `Some(should_flush)`.
+    fn buffer_location_updated(
+        &mut self,
+        batch: &mut WriterBatch,
+        records: &[u8],
+    ) -> repo_scan::Result<Option<bool>> {
+        let (seq, off) = self.assign();
+        let event = NewScanEvent {
+            scan_id: &self.scan_id,
+            seq,
+            catalog_rev: self.rev,
+            event_offset: off,
+            event_type: EventType::LocationUpdated.name(),
+            op: EventType::LocationUpdated.op().name(),
+            reset: false,
+            records,
+        };
+        Ok(Some(TursoStore::buffer_scan_event(batch, &event)?))
+    }
 }
 
 /// Resume command recorded in lifecycle payloads (D4): replays the exact
@@ -6296,6 +6320,69 @@ async fn journal_location_found(
     Ok(())
 }
 
+/// `location_updated` records (D4): checkout/store ids, the status
+/// observation that caused this update (state + mode + counts, unknown
+/// counts stay null), and the observation `rev` consumers replay against.
+/// No `analysis` claim: branch comparison is not implemented yet, so only
+/// the observed status facts are stated.
+#[allow(clippy::too_many_arguments)]
+fn location_updated_records(
+    checkout_id: &str,
+    store_id: &str,
+    mode: &str,
+    state: &str,
+    staged: Option<i64>,
+    unstaged: Option<i64>,
+    untracked: Option<i64>,
+    observed_rev: u64,
+) -> repo_scan::Result<Vec<u8>> {
+    let records = serde_json::json!({
+        "checkout_id": checkout_id,
+        "store_id": store_id,
+        "rev": observed_rev,
+        "status_state": state,
+        "mode": mode,
+        "staged": staged,
+        "unstaged": unstaged,
+        "untracked": untracked,
+    });
+    serde_json::to_vec(&records).map_err(|e| repo_scan::Error::Report(e.to_string()))
+}
+
+/// Buffer a `location_updated` (same journaling contract as
+/// [`journal_repository_found`]).
+#[allow(clippy::too_many_arguments)]
+async fn journal_location_updated(
+    runner: &mut Runner,
+    store: &TursoStore,
+    checkout_id: &str,
+    store_id: &str,
+    mode: &str,
+    state: &str,
+    staged: Option<i64>,
+    unstaged: Option<i64>,
+    untracked: Option<i64>,
+    observed_rev: u64,
+) -> repo_scan::Result<()> {
+    let Some(journal) = runner.journal.as_mut() else {
+        return Ok(());
+    };
+    let records = location_updated_records(
+        checkout_id,
+        store_id,
+        mode,
+        state,
+        staged,
+        unstaged,
+        untracked,
+        observed_rev,
+    )?;
+    if let Some(due) = journal.buffer_location_updated(&mut runner.batch, &records)? {
+        flush_if_due(runner, store, due).await?;
+    }
+    Ok(())
+}
+
 /// Persist collected observations from a validated probe. Remotes, refs, and
 /// HEAD fall back to installed git only on structural gaps; operational
 /// failures fail the task (retry, then park) instead of recording fake
@@ -7132,6 +7219,7 @@ async fn exec_status(
             runner,
             store,
             &checkout_id,
+            &checkout.instance_id,
             mode,
             "not_requested",
             None,
@@ -7174,6 +7262,7 @@ async fn exec_status(
                 runner,
                 store,
                 &checkout_id,
+                &checkout.instance_id,
                 mode,
                 "unsupported",
                 None,
@@ -7375,6 +7464,7 @@ async fn exec_status(
                 runner,
                 store,
                 &checkout_id,
+                &checkout.instance_id,
                 mode,
                 "unsupported",
                 None,
@@ -7395,6 +7485,7 @@ async fn exec_status(
                 runner,
                 store,
                 &checkout_id,
+                &checkout.instance_id,
                 mode,
                 state,
                 obs.staged.map(|c| c.min(i64::MAX as u64) as i64),
@@ -7480,6 +7571,7 @@ async fn record_status_row(
     runner: &mut Runner,
     store: &TursoStore,
     checkout_id: &str,
+    store_id: &str,
     mode: StatusMode,
     state: &str,
     staged: Option<i64>,
@@ -7513,6 +7605,21 @@ async fn record_status_row(
     };
     let due = TursoStore::buffer_record_status(&mut runner.batch, &status, finished_ms);
     flush_if_due(runner, store, due).await?;
+    // Same batch as the status row: the update is only readable once its
+    // cause has committed.
+    journal_location_updated(
+        runner,
+        store,
+        checkout_id,
+        store_id,
+        status_mode_str(mode),
+        state,
+        staged,
+        unstaged,
+        untracked,
+        observed_rev,
+    )
+    .await?;
     Ok(())
 }
 
