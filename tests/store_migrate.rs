@@ -1,12 +1,15 @@
-//! Catalog migration v2 acceptance (goal Step 5/9, contracts D1/D2/D4/D5):
+//! Catalog migration acceptance (goal Step 5/9/11, contracts D1/D2/D4/D5):
 //! the append-only chain upgrades v1 catalogs without touching v1 rows,
-//! and the new journal/group/scope APIs round-trip.
+//! and the new journal/group/scope/refresh APIs round-trip.
 //!
 //! The v1 catalog under test is built by executing the shipped v1
 //! migration SQL through a direct connection — the same bytes production
 //! applied — then reopened through [`TursoStore::open`].
 
-use repo_scan::store::{now_ms, NewScan, NewScanEvent, Store, TursoStore, CURRENT_SCHEMA_VERSION};
+use repo_scan::store::{
+    now_ms, NewRef, NewRemoteRefresh, NewScan, NewScanEvent, Store, TursoStore,
+    CURRENT_SCHEMA_VERSION,
+};
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -25,7 +28,7 @@ async fn build_v1_catalog(db: &std::path::Path) {
         .connect()
         .expect("turso connect");
     let chain = repo_scan::store::migrations();
-    assert!(chain.len() >= 2, "v2 chain wired");
+    assert!(chain.len() >= 3, "v3 chain wired");
     assert_eq!(chain[0].version, 1);
     conn.execute_batch(chain[0].sql).await.expect("v1 sql");
     conn.execute(
@@ -55,14 +58,14 @@ async fn build_v1_catalog(db: &std::path::Path) {
 }
 
 #[test]
-fn fresh_open_is_v2_with_working_tables() {
+fn fresh_open_is_v3_with_working_tables() {
     let rt = runtime();
     rt.block_on(async {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("catalog.db");
         let store = TursoStore::open(&db).await.expect("open");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 2);
-        assert_eq!(store.schema_version().expect("version"), 2);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 3);
+        assert_eq!(store.schema_version().expect("version"), 3);
 
         // v2 request columns persist through the extended insert.
         let now = now_ms();
@@ -78,6 +81,7 @@ fn fresh_open_is_v2_with_working_tables() {
                     targets_json: Some(r#"[{"raw":"o/r","canonical":"https://github.com/o/r"}]"#),
                     format: Some("jsonl"),
                     all_targets: Some(false),
+                    fetch: Some(true),
                 },
                 now,
             )
@@ -91,6 +95,7 @@ fn fresh_open_is_v2_with_working_tables() {
         );
         assert_eq!(row.format.as_deref(), Some("jsonl"));
         assert_eq!(row.all_targets, Some(false));
+        assert_eq!(row.fetch, Some(true));
 
         // v2 event journal accepts writes immediately.
         let appended = store
@@ -120,15 +125,16 @@ fn v1_catalog_upgrades_preserving_v1_rows() {
         build_v1_catalog(&db).await;
 
         let store = TursoStore::open(&db).await.expect("open upgrades");
-        assert_eq!(store.schema_version().expect("version"), 2);
+        assert_eq!(store.schema_version().expect("version"), 3);
 
-        // v1 rows survive byte-identical; v2 columns read NULL (legacy).
+        // v1 rows survive byte-identical; v2/v3 columns read NULL (legacy).
         let scan = store.get_scan("scan-v1").await.expect("get").expect("row");
         assert_eq!(scan.url_raw, b"https://github.com/o/r");
         assert_eq!(scan.state, "complete");
         assert_eq!(scan.targets_json, None);
         assert_eq!(scan.format, None);
         assert_eq!(scan.all_targets, None);
+        assert_eq!(scan.fetch, None);
         let generation = store.get_generation(1).await.expect("get").expect("gen");
         assert_eq!(generation.scope_policy, "roots");
         assert_eq!(generation.scope_key, None);
@@ -153,9 +159,9 @@ fn v1_catalog_upgrades_preserving_v1_rows() {
             .expect("append"));
         store.close().await.expect("close");
 
-        // Reopen is idempotent: still v2, rows intact.
+        // Reopen is idempotent: still v3, rows intact.
         let store = TursoStore::open(&db).await.expect("reopen");
-        assert_eq!(store.schema_version().expect("version"), 2);
+        assert_eq!(store.schema_version().expect("version"), 3);
         assert!(store.get_scan("scan-v1").await.expect("get").is_some());
         assert_eq!(store.last_event_seq("scan-v1").await.expect("seq"), Some(1));
         store.close().await.expect("close");
@@ -332,6 +338,155 @@ fn generation_scope_key_defaults_legacy_then_sets() {
             row.scope_key.as_deref(),
             Some("v2:roots:/a,/b:exclusions::policy:default")
         );
+        store.close().await.expect("close");
+    });
+}
+
+#[test]
+fn v3_remote_refresh_latest_attempt_wins() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        // Never attempted: explicit None, not a fabricated row.
+        assert!(store
+            .get_remote_refresh("git:aaa", b"origin")
+            .await
+            .expect("get")
+            .is_none());
+
+        store
+            .record_remote_refresh(&NewRemoteRefresh {
+                store_id: "git:aaa",
+                remote_name: b"origin",
+                status: "success",
+                observed_at_ms: 200,
+                duration_ms: Some(100),
+                refs_updated: 3,
+                refs_current_json: Some(r#"["refs/remotes/origin/main"]"#),
+                refs_deleted_json: None,
+                detail: None,
+            })
+            .await
+            .expect("record");
+        let row = store
+            .get_remote_refresh("git:aaa", b"origin")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.status, "success");
+        assert_eq!(row.observed_at_ms, 200);
+        assert_eq!(row.duration_ms, Some(100));
+        assert_eq!(row.refs_updated, 3);
+        assert_eq!(
+            row.refs_current_json.as_deref(),
+            Some(r#"["refs/remotes/origin/main"]"#)
+        );
+        assert_eq!(row.refs_deleted_json, None);
+        assert_eq!(row.detail, None);
+        assert_eq!(row.remote_name, b"origin");
+
+        // A later attempt replaces: the row always reflects the latest.
+        store
+            .record_remote_refresh(&NewRemoteRefresh {
+                store_id: "git:aaa",
+                remote_name: b"origin",
+                status: "failed",
+                observed_at_ms: 310,
+                duration_ms: Some(10),
+                refs_updated: 0,
+                refs_current_json: None,
+                refs_deleted_json: None,
+                detail: Some("timeout after 30s"),
+            })
+            .await
+            .expect("record failed");
+        let row = store
+            .get_remote_refresh("git:aaa", b"origin")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.status, "failed");
+        assert_eq!(row.detail.as_deref(), Some("timeout after 30s"));
+
+        // A second remote lists alongside, ordered by name; an
+        // untouched store still reads empty.
+        store
+            .record_remote_refresh(&NewRemoteRefresh {
+                store_id: "git:aaa",
+                remote_name: b"upstream",
+                status: "unsupported",
+                observed_at_ms: 300,
+                duration_ms: None,
+                refs_updated: 0,
+                refs_current_json: None,
+                refs_deleted_json: None,
+                detail: Some("refspec writes to local branches"),
+            })
+            .await
+            .expect("record upstream");
+        let listed = store.list_remote_refreshes("git:aaa").await.expect("list");
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].remote_name, b"origin");
+        assert_eq!(listed[1].remote_name, b"upstream");
+        assert!(store
+            .list_remote_refreshes("git:zzz")
+            .await
+            .expect("list")
+            .is_empty());
+        store.close().await.expect("close");
+    });
+}
+
+#[test]
+fn v3_ref_freshness_labels_and_upsert_preserves() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        let reference = NewRef {
+            id: "ref:aaa:rt:main",
+            instance_id: "git:aaa",
+            checkout_scope_id: None,
+            kind: "remote_tracking",
+            name: b"refs/remotes/origin/main",
+            oid: Some(b"0123456789abcdef0123456789abcdef01234567".as_slice()),
+            algo: Some("sha1"),
+            symbolic_target: None,
+            upstream: None,
+            state: "valid",
+        };
+        store.upsert_ref(&reference, 100).await.expect("upsert");
+        let refs = store.list_refs("git:aaa").await.expect("list");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].freshness, None);
+        assert_eq!(refs[0].freshness_at_ms, None);
+
+        assert!(store
+            .label_ref_freshness("ref:aaa:rt:main", "current", 200)
+            .await
+            .expect("label"));
+        assert!(!store
+            .label_ref_freshness("ref:missing", "current", 200)
+            .await
+            .expect("label missing"));
+        let refs = store.list_refs("git:aaa").await.expect("list");
+        assert_eq!(refs[0].freshness.as_deref(), Some("current"));
+        assert_eq!(refs[0].freshness_at_ms, Some(200));
+
+        // Re-observation updates the observed columns but preserves
+        // the freshness label (ON CONFLICT, not REPLACE).
+        store
+            .upsert_ref(&reference, 300)
+            .await
+            .expect("upsert again");
+        let refs = store.list_refs("git:aaa").await.expect("list");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].observed_at_ms, 300);
+        assert_eq!(refs[0].freshness.as_deref(), Some("current"));
+        assert_eq!(refs[0].freshness_at_ms, Some(200));
         store.close().await.expect("close");
     });
 }

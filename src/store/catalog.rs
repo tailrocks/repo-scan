@@ -302,6 +302,29 @@ fn v_opt_blob(value: Option<Vec<u8>>) -> turso::Value {
     value.map_or(turso::Value::Null, turso::Value::Blob)
 }
 
+/// Positional parameters for the `refs` observed-column statements
+/// (`INSERT OR IGNORE` + `UPDATE` in [`TursoStore::upsert_ref`] and
+/// [`TursoStore::buffer_upsert_ref`]): `?1..=?11` map to id,
+/// instance_id, checkout_scope_id, kind, name, oid, algo,
+/// symbolic_target, upstream, state, observed_at_ms. The v3
+/// `freshness` label columns are intentionally absent: labeling is a
+/// separate step and re-observation must preserve it.
+fn ref_params(reference: &NewRef<'_>, observed_ms: i64) -> Vec<turso::Value> {
+    vec![
+        v_text(reference.id),
+        v_text(reference.instance_id),
+        v_opt_text(reference.checkout_scope_id.map(str::to_string)),
+        v_text(reference.kind),
+        v_blob(reference.name.to_vec()),
+        v_opt_blob(reference.oid.map(<[u8]>::to_vec)),
+        v_opt_text(reference.algo.map(str::to_string)),
+        v_opt_blob(reference.symbolic_target.map(<[u8]>::to_vec)),
+        v_opt_blob(reference.upstream.map(<[u8]>::to_vec)),
+        v_text(reference.state),
+        v_int(observed_ms),
+    ]
+}
+
 /// Persist-safe scan-target bytes (RETEST-5): the catalog upholds the
 /// no-credential-bytes invariant even when callers bypass CLI sanitization.
 /// Valid UTF-8 targets are normalized with
@@ -2463,6 +2486,12 @@ pub struct RefRow {
     pub state: String,
     /// Observation time.
     pub observed_at_ms: i64,
+    /// v3: remote freshness (`current`|`stale`|`unknown`); `None` =
+    /// legacy/unlabeled row or a non-remote-tracking ref, read as
+    /// `unknown`. Only `kind = 'remote_tracking'` rows are labeled.
+    pub freshness: Option<String>,
+    /// v3: when the freshness label was assigned.
+    pub freshness_at_ms: Option<i64>,
 }
 
 impl RefRow {
@@ -2479,8 +2508,76 @@ impl RefRow {
             upstream: opt_blob(row, 8)?,
             state: req_text(row, 9)?,
             observed_at_ms: req_i64(row, 10)?,
+            freshness: opt_text(row, 11)?,
+            freshness_at_ms: opt_i64(row, 12)?,
         })
     }
+}
+
+/// One row of the v3 `remote_refreshes` table: the last `--fetch`
+/// attempt for one local store + remote name. Only the remote NAME is
+/// stored — never the URL (raw URLs may embed credentials; canonical
+/// URLs already live in `remotes`).
+#[derive(Debug, Clone)]
+pub struct RemoteRefreshRow {
+    /// Local-store (git instance) id.
+    pub store_id: String,
+    /// Remote name bytes (`origin`, ...).
+    pub remote_name: Vec<u8>,
+    /// Attempt status: `success`|`failed`|`unsupported`.
+    pub status: String,
+    /// Attempt observation (end) time.
+    pub observed_at_ms: i64,
+    /// Attempt duration; `None` when not measured.
+    pub duration_ms: Option<i64>,
+    /// Tracking refs the fetch updated.
+    pub refs_updated: i64,
+    /// JSON names observed current; `None` when none/unknown.
+    pub refs_current_json: Option<String>,
+    /// JSON names found deleted upstream (local tracking refs are
+    /// KEPT, never pruned); `None` when none/unknown.
+    pub refs_deleted_json: Option<String>,
+    /// Scrubbed detail; `None` on clean success.
+    pub detail: Option<String>,
+}
+
+impl RemoteRefreshRow {
+    fn from_row(row: &turso::Row) -> crate::Result<Self> {
+        Ok(Self {
+            store_id: req_text(row, 0)?,
+            remote_name: req_blob(row, 1)?,
+            status: req_text(row, 2)?,
+            observed_at_ms: req_i64(row, 3)?,
+            duration_ms: opt_i64(row, 4)?,
+            refs_updated: req_i64(row, 5)?,
+            refs_current_json: opt_text(row, 6)?,
+            refs_deleted_json: opt_text(row, 7)?,
+            detail: opt_text(row, 8)?,
+        })
+    }
+}
+
+/// Insert shape for a v3 `remote_refreshes` row.
+#[derive(Debug, Clone, Copy)]
+pub struct NewRemoteRefresh<'a> {
+    /// Local-store (git instance) id.
+    pub store_id: &'a str,
+    /// Remote name bytes.
+    pub remote_name: &'a [u8],
+    /// Attempt status: `success`|`failed`|`unsupported`.
+    pub status: &'a str,
+    /// Attempt observation (end) time.
+    pub observed_at_ms: i64,
+    /// Attempt duration; `None` when not measured.
+    pub duration_ms: Option<i64>,
+    /// Tracking refs the fetch updated.
+    pub refs_updated: i64,
+    /// JSON names observed current; `None` when none/unknown.
+    pub refs_current_json: Option<&'a str>,
+    /// JSON names found deleted upstream; `None` when none/unknown.
+    pub refs_deleted_json: Option<&'a str>,
+    /// Scrubbed detail; `None` on clean success.
+    pub detail: Option<&'a str>,
 }
 
 /// New ref for [`TursoStore::upsert_ref`].
@@ -2630,6 +2727,9 @@ pub struct ScanRow {
     pub format: Option<String>,
     /// v2: `--all` filesystem-discovery scan; `None` = legacy row.
     pub all_targets: Option<bool>,
+    /// v3: `--fetch` remote refresh requested; `None` = legacy row, no
+    /// fetch. Resume restores this.
+    pub fetch: Option<bool>,
 }
 
 impl ScanRow {
@@ -2649,6 +2749,7 @@ impl ScanRow {
             targets_json: opt_text(row, 11)?,
             format: opt_text(row, 12)?,
             all_targets: opt_i64(row, 13)?.map(|v| v != 0),
+            fetch: opt_i64(row, 14)?.map(|v| v != 0),
         })
     }
 }
@@ -2674,6 +2775,8 @@ pub struct NewScan<'a> {
     pub format: Option<&'a str>,
     /// v2: `--all` scan; `None` = legacy row.
     pub all_targets: Option<bool>,
+    /// v3: `--fetch` remote refresh; `None` = legacy row, no fetch.
+    pub fetch: Option<bool>,
 }
 
 /// One immutable report snapshot.
@@ -3342,27 +3445,31 @@ impl TursoStore {
         Ok(out)
     }
 
-    /// Idempotent ref upsert keyed by stable id.
+    /// Idempotent ref upsert keyed by stable id. v3: `INSERT OR
+    /// IGNORE` plus an unconditional `UPDATE` of the observed columns
+    /// only, so re-observation preserves the `freshness` label columns
+    /// (`INSERT OR REPLACE` would null them). Insert-first order is
+    /// race-safe: concurrent same-id upserts converge on
+    /// last-writer-wins, never a lost insert. (`ON CONFLICT DO UPDATE`
+    /// with `excluded.*` is avoided: turso 0.8.1 accepts the statement
+    /// but mis-evaluates the `excluded` references.)
     pub async fn upsert_ref(&self, reference: &NewRef<'_>, observed_ms: i64) -> crate::Result<()> {
         self.forbid_write("upsert_ref")?;
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO refs (id, instance_id, checkout_scope_id, kind, \
+                "INSERT OR IGNORE INTO refs (id, instance_id, checkout_scope_id, kind, \
                     name, oid, algo, symbolic_target, upstream, state, observed_at_ms) \
                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                vec![
-                    v_text(reference.id),
-                    v_text(reference.instance_id),
-                    v_opt_text(reference.checkout_scope_id.map(str::to_string)),
-                    v_text(reference.kind),
-                    v_blob(reference.name.to_vec()),
-                    v_opt_blob(reference.oid.map(<[u8]>::to_vec)),
-                    v_opt_text(reference.algo.map(str::to_string)),
-                    v_opt_blob(reference.symbolic_target.map(<[u8]>::to_vec)),
-                    v_opt_blob(reference.upstream.map(<[u8]>::to_vec)),
-                    v_text(reference.state),
-                    v_int(observed_ms),
-                ],
+                ref_params(reference, observed_ms),
+            )
+            .await
+            .map_err(store_err)?;
+        self.conn
+            .execute(
+                "UPDATE refs SET instance_id = ?2, checkout_scope_id = ?3, kind = ?4, \
+                    name = ?5, oid = ?6, algo = ?7, symbolic_target = ?8, \
+                    upstream = ?9, state = ?10, observed_at_ms = ?11 WHERE id = ?1",
+                ref_params(reference, observed_ms),
             )
             .await
             .map_err(store_err)?;
@@ -3375,7 +3482,8 @@ impl TursoStore {
             .conn
             .query(
                 "SELECT id, instance_id, checkout_scope_id, kind, name, oid, algo, \
-                    symbolic_target, upstream, state, observed_at_ms FROM refs \
+                    symbolic_target, upstream, state, observed_at_ms, freshness, \
+                    freshness_at_ms FROM refs \
                     WHERE instance_id = ?1 ORDER BY id ASC",
                 vec![v_text(instance_id)],
             )
@@ -3384,6 +3492,103 @@ impl TursoStore {
         let mut out = Vec::new();
         while let Some(row) = rows.next().await.map_err(store_err)? {
             out.push(RefRow::from_row(&row)?);
+        }
+        Ok(out)
+    }
+
+    /// Label the freshness of one persisted ref (v3). Only used for
+    /// `kind = 'remote_tracking'` rows after a `--fetch` attempt;
+    /// `freshness` is `current`|`stale`|`unknown`. Returns true when a
+    /// row was updated.
+    pub async fn label_ref_freshness(
+        &self,
+        ref_id: &str,
+        freshness: &str,
+        at_ms: i64,
+    ) -> crate::Result<bool> {
+        self.forbid_write("label_ref_freshness")?;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE refs SET freshness = ?2, freshness_at_ms = ?3 WHERE id = ?1",
+                vec![v_text(ref_id), v_text(freshness), v_int(at_ms)],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(changed > 0)
+    }
+
+    /// Record the last `--fetch` attempt for one store + remote (v3).
+    /// `INSERT OR REPLACE` keyed by (`store_id`, `remote_name`): the
+    /// row always reflects the latest attempt.
+    pub async fn record_remote_refresh(&self, refresh: &NewRemoteRefresh<'_>) -> crate::Result<()> {
+        self.forbid_write("record_remote_refresh")?;
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO remote_refreshes (store_id, remote_name, \
+                    status, observed_at_ms, duration_ms, refs_updated, \
+                    refs_current_json, refs_deleted_json, detail) \
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                vec![
+                    v_text(refresh.store_id),
+                    v_blob(refresh.remote_name.to_vec()),
+                    v_text(refresh.status),
+                    v_int(refresh.observed_at_ms),
+                    v_opt_int(refresh.duration_ms),
+                    v_int(refresh.refs_updated),
+                    v_opt_text(refresh.refs_current_json.map(str::to_string)),
+                    v_opt_text(refresh.refs_deleted_json.map(str::to_string)),
+                    v_opt_text(refresh.detail.map(str::to_string)),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Read the last `--fetch` attempt for one store + remote (v3),
+    /// or `None` when never attempted.
+    pub async fn get_remote_refresh(
+        &self,
+        store_id: &str,
+        remote_name: &[u8],
+    ) -> crate::Result<Option<RemoteRefreshRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT store_id, remote_name, status, observed_at_ms, \
+                    duration_ms, refs_updated, refs_current_json, \
+                    refs_deleted_json, detail \
+                    FROM remote_refreshes WHERE store_id = ?1 AND remote_name = ?2",
+                vec![v_text(store_id), v_blob(remote_name.to_vec())],
+            )
+            .await
+            .map_err(store_err)?;
+        match rows.next().await.map_err(store_err)? {
+            Some(row) => Ok(Some(RemoteRefreshRow::from_row(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List all recorded `--fetch` attempts for one store (v3).
+    pub async fn list_remote_refreshes(
+        &self,
+        store_id: &str,
+    ) -> crate::Result<Vec<RemoteRefreshRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT store_id, remote_name, status, observed_at_ms, \
+                    duration_ms, refs_updated, refs_current_json, \
+                    refs_deleted_json, detail \
+                    FROM remote_refreshes WHERE store_id = ?1 ORDER BY remote_name ASC",
+                vec![v_text(store_id)],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            out.push(RemoteRefreshRow::from_row(&row)?);
         }
         Ok(out)
     }
@@ -3471,8 +3676,8 @@ impl TursoStore {
             .execute(
                 "INSERT OR IGNORE INTO scan_requests (id, url_raw, url_canonical, scope, \
                     status_mode, report_dest, state, created_at_ms, updated_at_ms, \
-                    targets_json, format, all_targets) \
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?7, ?8, ?9, ?10)",
+                    targets_json, format, all_targets, fetch) \
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?7, ?8, ?9, ?10, ?11)",
                 vec![
                     v_text(scan.id),
                     v_blob(url_raw),
@@ -3484,6 +3689,7 @@ impl TursoStore {
                     v_opt_text(scan.targets_json.map(str::to_string)),
                     v_opt_text(scan.format.map(str::to_string)),
                     v_opt_int(scan.all_targets.map(i64::from)),
+                    v_opt_int(scan.fetch.map(i64::from)),
                 ],
             )
             .await
@@ -3525,7 +3731,7 @@ impl TursoStore {
             .query(
                 "SELECT id, url_raw, url_canonical, scope, status_mode, report_dest, \
                     state, outcome, successor_id, created_at_ms, updated_at_ms, \
-                    targets_json, format, all_targets \
+                    targets_json, format, all_targets, fetch \
                     FROM scan_requests WHERE id = ?1",
                 vec![v_text(id)],
             )
@@ -4733,30 +4939,28 @@ impl TursoStore {
     }
 
     /// Buffer a ref upsert; see [`TursoStore::buffer_enqueue_task`] for the
-    /// flush contract. Returns `WriterBatch::should_flush`.
+    /// flush contract. Two statements (`INSERT OR IGNORE` + `UPDATE`),
+    /// mirroring [`TursoStore::upsert_ref`]: the pair preserves the v3
+    /// `freshness` label columns and is race-safe. Returns
+    /// `WriterBatch::should_flush` (true when either push trips it).
     pub fn buffer_upsert_ref(
         batch: &mut WriterBatch,
         reference: &NewRef<'_>,
         observed_ms: i64,
     ) -> bool {
-        batch.push(
-            "INSERT OR REPLACE INTO refs (id, instance_id, checkout_scope_id, kind, \
+        let insert = batch.push(
+            "INSERT OR IGNORE INTO refs (id, instance_id, checkout_scope_id, kind, \
                 name, oid, algo, symbolic_target, upstream, state, observed_at_ms) \
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            vec![
-                v_text(reference.id),
-                v_text(reference.instance_id),
-                v_opt_text(reference.checkout_scope_id.map(str::to_string)),
-                v_text(reference.kind),
-                v_blob(reference.name.to_vec()),
-                v_opt_blob(reference.oid.map(<[u8]>::to_vec)),
-                v_opt_text(reference.algo.map(str::to_string)),
-                v_opt_blob(reference.symbolic_target.map(<[u8]>::to_vec)),
-                v_opt_blob(reference.upstream.map(<[u8]>::to_vec)),
-                v_text(reference.state),
-                v_int(observed_ms),
-            ],
-        )
+            ref_params(reference, observed_ms),
+        );
+        let update = batch.push(
+            "UPDATE refs SET instance_id = ?2, checkout_scope_id = ?3, kind = ?4, \
+                name = ?5, oid = ?6, algo = ?7, symbolic_target = ?8, \
+                upstream = ?9, state = ?10, observed_at_ms = ?11 WHERE id = ?1",
+            ref_params(reference, observed_ms),
+        );
+        insert || update
     }
 
     /// Buffer a status observation; see [`TursoStore::buffer_enqueue_task`]

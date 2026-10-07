@@ -1254,6 +1254,7 @@ async fn run_scan_inner(
                 &resolved.targets,
                 args.format,
                 resolved.all,
+                args.fetch,
                 &mut runner.counters,
             )
             .await?
@@ -2017,6 +2018,7 @@ async fn mint_scan_id(
     targets: &[(String, String)],
     format: Option<repo_scan::cli::OutputFormat>,
     all: bool,
+    fetch: bool,
     counters: &mut RunCounters,
 ) -> repo_scan::Result<String> {
     // Defense-in-depth: the CLI boundary already rejected credential
@@ -2061,6 +2063,7 @@ async fn mint_scan_id(
                     targets_json: Some(targets_json.as_str()),
                     format: format_str,
                     all_targets: Some(all),
+                    fetch: Some(fetch),
                 },
                 now,
             )
@@ -9827,7 +9830,9 @@ async fn continue_saved_scan(
         status,
         root,
         format: None,
-        fetch: false,
+        // v3: restore the saved `--fetch` request; legacy rows (NULL)
+        // resume without a fetch phase.
+        fetch: row.fetch.unwrap_or(false),
         color: None,
     };
     // The row's bound generation (R14), if any; `run_scan_inner`

@@ -447,6 +447,7 @@ fn finding3_query_resume_strip_opaque_tails() {
                     targets_json: None,
                     format: None,
                     all_targets: None,
+                    fetch: None,
                 },
                 repo_scan::store::now_ms(),
             )

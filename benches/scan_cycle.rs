@@ -245,6 +245,7 @@ async fn seed_catalog(store: &TursoStore, now: i64) {
                 targets_json: None,
                 format: None,
                 all_targets: None,
+                fetch: None,
             },
             now,
         )
