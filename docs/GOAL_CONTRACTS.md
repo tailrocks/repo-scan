@@ -31,8 +31,11 @@ freshness stay separate properties.
 ## D2. Schema versions (Step 5)
 
 - Report `1.0.0` → `1.1.0` (additive: `scan.targets` only; no field
-  removed/renamed). Later additive bumps: `1.2.0` adds the fetch freshness
-  basis, `1.3`/`1.4` add branch comparison and working-state fields,
+  removed/renamed).
+- Report `1.1.0` → `1.2.0` (additive, Step 11: branch `freshness` /
+  `freshness_at`, remote `refresh` summary; no field removed/renamed;
+  pre-1.2 snapshots deserialize with `unknown` / `None`). Later additive
+  bumps: `1.3`/`1.4` add branch comparison and working-state fields,
   `1.5.0` adds `groups[]` and `totals`.
 - NEW scan-event stream schema `1.0.0` (JSONL).
 - Catalog migration v2: `github_groups`, `scan_events` journal,

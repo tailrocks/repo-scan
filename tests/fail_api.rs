@@ -373,6 +373,7 @@ fn api_report_model_sanitized_drops_canaries() {
         url: "https://tok:FAILAPIREMOTECANARY07@github.com/o/r.git".to_string(),
         canonical_url: Some("https://github.com/o/r".to_string()),
         observed_at: "2026-01-01T00:00:00Z".to_string(),
+        refresh: None,
     }
     .sanitized();
     let bytes = serde_json::to_vec(&remote).expect("remote json");

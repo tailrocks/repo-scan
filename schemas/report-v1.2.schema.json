@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://repo-scan.local/schemas/report-v1.1.schema.json",
-  "title": "repo-scan report v1.1",
+  "$id": "https://repo-scan.local/schemas/report-v1.2.schema.json",
+  "title": "repo-scan report v1.2",
   "description": "Normative report contract for repo-scan v1 reports. All listed fields are required; unknown values use an explicitly allowed null or state, never omission. Record objects reject undeclared fields in version 1. Non-null relationship IDs must resolve within the report, except envelope, scan, and historical successor IDs (external catalog history) and native identities / event cursors (opaque strings, not foreign keys). Relationship counts must agree with emitted records. ID resolution and count agreement are validated by the REPORT-01 test harness, not by this schema alone.",
   "type": "object",
   "required": [
@@ -12,7 +12,7 @@
   ],
   "additionalProperties": false,
   "properties": {
-    "schema_version": { "const": "1.1.0" },
+    "schema_version": { "const": "1.2.0" },
     "report_id": { "$ref": "#/$defs/Id" },
     "created_at": { "$ref": "#/$defs/Time" },
     "tool": { "$ref": "#/$defs/Tool" },
@@ -244,7 +244,7 @@
     },
     "Branch": {
       "type": "object",
-      "required": ["id", "repository_id", "checkout_scope_id", "kind", "name", "oid", "symbolic_target", "upstream", "state", "observed_at", "error_ids"],
+      "required": ["id", "repository_id", "checkout_scope_id", "kind", "name", "oid", "symbolic_target", "upstream", "state", "observed_at", "error_ids", "freshness", "freshness_at"],
       "additionalProperties": false,
       "properties": {
         "id": { "$ref": "#/$defs/Id" },
@@ -257,7 +257,9 @@
         "upstream": { "anyOf": [{ "$ref": "#/$defs/EncodedName" }, { "type": "null" }] },
         "state": { "enum": ["valid", "unborn", "invalid", "unsupported"] },
         "observed_at": { "$ref": "#/$defs/Time" },
-        "error_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } }
+        "error_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+        "freshness": { "enum": ["current", "stale", "unknown"] },
+        "freshness_at": { "anyOf": [{ "$ref": "#/$defs/Time" }, { "type": "null" }] }
       }
     },
     "Status": {
@@ -302,7 +304,7 @@
     },
     "Remote": {
       "type": "object",
-      "required": ["id", "repository_id", "checkout_scope_id", "name", "role", "url", "canonical_url", "observed_at"],
+      "required": ["id", "repository_id", "checkout_scope_id", "name", "role", "url", "canonical_url", "observed_at", "refresh"],
       "additionalProperties": false,
       "properties": {
         "id": { "$ref": "#/$defs/Id" },
@@ -312,7 +314,19 @@
         "role": { "enum": ["fetch", "push"] },
         "url": { "type": "string", "description": "Credentials redacted." },
         "canonical_url": { "type": ["string", "null"] },
-        "observed_at": { "$ref": "#/$defs/Time" }
+        "observed_at": { "$ref": "#/$defs/Time" },
+        "refresh": { "anyOf": [{ "$ref": "#/$defs/RemoteRefresh" }, { "type": "null" }] }
+      }
+    },
+    "RemoteRefresh": {
+      "type": "object",
+      "required": ["status", "observed_at", "duration_ms", "refs_updated"],
+      "additionalProperties": false,
+      "properties": {
+        "status": { "enum": ["success", "failed", "unsupported"] },
+        "observed_at": { "$ref": "#/$defs/Time" },
+        "duration_ms": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] },
+        "refs_updated": { "$ref": "#/$defs/Count" }
       }
     },
     "StorageLink": {
