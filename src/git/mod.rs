@@ -17,6 +17,7 @@
 //! [`fallback`] backend; anything else is an operational probe failure.
 
 pub mod fallback;
+pub mod refspec;
 
 use crate::model::StatusMode;
 use gix::bstr::{BString, ByteSlice};
