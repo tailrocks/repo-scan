@@ -1867,6 +1867,261 @@ fn oid_from_hex(algorithm: &str, hex: &str) -> Oid {
     Oid { algorithm, hex }
 }
 
+// ---------------------------------------------------------------------------
+// Remote refresh operations (goal Step 11, `--fetch` only)
+// ---------------------------------------------------------------------------
+// The read-only probes above never touch the network. The methods below
+// are the fetch phase's installed-git surface: config inspection, the
+// fetch itself, the ls-remote audit, and the post-fetch tracking-ref
+// re-read. Every spawn goes through `spawn_enveloped` (timeout, capture
+// cap, cancel token, helper ledger). Error details are NOT scrubbed here
+// (stderr may echo the remote URL): the fetch phase scrubs before any
+// persistence or display.
+
+/// Disable interactive credential prompting on a network git command.
+/// Stored credentials (`credential.helper`, ssh keys/agents) keep
+/// working; only terminal/askpass/ssh interactive fallbacks die.
+/// Runs AFTER `sanitize_git_env` (which strips both `GIT_SSH*` vars),
+/// so every branch below re-derives from the ambient process env:
+/// * ambient `GIT_SSH_COMMAND`: preserved (ports, keys, proxies) with
+///   `-o BatchMode=yes` appended so ssh can never open /dev/tty
+///   mid-scan. `OsString::push` is byte-exact: non-UTF-8 survives.
+/// * else ambient `GIT_SSH` (bare program, e.g. plink): honored as-is;
+///   no flag injection point exists. The fetch timeout still bounds it.
+/// * else: `ssh -o BatchMode=yes`.
+fn harden_no_prompt(cmd: &mut Command) {
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    cmd.env("GIT_ASKPASS", "true");
+    match (
+        std::env::var_os("GIT_SSH_COMMAND"),
+        std::env::var_os("GIT_SSH"),
+    ) {
+        (Some(ambient), _) => {
+            let mut hardened = ambient;
+            hardened.push(" -o BatchMode=yes");
+            cmd.env("GIT_SSH_COMMAND", hardened);
+        }
+        (None, Some(ssh)) => {
+            cmd.env("GIT_SSH", ssh);
+        }
+        (None, None) => {
+            cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+        }
+    }
+}
+
+impl FallbackGit {
+    /// Build a fetch-phase command: the [`FallbackGit::run`] hardening
+    /// (binary re-bind per spawn, env sanitize, optional locks off, no
+    /// pager, hooks/fsmonitor neutered) MINUS `core.sshCommand=false` —
+    /// fetch needs the user's ssh transport; prompts die via `BatchMode`
+    /// instead. `--git-dir` + ceiling mirror `run_inner` (fetch never
+    /// needs the worktree); the flag is built from exact bytes so
+    /// non-UTF-8 store paths survive.
+    fn fetch_command(&self, git_dir: &Path) -> Result<Command, String> {
+        // Re-bind the executable before every spawn (XSEC-02, mirrors
+        // `run_inner`): a swapped binary is refused, never spawned.
+        let canonical = self.path.canonicalize().map_err(|e| {
+            format!(
+                "installed git ({}): refusing spawn: cannot resolve binary: {e}",
+                self.path.display()
+            )
+        })?;
+        if binary_identity(&canonical) != Some(self.identity) {
+            return Err(format!(
+                "installed git ({}): refusing spawn: binary identity changed since probe",
+                self.path.display()
+            ));
+        }
+        let mut command = Command::new(&canonical);
+        let mut dir_flag = std::ffi::OsString::from("--git-dir=");
+        dir_flag.push(git_dir);
+        command.arg(dir_flag);
+        sanitize_git_env(&mut command);
+        command.env("GIT_OPTIONAL_LOCKS", "0");
+        command.env("GIT_CEILING_DIRECTORIES", git_dir);
+        if self.capabilities.no_optional_locks {
+            command.arg("--no-optional-locks");
+        }
+        command
+            .arg("--no-pager")
+            .arg("-c")
+            .arg("core.hooksPath=/dev/null")
+            .arg("-c")
+            .arg("core.fsmonitor=false")
+            .arg("-c")
+            .arg("credential.interactive=never");
+        command.env("GIT_PAGER", "cat");
+        // AFTER sanitizing (XSEC-03): the prompt-killers must win.
+        harden_no_prompt(&mut command);
+        Ok(command)
+    }
+
+    /// Read one multivalued git config key (`--get-all`) in `dir`,
+    /// honoring includes and worktree scope exactly as git resolves
+    /// them. A missing key yields an empty vec (exit 1 + empty
+    /// stdout); values are exact bytes and may be empty strings.
+    /// Callers validate encoding.
+    pub fn git_config_get_all(
+        &self,
+        dir: &Path,
+        key: &std::ffi::OsStr,
+        timeout: Duration,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        let mut cmd = self.fetch_command(dir)?;
+        cmd.arg("config").arg("--get-all").arg(key);
+        let out = spawn_enveloped(&mut cmd, true, timeout, MAX_CAPTURE_BYTES)?;
+        if out.truncated {
+            return Err("git config output exceeded capture cap".to_string());
+        }
+        if out.status.success() {
+            let mut values: Vec<Vec<u8>> = out
+                .stdout
+                .split(|b| *b == b'\n')
+                .map(<[u8]>::to_vec)
+                .collect();
+            // Every value row ends with `\n`; drop that one trailing empty.
+            if values.last().is_some_and(Vec::is_empty) {
+                values.pop();
+            }
+            return Ok(values);
+        }
+        if out.status.code() == Some(1) && out.stdout.is_empty() {
+            return Ok(Vec::new());
+        }
+        Err(format!(
+            "git config --get-all failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+
+    /// Fetch one remote: `git fetch --no-prune --no-recurse-submodules`,
+    /// prompts disabled, bounded by `timeout`. No prune, no
+    /// maintenance, no submodule recursion, no forced tag mode
+    /// (configured `tagOpt` honored). `Ok` on exit 0; the `Err` detail
+    /// is unscrubbed stderr — scrub before persisting.
+    pub fn git_fetch_remote(
+        &self,
+        dir: &Path,
+        remote: &std::ffi::OsStr,
+        timeout: Duration,
+        cap_bytes: u64,
+    ) -> Result<(), String> {
+        let mut cmd = self.fetch_command(dir)?;
+        cmd.arg("fetch")
+            .arg("--no-prune")
+            .arg("--no-recurse-submodules")
+            .arg(remote);
+        let out = spawn_enveloped(&mut cmd, true, timeout, cap_bytes)?;
+        if out.truncated {
+            return Err("git fetch output exceeded capture cap".to_string());
+        }
+        if out.status.success() {
+            return Ok(());
+        }
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+
+    /// List upstream refs via `git ls-remote --heads --tags`
+    /// (exact-byte names; peeled and malformed rows skipped by
+    /// [`crate::git::refspec::parse_ls_remote_refs`]). Prompts disabled
+    /// like [`FallbackGit::git_fetch_remote`]. The `Err` detail is
+    /// unscrubbed stderr — scrub before persisting.
+    pub fn git_ls_remote_refs(
+        &self,
+        dir: &Path,
+        remote: &std::ffi::OsStr,
+        timeout: Duration,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        let mut cmd = self.fetch_command(dir)?;
+        cmd.arg("ls-remote")
+            .arg("--heads")
+            .arg("--tags")
+            .arg(remote);
+        let out = spawn_enveloped(&mut cmd, true, timeout, MAX_CAPTURE_BYTES)?;
+        if out.truncated {
+            return Err("git ls-remote output exceeded capture cap".to_string());
+        }
+        if out.status.success() {
+            return Ok(crate::git::refspec::parse_ls_remote_refs(&out.stdout));
+        }
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+}
+
+/// One remote-tracking ref observed via `for-each-ref` (exact bytes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackingRef {
+    /// Full ref name (`refs/remotes/<remote>/...`).
+    pub name: Vec<u8>,
+    /// `%(objectname)` hex bytes (may be empty for a broken ref).
+    pub oid: Vec<u8>,
+    /// `%(symref)` target; nonempty exactly for symbolic refs
+    /// (`refs/remotes/<remote>/HEAD`).
+    pub symref: Vec<u8>,
+}
+
+impl FallbackGit {
+    /// Read every ref under `refs/remotes/` via NUL-delimited
+    /// `for-each-ref` (byte-exact). Pure local read, bounded by
+    /// `timeout`. Callers filter by remote in Rust (no
+    /// user-controlled patterns reach git). Malformed (non-triple)
+    /// output errors, never half-parses.
+    pub fn git_remote_tracking_refs(
+        &self,
+        dir: &Path,
+        timeout: Duration,
+    ) -> Result<Vec<TrackingRef>, String> {
+        let mut cmd = self.fetch_command(dir)?;
+        cmd.arg("for-each-ref")
+            .arg("--format=%(refname)%00%(objectname)%00%(symref)%00")
+            .arg("refs/remotes");
+        let out = self.fetch_outcome(&mut cmd, timeout, MAX_CAPTURE_BYTES, "for-each-ref")?;
+        Self::parse_tracking_refs(&out)
+    }
+
+    /// Spawn one fetch-phase read and return its stdout on exit 0
+    /// (`what` names the subcommand in errors).
+    fn fetch_outcome(
+        &self,
+        cmd: &mut Command,
+        timeout: Duration,
+        cap_bytes: u64,
+        what: &str,
+    ) -> Result<Vec<u8>, String> {
+        let _ = self;
+        let out = spawn_enveloped(cmd, true, timeout, cap_bytes)?;
+        if out.truncated {
+            return Err(format!("git {what} output exceeded capture cap"));
+        }
+        if !out.status.success() {
+            return Err(format!(
+                "git {what} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(out.stdout)
+    }
+
+    /// Parse NUL-terminated `for-each-ref` triples; malformed output
+    /// errors, never half-parses.
+    fn parse_tracking_refs(stdout: &[u8]) -> Result<Vec<TrackingRef>, String> {
+        let parts: Vec<&[u8]> = stdout.split(|b| *b == 0).collect();
+        let trailing_empty = parts.last().is_some_and(|p| p.is_empty());
+        if !trailing_empty || (parts.len() - 1) % 3 != 0 {
+            return Err("git for-each-ref output is not NUL-terminated triples".to_string());
+        }
+        Ok(parts[..parts.len() - 1]
+            .chunks_exact(3)
+            .map(|c| TrackingRef {
+                name: c[0].to_vec(),
+                oid: c[1].to_vec(),
+                symref: c[2].to_vec(),
+            })
+            .collect())
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -2365,5 +2620,154 @@ mod tests {
         }
         assert!(saw_guard, "driver-guard spawn logged: {text}");
         assert!(saw_status, "isolated status spawn logged: {text}");
+    }
+
+    #[test]
+    fn parse_tracking_refs_triples_and_rejects() {
+        let out = b"refs/remotes/origin/main\0\
+            0123456789abcdef0123456789abcdef01234567\0\0\
+            refs/remotes/origin/HEAD\0\
+            0123456789abcdef0123456789abcdef01234567\0refs/remotes/origin/main\0";
+        let refs = FallbackGit::parse_tracking_refs(out).expect("triples parse");
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].name, b"refs/remotes/origin/main");
+        assert_eq!(refs[0].oid, b"0123456789abcdef0123456789abcdef01234567");
+        assert!(refs[0].symref.is_empty());
+        assert_eq!(refs[1].name, b"refs/remotes/origin/HEAD");
+        assert_eq!(refs[1].symref, b"refs/remotes/origin/main");
+
+        // Empty output (no tracking refs) is valid: zero refs.
+        assert!(FallbackGit::parse_tracking_refs(b"")
+            .expect("empty parses")
+            .is_empty());
+        // Non-triples never half-parse.
+        for bad in [
+            b"refs/a\0oid\0".as_slice(),
+            b"refs/a\0oid\0sym".as_slice(),
+            b"a\0b\0c\0d\0".as_slice(),
+        ] {
+            assert!(
+                FallbackGit::parse_tracking_refs(bad).is_err(),
+                "{bad:?} must error"
+            );
+        }
+    }
+
+    /// Discover the fixture git for fetch-command tests.
+    fn fixture_git(dir: &Path) -> FallbackGit {
+        let _ = git_fixture(dir, "git", "git version 2.47.1", CAPABLE_BODY);
+        let path_var = dir.to_str().expect("utf8").to_string();
+        FallbackGit::discover_from(&[], &[], Some(path_var)).expect("discover")
+    }
+
+    #[test]
+    fn fetch_command_hardening() {
+        let _serial = spawn_serial();
+        // Hermetic ssh-command assertions: `fetch_command` is the only
+        // reader of ambient `GIT_SSH_COMMAND` in the test binary, so
+        // save/remove/set/restore here cannot disturb another test.
+        let saved_ssh = std::env::var_os("GIT_SSH_COMMAND");
+        let saved_bare = std::env::var_os("GIT_SSH");
+        std::env::remove_var("GIT_SSH_COMMAND");
+        std::env::remove_var("GIT_SSH");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = fixture_git(dir.path());
+        let repo = dir.path().join("repo.git");
+        let cmd = git.fetch_command(&repo).expect("command");
+        let argv: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let env: std::collections::HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        // Exact --git-dir flag (not lossy display formatting).
+        let mut flag = std::ffi::OsString::from("--git-dir=");
+        flag.push(&repo);
+        assert!(cmd.get_args().any(|a| a == flag), "{argv:?}");
+        // Prompt killers win over sanitization.
+        assert_eq!(
+            env.get("GIT_TERMINAL_PROMPT").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(env.get("GIT_ASKPASS").map(String::as_str), Some("true"));
+        assert!(
+            env.get("GIT_SSH_COMMAND")
+                .is_some_and(|v| v.contains("BatchMode=yes")),
+            "{env:?}"
+        );
+        assert!(
+            argv.contains(&"credential.interactive=never".to_string()),
+            "{argv:?}"
+        );
+        // Probes neuter ssh; fetch needs the transport.
+        assert!(!argv.iter().any(|a| a.contains("sshCommand")), "{argv:?}");
+        assert_eq!(
+            argv.contains(&"--no-optional-locks".to_string()),
+            git.capabilities().no_optional_locks
+        );
+        // Ambient GIT_SSH_COMMAND: preserved, BatchMode appended
+        // (sanitize strips it; harden must re-derive, never drop it to
+        // a prompting ssh).
+        std::env::set_var("GIT_SSH_COMMAND", "ssh -o Custom=yes");
+        let cmd = git.fetch_command(&repo).expect("command");
+        let ssh = cmd
+            .get_envs()
+            .find_map(|(k, v)| {
+                (k.to_string_lossy() == "GIT_SSH_COMMAND")
+                    .then(|| v.map(|s| s.to_owned()))
+                    .flatten()
+            })
+            .expect("ssh passthrough");
+        assert_eq!(ssh, "ssh -o Custom=yes -o BatchMode=yes");
+        // Bare GIT_SSH alone: honored as-is, no GIT_SSH_COMMAND set
+        // (COMMAND would take precedence and hijack the mechanism).
+        std::env::remove_var("GIT_SSH_COMMAND");
+        std::env::set_var("GIT_SSH", "/usr/bin/plink");
+        let cmd = git.fetch_command(&repo).expect("command");
+        let env: std::collections::HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        assert_eq!(
+            env.get("GIT_SSH").map(String::as_str),
+            Some("/usr/bin/plink")
+        );
+        assert!(!env.contains_key("GIT_SSH_COMMAND"), "{env:?}");
+        match saved_ssh {
+            Some(v) => std::env::set_var("GIT_SSH_COMMAND", v),
+            None => std::env::remove_var("GIT_SSH_COMMAND"),
+        }
+        match saved_bare {
+            Some(v) => std::env::set_var("GIT_SSH", v),
+            None => std::env::remove_var("GIT_SSH"),
+        }
+    }
+
+    #[test]
+    fn fetch_command_refuses_swapped_binary() {
+        let _serial = spawn_serial();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = fixture_git(dir.path());
+        // Rewrite the binary after discovery: identity changes.
+        let path = dir.path().join("git");
+        let mut body = std::fs::read(&path).expect("read");
+        body.extend_from_slice(b"# swapped\n");
+        std::fs::write(&path, body).expect("write");
+        let err = git
+            .fetch_command(dir.path())
+            .expect_err("swapped binary refused");
+        assert!(err.contains("identity changed"), "{err}");
     }
 }

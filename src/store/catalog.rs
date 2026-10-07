@@ -4963,6 +4963,50 @@ impl TursoStore {
         insert || update
     }
 
+    /// Buffer a `--fetch` attempt record (v3); see
+    /// [`TursoStore::buffer_enqueue_task`] for the flush contract.
+    /// Same `INSERT OR REPLACE` semantics as
+    /// [`TursoStore::record_remote_refresh`]. Returns
+    /// `WriterBatch::should_flush`.
+    pub fn buffer_record_remote_refresh(
+        batch: &mut WriterBatch,
+        refresh: &NewRemoteRefresh<'_>,
+    ) -> bool {
+        batch.push(
+            "INSERT OR REPLACE INTO remote_refreshes (store_id, remote_name, \
+                status, observed_at_ms, duration_ms, refs_updated, \
+                refs_current_json, refs_deleted_json, detail) \
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            vec![
+                v_text(refresh.store_id),
+                v_blob(refresh.remote_name.to_vec()),
+                v_text(refresh.status),
+                v_int(refresh.observed_at_ms),
+                v_opt_int(refresh.duration_ms),
+                v_int(refresh.refs_updated),
+                v_opt_text(refresh.refs_current_json.map(str::to_string)),
+                v_opt_text(refresh.refs_deleted_json.map(str::to_string)),
+                v_opt_text(refresh.detail.map(str::to_string)),
+            ],
+        )
+    }
+
+    /// Buffer a ref freshness label (v3); see
+    /// [`TursoStore::buffer_enqueue_task`] for the flush contract.
+    /// Same `UPDATE` semantics as [`TursoStore::label_ref_freshness`].
+    /// Returns `WriterBatch::should_flush`.
+    pub fn buffer_label_ref_freshness(
+        batch: &mut WriterBatch,
+        ref_id: &str,
+        freshness: &str,
+        at_ms: i64,
+    ) -> bool {
+        batch.push(
+            "UPDATE refs SET freshness = ?2, freshness_at_ms = ?3 WHERE id = ?1",
+            vec![v_text(ref_id), v_text(freshness), v_int(at_ms)],
+        )
+    }
+
     /// Buffer a status observation; see [`TursoStore::buffer_enqueue_task`]
     /// for the flush contract. Unlike [`TursoStore::record_status`] the
     /// inserted-or-ignored outcome is only knowable after flush (by
