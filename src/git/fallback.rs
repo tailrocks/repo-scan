@@ -2159,24 +2159,31 @@ impl FallbackGit {
         Ok(out.stdout)
     }
 
-    /// Parse NUL-terminated `for-each-ref` triples; malformed output
-    /// errors, never half-parses.
+    /// Parse `for-each-ref` tracking records. Real git appends `\n`
+    /// after every formatted record, so each record is
+    /// `name\0oid\0symref\0\n` (verified against installed git; a
+    /// bare-`\0` split mis-parses real output). Ref names, hex oids,
+    /// and symref targets never contain `\n`, so records split safely
+    /// on newlines. Malformed output errors, never half-parses.
     fn parse_tracking_refs(stdout: &[u8]) -> Result<Vec<TrackingRef>, String> {
-        let parts: Vec<&[u8]> = stdout.split(|b| *b == 0).collect();
-        let trailing_empty = parts.last().is_some_and(|p| p.is_empty());
-        if !trailing_empty || !(parts.len() - 1).is_multiple_of(3) {
-            return Err("git for-each-ref output is not NUL-terminated triples".to_string());
+        if stdout.is_empty() {
+            return Ok(Vec::new());
         }
-        let (triples, rest) = parts[..parts.len() - 1].as_chunks::<3>();
-        debug_assert!(rest.is_empty(), "triple count checked above");
-        Ok(triples
-            .iter()
-            .map(|c| TrackingRef {
-                name: c[0].to_vec(),
-                oid: c[1].to_vec(),
-                symref: c[2].to_vec(),
-            })
-            .collect())
+        let err = || "git for-each-ref output is not NUL-field records".to_string();
+        let body = stdout.strip_suffix(b"\n").ok_or_else(err)?;
+        let mut refs = Vec::new();
+        for record in body.split(|b| *b == b'\n') {
+            let fields: Vec<&[u8]> = record.split(|b| *b == 0).collect();
+            if fields.len() != 4 || !fields[3].is_empty() {
+                return Err(err());
+            }
+            refs.push(TrackingRef {
+                name: fields[0].to_vec(),
+                oid: fields[1].to_vec(),
+                symref: fields[2].to_vec(),
+            });
+        }
+        Ok(refs)
     }
 }
 
@@ -2682,27 +2689,32 @@ mod tests {
 
     #[test]
     fn parse_tracking_refs_triples_and_rejects() {
-        let out = b"refs/remotes/origin/main\0\
-            0123456789abcdef0123456789abcdef01234567\0\0\
-            refs/remotes/origin/HEAD\0\
-            0123456789abcdef0123456789abcdef01234567\0refs/remotes/origin/main\0";
-        let refs = FallbackGit::parse_tracking_refs(out).expect("triples parse");
+        // Byte-exact shape of real git output: git appends `\n` after
+        // every `--format` record, and `%(objectname)` of a symbolic
+        // ref resolves to the target oid.
+        let out = b"refs/remotes/origin/HEAD\0\
+            0123456789abcdef0123456789abcdef01234567\0refs/remotes/origin/main\0\n\
+            refs/remotes/origin/main\0\
+            0123456789abcdef0123456789abcdef01234567\0\0\n";
+        let refs = FallbackGit::parse_tracking_refs(out).expect("records parse");
         assert_eq!(refs.len(), 2);
-        assert_eq!(refs[0].name, b"refs/remotes/origin/main");
-        assert_eq!(refs[0].oid, b"0123456789abcdef0123456789abcdef01234567");
-        assert!(refs[0].symref.is_empty());
-        assert_eq!(refs[1].name, b"refs/remotes/origin/HEAD");
-        assert_eq!(refs[1].symref, b"refs/remotes/origin/main");
+        assert_eq!(refs[0].name, b"refs/remotes/origin/HEAD");
+        assert_eq!(refs[0].symref, b"refs/remotes/origin/main");
+        assert_eq!(refs[1].name, b"refs/remotes/origin/main");
+        assert_eq!(refs[1].oid, b"0123456789abcdef0123456789abcdef01234567");
+        assert!(refs[1].symref.is_empty());
 
         // Empty output (no tracking refs) is valid: zero refs.
         assert!(FallbackGit::parse_tracking_refs(b"")
             .expect("empty parses")
             .is_empty());
-        // Non-triples never half-parse.
+        // Malformed records never half-parse: truncated tail, short
+        // record, long record, missing record terminator.
         for bad in [
-            b"refs/a\0oid\0".as_slice(),
-            b"refs/a\0oid\0sym".as_slice(),
-            b"a\0b\0c\0d\0".as_slice(),
+            b"refs/a\0oid\0\0\ntrail".as_slice(),
+            b"refs/a\0oid\0\n".as_slice(),
+            b"a\0b\0c\0d\0\n".as_slice(),
+            b"a\0b\0\0".as_slice(),
         ] {
             assert!(
                 FallbackGit::parse_tracking_refs(bad).is_err(),
