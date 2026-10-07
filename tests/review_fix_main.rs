@@ -222,7 +222,11 @@ fn r4_lease_released_on_skip() {
 
         let task = store.get_task("task-1").await.expect("get").expect("row");
         assert_eq!(task.state, repo_scan::model::TaskState::Pending);
-        assert_eq!(task.attempts, attempts_at_claim, "no attempt penalty");
+        assert_eq!(
+            task.attempts,
+            attempts_at_claim - 1,
+            "release refunds the denied claim's attempts increment"
+        );
         assert_eq!(task.lease_token, None, "lease cleared");
         assert_eq!(task.lease_epoch, None, "lease epoch cleared");
 
