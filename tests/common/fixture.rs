@@ -87,6 +87,127 @@ pub fn git_str(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&git(dir, args)).trim().to_owned()
 }
 
+/// Run `git` with byte-exact args (non-UTF-8 refnames/paths). Same
+/// hermetic env as [`git`]; returns raw stdout. Unix-only.
+#[cfg(unix)]
+pub fn git_os(dir: &Path, args: &[&std::ffi::OsStr]) -> Vec<u8> {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", null_device())
+        .env("GIT_CONFIG_SYSTEM", null_device())
+        .env("GIT_AUTHOR_NAME", "repo-scan-fixture")
+        .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+        .env("GIT_COMMITTER_NAME", "repo-scan-fixture")
+        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .arg("-c")
+        .arg("user.name=repo-scan-fixture")
+        .arg("-c")
+        .arg("user.email=fixture@example.invalid")
+        .arg("-c")
+        .arg("init.defaultBranch=main")
+        .arg("-c")
+        .arg("commit.gpgsign=false")
+        .arg("-c")
+        .arg("maintenance.auto=false")
+        .arg("-c")
+        .arg("gc.autoDetach=false")
+        .arg("-c")
+        .arg("protocol.file.allow=always");
+    for arg in args {
+        cmd.arg(arg);
+    }
+    let output = cmd.output().unwrap_or_else(|e| {
+        panic!(
+            "spawn git {} in {}: {e}",
+            args.iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" "),
+            dir.display()
+        )
+    });
+    assert!(
+        output.status.success(),
+        "git {} in {} failed ({}): {}",
+        args.iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" "),
+        dir.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+/// Repo with a non-UTF-8 branch (`refs/heads/byte-\xE9-\xFF`, legal
+/// refname bytes) with HEAD pointing at it. The ref lives in
+/// `.git/packed-refs` (raw bytes, no filename involved), so this works
+/// even where the filesystem rejects non-UTF-8 names (macOS EILSEQ).
+/// Returns `(repo, full_refname_bytes)`. Unix-only.
+#[cfg(unix)]
+pub fn non_utf8_branch_repo(parent: &Path, name: &str) -> (PathBuf, Vec<u8>) {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStringExt;
+    let dir = normal_clone(parent, name);
+    let head = git_str(&dir, &["rev-parse", "HEAD"]);
+    let refname = b"refs/heads/byte-\xe9-\xff".to_vec();
+    let packed = dir.join(".git/packed-refs");
+    let mut contents = std::fs::read(&packed).unwrap_or_default();
+    contents.extend_from_slice(head.as_bytes());
+    contents.push(b' ');
+    contents.extend_from_slice(&refname);
+    contents.push(b'\n');
+    private_write_0600(&packed, &contents).unwrap();
+    let ref_arg = OsString::from_vec(refname.clone());
+    git_os(
+        &dir,
+        &[
+            OsStr::new("symbolic-ref"),
+            OsStr::new("HEAD"),
+            ref_arg.as_os_str(),
+        ],
+    );
+    (dir, refname)
+}
+
+/// Repo with hostile worktree paths: a staged quote/backslash-hostile
+/// file (non-UTF-8 `bad-\xFF-staged.txt` where the filesystem allows;
+/// ASCII `quo"ted\\staged.txt` where it rejects, e.g. macOS EILSEQ),
+/// an untracked newline name, an untracked control-char name, plus one
+/// unstaged ASCII modification. Returns `(repo, staged_raw_name)`.
+/// Unix-only.
+#[cfg(unix)]
+pub fn hostile_status_repo(parent: &Path, name: &str) -> (PathBuf, Vec<u8>) {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStringExt;
+    let dir = normal_clone(parent, name);
+    let mut staged_raw = b"bad-\xff-staged.txt".to_vec();
+    let staged_name = OsString::from_vec(staged_raw.clone());
+    if private_write_0600(&dir.join(&staged_name), b"staged\n").is_err() {
+        // Filesystem rejects non-UTF-8 names (macOS): fall back to a
+        // C-quote-hostile ASCII name (still raw under `-z`).
+        staged_raw = b"quo\"ted\\staged.txt".to_vec();
+        let staged_name = OsString::from_vec(staged_raw.clone());
+        private_write_0600(&dir.join(&staged_name), b"staged\n").unwrap();
+    }
+    let staged_name = OsString::from_vec(staged_raw.clone());
+    git_os(
+        &dir,
+        &[OsStr::new("add"), OsStr::new("--"), staged_name.as_os_str()],
+    );
+    for raw in [
+        b"new\nline.txt".as_slice(),
+        b"ctrl-\x01-char.txt".as_slice(),
+    ] {
+        let name = OsString::from_vec(raw.to_vec());
+        private_write_0600(&dir.join(&name), b"hostile\n").unwrap();
+    }
+    private_write_0600(&dir.join("README.md"), b"# fixture\nmodified\n").unwrap();
+    (dir, staged_raw)
+}
+
 /// Private scratch root for fixture/state/report/log trees: a fresh
 /// owner-only (`0o700`) tempdir pinned under `/tmp`. All fixture builders
 /// take their `parent` from the returned dir; never pass a machine-wide path.

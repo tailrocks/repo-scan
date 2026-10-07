@@ -512,7 +512,9 @@ impl FallbackGit {
     ///
     /// Symbolic targets are preserved from `%(symref)`. Peeled values are
     /// left `None`: peeling here would add object-store reads the caller
-    /// did not request.
+    /// did not request. Raw-byte parse: records split on `\n`, fields on
+    /// `\0` — names and symref targets keep exact bytes; oids must be
+    /// ASCII hex (malformed records skip, like empty fields).
     pub fn refs(
         &self,
         git_dir: &Path,
@@ -534,25 +536,30 @@ impl FallbackGit {
                 "--format=%(refname)%00%(objectname)%00%(symref)",
             ],
         )?;
-        let text = String::from_utf8_lossy(&out);
         let mut refs = Vec::new();
-        for line in text.lines() {
-            let mut parts = line.split('\0');
-            let (Some(name), Some(oid), symref) =
+        for record in out.split(|b| *b == b'\n') {
+            if record.is_empty() {
+                continue;
+            }
+            let mut parts = record.split(|b| *b == 0);
+            let (Some(name), Some(oid_hex), symref) =
                 (parts.next(), parts.next(), parts.next().unwrap_or_default())
             else {
                 continue;
             };
-            if name.is_empty() || oid.is_empty() {
+            if name.is_empty() {
                 continue;
             }
+            let Some(oid) = oid_from_ascii_hex(&expected_algorithm, oid_hex) else {
+                continue;
+            };
             let target = if symref.is_empty() {
-                RefTarget::Object(oid_from_hex(&expected_algorithm, oid))
+                RefTarget::Object(oid)
             } else {
-                RefTarget::Symbolic(symref.as_bytes().to_vec())
+                RefTarget::Symbolic(symref.to_vec())
             };
             refs.push(RefObservation {
-                name: name.as_bytes().to_vec(),
+                name: name.to_vec(),
                 target,
                 peeled: None,
             });
@@ -561,43 +568,43 @@ impl FallbackGit {
     }
 
     /// Observe HEAD via `symbolic-ref` + `rev-parse` (no checkout touched).
+    /// Ref names keep exact bytes (ASCII-whitespace trimmed, no lossy
+    /// round-trip); oids must be ASCII hex (branch oid `None`, detached
+    /// `Unknown`, when malformed).
     pub fn head(&self, git_dir: &Path, work_tree: Option<&Path>) -> crate::Result<HeadState> {
         let algorithm = self.object_format(git_dir, work_tree);
         match self.run(git_dir, work_tree, &["symbolic-ref", "-q", "HEAD"]) {
             Ok(out) => {
-                let name = String::from_utf8_lossy(&out).trim().to_string();
+                let name = out.trim_ascii();
                 if name.is_empty() {
                     return Ok(HeadState::Unknown);
                 }
                 match self.run(git_dir, work_tree, &["rev-parse", "--verify", "HEAD"]) {
                     Ok(oid_out) => {
-                        let hex = String::from_utf8_lossy(&oid_out).trim().to_string();
+                        let hex = oid_out.trim_ascii();
                         Ok(HeadState::Branch {
-                            ref_name: name.into_bytes(),
-                            oid: (!hex.is_empty()).then(|| oid_from_hex(&algorithm, &hex)),
+                            ref_name: name.to_vec(),
+                            oid: oid_from_ascii_hex(&algorithm, hex),
                         })
                     }
                     Err(_) => Ok(HeadState::Unborn {
-                        ref_name: name.into_bytes(),
+                        ref_name: name.to_vec(),
                     }),
                 }
             }
             Err(_) => match self.run(git_dir, work_tree, &["rev-parse", "HEAD"]) {
                 Ok(oid_out) => {
-                    let hex = String::from_utf8_lossy(&oid_out).trim().to_string();
-                    if hex.is_empty() {
+                    let hex = oid_out.trim_ascii();
+                    let Some(target) = oid_from_ascii_hex(&algorithm, hex) else {
                         return Ok(HeadState::Unknown);
-                    }
+                    };
                     let peeled = self
                         .run(git_dir, work_tree, &["rev-parse", "HEAD^{}"])
                         .ok()
-                        .map(|raw| String::from_utf8_lossy(&raw).trim().to_string())
-                        .filter(|peeled| !peeled.is_empty() && *peeled != hex)
-                        .map(|peeled| oid_from_hex(&algorithm, &peeled));
-                    Ok(HeadState::Detached {
-                        target: oid_from_hex(&algorithm, &hex),
-                        peeled,
-                    })
+                        .map(|raw| raw.trim_ascii().to_vec())
+                        .filter(|peeled| !peeled.is_empty() && peeled.as_slice() != hex)
+                        .and_then(|peeled| oid_from_ascii_hex(&algorithm, &peeled));
+                    Ok(HeadState::Detached { target, peeled })
                 }
                 Err(_) => {
                     if git_dir.join("HEAD").is_file() {
@@ -610,12 +617,14 @@ impl FallbackGit {
         }
     }
 
-    /// Status counts via `status --porcelain=v2`.
+    /// Status counts via `status --porcelain=v2 -z`.
     ///
     /// `collapsed` selects `--untracked-files=normal` (one entry per
     /// untracked directory, spec `summary`) versus `all` (spec `full`).
-    /// Returns `(staged, unstaged, untracked)`. Renames are disabled for
-    /// parity with the gix counting policy.
+    /// Returns `(staged, unstaged, untracked, conflicts)`. Renames are
+    /// disabled for parity with the gix counting policy. `-z` NUL
+    /// records keep hostile paths (newlines, non-UTF-8) from splitting
+    /// records; counts parse from raw bytes (record-type byte + XY).
     ///
     /// FIXREADY4 F: both this spawn and its driver guard run under
     /// `StatusConfigIsolation` (empty global/system config, empty HOME,
@@ -659,22 +668,21 @@ impl FallbackGit {
         let out = self.run_inner(
             git_dir,
             work_tree,
-            &["status", "--porcelain=v2", untracked, "--no-renames"],
+            &["status", "--porcelain=v2", "-z", untracked, "--no-renames"],
             Some(&isolation),
         )?;
-        let text = String::from_utf8_lossy(&out);
         let mut staged = 0u64;
         let mut unstaged = 0u64;
         let mut untracked_count = 0u64;
         let mut conflicts = 0u64;
-        for line in text.lines() {
-            match line.as_bytes().first() {
+        // `-z`: every record (including `#` headers) is NUL-terminated,
+        // so hostile paths never split records. Rename records would
+        // append a second NUL field, but `--no-renames` disables them —
+        // every NUL field is one record.
+        for record in out.split(|b| *b == 0) {
+            match record.first() {
                 Some(b'1') | Some(b'2') => {
-                    let fields: Vec<&str> = line.splitn(9, ' ').collect();
-                    if fields.len() < 2 {
-                        continue;
-                    }
-                    let xy = fields[1].as_bytes();
+                    let xy = record.split(|b| *b == b' ').nth(1).unwrap_or_default();
                     let staged_dirty = xy.first().is_some_and(|c| !matches!(c, b'.' | b'!'));
                     let unstaged_dirty = xy.get(1).is_some_and(|c| !matches!(c, b'.' | b'!'));
                     if staged_dirty {
@@ -752,6 +760,10 @@ impl FallbackGit {
     ) -> bool {
         let parent_hit =
             match self.run_inner(git_dir, work_tree, &["config", "--list"], Some(isolation)) {
+                // Lossy is sound here: only ASCII key shapes (`filter.*.
+                // clean|smudge|process) are matched, and the U+FFFD
+                // replacement never equals ASCII — mangled bytes can
+                // neither forge nor hide a driver key.
                 Ok(out) => String::from_utf8_lossy(&out).lines().any(|line| {
                     line.split_once('=')
                         .is_some_and(|(key, _)| Self::is_exec_filter_key(&key.to_ascii_lowercase()))
@@ -818,21 +830,37 @@ impl FallbackGit {
     /// Resolve the common dir for the absorbed-tree scan: `git_dir`
     /// plus its `commondir` pointer when present. Absent pointer =
     /// `git_dir` itself. Present-but-unreadable/unparseable/empty =
-    /// `None` (fail closed: the absorbed set is unprovable).
+    /// `None` (fail closed: the absorbed set is unprovable). The
+    /// pointer is a path: first line, ASCII-trimmed, byte-exact, so
+    /// non-UTF-8 stores resolve exactly, never lossy-mangled.
     fn common_dir_for(git_dir: &Path) -> Option<PathBuf> {
         let pointer = git_dir.join("commondir");
-        let text = match super::read_bounded_string(&pointer, super::MAX_GIT_CONTROL_BYTES) {
-            Some(text) => text,
+        let raw = match super::read_bounded_bytes(&pointer, super::MAX_GIT_CONTROL_BYTES) {
+            Some(raw) => raw,
             None if std::fs::symlink_metadata(&pointer).is_err() => {
                 return Some(git_dir.to_path_buf());
             }
             None => return None,
         };
-        let target = text.lines().next().unwrap_or_default().trim();
+        let target = raw
+            .split(|b| *b == b'\n')
+            .next()
+            .unwrap_or_default()
+            .trim_ascii();
         if target.is_empty() {
             return None;
         }
-        let target_path = Path::new(target);
+        let target_os: &std::ffi::OsStr = {
+            #[cfg(unix)]
+            {
+                std::os::unix::ffi::OsStrExt::from_bytes(target)
+            }
+            #[cfg(not(unix))]
+            {
+                std::ffi::OsStr::new(std::str::from_utf8(target).unwrap_or_default())
+            }
+        };
+        let target_path = Path::new(target_os);
         if target_path.is_absolute() {
             Some(target_path.to_path_buf())
         } else {
@@ -1860,6 +1888,22 @@ fn parse_git_version(banner: &str) -> (u32, u32, u32) {
     (major, minor, patch)
 }
 
+/// True when every byte is ASCII hex (non-empty). Oid-shaped gate
+/// for raw-byte CLI parses: names stay byte-exact, oids stay ASCII.
+fn is_ascii_hex(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && bytes.iter().all(|b| b.is_ascii_hexdigit())
+}
+
+/// [`oid_from_hex`] over raw bytes: `None` unless ASCII hex.
+fn oid_from_ascii_hex(algorithm: &str, hex: &[u8]) -> Option<Oid> {
+    if !is_ascii_hex(hex) {
+        return None;
+    }
+    std::str::from_utf8(hex)
+        .ok()
+        .map(|hex| oid_from_hex(algorithm, hex))
+}
+
 /// Build an [`Oid`] from hex, tolerating either hash length.
 fn oid_from_hex(algorithm: &str, hex: &str) -> Oid {
     let hex = hex.trim().to_lowercase();
@@ -2597,8 +2641,9 @@ mod tests {
         ]);
         // Fake git: `--version` + the feature probe answer canned; the
         // driver guard (`config --list`) answers empty; the status read
-        // answers one staged, one unstaged, one untracked entry. Both
-        // status-path spawns append an argv/env block to the log.
+        // answers one staged, one unstaged, one untracked entry as `-z`
+        // NUL records. Both status-path spawns append an argv/env block
+        // to the log.
         let dir = tempfile::tempdir().expect("tempdir");
         let log = dir.path().join("spawn.log");
         let log_str = log.to_str().expect("utf8").to_string();
@@ -2610,9 +2655,9 @@ mod tests {
              echo \"SYSTEM=${{GIT_CONFIG_SYSTEM-unset}}\" >> \"{log_str}\"\n\
              echo \"HOME=$HOME\" >> \"{log_str}\"\n\
              echo \"XDG=${{XDG_CONFIG_HOME-unset}}\" >> \"{log_str}\"\n\
-             echo '1 M. N... 100644 100644 100644 abcdef01 abcdef01 staged.txt'\n\
-             echo '1 .M N... 100644 100644 100644 abcdef02 abcdef03 unstaged.txt'\n\
-             echo '? untracked.txt'\nexit 0\nfi\n\
+             printf '1 M. N... 100644 100644 100644 abcdef01 abcdef01 staged.txt\\0'\n\
+             printf '1 .M N... 100644 100644 100644 abcdef02 abcdef03 unstaged.txt\\0'\n\
+             printf '? untracked.txt\\0'\nexit 0\nfi\n\
              if [ \"$subcmd\" = \"config\" ]; then\n\
              echo \"SPAWN argv=$*\" >> \"{log_str}\"\n\
              echo \"GLOBAL=${{GIT_CONFIG_GLOBAL-unset}}\" >> \"{log_str}\"\n\
@@ -2683,6 +2728,7 @@ mod tests {
             }
             if argv.contains("status")
                 && argv.contains("--porcelain=v2")
+                && argv.contains(" -z ")
                 && argv.contains("--untracked-files=normal")
                 && argv.contains("--no-renames")
             {
