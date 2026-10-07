@@ -17,10 +17,11 @@ preventing unmanaged file drift in CI.
 
 | Job id            | Display           | Runs on      | Timeout | Steps                                              |
 |-------------------|-------------------|--------------|---------|----------------------------------------------------|
-| `actionlint`      | Actionlint        | ubuntu-26.04 | 10 min  | Checkout, Setup Mise, actionlint over the tree     |
-| `plan`            | Plan              | ubuntu-26.04 | 10 min  | Checkout, Setup Mise, velnor-actions generate check |
-| `rust-repo-scan`  | Rust / repo-scan  | ubuntu-26.04 | 30 min  | Checkout, Setup Mise, rust-cache, Format, Clippy, Build, Tests, Doctests, Documentation |
-| `required`        | Required          | ubuntu-26.04 | 10 min  | Verdict from `needs.*.result` (`if: always()`)     |
+| `actionlint`      | Actionlint        | ubuntu-24.04 | 10 min  | Checkout, Setup Mise, actionlint over the tree     |
+| `plan`            | Plan              | ubuntu-24.04 | 10 min  | Checkout, Setup Mise, velnor-actions generate check |
+| `rust-repo-scan`  | Rust / repo-scan  | ubuntu-24.04 | 30 min  | Checkout, Setup Mise, rust-cache, Format, Clippy, Tests, Doctests, Documentation |
+| `required`        | Required          | ubuntu-24.04 | 10 min  | Verdict from `needs.*.result` (`if: always()`)     |
+| `publish-baseline`| Publish baseline  | ubuntu-24.04 | 10 min  | Push-to-main only; Acquire Velnor, Download plan, Publish baseline |
 
 Tool pins (velnor's qualified pins): checkout v7.0.1, mise-action v5.0.0,
 rust-cache v2.9.2, mise 2026.9.18, rust 1.98.1, actionlint 1.7.12,
@@ -28,18 +29,37 @@ shellcheck 0.11.0, zizmor 1.30.1. Plain `cargo`/`cargo test` — no mbx, no
 nextest (§3.3.3); default features only (§3.3.4); `rustfmt.toml` and
 `.cargo/config.toml` honored automatically (§3.3.5–6).
 
+## Hand-maintained workflows (re-apply procedure)
+
+`docs/workflows/macos.yml` (jobs `macos` on `macos-15`, `release` matrixed
+over `macos-15` + `ubuntu-24.04`) and `docs/workflows/audit.yml` (job
+`audit`) cannot live inside velnor's whole-tree-owned `.github/`: the
+`plan` job's generate check diffs `.github` against a fresh
+`velnor-actions generate`, so velnor-owned files cannot carry these jobs.
+After every `velnor-actions generate`, copy both files to
+`.github/workflows/macos.yml` and `.github/workflows/audit.yml`
+respectively, then run the required-check migration below. Until velnor
+grows a macOS-runner, release-build, and consumer-audit story, dropping
+either file means explicitly reduced coverage — record the choice.
+
 ## Required-check migration (human admin)
 
-Branch protection must require **both**:
+Branch protection must require **all four**:
 
 - `Required` — the `required` job in `ci.yml` (sole gate for this workflow).
 - `audit` — the existing audit gate (`docs/AUDIT_GATE.md`); velnor has no
   consumer-side deny/audit equivalent, so it stays a separate required check.
+- `macos` — the `macos` job from the re-applied `macos.yml` (Apple Silicon
+  clippy + tests over the cfg-gated macOS backends).
+- `release` — the `release` job from the re-applied `macos.yml`
+  (`cargo build --release` on macOS + Linux; neither velnor's Linux job
+  set nor the `macos` job builds release).
 
 Procedure (§1 Step 6): merge so `ci.yml` exists on `main`, let one run
 complete so the `Required` check appears
 (`gh run list --workflow ci.yml --branch main`), then in branch protection
-require `Required` (and keep `audit`). The admin step cannot be automated.
+require `Required` (and keep `audit`, `macos`, `release`). The admin step
+cannot be automated.
 
 ## Why a macOS job (§3.3.2)
 
