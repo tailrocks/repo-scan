@@ -1531,15 +1531,8 @@ impl TursoStore {
                 return Err(Error::Store(format!("unknown task kind: {kind}")));
             }
         }
-        self.claim_tasks_in_generation_inner(
-            generation,
-            epoch,
-            limit,
-            ttl_ms,
-            now_ms,
-            Some(kinds),
-        )
-        .await
+        self.claim_tasks_in_generation_inner(generation, epoch, limit, ttl_ms, now_ms, Some(kinds))
+            .await
     }
 
     /// Shared generation-scoped claim body. `Some(kinds)` restricts the
@@ -1573,9 +1566,8 @@ impl TursoStore {
             // while directory enumeration continues in parallel/interleaved.
             let kind_predicate = match kinds {
                 Some(kinds) => {
-                    let kind_params: Vec<String> = (0..kinds.len())
-                        .map(|i| format!("?{}", i + 3))
-                        .collect();
+                    let kind_params: Vec<String> =
+                        (0..kinds.len()).map(|i| format!("?{}", i + 3)).collect();
                     format!("AND kind IN ({})", kind_params.join(", "))
                 }
                 None => String::new(),
