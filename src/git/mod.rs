@@ -709,7 +709,7 @@ impl GixInspector {
         evidence.push(format!(".git entry: {dot_git_kind}"));
         if dot_git_kind == "file" {
             match read_gitdir_pointer(&dot_git) {
-                Some(target) => evidence.push(format!("gitdir pointer: {target}")),
+                Some(target) => evidence.push(format!("gitdir pointer: {}", target.display())),
                 None => evidence.push("gitdir pointer: unparseable".to_string()),
             }
         }
@@ -1076,15 +1076,17 @@ impl GixInspector {
         if !exists || depth == 4 {
             return;
         }
-        // Byte-capped: giant, special, or racing files yield no text, so
+        // Byte-capped: giant, special, or racing files yield no bytes, so
         // no include paths are followed from them — never an unbounded
-        // read, never a `/dev/zero`/FIFO hang.
-        let Some(text) = read_bounded_string(path, MAX_GIT_CONTROL_BYTES) else {
+        // read, never a `/dev/zero`/FIFO hang. Byte-exact throughout, so
+        // non-UTF-8 include spellings resolve exactly (unix `OsStrExt`),
+        // never lossy-mangled.
+        let Some(bytes) = read_bounded_bytes(path, MAX_GIT_CONTROL_BYTES) else {
             return;
         };
         let base = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-        for target in scan_include_paths(&text) {
-            let resolved = resolve_include_path(&target, base);
+        for target in scan_include_paths_bytes(&bytes) {
+            let resolved = resolve_include_path_bytes(&target, base);
             self.collect_config_deps(&resolved, true, depth + 1, seen, out);
         }
     }
@@ -1396,14 +1398,18 @@ fn looks_like_git_dir(path: &std::path::Path) -> bool {
 }
 
 /// Read a `.git` pointer file's `gitdir: <target>` line, if well-formed.
-fn read_gitdir_pointer(path: &std::path::Path) -> Option<String> {
-    let text = read_bounded_string(path, MAX_GITDIR_POINTER_BYTES)?;
-    let line = text.lines().next()?;
-    let target = line.strip_prefix("gitdir:")?.trim();
+/// Byte-exact: the target is a path, so non-UTF-8 spellings resolve
+/// exactly via [`os_str_from_bytes`] (unix `OsStrExt`, same pattern as
+/// `fallback::common_dir_for`), never lossy-mangled. Callers render
+/// ASCII identically through `display()`.
+fn read_gitdir_pointer(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let raw = read_bounded_bytes(path, MAX_GITDIR_POINTER_BYTES)?;
+    let line = raw.split(|b| *b == b'\n').next().unwrap_or_default();
+    let target = line.strip_prefix(b"gitdir:")?.trim_ascii();
     if target.is_empty() {
         return None;
     }
-    Some(target.to_string())
+    Some(std::path::PathBuf::from(os_str_from_bytes(target)))
 }
 
 /// `head:<hex|unborn|unknown>` fingerprint for instability detection.
@@ -1443,40 +1449,171 @@ fn index_fingerprint(repo: &gix::Repository) -> String {
 }
 
 /// Narrow scan for `path = ...` values under `[include]`/`[includeIf]`.
-/// Scans the continuation-joined text PLUS the original physical lines
+/// Scans the continuation-joined bytes PLUS the original physical lines
 /// (deduped): the joined leg sees the values git loads through `\` +
 /// newline, the unjoined leg keeps every physical line git parses
 /// without joining (comments, section headers) visible — a join-only
 /// scan would hide a `path = ...` line glued onto a preceding `\`-ended
 /// comment while git still loads it. Over-following is the safe
 /// direction (extra candidates only add evidence / refusal).
-fn scan_include_paths(config_text: &str) -> Vec<String> {
-    let joined = join_continuations(config_text);
+/// Byte-exact: same matching as the retired `str` scan, over raw bytes,
+/// so non-UTF-8 include spellings survive to path resolution.
+fn scan_include_paths_bytes(config: &[u8]) -> Vec<Vec<u8>> {
+    let joined = join_continuations_bytes(config);
     let mut out = Vec::new();
-    for text in [&joined[..], config_text] {
+    for text in [&joined[..], config] {
         let mut in_include = false;
-        for raw_line in text.lines() {
-            let line = strip_bom(raw_line).trim();
-            if line.is_empty() || line.starts_with(['#', ';']) {
+        for raw_line in text.split(|b| *b == b'\n') {
+            let line = strip_bom_bytes(raw_line).trim_ascii();
+            if line.is_empty() || matches!(line.first(), Some(b'#') | Some(b';')) {
                 continue;
             }
-            if line.starts_with('[') {
-                let section = line.to_lowercase();
-                in_include = section == "[include]" || section.starts_with("[includeif ");
+            if line.first() == Some(&b'[') {
+                in_include = line.eq_ignore_ascii_case(b"[include]")
+                    || (line.len() >= b"[includeif ".len()
+                        && line[..b"[includeif ".len()].eq_ignore_ascii_case(b"[includeif "));
                 continue;
             }
             if !in_include {
                 continue;
             }
-            if let Some((key, value)) = line.split_once('=') {
-                if key.trim().eq_ignore_ascii_case("path") {
-                    for candidate in include_path_candidates(value) {
+            if let Some(eq) = line.iter().position(|b| *b == b'=') {
+                if line[..eq].trim_ascii().eq_ignore_ascii_case(b"path") {
+                    for candidate in include_path_candidates_bytes(line[eq + 1..].trim_ascii()) {
                         if !out.contains(&candidate) {
                             out.push(candidate);
                         }
                     }
                 }
             }
+        }
+    }
+    out
+}
+
+/// Byte twin of [`join_continuations`]: identical `\`-before-newline
+/// joining (parity rule, `\r\n` breaks, `\`-at-EOF drop), over raw
+/// bytes, returning raw bytes.
+fn join_continuations_bytes(config: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(config.len());
+    let mut i = 0;
+    while i < config.len() {
+        if config[i] != b'\\' {
+            out.push(config[i]);
+            i += 1;
+            continue;
+        }
+        let mut run_end = i;
+        while run_end < config.len() && config[run_end] == b'\\' {
+            run_end += 1;
+        }
+        let run = run_end - i;
+        let mut break_end = run_end;
+        if break_end < config.len() && config[break_end] == b'\r' {
+            break_end += 1;
+        }
+        if break_end < config.len() && config[break_end] == b'\n' {
+            out.extend(std::iter::repeat_n(b'\\', run - run % 2));
+            if run % 2 == 0 {
+                out.extend_from_slice(&config[run_end..=break_end]);
+            }
+            i = break_end + 1;
+        } else if run_end == config.len() {
+            out.extend(std::iter::repeat_n(b'\\', run - run % 2));
+            i = run_end;
+        } else {
+            out.extend(std::iter::repeat_n(b'\\', run));
+            i = run_end;
+        }
+    }
+    out
+}
+
+/// Byte twin of [`strip_bom`]: strips a leading UTF-8 BOM per line.
+fn strip_bom_bytes(line: &[u8]) -> &[u8] {
+    line.strip_prefix(b"\xef\xbb\xbf").unwrap_or(line)
+}
+
+/// Byte twin of [`strip_git_comment`]: `;`/`#` outside double quotes
+/// ends the value; a backslash escapes the next byte.
+fn strip_git_comment_bytes(value: &[u8]) -> &[u8] {
+    let mut in_quotes = false;
+    let mut i = 0;
+    while i < value.len() {
+        match value[i] {
+            b'\\' => i += 2,
+            b'"' => {
+                in_quotes = !in_quotes;
+                i += 1;
+            }
+            b';' | b'#' if !in_quotes => return &value[..i],
+            _ => i += 1,
+        }
+    }
+    value
+}
+
+/// Byte twin of [`unescape_git_value`]: drop `"` chars, map `\\` `\"`
+/// `\n` `\t` `\b`; anything else (or a trailing lone `\`) is `None`.
+fn unescape_git_value_bytes(value: &[u8]) -> Option<Vec<u8>> {
+    if !value.contains(&b'"') && !value.contains(&b'\\') {
+        return Some(value.to_vec());
+    }
+    let mut out = Vec::with_capacity(value.len());
+    let mut i = 0;
+    while i < value.len() {
+        match value[i] {
+            b'"' => {
+                i += 1;
+            }
+            b'\\' => {
+                i += 1;
+                match value.get(i) {
+                    Some(b'n') => out.push(b'\n'),
+                    Some(b't') => out.push(b'\t'),
+                    Some(b'b') => out.push(0x08),
+                    Some(b'"') => out.push(b'"'),
+                    Some(b'\\') => out.push(b'\\'),
+                    _ => return None,
+                }
+                i += 1;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Byte twin of [`include_path_candidates`]: the legacy raw parse plus
+/// the git-normalized parse when they differ (same both-legs rationale).
+fn include_path_candidates_bytes(raw_value: &[u8]) -> Vec<Vec<u8>> {
+    // Raw leg: trim, strip `"` chars from both ends, trim again (mirrors
+    // the `str` twin's `trim().trim_matches('"').trim()`).
+    let trimmed = raw_value.trim_ascii();
+    let stripped = trimmed
+        .iter()
+        .position(|b| *b != b'"')
+        .map(|start| {
+            let end = trimmed
+                .iter()
+                .rposition(|b| *b != b'"')
+                .map_or(start, |end| end + 1);
+            &trimmed[start..end]
+        })
+        .unwrap_or(&[][..]);
+    let raw = stripped.trim_ascii().to_vec();
+    let mut out = Vec::with_capacity(2);
+    if !raw.is_empty() {
+        out.push(raw.clone());
+    }
+    let trimmed = raw_value.trim_ascii();
+    let normalized = unescape_git_value_bytes(strip_git_comment_bytes(trimmed).trim_ascii());
+    if let Some(normalized) = normalized {
+        if !normalized.is_empty() && normalized != raw && !out.contains(&normalized) {
+            out.push(normalized);
         }
     }
     out
@@ -2082,12 +2219,20 @@ fn scan_modules_tree_with_includes(modules_dir: &std::path::Path, depth: u8) -> 
 /// Resolve an include path the way git does: `~/` against HOME, relative
 /// against the including file's directory, absolute as-is.
 fn resolve_include_path(target: &str, base: &std::path::Path) -> std::path::PathBuf {
-    if let Some(rest) = target.strip_prefix("~/") {
+    resolve_include_path_bytes(target.as_bytes(), base)
+}
+
+/// Byte-exact include-path resolution: `~/` against HOME, relative
+/// against the including file's directory, absolute as-is — with the
+/// target carried as bytes into the path (unix `OsStrExt` via
+/// [`os_str_from_bytes`]), so non-UTF-8 spellings resolve exactly.
+fn resolve_include_path_bytes(target: &[u8], base: &std::path::Path) -> std::path::PathBuf {
+    if let Some(rest) = target.strip_prefix(b"~/") {
         if let Ok(home) = std::env::var("HOME") {
-            return std::path::Path::new(&home).join(rest);
+            return std::path::Path::new(&home).join(os_str_from_bytes(rest));
         }
     }
-    let path = std::path::Path::new(target);
+    let path = std::path::Path::new(os_str_from_bytes(target));
     if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -2096,7 +2241,7 @@ fn resolve_include_path(target: &str, base: &std::path::Path) -> std::path::Path
 }
 
 /// Lossless bytes-to-`OsStr` on unix; lossy fallback elsewhere.
-fn os_str_from_bytes(bytes: &[u8]) -> &std::ffi::OsStr {
+pub fn os_str_from_bytes(bytes: &[u8]) -> &std::ffi::OsStr {
     #[cfg(unix)]
     {
         std::os::unix::ffi::OsStrExt::from_bytes(bytes)

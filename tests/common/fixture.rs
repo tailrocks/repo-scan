@@ -42,55 +42,8 @@ fn null_device() -> &'static str {
     "NUL"
 }
 
-/// Run `git` in `dir` with the hermetic environment. Returns stdout; panics
-/// with command + status + stderr on failure.
-pub fn git(dir: &Path, args: &[&str]) -> Vec<u8> {
-    let mut cmd = Command::new("git");
-    cmd.current_dir(dir)
-        .env("GIT_CONFIG_GLOBAL", null_device())
-        .env("GIT_CONFIG_SYSTEM", null_device())
-        .env("GIT_AUTHOR_NAME", "repo-scan-fixture")
-        .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
-        .env("GIT_COMMITTER_NAME", "repo-scan-fixture")
-        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .arg("-c")
-        .arg("user.name=repo-scan-fixture")
-        .arg("-c")
-        .arg("user.email=fixture@example.invalid")
-        .arg("-c")
-        .arg("init.defaultBranch=main")
-        .arg("-c")
-        .arg("commit.gpgsign=false")
-        .arg("-c")
-        .arg("maintenance.auto=false")
-        .arg("-c")
-        .arg("gc.autoDetach=false")
-        .arg("-c")
-        .arg("protocol.file.allow=always")
-        .args(args);
-    let output = cmd
-        .output()
-        .unwrap_or_else(|e| panic!("spawn git {args:?} in {}: {e}", dir.display()));
-    assert!(
-        output.status.success(),
-        "git {args:?} in {} failed ({}): {}",
-        dir.display(),
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output.stdout
-}
-
-/// Run `git` and return trimmed stdout as a string.
-pub fn git_str(dir: &Path, args: &[&str]) -> String {
-    String::from_utf8_lossy(&git(dir, args)).trim().to_owned()
-}
-
-/// Run `git` with byte-exact args (non-UTF-8 refnames/paths). Same
-/// hermetic env as [`git`]; returns raw stdout. Unix-only.
-#[cfg(unix)]
-pub fn git_os(dir: &Path, args: &[&std::ffi::OsStr]) -> Vec<u8> {
+/// Base `git` command with the hermetic environment (no subcommand yet).
+fn git_cmd(dir: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", null_device())
@@ -114,6 +67,49 @@ pub fn git_os(dir: &Path, args: &[&std::ffi::OsStr]) -> Vec<u8> {
         .arg("gc.autoDetach=false")
         .arg("-c")
         .arg("protocol.file.allow=always");
+    cmd
+}
+
+/// Run `git` in `dir` with the hermetic environment. Returns stdout; panics
+/// with command + status + stderr on failure.
+pub fn git(dir: &Path, args: &[&str]) -> Vec<u8> {
+    let output = git_output(dir, args);
+    assert!(
+        output.status.success(),
+        "git {args:?} in {} failed ({}): {}",
+        dir.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+/// Run `git` in `dir` with the hermetic environment; return raw output
+/// without asserting success. Reference oracle for negative cases
+/// (installed git must fail there too).
+pub fn git_output(dir: &Path, args: &[&str]) -> std::process::Output {
+    let mut cmd = git_cmd(dir);
+    cmd.args(args);
+    cmd.output()
+        .unwrap_or_else(|e| panic!("spawn git {args:?} in {}: {e}", dir.display()))
+}
+
+/// True when installed git runs `args` in `dir` successfully (same
+/// hermetic environment as [`git`]).
+pub fn git_succeeds(dir: &Path, args: &[&str]) -> bool {
+    git_output(dir, args).status.success()
+}
+
+/// Run `git` and return trimmed stdout as a string.
+pub fn git_str(dir: &Path, args: &[&str]) -> String {
+    String::from_utf8_lossy(&git(dir, args)).trim().to_owned()
+}
+
+/// Run `git` with byte-exact args (non-UTF-8 refnames/paths). Same
+/// hermetic env as [`git`]; returns raw stdout. Unix-only.
+#[cfg(unix)]
+pub fn git_os(dir: &Path, args: &[&std::ffi::OsStr]) -> Vec<u8> {
+    let mut cmd = git_cmd(dir);
     for arg in args {
         cmd.arg(arg);
     }
@@ -543,6 +539,117 @@ pub fn conflict_clone(parent: &Path, name: &str) -> PathBuf {
     );
     assert!(unmerged.contains("file.txt") && unmerged.contains("file2.txt"));
     dir
+}
+
+/// Clone whose `main` tracks `origin/main` through the default fetch
+/// refspec: the tracking ref is created offline (`update-ref`, no fetch)
+/// and the `branch.main` stanza is written explicitly. Returns the repo
+/// root. (Step 10 upstream tests.)
+pub fn tracking_clone(parent: &Path, name: &str) -> PathBuf {
+    let dir = normal_clone(parent, name);
+    let head = git_str(&dir, &["rev-parse", "HEAD"]);
+    git(&dir, &["update-ref", "refs/remotes/origin/main", &head]);
+    git(&dir, &["config", "branch.main.remote", "origin"]);
+    git(&dir, &["config", "branch.main.merge", "refs/heads/main"]);
+    dir
+}
+
+/// Clone whose `main` tracks through a rewritten (non-default) fetch
+/// refspec `+refs/heads/*:refs/custom/*`, with the tracking ref created
+/// offline at the custom location. Returns the repo root.
+pub fn custom_fetch_clone(parent: &Path, name: &str) -> PathBuf {
+    let dir = normal_clone(parent, name);
+    let head = git_str(&dir, &["rev-parse", "HEAD"]);
+    git(
+        &dir,
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/custom/*",
+        ],
+    );
+    git(&dir, &["update-ref", "refs/custom/main", &head]);
+    git(&dir, &["config", "branch.main.remote", "origin"]);
+    git(&dir, &["config", "branch.main.merge", "refs/heads/main"]);
+    dir
+}
+
+/// Clone whose `main` tracks a local branch (`remote = .`). Returns the
+/// repo root.
+pub fn local_upstream_clone(parent: &Path, name: &str) -> PathBuf {
+    let dir = normal_clone(parent, name);
+    git(&dir, &["branch", "other"]);
+    git(&dir, &["config", "branch.main.remote", "."]);
+    git(&dir, &["config", "branch.main.merge", "refs/heads/other"]);
+    dir
+}
+
+/// Clone whose `branch.main` stanza lives in an included file
+/// (`.git/extra.inc`, via `[include] path`), with the tracking ref
+/// created offline. Returns the repo root.
+pub fn include_upstream_clone(parent: &Path, name: &str) -> PathBuf {
+    let dir = normal_clone(parent, name);
+    let head = git_str(&dir, &["rev-parse", "HEAD"]);
+    git(&dir, &["update-ref", "refs/remotes/origin/main", &head]);
+    private_write_0600(
+        &dir.join(".git/extra.inc"),
+        b"[branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main\n",
+    )
+    .unwrap();
+    git(&dir, &["config", "include.path", "extra.inc"]);
+    dir
+}
+
+/// Main repo plus one linked worktree on branch `wtbranch`, whose
+/// tracking stanza lives ONLY in the linked worktree's own
+/// `config.worktree` (gated by `extensions.worktreeConfig` in the common
+/// config), with the tracking ref created offline. Returns
+/// `(main_repo, worktree)`.
+pub fn tracking_worktree(parent: &Path) -> (PathBuf, PathBuf) {
+    let main = normal_clone(parent, "wtmain");
+    let wt = parent.join("wtlink");
+    let wt_arg = wt.to_string_lossy().into_owned();
+    git(&main, &["worktree", "add", "-b", "wtbranch", &wt_arg]);
+    let head = git_str(&main, &["rev-parse", "HEAD"]);
+    git(&main, &["update-ref", "refs/remotes/origin/main", &head]);
+    git(&main, &["config", "extensions.worktreeConfig", "true"]);
+    let wt_gitdir = PathBuf::from(git_str(&wt, &["rev-parse", "--absolute-git-dir"]));
+    private_write_0600(
+        &wt_gitdir.join("config.worktree"),
+        b"[branch \"wtbranch\"]\n\tremote = origin\n\tmerge = refs/heads/main\n",
+    )
+    .unwrap();
+    (main, wt)
+}
+
+/// [`non_utf8_branch_repo`] plus tracking: `branch.<hostile>` tracks
+/// `origin/main` (stanza written with byte-exact args, tracking ref
+/// created offline). Returns `(repo, full_refname_bytes)`. Unix-only.
+#[cfg(unix)]
+pub fn non_utf8_tracking_repo(parent: &Path, name: &str) -> (PathBuf, Vec<u8>) {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStringExt;
+    let (dir, refname) = non_utf8_branch_repo(parent, name);
+    let head = git_str(&dir, &["rev-parse", "HEAD"]);
+    git(&dir, &["update-ref", "refs/remotes/origin/main", &head]);
+    let short = refname
+        .strip_prefix(b"refs/heads/")
+        .expect("hostile branch under refs/heads")
+        .to_vec();
+    for (suffix, value) in [
+        (b".remote".as_slice(), "origin"),
+        (b".merge".as_slice(), "refs/heads/main"),
+    ] {
+        let mut key = b"branch.".to_vec();
+        key.extend_from_slice(&short);
+        key.extend_from_slice(suffix);
+        let key = std::ffi::OsString::from_vec(key);
+        git_os(
+            &dir,
+            &[OsStr::new("config"), key.as_os_str(), OsStr::new(value)],
+        );
+    }
+    (dir, refname)
 }
 
 /// Read a file to string; panics with the path on failure.

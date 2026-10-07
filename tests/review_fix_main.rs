@@ -553,6 +553,9 @@ fn r16_refs_submodules_snapshot() {
     fixture::git(&repo, &["remote", "set-url", "origin", URL_A]);
     fixture::git(&repo, &["config", "branch.main.remote", "origin"]);
     fixture::git(&repo, &["config", "branch.main.merge", "refs/heads/main"]);
+    // Real tracking ref: without it installed git fails `@{u}` too, and
+    // the scanner (correctly) stores no upstream.
+    fixture::git(&repo, &["update-ref", "refs/remotes/origin/main", "main"]);
     let state = tmp.path().join("state");
     let rep = tmp.path().join("rep.json");
     let out = scan(&state, URL_A, &[&root], &rep, &["--status", "summary"]);
@@ -565,7 +568,7 @@ fn r16_refs_submodules_snapshot() {
         .expect("main branch");
     assert_eq!(
         main["upstream"]["value"].as_str(),
-        Some("origin/main"),
+        Some("refs/remotes/origin/main"),
         "upstream tracked: {main:?}"
     );
 

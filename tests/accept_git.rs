@@ -749,6 +749,229 @@ fn read01_scan_leaves_repos_and_locks_untouched() {
     );
 }
 
+/// Find one branch row by full ref name within a repository.
+fn branch_named<'a>(report: &'a Value, repo_id: &str, name: &str) -> &'a Value {
+    branches_of(report, repo_id)
+        .into_iter()
+        .find(|b| b["name"]["value"].as_str() == Some(name))
+        .unwrap_or_else(|| panic!("branch {name} for {repo_id}"))
+}
+
+/// A rewritten (non-default) fetch refspec resolves to the non-default
+/// full comparison ref, exactly as installed git spells it (Step 10).
+#[test]
+fn upstream10_custom_fetch_refspec_resolves_full_ref() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("ws");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    let repo = fixture::custom_fetch_clone(&root, "custom");
+    // Independent reference: installed git's own upstream spelling.
+    let expected = fixture::git_str(
+        &repo,
+        &["rev-parse", "--symbolic-full-name", "main@{upstream}"],
+    );
+    assert_eq!(expected, "refs/custom/main");
+    let state = dir.path().join("state");
+    let report_path = dir.path().join("rep.json");
+    let out = scan(&root, &state, &report_path, &["--status", "metadata"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let report = read_report(&report_path);
+    let paths = path_map(&report);
+    let repo_row = repo_by_path(&report, &paths, "custom");
+    assert_eq!(repo_row["match"].as_str(), Some("confirmed"));
+    let main = branch_named(&report, repo_id(repo_row), "refs/heads/main");
+    assert_eq!(main["upstream"]["encoding"].as_str(), Some("utf8"));
+    assert_eq!(
+        main["upstream"]["value"].as_str(),
+        Some(expected.as_str()),
+        "custom fetch destination, not a remote/leaf guess"
+    );
+}
+
+/// A local upstream (`remote = .`) resolves to the local merge ref itself
+/// (Step 10).
+#[test]
+fn upstream10_local_dot_resolves_merge_ref() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("ws");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    let repo = fixture::local_upstream_clone(&root, "local");
+    let expected = fixture::git_str(
+        &repo,
+        &["rev-parse", "--symbolic-full-name", "main@{upstream}"],
+    );
+    assert_eq!(expected, "refs/heads/other");
+    let state = dir.path().join("state");
+    let report_path = dir.path().join("rep.json");
+    let out = scan(&root, &state, &report_path, &["--status", "metadata"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let report = read_report(&report_path);
+    let paths = path_map(&report);
+    let repo_row = repo_by_path(&report, &paths, "local");
+    assert_eq!(repo_row["match"].as_str(), Some("confirmed"));
+    let main = branch_named(&report, repo_id(repo_row), "refs/heads/main");
+    assert_eq!(main["upstream"]["value"].as_str(), Some(expected.as_str()));
+}
+
+/// Branch stanzas living in an `include.path` file resolve (Step 10).
+#[test]
+fn upstream10_include_file_stanzas_resolve() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("ws");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    let repo = fixture::include_upstream_clone(&root, "included");
+    let expected = fixture::git_str(
+        &repo,
+        &["rev-parse", "--symbolic-full-name", "main@{upstream}"],
+    );
+    assert_eq!(expected, "refs/remotes/origin/main");
+    let state = dir.path().join("state");
+    let report_path = dir.path().join("rep.json");
+    let out = scan(&root, &state, &report_path, &["--status", "metadata"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let report = read_report(&report_path);
+    let paths = path_map(&report);
+    let repo_row = repo_by_path(&report, &paths, "included");
+    assert_eq!(repo_row["match"].as_str(), Some("confirmed"));
+    let main = branch_named(&report, repo_id(repo_row), "refs/heads/main");
+    assert_eq!(main["upstream"]["value"].as_str(), Some(expected.as_str()));
+}
+
+/// Worktree-level branch config (the linked worktree's own
+/// `config.worktree`) resolves for that checkout's branch, while the
+/// main checkout's untracked branch stays null (Step 10).
+#[test]
+fn upstream10_worktree_config_resolves_for_checkout() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("ws");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    let (_main_repo, wt) = fixture::tracking_worktree(&root);
+    // Reference from the linked checkout's own perspective.
+    let expected = fixture::git_str(
+        &wt,
+        &["rev-parse", "--symbolic-full-name", "wtbranch@{upstream}"],
+    );
+    assert_eq!(expected, "refs/remotes/origin/main");
+    let state = dir.path().join("state");
+    let report_path = dir.path().join("rep.json");
+    let out = scan(&root, &state, &report_path, &["--status", "metadata"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let report = read_report(&report_path);
+    let paths = path_map(&report);
+    let repo_row = repo_by_path(&report, &paths, "wtmain");
+    assert_eq!(repo_row["match"].as_str(), Some("confirmed"));
+    let wt_branch = branch_named(&report, repo_id(repo_row), "refs/heads/wtbranch");
+    assert_eq!(
+        wt_branch["upstream"]["value"].as_str(),
+        Some(expected.as_str())
+    );
+    let main_branch = branch_named(&report, repo_id(repo_row), "refs/heads/main");
+    assert!(
+        main_branch["upstream"].is_null(),
+        "untracked main stays null: {}",
+        main_branch["upstream"]
+    );
+}
+
+/// A non-UTF-8 branch with tracking resolves byte-exact: the only
+/// base64-encoded branch row carries the installed-git upstream (Step 10).
+/// Unix-only (raw-byte refnames via packed-refs).
+#[cfg(unix)]
+#[test]
+fn upstream10_non_utf8_branch_resolves_byte_exact() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStringExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("ws");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    let (repo, refname) = fixture::non_utf8_tracking_repo(&root, "bytes");
+    assert!(
+        refname.contains(&0xe9) && refname.contains(&0xff),
+        "fixture must carry raw hostile bytes: {refname:?}"
+    );
+    // Reference: installed git resolves the hostile branch's upstream
+    // (byte-exact argv; no UTF-8 anywhere).
+    let short = refname
+        .strip_prefix(b"refs/heads/")
+        .expect("hostile branch under refs/heads")
+        .to_vec();
+    let mut upstream_arg = short;
+    upstream_arg.extend_from_slice(b"@{upstream}");
+    let upstream_os = std::ffi::OsString::from_vec(upstream_arg);
+    let raw = fixture::git_os(
+        &repo,
+        &[
+            OsStr::new("rev-parse"),
+            OsStr::new("--symbolic-full-name"),
+            upstream_os.as_os_str(),
+        ],
+    );
+    assert_eq!(raw.trim_ascii(), b"refs/remotes/origin/main");
+    let state = dir.path().join("state");
+    let report_path = dir.path().join("rep.json");
+    let out = scan(&root, &state, &report_path, &["--status", "metadata"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let report = read_report(&report_path);
+    let paths = path_map(&report);
+    let repo_row = repo_by_path(&report, &paths, "bytes");
+    assert_eq!(repo_row["match"].as_str(), Some("confirmed"));
+    let hostile: Vec<&Value> = branches_of(&report, repo_id(repo_row))
+        .into_iter()
+        .filter(|b| b["name"]["encoding"].as_str() == Some("base64"))
+        .collect();
+    assert_eq!(hostile.len(), 1, "exactly the hostile branch is base64");
+    assert_eq!(
+        hostile[0]["upstream"]["value"].as_str(),
+        Some("refs/remotes/origin/main")
+    );
+}
+
+/// Unresolvable upstreams yield null, never a guess: a missing remote, a
+/// fetch refspec that maps nothing (destination-less: fetches into
+/// `FETCH_HEAD` only), and a merge target with no tracking ref (Step 10).
+/// Installed git fails all three as well. (A syntactically unparseable
+/// fetch value would also poison remote identity parsing — a separate
+/// lane — so the refspec case uses the valid-but-unmappable shape.)
+#[test]
+fn upstream10_unresolvable_yields_null() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("ws");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    let missing = fixture::tracking_clone(&root, "missing-remote");
+    fixture::git(&missing, &["config", "branch.main.remote", "nonexistent"]);
+    let bad = fixture::tracking_clone(&root, "bad-refspec");
+    fixture::git(&bad, &["config", "remote.origin.fetch", "+refs/heads/main"]);
+    let gone = fixture::tracking_clone(&root, "absent-target");
+    fixture::git(&gone, &["config", "branch.main.merge", "refs/heads/gone"]);
+    // Reference: installed git resolves none of these either.
+    for repo in [&missing, &bad, &gone] {
+        assert!(
+            !fixture::git_succeeds(
+                repo,
+                &["rev-parse", "--symbolic-full-name", "main@{upstream}"]
+            ),
+            "installed git must also fail in {}",
+            repo.display()
+        );
+    }
+    let state = dir.path().join("state");
+    let report_path = dir.path().join("rep.json");
+    let out = scan(&root, &state, &report_path, &["--status", "metadata"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let report = read_report(&report_path);
+    let paths = path_map(&report);
+    for needle in ["missing-remote", "bad-refspec", "absent-target"] {
+        let repo_row = repo_by_path(&report, &paths, needle);
+        assert_eq!(repo_row["match"].as_str(), Some("confirmed"), "{needle}");
+        let main = branch_named(&report, repo_id(repo_row), "refs/heads/main");
+        assert!(
+            main["upstream"].is_null(),
+            "{needle}: unresolvable must be null, got {}",
+            main["upstream"]
+        );
+    }
+}
+
 /// Conflict-only checkout reports `conflicted` with a separate conflict
 /// count (Step 10 case 10): the two unmerged paths never read as staged,
 /// unstaged, dirty, or clean.

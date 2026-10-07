@@ -927,6 +927,82 @@ fn ssh_alias_config_parses_narrowly() {
     assert!(!map.contains_key("second"), "missing hostname ignored");
 }
 
+/// A non-UTF-8 `include.path` spelling reaches `config_dependencies`
+/// byte-exact (no lossy `U+FFFD` mangling), recorded as a missing
+/// include target — installed git tolerates the same config (missing
+/// includes are silently skipped). Unix-only (raw-byte paths).
+#[cfg(unix)]
+#[test]
+fn config_deps_record_non_utf8_include_bytes() {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let Some(git_bin) = git_or_skip() else {
+        eprintln!("skip: no installed git");
+        return;
+    };
+    let scratch = tempfile::tempdir().expect("scratch");
+    let home = scratch.path().join("home");
+    let work = init_with_commit(&git_bin, scratch.path());
+    let config_path = work.join(".git").join("config");
+    let mut config = std::fs::read(&config_path).expect("read config");
+    config.extend_from_slice(b"[include]\n\tpath = bad-\xff.inc\n");
+    repo_scan::privacy::private_write_0600(&config_path, &config).expect("append include");
+    // Reference: installed git still opens the repo (missing include
+    // targets are silently skipped, never fatal).
+    git(&git_bin, &home, &work, &["rev-parse", "HEAD"]);
+
+    let inspector = GixInspector::new();
+    let instance = inspector.open_exact(&work).expect("open");
+    let deps = inspector.config_dependencies(&instance);
+    let expected = work
+        .join(".git")
+        .join(std::ffi::OsString::from_vec(b"bad-\xff.inc".to_vec()));
+    let found = deps
+        .iter()
+        .find(|d| d.path == expected)
+        .unwrap_or_else(|| panic!("byte-exact include dep missing: {deps:?}"));
+    assert!(!found.exists, "target is genuinely missing");
+    assert!(found.via_include);
+    // No lossy twin: the replacement-character spelling must not appear.
+    assert!(
+        !deps.iter().any(|d| d
+            .path
+            .as_os_str()
+            .as_bytes()
+            .windows("�".len())
+            .any(|w| w == "�".as_bytes())),
+        "lossy U+FFFD spelling leaked into deps: {deps:?}"
+    );
+}
+
+/// A `.git` pointer file's ASCII `gitdir:` target keeps its exact
+/// evidence spelling after the byte-exact conversion.
+#[test]
+fn gitdir_pointer_evidence_ascii_stable() {
+    let Some(git_bin) = git_or_skip() else {
+        eprintln!("skip: no installed git");
+        return;
+    };
+    let scratch = tempfile::tempdir().expect("scratch");
+    let work = init_with_commit(&git_bin, scratch.path());
+    let elsewhere = scratch.path().join("elsewhere.git");
+    std::fs::rename(work.join(".git"), &elsewhere).expect("move gitdir");
+    repo_scan::privacy::private_write_0600(
+        &work.join(".git"),
+        format!("gitdir: {}\n", elsewhere.display()).as_bytes(),
+    )
+    .expect("pointer");
+    let inspector = GixInspector::new();
+    let validated = inspector.validate(&work).expect("validate pointer");
+    assert!(
+        validated
+            .evidence
+            .iter()
+            .any(|e| e == &format!("gitdir pointer: {}", elsewhere.display())),
+        "ASCII pointer evidence unchanged: {:?}",
+        validated.evidence
+    );
+}
+
 /// Round-2 F-note1: every status observation declares the isolated
 /// config scope it was inspected under (spec "declare what was
 /// inspected"), so readers never mistake the counts for operator-`git

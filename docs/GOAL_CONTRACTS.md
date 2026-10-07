@@ -160,3 +160,24 @@ fixtures/acceptance tests, corpus + gates.
   subprocesses; scope reuse by bare policy name (stale-root reuse bug).
 - `src/main.rs` (11,318 lines) is the shared-contention file: only the
   coordinator edits it until the planned small module splits land.
+
+## D10. Upstream storage shape (Step 10, Wave1c-3)
+
+`branch.upstream` (catalog `refs.upstream` blob, report `Branch.upstream`,
+`branch_batch` event `upstream`/`upstream_hex`) stores the RESOLVED full
+local comparison ref — what `git rev-parse --symbolic-full-name '@{u}'`
+prints when the target exists (`refs/remotes/<remote>/…`, custom fetch
+destinations, or the local merge ref for `remote = .`) — NOT the old
+`remote/leaf` short guess. Rationale: only the full refname identifies
+the comparison target under custom fetch refspecs; no consumer
+constrains the shape (blob storage, shape-agnostic validation, branch
+comparison unimplemented). Resolution is Git-compatible (last-wins
+singles, first-wins `branch.merge`, first-match fetch mapping, no
+fallback, existence-checked, includes + per-checkout `config.worktree`
+under effective `extensions.worktreeConfig`); unresolvable is null,
+never fabricated. Consequence: the `tests/review_fix_main.rs` R16 pin
+`origin/main` must move to `refs/remotes/origin/main` (coordinator-owned
+file; Wave1c-3 may not touch it).
+Worktree config is read per checkout gitdir
+(`<gitdir>/config.worktree`), not from the common dir — probed against
+git 2.56.0 (a linked worktree ignores the common `config.worktree`).

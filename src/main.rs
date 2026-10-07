@@ -8116,91 +8116,755 @@ async fn persist_probe(
     Ok(())
 }
 
-/// Upstream (`remote/branch`) per local branch from the repo config (R16):
-/// `[branch "X"]` with `remote = R` and `merge = refs/heads/Y` means local
-/// `X` tracks `R/Y`. Best-effort INI scan: only `[branch "<name>"]`
-/// sections are read (first `remote`/`merge` each); anything unparseable
-/// yields no upstreams rather than fake ones.
-fn load_branch_upstreams(common_dir: &Path) -> HashMap<String, Vec<u8>> {
-    fn flush(
-        branch: &Option<String>,
-        remote: &Option<String>,
-        merge: &Option<String>,
-        out: &mut HashMap<String, Vec<u8>>,
-    ) {
-        if let (Some(name), Some(remote_name), Some(merge_ref)) = (branch, remote, merge) {
-            let leaf = merge_ref.strip_prefix("refs/heads/").unwrap_or(merge_ref);
-            out.entry(name.clone())
-                .or_insert_with(|| format!("{remote_name}/{leaf}").into_bytes());
+/// Upstream (full local comparison ref) per local branch (R16, Step 10):
+/// `[branch "X"]` with `remote = R` and `merge = M` resolves through the
+/// remote's actual fetch refspecs to the full ref git's `@{upstream}`
+/// names (e.g. `refs/remotes/origin/main`, or `refs/custom/main` under a
+/// custom fetch refspec) — never a fabricated `remote/leaf` guess.
+///
+/// Effective config = `common_dir/config` with `include`/`includeIf`
+/// chains expanded inline (bounded depth, cycle-safe, byte-capped),
+/// overlaid per checkout by that checkout's own `config.worktree` when
+/// the effective `extensions.worktreeConfig` is true. Every rule below
+/// was probed against installed git 2.56.0: last-wins single values,
+/// first-wins `branch.merge`, first-match-wins fetch mapping with no
+/// fallback, `remote = .` resolving locally, case-sensitive
+/// remote/subsection lookup, and existence of the mapped ref (absent
+/// targets yield no upstream, exactly like git's `rev-parse
+/// --symbolic-full-name '@{u}'` failing there).
+///
+/// Fail-closed throughout: unparseable lines stop that file with earlier
+/// values kept (matching git's "earlier ones keep working"), missing
+/// remotes/refspecs/targets yield no entry, and divergent per-checkout
+/// overlays drop the branch rather than guess. Read-only and offline:
+/// bounded regular-file reads only, no spawns.
+fn load_branch_upstreams(
+    instance: &git::GitInstance,
+    checkouts: &[store::CheckoutRow],
+    refs: &[git::RefObservation],
+) -> HashMap<Vec<u8>, Vec<u8>> {
+    let known: HashSet<&[u8]> = refs.iter().map(|r| r.name.as_slice()).collect();
+    // Checkout git dirs in row order, deduplicated; the store instance
+    // dir covers the degenerate no-checkout case.
+    let mut git_dirs: Vec<std::path::PathBuf> = Vec::new();
+    for checkout in checkouts {
+        let dir = config::path_from_bytes(checkout.git_path.clone());
+        if !git_dirs.contains(&dir) {
+            git_dirs.push(dir);
         }
     }
-
-    let mut out = HashMap::new();
-    // Byte-capped, regular-file-only read (PATH-GIT-07): a giant,
-    // special, or swapped control file yields no upstreams instead of
-    // an unbounded allocation or a blocked scan.
-    let bytes =
-        match git::read_bounded_bytes(&common_dir.join("config"), git::MAX_GIT_CONTROL_BYTES) {
-            Some(bytes) => bytes,
-            None => return out,
-        };
-    let mut branch: Option<String> = None;
-    let mut remote: Option<String> = None;
-    let mut merge: Option<String> = None;
-    for raw_line in String::from_utf8_lossy(&bytes).lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+    if git_dirs.is_empty() {
+        git_dirs.push(instance.git_dir.clone());
+    }
+    // Base effective config from the common dir (+ includes). `gitdir:`
+    // conditions match against any checkout git dir (documented at
+    // `include_condition_matches`).
+    let mut base = UpstreamConfig::default();
+    let mut chain = IncludeChain::default();
+    parse_config_tree(
+        &instance.common_dir.join("config"),
+        &mut base,
+        &mut chain,
+        &git_dirs,
+    );
+    let base_map = resolve_all_upstreams(&base, &known);
+    // Worktree overlays apply only under the effective gate (read from
+    // the common scope — a gate inside a worktree file itself never
+    // counts, probed). Each overlay appends after the base, so last-wins
+    // keys resolve to the worktree value while multi-value keys keep
+    // file order (common first, probed).
+    let gate = base
+        .last(b"extensions", b"", b"worktreeconfig")
+        .is_some_and(git::refspec::config_bool_is_true);
+    if !gate {
+        return base_map;
+    }
+    // Per-checkout effective maps. Checkouts without an overlay file
+    // observe the base map; poisoned checkouts (present-but-unreadable
+    // worktree file, where git itself fails) observe nothing.
+    let mut participants: Vec<HashMap<Vec<u8>, Vec<u8>>> = Vec::new();
+    let mut overlay_seen: HashSet<std::path::PathBuf> = HashSet::new();
+    for dir in &git_dirs {
+        let overlay = dir.join("config.worktree");
+        if !overlay_seen.insert(overlay.clone()) {
             continue;
         }
-        if line.starts_with('[') {
-            flush(&branch, &remote, &merge, &mut out);
-            branch = None;
-            remote = None;
-            merge = None;
-            let inner = line
-                .strip_prefix('[')
-                .and_then(|s| s.strip_suffix(']'))
-                .unwrap_or("");
-            let mut parts = inner.splitn(2, char::is_whitespace);
-            if parts
-                .next()
-                .is_some_and(|h| h.eq_ignore_ascii_case("branch"))
-            {
-                if let Some(name) = parts.next() {
-                    let name = name.trim().trim_matches('"').to_string();
-                    if !name.is_empty() {
-                        branch = Some(name);
-                    }
+        if std::fs::symlink_metadata(&overlay).is_err() {
+            // Absent overlay: the checkout observes the base map.
+            // (Duplicates across checkouts are harmless: merging below
+            // is idempotent.)
+            participants.push(base_map.clone());
+        } else if git::read_bounded_bytes(&overlay, git::MAX_GIT_CONTROL_BYTES).is_none() {
+            // Poisoned: directory, link, over-cap, or raced away. git
+            // fails here too, so this checkout contributes nothing.
+        } else {
+            let mut effective = base.clone();
+            let mut overlay_chain = IncludeChain::default();
+            parse_config_tree(
+                &overlay,
+                &mut effective,
+                &mut overlay_chain,
+                std::slice::from_ref(dir),
+            );
+            participants.push(resolve_all_upstreams(&effective, &known));
+        }
+    }
+    // Merge: present wins over absent (union), any divergent present
+    // value drops the branch (fail closed). Deterministic and
+    // order-independent.
+    let mut merged: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    let mut dropped: HashSet<Vec<u8>> = HashSet::new();
+    for map in &participants {
+        for (branch, upstream) in map {
+            if dropped.contains(branch) {
+                continue;
+            }
+            match merged.get(branch) {
+                None => {
+                    merged.insert(branch.clone(), upstream.clone());
+                }
+                Some(prev) if prev == upstream => {}
+                Some(_) => {
+                    merged.remove(branch);
+                    dropped.insert(branch.clone());
                 }
             }
-            continue;
-        }
-        if branch.is_none() {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let value = value.trim().trim_matches('"').to_string();
-        match key.trim().to_ascii_lowercase().as_str() {
-            "remote" if remote.is_none() => {
-                remote = Some(value);
-            }
-            "merge" if merge.is_none() => {
-                merge = Some(value);
-            }
-            _ => {}
         }
     }
-    flush(&branch, &remote, &merge, &mut out);
-    out
+    merged
 }
 
 /// Upstream bytes for one ref, if it is a local branch with config tracking.
-fn upstream_for_ref(upstreams: &HashMap<String, Vec<u8>>, name: &[u8]) -> Option<Vec<u8>> {
-    let name = std::str::from_utf8(name).ok()?;
-    let short = name.strip_prefix("refs/heads/")?;
+/// Byte-exact: non-UTF-8 branch names resolve like any other.
+fn upstream_for_ref(upstreams: &HashMap<Vec<u8>, Vec<u8>>, name: &[u8]) -> Option<Vec<u8>> {
+    let short = name.strip_prefix(b"refs/heads/")?;
     upstreams.get(short).cloned()
+}
+
+/// Maximum include-chain depth followed for upstream resolution (mirrors
+/// `GixInspector::config_dependencies`).
+const UPSTREAM_INCLUDE_MAX_DEPTH: u8 = 4;
+/// Maximum config files read per tree (mirrors the filter-guard scan).
+const UPSTREAM_INCLUDE_MAX_FILES: usize = 256;
+/// Maximum `gitdir:` pattern bytes evaluated (fail closed past it).
+const UPSTREAM_GITDIR_PATTERN_MAX: usize = 1024;
+/// Glob-match step budget per pattern (fail closed past it).
+const UPSTREAM_GLOB_STEP_BUDGET: u64 = 100_000;
+
+/// Bounded include traversal for one config tree: lexical cycle set (no
+/// symlink following anywhere, so no canonicalization for identity —
+/// the depth cap bounds missed aliases) plus a shared file budget.
+#[derive(Default)]
+struct IncludeChain {
+    seen: HashSet<std::path::PathBuf>,
+    files: usize,
+}
+
+/// Ordered config values: `(section, subsection, key)` (section/key
+/// ASCII-lowercased, subsection raw bytes) to values in file order.
+/// Callers pass lowercase section/key literals. Last-wins keys read
+/// [`UpstreamConfig::last`], first-wins [`UpstreamConfig::first`],
+/// ordered multi-values [`UpstreamConfig::all`].
+/// Ordered config values keyed by `(section, subsection, key)`.
+type UpstreamValues = HashMap<(Vec<u8>, Vec<u8>, Vec<u8>), Vec<Vec<u8>>>;
+
+#[derive(Clone, Default)]
+struct UpstreamConfig {
+    values: UpstreamValues,
+}
+
+impl UpstreamConfig {
+    fn push(&mut self, section: &[u8], subsection: &[u8], key: &[u8], value: Vec<u8>) {
+        self.values
+            .entry((
+                section.to_ascii_lowercase(),
+                subsection.to_vec(),
+                key.to_ascii_lowercase(),
+            ))
+            .or_default()
+            .push(value);
+    }
+
+    fn all(&self, section: &[u8], subsection: &[u8], key: &[u8]) -> &[Vec<u8>] {
+        self.values
+            .get(&(section.to_vec(), subsection.to_vec(), key.to_vec()))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    fn last(&self, section: &[u8], subsection: &[u8], key: &[u8]) -> Option<&[u8]> {
+        self.all(section, subsection, key).last().map(Vec::as_slice)
+    }
+
+    fn first(&self, section: &[u8], subsection: &[u8], key: &[u8]) -> Option<&[u8]> {
+        self.all(section, subsection, key)
+            .first()
+            .map(Vec::as_slice)
+    }
+
+    /// Branch names carrying any config, sorted and deduplicated.
+    fn branch_names(&self) -> Vec<&[u8]> {
+        let mut names: Vec<&[u8]> = self
+            .values
+            .keys()
+            .filter(|(section, _, _)| section == b"branch")
+            .map(|(_, subsection, _)| subsection.as_slice())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+}
+
+/// Parse one config tree root (common `config` or a worktree overlay):
+/// a missing or unreadable root contributes nothing (fail closed).
+fn parse_config_tree(
+    path: &std::path::Path,
+    cfg: &mut UpstreamConfig,
+    chain: &mut IncludeChain,
+    git_dirs: &[std::path::PathBuf],
+) {
+    if chain.files >= UPSTREAM_INCLUDE_MAX_FILES {
+        return;
+    }
+    if !chain.seen.insert(path.to_path_buf()) {
+        return;
+    }
+    chain.files += 1;
+    let Some(bytes) = git::read_bounded_bytes(path, git::MAX_GIT_CONTROL_BYTES) else {
+        return;
+    };
+    let base = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    parse_config_bytes(&bytes, cfg, chain, base, git_dirs, 0);
+}
+
+/// Parse one config file's bytes, following includes inline in file
+/// order. Any construct git fatals on (bad header, bad key, bad escape,
+/// content outside a section, NUL bytes, present-but-unreadable include
+/// target) stops the file with earlier values kept — matching git's
+/// "earlier ones keep working". CRLF, trailing comments/junk after `]`,
+/// and valueless keys (empty value) are accepted, all probed.
+fn parse_config_bytes(
+    bytes: &[u8],
+    cfg: &mut UpstreamConfig,
+    chain: &mut IncludeChain,
+    base: &std::path::Path,
+    git_dirs: &[std::path::PathBuf],
+    depth: u8,
+) {
+    // git skips a BOM at file start.
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    let joined = join_config_continuations(bytes);
+    let mut section: Option<(Vec<u8>, Vec<u8>)> = None;
+    for logical in joined.split(|b| *b == b'\n') {
+        let line = logical.strip_suffix(b"\r").unwrap_or(logical).trim_ascii();
+        if line.is_empty() || matches!(line.first(), Some(b'#') | Some(b';')) {
+            continue;
+        }
+        if line.contains(&b'\0') {
+            return;
+        }
+        if line.first() == Some(&b'[') {
+            let Some(header) = parse_config_header(line) else {
+                return;
+            };
+            section = Some(header);
+            continue;
+        }
+        let Some((name, subsection)) = section.as_ref() else {
+            return;
+        };
+        let is_include = name == b"include" && subsection.is_empty();
+        let is_include_if = name == b"includeif" && !subsection.is_empty();
+        let (key, value): (&[u8], Vec<u8>) = match line.iter().position(|b| *b == b'=') {
+            None => (strip_config_comment(line).trim_ascii(), Vec::new()),
+            Some(eq) => {
+                let raw = strip_config_comment(line[eq + 1..].trim_ascii()).trim_ascii();
+                let Some(value) = unescape_config_value(raw) else {
+                    return;
+                };
+                (line[..eq].trim_ascii(), value)
+            }
+        };
+        if key.is_empty() || !key.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'-') {
+            return;
+        }
+        if is_include && key.eq_ignore_ascii_case(b"path") {
+            if follow_config_include(&value, base, cfg, chain, git_dirs, depth) {
+                return;
+            }
+        } else if is_include_if
+            && key.eq_ignore_ascii_case(b"path")
+            && include_condition_matches(subsection, git_dirs)
+            && follow_config_include(&value, base, cfg, chain, git_dirs, depth)
+        {
+            return;
+        } else {
+            cfg.push(name, subsection, key, value);
+        }
+    }
+}
+
+/// Parse a section header line (already trimmed, starts with `[`):
+/// `[name]` (no leading space, probed), `[name.sub]` dotted (probed:
+/// defines the subsection), or `[name "quoted"]` (`]` immediately after
+/// the closing quote, probed). Anything after a bare `]` is ignored
+/// (probed: junk and comments both accepted). `None` = malformed.
+fn parse_config_header(line: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let rest = &line[1..];
+    let mut end = 0;
+    while end < rest.len() && (rest[end].is_ascii_alphanumeric() || rest[end] == b'-') {
+        end += 1;
+    }
+    if end == 0 {
+        return None;
+    }
+    let name = rest[..end].to_ascii_lowercase();
+    let rest = &rest[end..];
+    if rest.first() == Some(&b']') {
+        return Some((name, Vec::new()));
+    }
+    if rest.first() == Some(&b'.') {
+        let after_dot = &rest[1..];
+        let close = after_dot.iter().position(|b| *b == b']')?;
+        let subsection = &after_dot[..close];
+        if subsection.is_empty()
+            || subsection
+                .iter()
+                .any(|b| b.is_ascii_whitespace() || *b == b'"')
+        {
+            return None;
+        }
+        return Some((name, subsection.to_vec()));
+    }
+    let mut indent = 0;
+    while indent < rest.len() && (rest[indent] == b' ' || rest[indent] == b'\t') {
+        indent += 1;
+    }
+    if indent == 0 || indent >= rest.len() || rest[indent] != b'"' {
+        return None;
+    }
+    let inner = &rest[indent + 1..];
+    let mut subsection = Vec::new();
+    let mut next = 0;
+    let mut closed = false;
+    while next < inner.len() {
+        match inner[next] {
+            b'"' => {
+                closed = true;
+                next += 1;
+                break;
+            }
+            b'\\' => {
+                next += 1;
+                match inner.get(next) {
+                    Some(b'n') => subsection.push(b'\n'),
+                    Some(b't') => subsection.push(b'\t'),
+                    Some(b'b') => subsection.push(0x08),
+                    Some(b'"') => subsection.push(b'"'),
+                    Some(b'\\') => subsection.push(b'\\'),
+                    _ => return None,
+                }
+                next += 1;
+            }
+            byte => {
+                subsection.push(byte);
+                next += 1;
+            }
+        }
+    }
+    if !closed || inner[next..].first() != Some(&b']') {
+        return None;
+    }
+    Some((name, subsection))
+}
+
+/// Join git line continuations the way git 2.56.0 parses values: a `\`
+/// IMMEDIATELY before `\n` (or `\r\n`) joins the next line by pure
+/// concatenation (leading whitespace kept, inside and outside quotes);
+/// the parity of a trailing `\` run decides (odd joins, even stays
+/// literal); a trailing `\` at EOF is dropped (odd) or paired (even); a
+/// `\` before anything else stays literal for the escape parser (which
+/// fails the file there exactly as git fatals). Byte port of the
+/// `git::join_continuations` rule-set (private there; this path needs
+/// byte-exact values for non-UTF-8 names).
+fn join_config_continuations(config: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(config.len());
+    let mut i = 0;
+    while i < config.len() {
+        if config[i] != b'\\' {
+            out.push(config[i]);
+            i += 1;
+            continue;
+        }
+        let mut run_end = i;
+        while run_end < config.len() && config[run_end] == b'\\' {
+            run_end += 1;
+        }
+        let run = run_end - i;
+        let mut break_end = run_end;
+        if break_end < config.len() && config[break_end] == b'\r' {
+            break_end += 1;
+        }
+        if break_end < config.len() && config[break_end] == b'\n' {
+            out.extend(std::iter::repeat_n(b'\\', run - run % 2));
+            if run % 2 == 0 {
+                out.extend_from_slice(&config[run_end..=break_end]);
+            }
+            i = break_end + 1;
+        } else if run_end == config.len() {
+            out.extend(std::iter::repeat_n(b'\\', run - run % 2));
+            i = run_end;
+        } else {
+            out.extend(std::iter::repeat_n(b'\\', run));
+            i = run_end;
+        }
+    }
+    out
+}
+
+/// Strip a git trailing comment: `;`/`#` outside double quotes ends the
+/// value (only double quotes protect); a backslash escapes the next
+/// byte. Byte port of the `git::strip_git_comment` rule.
+fn strip_config_comment(value: &[u8]) -> &[u8] {
+    let mut in_quotes = false;
+    let mut i = 0;
+    while i < value.len() {
+        match value[i] {
+            b'\\' => i += 2,
+            b'"' => {
+                in_quotes = !in_quotes;
+                i += 1;
+            }
+            b';' | b'#' if !in_quotes => return &value[..i],
+            _ => i += 1,
+        }
+    }
+    value
+}
+
+/// Resolve git quote grouping + backslash escapes in an already
+/// comment-stripped, trimmed value: drop `"` chars, map `\\` `\"` `\n`
+/// `\t` `\b` (the full set git 2.56.0 accepts — anything else, or a
+/// trailing lone `\`, makes git reject the file, reported here as
+/// `None` so the caller stops the file too). Byte port of the
+/// `git::unescape_git_value` rule.
+fn unescape_config_value(value: &[u8]) -> Option<Vec<u8>> {
+    if !value.contains(&b'"') && !value.contains(&b'\\') {
+        return Some(value.to_vec());
+    }
+    let mut out = Vec::with_capacity(value.len());
+    let mut i = 0;
+    while i < value.len() {
+        match value[i] {
+            b'"' => {
+                i += 1;
+            }
+            b'\\' => {
+                i += 1;
+                match value.get(i) {
+                    Some(b'n') => out.push(b'\n'),
+                    Some(b't') => out.push(b'\t'),
+                    Some(b'b') => out.push(0x08),
+                    Some(b'"') => out.push(b'"'),
+                    Some(b'\\') => out.push(b'\\'),
+                    _ => return None,
+                }
+                i += 1;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Follow one `include.path` value inline (file order). Returns true when
+/// the including file must stop (present-but-unreadable target — git
+/// fatals there). Missing targets are silently skipped (probed), as are
+/// revisits (cycles), depth/file cap overflows, and empty/unresolvable
+/// spellings.
+fn follow_config_include(
+    value: &[u8],
+    base: &std::path::Path,
+    cfg: &mut UpstreamConfig,
+    chain: &mut IncludeChain,
+    git_dirs: &[std::path::PathBuf],
+    depth: u8,
+) -> bool {
+    if value.is_empty() || depth >= UPSTREAM_INCLUDE_MAX_DEPTH {
+        return false;
+    }
+    let Some(target) = resolve_include_target(value, base) else {
+        return false;
+    };
+    if chain.seen.contains(&target) || chain.files >= UPSTREAM_INCLUDE_MAX_FILES {
+        return false;
+    }
+    if std::fs::symlink_metadata(&target).is_err() {
+        return false;
+    }
+    let Some(bytes) = git::read_bounded_bytes(&target, git::MAX_GIT_CONTROL_BYTES) else {
+        return true;
+    };
+    chain.seen.insert(target.clone());
+    chain.files += 1;
+    let child_base = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+    parse_config_bytes(&bytes, cfg, chain, child_base, git_dirs, depth + 1);
+    false
+}
+
+/// Resolve an include target the way git does: `~`/`~/` against HOME
+/// (probed), relative against the including file's directory, absolute
+/// as-is. Byte-exact on unix (a path, never lossy text). No variable
+/// expansion (git does none).
+fn resolve_include_target(value: &[u8], base: &std::path::Path) -> Option<std::path::PathBuf> {
+    if value == b"~" || value.starts_with(b"~/") {
+        let home = std::env::var_os("HOME")?;
+        let mut out = std::path::PathBuf::from(home);
+        if value.len() > 1 {
+            out.push(git::os_str_from_bytes(&value[2..]));
+        }
+        return Some(out);
+    }
+    let path = std::path::Path::new(git::os_str_from_bytes(value));
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        Some(base.join(path))
+    }
+}
+
+/// True when an `includeIf` subsection condition positively matches one of
+/// the candidate git dirs. Only absolute `gitdir:`/`gitdir/i:` patterns
+/// are evaluated (probed git 2.56.0, condition keywords case-sensitive:
+/// `*` never crosses `/`, `?` matches one non-`/` byte, `**` crosses, a
+/// trailing `/` appends `**`, matching runs against both the spelled and
+/// canonicalized dir). Every other condition (`onbranch:`, `hasconfig:`,
+/// unknown keywords, bare sections, relative patterns, over-long
+/// patterns, exhausted match budgets) fails closed to false — its
+/// include is skipped, never misapplied.
+///
+/// Multi-checkout approximation: conditions match when ANY checkout git
+/// dir matches. Single-checkout stores are exact; a `gitdir:` include
+/// that git would apply to only one checkout of a divergent store
+/// over-applies here (its values are still real config bytes, attributed
+/// store-wide like every other shared upstream input).
+fn include_condition_matches(condition: &[u8], git_dirs: &[std::path::PathBuf]) -> bool {
+    let (pattern, ignore_case) = if let Some(pattern) = condition.strip_prefix(b"gitdir:") {
+        (pattern, false)
+    } else if let Some(pattern) = condition.strip_prefix(b"gitdir/i:") {
+        (pattern, true)
+    } else {
+        return false;
+    };
+    if pattern.is_empty()
+        || !pattern.starts_with(b"/")
+        || pattern.len() > UPSTREAM_GITDIR_PATTERN_MAX
+    {
+        return false;
+    }
+    let mut expanded;
+    let mut pattern = pattern;
+    if pattern.ends_with(b"/") {
+        expanded = pattern.to_vec();
+        expanded.extend_from_slice(b"**");
+        pattern = &expanded;
+    }
+    git_dirs.iter().any(|dir| {
+        gitdir_match_forms(dir).iter().any(|form| {
+            let mut memo = HashSet::new();
+            let mut budget = UPSTREAM_GLOB_STEP_BUDGET;
+            glob_match(pattern, form, ignore_case, &mut memo, &mut budget)
+        })
+    })
+}
+
+/// Candidate spellings of one git dir for `gitdir:` matching: the spelled
+/// path plus its canonicalized form when that succeeds (probed: git
+/// matches both, e.g. `/tmp/…` and `/private/tmp/…` on macOS).
+/// Canonicalization is for matching only — no file is read through it.
+fn gitdir_match_forms(dir: &std::path::Path) -> Vec<Vec<u8>> {
+    let mut forms = vec![os_bytes(dir.as_os_str())];
+    if let Ok(canonical) = std::fs::canonicalize(dir) {
+        let bytes = os_bytes(canonical.as_os_str());
+        if !forms.contains(&bytes) {
+            forms.push(bytes);
+        }
+    }
+    forms
+}
+
+/// Match one expanded `gitdir:` pattern against one dir spelling: `**`
+/// crosses `/`, `*`/`?` never do, `\` escapes the next byte, and `[`
+/// classes are unsupported (fail closed). Bounded by a step budget plus
+/// a visited-state memo (adversarial patterns cannot hang the scan).
+fn glob_match(
+    pattern: &[u8],
+    value: &[u8],
+    ignore_case: bool,
+    memo: &mut HashSet<(usize, usize)>,
+    budget: &mut u64,
+) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    // Pointer-pair memo: every recursive slice derives from the same two
+    // buffers, so pairs are unique positions; recursion always shrinks
+    // `pattern.len() + value.len()`, so a revisited state already failed.
+    if !memo.insert((pattern.as_ptr() as usize, value.as_ptr() as usize)) {
+        return false;
+    }
+    if pattern.is_empty() {
+        return value.is_empty();
+    }
+    if pattern[0] == b'*' {
+        let mut end = 0;
+        while end < pattern.len() && pattern[end] == b'*' {
+            end += 1;
+        }
+        let rest = &pattern[end..];
+        let double = end >= 2;
+        let mut split = 0;
+        loop {
+            if glob_match(rest, &value[split..], ignore_case, memo, budget) {
+                return true;
+            }
+            if split == value.len() || (!double && value[split] == b'/') {
+                return false;
+            }
+            split += 1;
+        }
+    }
+    if value.is_empty() {
+        return false;
+    }
+    match pattern[0] {
+        b'?' => {
+            if value[0] == b'/' {
+                return false;
+            }
+            glob_match(&pattern[1..], &value[1..], ignore_case, memo, budget)
+        }
+        b'\\' => {
+            if pattern.len() < 2 || !glob_byte_eq(pattern[1], value[0], ignore_case) {
+                return false;
+            }
+            glob_match(&pattern[2..], &value[1..], ignore_case, memo, budget)
+        }
+        b'[' => false,
+        literal => {
+            if !glob_byte_eq(literal, value[0], ignore_case) {
+                return false;
+            }
+            glob_match(&pattern[1..], &value[1..], ignore_case, memo, budget)
+        }
+    }
+}
+
+/// Byte equality with optional ASCII case folding.
+fn glob_byte_eq(left: u8, right: u8, ignore_case: bool) -> bool {
+    left == right || (ignore_case && left.eq_ignore_ascii_case(&right))
+}
+
+/// Lossless `OsStr`-to-bytes on unix; lossy fallback elsewhere.
+fn os_bytes(os: &std::ffi::OsStr) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        std::os::unix::ffi::OsStrExt::as_bytes(os).to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        os.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+/// Resolve every branch in the effective config to its full comparison ref.
+fn resolve_all_upstreams(
+    cfg: &UpstreamConfig,
+    known: &HashSet<&[u8]>,
+) -> HashMap<Vec<u8>, Vec<u8>> {
+    let mut out = HashMap::new();
+    for branch in cfg.branch_names() {
+        if branch.is_empty() {
+            continue;
+        }
+        if let Some(upstream) = resolve_branch_upstream(cfg, branch, known) {
+            out.insert(branch.to_vec(), upstream);
+        }
+    }
+    out
+}
+
+/// Resolve one branch to its full comparison ref: last `remote`, first
+/// `merge` (both probed). `remote = .` resolves locally to the merge ref
+/// itself. Otherwise the first positive fetch refspec (config order)
+/// whose source matches the merge ref maps it to the local tracking ref
+/// — with no fallback when that target is missing and no default when
+/// the remote carries no fetch lines (all probed). The mapped ref must
+/// exist in the same observation; anything else yields no upstream.
+fn resolve_branch_upstream(
+    cfg: &UpstreamConfig,
+    branch: &[u8],
+    known: &HashSet<&[u8]>,
+) -> Option<Vec<u8>> {
+    let remote = cfg.last(b"branch", branch, b"remote")?;
+    if remote.is_empty() {
+        return None;
+    }
+    let merge = cfg.first(b"branch", branch, b"merge")?;
+    if merge.is_empty() {
+        return None;
+    }
+    if remote == b"." {
+        return known.contains(merge).then(|| merge.to_vec());
+    }
+    for fetch in cfg.all(b"remote", remote, b"fetch") {
+        let Ok(text) = std::str::from_utf8(fetch) else {
+            continue;
+        };
+        let Some(spec) = git::refspec::parse_fetch_refspec(text) else {
+            continue;
+        };
+        if spec.negative || spec.dst.is_none() {
+            continue;
+        }
+        let mapped = map_fetch_refspec(&spec, merge)?;
+        return known.contains(mapped.as_slice()).then_some(mapped);
+    }
+    None
+}
+
+/// Map a merge ref through one positive fetch refspec with a destination:
+/// a literal source requires equality, a `*` source substitutes the
+/// middle capture into the destination pattern (exact bytes; the parser
+/// guarantees at most one `*` per side with `*` in source iff `*` in
+/// destination). `None` = no match.
+fn map_fetch_refspec(spec: &git::refspec::FetchRefspec, merge: &[u8]) -> Option<Vec<u8>> {
+    let dst = spec.dst.as_deref()?;
+    match spec.src.split_once('*') {
+        None => {
+            if merge == spec.src.as_bytes() {
+                Some(dst.as_bytes().to_vec())
+            } else {
+                None
+            }
+        }
+        Some((pre, post)) => {
+            let middle = merge
+                .strip_prefix(pre.as_bytes())?
+                .strip_suffix(post.as_bytes())?;
+            let (dst_pre, dst_post) = dst.split_once('*')?;
+            let mut out = Vec::with_capacity(dst_pre.len() + middle.len() + dst_post.len());
+            out.extend_from_slice(dst_pre.as_bytes());
+            out.extend_from_slice(middle);
+            out.extend_from_slice(dst_post.as_bytes());
+            Some(out)
+        }
+    }
 }
 
 /// Honest ref state (R16): directly observed targets are valid, as is
@@ -8411,7 +9075,7 @@ struct AnalysisReads {
     refs: Vec<git::RefObservation>,
     refs_notes: Vec<String>,
     ref_errors: Vec<String>,
-    branch_upstreams: HashMap<String, Vec<u8>>,
+    branch_upstreams: HashMap<Vec<u8>, Vec<u8>>,
     /// `(checkout_id, HEAD)` per checkout of the store.
     heads: Vec<(String, git::HeadState)>,
 }
@@ -8462,7 +9126,7 @@ fn collect_analysis_reads(
         return Ok(AnalysisOutcome::TimedOut);
     }
     let ref_errors = ctx.inspector.reference_errors(instance);
-    let branch_upstreams = load_branch_upstreams(&instance.common_dir);
+    let branch_upstreams = load_branch_upstreams(instance, checkouts, &refs);
     if !poll.ok_throttled() {
         return Ok(AnalysisOutcome::IdentityChanged);
     }
