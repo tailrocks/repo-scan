@@ -561,6 +561,23 @@ pub enum TaskOutcome {
     },
 }
 
+/// Gap row a completion just recorded (`Retry`/`Parked` arms of
+/// [`TursoStore::complete_task`]), returned so the caller can journal the
+/// matching `error` event after the completion transaction commits. The
+/// store is the single source of truth for the id/category/detail — the
+/// caller must not reconstruct them from the outcome.
+#[derive(Debug, Clone)]
+pub struct CompletionGap {
+    /// Stable error id (`gap:<task id>`).
+    pub id: String,
+    /// Scope the error belongs to.
+    pub scope_key: String,
+    /// Stable category.
+    pub category: String,
+    /// Human-readable detail.
+    pub detail: String,
+}
+
 /// New task for [`TursoStore::enqueue_task`] (insert is idempotent).
 #[derive(Debug, Clone)]
 pub struct NewTask<'a> {
@@ -1632,6 +1649,10 @@ impl TursoStore {
     /// `stale-completion` scheduler error is returned. A token/epoch
     /// mismatch returns `lease-mismatch`. Stale results never erase
     /// newer invalidations (spec §12).
+    /// Complete one claimed task, discarding any gap the outcome
+    /// recorded. Production completion goes through
+    /// [`TursoStore::complete_task_report_gap`] so the recorded gap can be
+    /// journaled as an `error` event after the commit.
     pub async fn complete_task(
         &self,
         task_id: &str,
@@ -1640,8 +1661,24 @@ impl TursoStore {
         outcome: &TaskOutcome,
         now_ms: i64,
     ) -> crate::Result<()> {
+        self.complete_task_report_gap(task_id, token, epoch, outcome, now_ms)
+            .await
+            .map(|_| ())
+    }
+
+    /// Complete one claimed task. Returns the gap row the outcome
+    /// recorded (`Retry`/`Parked`), if any, so the caller can journal the
+    /// matching `error` event after this transaction commits.
+    pub async fn complete_task_report_gap(
+        &self,
+        task_id: &str,
+        token: i64,
+        epoch: u64,
+        outcome: &TaskOutcome,
+        now_ms: i64,
+    ) -> crate::Result<Option<CompletionGap>> {
         self.check_owner_epoch(epoch, "complete_task")?;
-        let stale = self
+        let (stale, gap) = self
             .with_tx(|conn| async move {
                 Self::complete_task_on(conn, task_id, token, epoch, outcome, now_ms).await
             })
@@ -1649,7 +1686,7 @@ impl TursoStore {
         // The stale requeue above committed; report it now. Returning the
         // error from inside the transaction would roll the requeue back.
         match stale {
-            None => Ok(()),
+            None => Ok(gap),
             Some(message) => Err(Error::Scheduler(message)),
         }
     }
@@ -1726,13 +1763,15 @@ impl TursoStore {
 
     /// Revision gate plus outcome application shared by plain and verified
     /// completions. Returns the stale-completion message when the task was
-    /// requeued (committed by the caller), `None` on a clean completion.
+    /// requeued (committed by the caller), `None` on a clean completion —
+    /// plus the gap row the outcome recorded, if any, so the caller can
+    /// journal the matching `error` event after this transaction commits.
     async fn apply_completion_on(
         conn: &turso::Connection,
         task: &FrontierTask,
         outcome: &TaskOutcome,
         now_ms: i64,
-    ) -> crate::Result<Option<String>> {
+    ) -> crate::Result<(Option<String>, Option<CompletionGap>)> {
         let current_rev = Self::scope_rev_on(conn, &task.scope_key).await?;
         if current_rev != task.expected_rev {
             conn.execute(
@@ -1747,13 +1786,16 @@ impl TursoStore {
             )
             .await
             .map_err(store_err)?;
-            return Ok(Some(format!(
-                "stale-completion: task {} expected rev {} but scope {:?} \
+            return Ok((
+                Some(format!(
+                    "stale-completion: task {} expected rev {} but scope {:?} \
                     is at rev {current_rev}; task requeued",
-                task.id, task.expected_rev, task.scope_key
-            )));
+                    task.id, task.expected_rev, task.scope_key
+                )),
+                None,
+            ));
         }
-        match outcome {
+        let gap = match outcome {
             TaskOutcome::Complete => {
                 conn.execute(
                     "UPDATE frontier_tasks SET state = 'complete', lease_token = NULL, \
@@ -1775,6 +1817,9 @@ impl TursoStore {
                 )
                 .await
                 .map_err(store_err)?;
+                // Gap closes report nothing here: close deltas belong to
+                // `coverage_updated`, not `error`.
+                None
             }
             TaskOutcome::Retry {
                 category,
@@ -1804,6 +1849,12 @@ impl TursoStore {
                     now_ms,
                 )
                 .await?;
+                Some(CompletionGap {
+                    id: gap_id,
+                    scope_key: task.scope_key.clone(),
+                    category: (*category).clone(),
+                    detail: (*detail).clone(),
+                })
             }
             TaskOutcome::Parked { state, reason } => {
                 if !matches!(state, TaskState::Unavailable | TaskState::Unsupported) {
@@ -1834,15 +1885,22 @@ impl TursoStore {
                     now_ms,
                 )
                 .await?;
+                Some(CompletionGap {
+                    id: gap_id,
+                    scope_key: task.scope_key.clone(),
+                    category: task_state_as_str(*state).to_string(),
+                    detail: (*reason).clone(),
+                })
             }
-        }
-        Ok(None)
+        };
+        Ok((None, gap))
     }
 
     /// Returns the stale-completion message when the task was requeued
-    /// (committed by the caller), `None` on a clean completion. Lease and
-    /// parked-state errors return before any write, so their rollback is a
-    /// no-op; only the stale path writes-then-reports.
+    /// (committed by the caller), `None` on a clean completion — plus the
+    /// gap row the outcome recorded, if any. Lease and parked-state errors
+    /// return before any write, so their rollback is a no-op; only the
+    /// stale path writes-then-reports.
     async fn complete_task_on(
         conn: &turso::Connection,
         task_id: &str,
@@ -1850,7 +1908,7 @@ impl TursoStore {
         epoch: u64,
         outcome: &TaskOutcome,
         now_ms: i64,
-    ) -> crate::Result<Option<String>> {
+    ) -> crate::Result<(Option<String>, Option<CompletionGap>)> {
         let task = Self::check_lease_on(conn, task_id, token, epoch).await?;
         Self::apply_completion_on(conn, &task, outcome, now_ms).await
     }
@@ -1863,6 +1921,10 @@ impl TursoStore {
     /// non-`Complete` outcomes skip the child check (no children are claimed
     /// durable). Stale completions still requeue and report as before.
     /// Callers using writer batches must flush before calling this.
+    /// Returns the gap row the outcome recorded, if any (see
+    /// [`TursoStore::complete_task`]). Recorded gaps are discarded: no
+    /// production caller completes verified parents yet, so there is no
+    /// journal to report them to.
     pub async fn complete_task_with_children(
         &self,
         task_id: &str,
@@ -1873,7 +1935,7 @@ impl TursoStore {
         now_ms: i64,
     ) -> crate::Result<()> {
         self.check_owner_epoch(epoch, "complete_task_with_children")?;
-        let stale = self
+        let (stale, _gap) = self
             .with_tx(|conn| async move {
                 let task = Self::check_lease_on(conn, task_id, token, epoch).await?;
                 if matches!(outcome, TaskOutcome::Complete) {
