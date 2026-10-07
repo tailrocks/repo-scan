@@ -22,12 +22,18 @@ use repo_scan::report::builder::{
     verify_staged_report, AliasInput, ArtifactInput, CandidateInput,
     ReportInputs as LibReportInputs, ReportPipeline, RootInput, StorageLinkInput,
 };
-use repo_scan::scan_events::{is_terminal_event, Cursor, Envelope, EventType, Op};
+use repo_scan::scan_events::{
+    classify_cursor, is_progress_coalescible, is_terminal_event, retention_cutoff, Cursor,
+    Envelope, EventType, Op, ResumeAction, MAX_RETAINED_SCAN_EVENTS,
+};
 use repo_scan::scheduler::{backoff_for_attempt, Admission, CircuitBreaker, OpClass, Permit};
+#[cfg(test)]
+use repo_scan::store::FrontierTask;
 use repo_scan::store::{
-    self, CheckpointCoordinator, CheckpointPolicy, ClaimedTask, CompletionDelta, NewCheckout,
-    NewGitInstance, NewRef, NewRemote, NewRemoteRefresh, NewScan, NewScanEvent, NewStatus, NewTask,
-    NewVolume, OwnerGuard, ScanEventRow, Store, TaskOutcome, TursoStore, WriterBatch,
+    self, CheckpointCoordinator, CheckpointPolicy, ClaimedTask, CompletionDelta, CompletionGap,
+    NewCheckout, NewGitInstance, NewRef, NewRemote, NewRemoteRefresh, NewScan, NewScanEvent,
+    NewStatus, NewTask, NewVolume, OwnerGuard, ScanEventRow, Store, TaskOutcome, TursoStore,
+    WriterBatch,
 };
 use repo_scan::telemetry::{live_helper_rss_bytes, FootprintSampler, SamplerInputs};
 use repo_scan::walk::roots::{plan_machine_roots, PlannedRoot, RootPriority};
@@ -777,23 +783,41 @@ struct ScanJournal {
     emitted_stores: HashSet<String>,
     emitted_checkouts: HashSet<String>,
     emitted_branch_stores: HashSet<String>,
+    /// Seq of the coalesced `discovery_progress` gauge row, if journaled
+    /// (Step 12: progress coalesces by seq reuse — the first tick takes a
+    /// fresh seq, later ticks update that row's payload in place at its
+    /// immutable `(rev, off)` position, so exactly one progress row (the
+    /// newest) survives per scan and replay order always matches seq
+    /// order).
+    progress_seq: Option<u64>,
+    /// Highest seq known pruned by retention (heuristic for the
+    /// over-bound check; the `COUNT(*)` confirm is authoritative).
+    pruned_through: u64,
 }
 
 impl ScanJournal {
     async fn open(store: &TursoStore, scan_id: &str, rev: u64) -> repo_scan::Result<Self> {
         let mut max_seq = 0u64;
+        let mut min_seq = None;
         let mut last_rev = None;
         let mut last_off = 0u64;
         let mut emitted_stores = HashSet::new();
         let mut emitted_checkouts = HashSet::new();
         let mut emitted_branch_stores = HashSet::new();
+        let mut progress_seq = None;
         loop {
             let rows = store.read_scan_events(scan_id, max_seq, 500).await?;
             let short = rows.len() < 500;
             for row in &rows {
+                if min_seq.is_none() {
+                    min_seq = Some(row.seq);
+                }
                 max_seq = row.seq;
                 last_rev = Some(row.catalog_rev);
                 last_off = row.event_offset;
+                if row.event_type == EventType::DiscoveryProgress.name() {
+                    progress_seq = Some(row.seq);
+                }
                 let id_key = match row.event_type.as_str() {
                     "repository_found" => Some((&mut emitted_stores, "store_id")),
                     "location_found" => Some((&mut emitted_checkouts, "checkout_id")),
@@ -827,6 +851,10 @@ impl ScanJournal {
             emitted_stores,
             emitted_checkouts,
             emitted_branch_stores,
+            progress_seq,
+            // Retention prunes a contiguous prefix, so everything below
+            // the retained minimum is gone; a fresh journal starts at 1.
+            pruned_through: min_seq.map(|m| m.saturating_sub(1)).unwrap_or(0),
         })
     }
 
@@ -858,6 +886,11 @@ impl ScanJournal {
         self.last_off = off;
         self.last_seq = Some(seq);
         (seq, off)
+    }
+
+    /// Highest seq assigned so far (`next_seq - 1`; 0 when empty).
+    fn tip_seq(&self) -> u64 {
+        self.next_seq.saturating_sub(1)
     }
 
     /// Journal one lifecycle event. Each call is its own transaction
@@ -1034,6 +1067,139 @@ impl ScanJournal {
         };
         Ok(Some(TursoStore::buffer_scan_event(batch, &event)?))
     }
+
+    /// Buffer one `discovery_progress` tick: it commits with the writer
+    /// batch (visible while later discovery is still active, never held
+    /// to phase end). Coalescing is by seq reuse
+    /// ([`is_progress_coalescible`]): the first tick takes a fresh seq;
+    /// every later tick updates that same row's payload in place, so
+    /// exactly one progress row (the newest) survives per scan. The
+    /// row's `(seq, rev, off)` position is immutable after the first
+    /// tick, so `(rev, off)` replay order always matches seq order; when
+    /// retention pruned the row, the next tick re-inserts at a fresh
+    /// seq. Always `Some(should_flush)`.
+    fn buffer_discovery_progress(
+        &mut self,
+        batch: &mut WriterBatch,
+        records: &[u8],
+    ) -> repo_scan::Result<Option<bool>> {
+        debug_assert!(is_progress_coalescible(EventType::DiscoveryProgress));
+        // A pruned gauge row reads as absent: re-insert below at a fresh
+        // seq (retention only deletes the prefix, so this test is exact).
+        if self
+            .progress_seq
+            .is_some_and(|seq| seq <= self.pruned_through)
+        {
+            self.progress_seq = None;
+        }
+        match self.progress_seq {
+            Some(seq) => {
+                let seq_i64 = i64::try_from(seq).map_err(|_| {
+                    repo_scan::Error::Store(format!("event seq {seq} exceeds i64 range"))
+                })?;
+                Ok(Some(batch.push(
+                    "UPDATE scan_events SET records = ?1 \
+                        WHERE scan_id = ?2 AND seq = ?3",
+                    vec![
+                        turso::Value::Blob(records.to_vec()),
+                        turso::Value::Text(self.scan_id.clone()),
+                        turso::Value::Integer(seq_i64),
+                    ],
+                )))
+            }
+            None => {
+                let event_type = EventType::DiscoveryProgress;
+                let (seq, off) = self.assign();
+                self.progress_seq = Some(seq);
+                let seq_i64 = i64::try_from(seq).map_err(|_| {
+                    repo_scan::Error::Store(format!("event seq {seq} exceeds i64 range"))
+                })?;
+                let rev_i64 = i64::try_from(self.rev).map_err(|_| {
+                    repo_scan::Error::Store(format!(
+                        "event catalog_rev {} exceeds i64 range",
+                        self.rev
+                    ))
+                })?;
+                let off_i64 = i64::try_from(off).map_err(|_| {
+                    repo_scan::Error::Store(format!("event offset {off} exceeds i64 range"))
+                })?;
+                Ok(Some(batch.push(
+                    "INSERT OR IGNORE INTO scan_events (scan_id, seq, catalog_rev, event_offset, \
+                        event_type, op, reset, records) \
+                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    vec![
+                        turso::Value::Text(self.scan_id.clone()),
+                        turso::Value::Integer(seq_i64),
+                        turso::Value::Integer(rev_i64),
+                        turso::Value::Integer(off_i64),
+                        turso::Value::Text(event_type.name().to_string()),
+                        turso::Value::Text(event_type.op().name().to_string()),
+                        turso::Value::Integer(0),
+                        turso::Value::Blob(records.to_vec()),
+                    ],
+                )))
+            }
+        }
+    }
+}
+
+/// Retained rows for one scan (Step 12 retention confirm).
+async fn scan_event_count(store: &TursoStore, scan_id: &str) -> repo_scan::Result<u64> {
+    count_query(
+        store,
+        "SELECT COUNT(*) FROM scan_events WHERE scan_id = ?1",
+        vec![turso::Value::Text(scan_id.to_string())],
+    )
+    .await
+}
+
+/// Delete one scan's journal prefix through `cutoff` (inclusive) in one
+/// transaction. Position-based: everything at or below the cutoff goes,
+/// so the retained window stays a contiguous `[cutoff+1..=tip]` and the
+/// tip (a finished scan's terminal event) always survives.
+async fn prune_scan_events_through(
+    store: &TursoStore,
+    scan_id: &str,
+    cutoff: u64,
+) -> repo_scan::Result<()> {
+    let cutoff_i64 = i64::try_from(cutoff)
+        .map_err(|_| repo_scan::Error::Store(format!("prune cutoff {cutoff} exceeds i64 range")))?;
+    store
+        .connection()
+        .execute(
+            "DELETE FROM scan_events WHERE scan_id = ?1 AND seq <= ?2",
+            vec![
+                turso::Value::Text(scan_id.to_string()),
+                turso::Value::Integer(cutoff_i64),
+            ],
+        )
+        .await
+        .map_err(|e| repo_scan::Error::Store(e.to_string()))?;
+    Ok(())
+}
+
+/// Enforce Step 12 bounded retention after a flush committed: when the
+/// journal's cheap suspected check fires, confirm with `COUNT(*)` and
+/// prune to `keep_rows` (production passes
+/// [`MAX_RETAINED_SCAN_EVENTS`]), advancing the watermark. Returns true
+/// when a prune transaction committed (callers count it). Cursors the
+/// retained window no longer covers resolve to an explicit-reset
+/// snapshot via [`classify_cursor`], never a silent gap.
+async fn maybe_prune_scan_journal(
+    store: &TursoStore,
+    journal: &mut ScanJournal,
+    keep_rows: u64,
+) -> repo_scan::Result<bool> {
+    if journal.tip_seq().saturating_sub(journal.pruned_through) <= keep_rows.max(1) {
+        return Ok(false);
+    }
+    if scan_event_count(store, &journal.scan_id).await? <= keep_rows.max(1) {
+        return Ok(false);
+    }
+    let cutoff = retention_cutoff(journal.tip_seq(), keep_rows);
+    prune_scan_events_through(store, &journal.scan_id, cutoff).await?;
+    journal.pruned_through = cutoff.max(journal.pruned_through);
+    Ok(true)
 }
 
 /// Resume command recorded in lifecycle payloads (D4): replays the exact
@@ -3652,6 +3818,11 @@ struct Runner {
     /// records/resolves so deltas fire only on genuine transitions —
     /// never for re-records or zero-row closes.
     open_gaps: HashSet<String>,
+    /// Completions buffered into [`Self::batch`] but not yet flushed
+    /// (Step 12 batched completion): each entry's conditional SQL commits
+    /// with the writer batch, and [`classify_flushed_completions`]
+    /// resolves every entry against committed rows after each flush.
+    pending_completions: Vec<PendingCompletion>,
 }
 
 impl Runner {
@@ -3685,6 +3856,7 @@ impl Runner {
             pending_alias_checks: Vec::new(),
             journal: None,
             open_gaps: HashSet::new(),
+            pending_completions: Vec::new(),
         }
     }
 
@@ -3875,13 +4047,15 @@ fn park_on_timeout(detail: &str) -> TaskOutcome {
     }
 }
 
-/// Complete one finished task (flush + verified completion) and apply
+/// Complete one finished task (buffered batched completion) and apply
 /// the per-task accounting the sequential drain did inline: permit
 /// release, slow-task log, watchdog verdict, breaker update, claimed /
 /// probe counters, and progress emission. `finished` is the finish
 /// output — coordinator-completed (`Done`) outcomes arrive as
-/// `Ok((outcome, 0))`. A finished outcome that fails to complete, or a
+/// `Ok((outcome, 0))`. A finished outcome that fails to buffer, or a
 /// finish error, aborts the run loudly — same as the sequential drain.
+/// Buffered completions commit with the writer batch (classified after
+/// each flush); stale verdicts count and print at classify time.
 #[allow(clippy::too_many_arguments)]
 async fn account_task(
     runner: &mut Runner,
@@ -3889,6 +4063,7 @@ async fn account_task(
     epoch: u64,
     scan_id: &str,
     generation: u64,
+    phase: DrainPhase,
     record: &PrepRecord,
     finished: repo_scan::Result<(TaskOutcome, u64)>,
 ) -> repo_scan::Result<()> {
@@ -3897,20 +4072,14 @@ async fn account_task(
     let scope_key = record.claimed.task.scope_key.clone();
     let is_probe = record.claimed.task.kind == KIND_PROBE;
     let started = record.started;
-    // RSF-AC461500-609D-4D55-991E-09C60D382D67: children commit in
-    // earlier batches; completion verifies against committed rows.
+    // Step 12 batched completion (D5): the outcome's conditional SQL
+    // joins the writer batch — children buffered during execution
+    // commit in the same transaction as the parent completion whenever
+    // the batch holds both — and flushes at the row/byte/age caps.
     let units = match finished {
         Ok((outcome, units)) => {
-            flush_runner_batch(runner, store).await?;
-            match complete_claimed(store, runner, &record.claimed, epoch, &outcome).await? {
-                CompletionApplied::Applied => {}
-                CompletionApplied::StaleRequeued => {
-                    runner.counters.stale_requeued += 1;
-                    eprintln!(
-                        "repo-scan: stale completion requeued: {task_id} (invalidation kept)",
-                    );
-                }
-            }
+            let due = buffer_completion(runner, store, &record.claimed, epoch, &outcome)?;
+            flush_if_due(runner, store, due).await?;
             runner.admission.release(&record.permit);
             if is_probe {
                 runner.counters.probes_complete += 1;
@@ -3952,8 +4121,12 @@ async fn account_task(
     // At-most-2 Hz token-timer gate (RSF-CHAINARGOS-PROGRESS-001):
     // progress lines carry position, pending, and elapsed.
     // R06: Also emit promptly on probe completions to surface discovered repositories.
-    if is_probe || runner.admission.progress_due() {
-        emit_progress(runner, store, scan_id, generation).await?;
+    // Journaled progress stays on due-ticks only (Step 12 bounded
+    // rate): probe-prompt lines are stderr-only, since each probe
+    // already journals its found events.
+    let journal_tick = !is_probe && runner.admission.progress_due();
+    if is_probe || journal_tick {
+        emit_progress(runner, store, scan_id, generation, phase, journal_tick).await?;
     }
     Ok(())
 }
@@ -4050,6 +4223,12 @@ async fn run_until_boundary(
             eprintln!("repo-scan: interrupted; saving progress (bounded)");
             break;
         }
+        // Step 12 batched completion: buffered completions are invisible
+        // until flushed, so every claim round starts by committing them —
+        // a claim must observe completed, stale-requeued, and retried
+        // tasks, and an empty claim must mean an empty queue, never an
+        // unflushed one. No-op when the batch is empty.
+        flush_runner_batch(runner, store).await?;
         let now = store::now_ms();
         // RSF-3E2FDCF3-78C5-401A-84DD-A799688ED84F: claims are scoped to
         // this run's traversal generation, so a resumed or force-rescan
@@ -4147,6 +4326,7 @@ async fn run_until_boundary(
                         epoch,
                         scan_id,
                         generation,
+                        phase,
                         &prepared.record,
                         Ok((outcome, 0)),
                     )
@@ -4187,8 +4367,10 @@ async fn run_until_boundary(
                             runner, store, generation, run_rev, canonical, &record, result,
                         )
                         .await;
-                        account_task(runner, store, epoch, scan_id, generation, &record, finished)
-                            .await?;
+                        account_task(
+                            runner, store, epoch, scan_id, generation, phase, &record, finished,
+                        )
+                        .await?;
                     }
                     break;
                 }
@@ -4210,7 +4392,14 @@ async fn run_until_boundary(
                         )
                         .await;
                         account_task(
-                            runner, store, epoch, scan_id, generation, &record, finished,
+                            runner,
+                            store,
+                            epoch,
+                            scan_id,
+                            generation,
+                            phase,
+                            &record,
+                            finished,
                         )
                         .await?;
                     }
@@ -4488,18 +4677,68 @@ fn format_progress_eta_growth(
     format_progress_eta(session_claimed, pending, elapsed)
 }
 
+/// `discovery_progress` records (D4): phase, elapsed, discovered
+/// counts, pending, and open gaps — committed catalog reads only (the
+/// event journals only after its underlying state commits), and no
+/// percent of an unknown total.
+fn discovery_progress_records(
+    phase: DrainPhase,
+    elapsed: Duration,
+    totals: &ProgressTotals,
+    open_gaps: u64,
+) -> repo_scan::Result<Vec<u8>> {
+    let phase_name = match phase {
+        DrainPhase::Discovery => "discovery",
+        DrainPhase::Analysis => "analysis",
+    };
+    let records = serde_json::json!({
+        "phase": phase_name,
+        "elapsed_s": elapsed.as_secs(),
+        "discovered": {
+            "tasks_done": totals.done_tasks(),
+            "dirs": totals.cum_dirs,
+            "entries": totals.cum_entries,
+        },
+        "pending": totals.pending,
+        "gaps": { "open": open_gaps },
+    });
+    serde_json::to_vec(&records).map_err(|e| repo_scan::Error::Report(e.to_string()))
+}
+
+/// Buffer one `discovery_progress` tick when this runner journals
+/// (production scans); unit-test runners (`journal: None`) persist
+/// without journaling.
+async fn journal_discovery_progress(
+    runner: &mut Runner,
+    store: &TursoStore,
+    records: &[u8],
+) -> repo_scan::Result<()> {
+    let Some(journal) = runner.journal.as_mut() else {
+        return Ok(());
+    };
+    if let Some(due) = journal.buffer_discovery_progress(&mut runner.batch, records)? {
+        flush_if_due(runner, store, due).await?;
+    }
+    Ok(())
+}
+
 /// Emit one 2 Hz progress line with scan position and completion context
 /// (RSF-CHAINARGOS-PROGRESS-001): current scope/volume, session counters,
 /// cumulative scan totals, frontier denominator, throughput, ETA, and elapsed
 /// run time. Session counters are per-invocation run totals
 /// (RSF-CHAINARGOS-RESUME-002): a resume starts a new run at 1/1/1 and the
 /// `session(this run)` vs `cumulative(scan total)` labels keep that
-/// unambiguous. Still gated at most 2 Hz by the caller.
+/// unambiguous. Still gated at most 2 Hz by the caller. On due-ticks
+/// (`journal_progress`) the tick also journals a coalesced
+/// `discovery_progress` gauge event (Step 12); probe-prompt lines stay
+/// stderr-only.
 async fn emit_progress(
     runner: &mut Runner,
     store: &TursoStore,
     scan_id: &str,
     generation: u64,
+    phase: DrainPhase,
+    journal_progress: bool,
 ) -> repo_scan::Result<()> {
     let totals = load_progress_totals(store, generation).await?;
     // RSF-CHAINARGOS-PROGRESS-002: compare the frontier denominator
@@ -4512,18 +4751,24 @@ async fn emit_progress(
         None => (false, 0),
     };
     runner.progress_last_total = Some(totals.total_tasks);
+    let elapsed = runner.run_started.elapsed();
     let line = format_progress_line_full_with_growth(
         scan_id,
         generation,
         &runner.counters,
         &totals,
-        runner.run_started.elapsed(),
+        elapsed,
         &runner.current_scope,
         &runner.current_volume,
         denominator_grew,
         new_since_tick,
     );
     eprintln!("{line}");
+    if journal_progress {
+        let open_gaps = count_open_errors(store).await?;
+        let records = discovery_progress_records(phase, elapsed, &totals, open_gaps)?;
+        journal_discovery_progress(runner, store, &records).await?;
+    }
     Ok(())
 }
 
@@ -4661,9 +4906,11 @@ fn format_progress_line(
 /// (RSF-AC461500-609D-4D55-991E-09C60D382D67). Applied ops feed the
 /// checkpoint cadence ([`CheckpointCoordinator::note_ops`] /
 /// [`CheckpointCoordinator::maybe_checkpoint`], which calls `wal_status`
-/// and, over budget, `checkpoint_truncate`); deferred alias checks then
-/// run against committed rows. Returns applied ops. One transaction,
-/// counted as such.
+/// and, over budget, `checkpoint_truncate`); completions the flush
+/// committed classify next (applied entries buffer their gap events for
+/// the following flush); retention prunes last; deferred alias checks
+/// then run against committed rows. Returns applied ops. One
+/// transaction, counted as such (a prune commits its own, counted too).
 async fn flush_runner_batch(runner: &mut Runner, store: &TursoStore) -> repo_scan::Result<u64> {
     if runner.batch.is_empty() {
         return Ok(0);
@@ -4673,6 +4920,16 @@ async fn flush_runner_batch(runner: &mut Runner, store: &TursoStore) -> repo_sca
         return Ok(0);
     }
     runner.counters.db_transactions += 1;
+    // Step 12 batched completion: resolve every completion this flush
+    // committed, in buffer order (unknown-tasks and lease mismatches
+    // abort loudly; stale entries only count).
+    classify_flushed_completions(runner, store).await?;
+    // Step 12 bounded retention (unit-test runners have no journal).
+    if let Some(journal) = runner.journal.as_mut() {
+        if maybe_prune_scan_journal(store, journal, MAX_RETAINED_SCAN_EVENTS).await? {
+            runner.counters.db_transactions += 1;
+        }
+    }
     if runner.checkpoints.note_ops(applied) {
         let _ = runner.checkpoints.maybe_checkpoint(store).await?;
     }
@@ -5287,94 +5544,439 @@ async fn execute_task(
     Ok(outcome)
 }
 
-enum CompletionApplied {
+/// One completion buffered into the writer batch (Step 12 batched
+/// completion, D5: no per-task flush+completion transactions).
+struct PendingCompletion {
+    task_id: String,
+    token: i64,
+    epoch: u64,
+    scope_key: String,
+    outcome: TaskOutcome,
+    /// Frontier state the outcome writes on the applied path
+    /// (`complete` | `retry_wait` | `unavailable` | `unsupported`;
+    /// validated at buffer time, also the `Parked` gap category).
+    outcome_state: &'static str,
+    /// `updated_at_ms` stamped by this completion's SQL: the classifier's
+    /// "our write landed" signal.
+    now_ms: i64,
+}
+
+/// Observed verdict for one flushed completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionVerdict {
     Applied,
     StaleRequeued,
 }
 
-/// Complete one claimed task, translating the store's scheduler signals:
-/// stale completions (already requeued by the store) are routine; lease
-/// mismatches and unknown tasks become typed errors that abort the run.
-/// A gap delta the completion caused is journaled as `error` /
-/// `coverage_updated` events after the completion transaction commits —
-/// never inside it.
-async fn complete_claimed(
-    store: &TursoStore,
+/// Buffer one task completion into the writer batch (Step 12 batched
+/// completion, D5): the completion's conditional SQL commits with the
+/// batch, so children enqueued during execution commit in the same
+/// transaction as the parent completion whenever the batch holds both —
+/// and always at-or-before it (a spec §5 limit split commits children
+/// first) — so a directory is never marked complete unless its
+/// discovered children are saved. Lease/token/epoch guards and the
+/// scope-revision gate evaluate at commit time inside the flush
+/// transaction (the single owner writes these rows alone);
+/// [`classify_flushed_completions`] resolves each entry against
+/// committed rows after the flush. The owner-epoch and parked-state
+/// checks run here (both are buffer-time facts). Returns
+/// `WriterBatch::should_flush`: row/byte/age caps bound the transaction.
+fn buffer_completion(
     runner: &mut Runner,
+    store: &TursoStore,
     claimed: &ClaimedTask,
     epoch: u64,
     outcome: &TaskOutcome,
-) -> repo_scan::Result<CompletionApplied> {
-    let now = store::now_ms();
-    match store
-        .complete_task_report_gap(&claimed.task.id, claimed.token, epoch, outcome, now)
+) -> repo_scan::Result<bool> {
+    // Owner check first (SR-STATE-08, same refusal as the store gate):
+    // neither this handle's epoch nor the run epoch changes mid-run, so
+    // buffer-time refusal is exactly commit-time refusal.
+    if epoch != store.epoch() {
+        return Err(repo_scan::Error::Store(format!(
+            "complete_task refused: epoch {epoch} is not this owner (epoch {})",
+            store.epoch()
+        )));
+    }
+    let outcome_state = match outcome {
+        TaskOutcome::Complete => "complete",
+        TaskOutcome::Retry { .. } => "retry_wait",
+        TaskOutcome::Parked { state, .. } => match state {
+            TaskState::Unavailable => "unavailable",
+            TaskState::Unsupported => "unsupported",
+            other => {
+                return Err(repo_scan::Error::Scheduler(format!(
+                    "invalid-parked-state: {other:?} (want unavailable or unsupported)"
+                )));
+            }
+        },
+    };
+    let epoch_i64 = i64::try_from(epoch)
+        .map_err(|_| repo_scan::Error::Store(format!("lease epoch {epoch} exceeds i64 range")))?;
+    let now_ms = store::now_ms();
+    let task_id = claimed.task.id.clone();
+    let scope_key = claimed.task.scope_key.clone();
+    let gap_id = format!("gap:{task_id}");
+    // Applied path: outcome write guarded by the exact lease plus the
+    // scope-revision match. The revision compares the row's own
+    // `expected_rev` (what the store's in-transaction read compared)
+    // against the live scope revision, defaulting to 0 for unscored
+    // scopes exactly like the store gate.
+    match outcome {
+        TaskOutcome::Complete => {
+            runner.batch.push(
+                "UPDATE frontier_tasks SET state = 'complete', lease_token = NULL, \
+                    lease_epoch = NULL, lease_expires_ms = NULL, updated_at_ms = ?1 \
+                    WHERE id = ?2 AND state = 'leased' AND lease_token = ?3 \
+                    AND lease_epoch = ?4 AND expected_rev = COALESCE( \
+                    (SELECT rev FROM scope_revisions WHERE scope_key = ?5), 0)",
+                vec![
+                    turso::Value::Integer(now_ms),
+                    turso::Value::Text(task_id.clone()),
+                    turso::Value::Integer(claimed.token),
+                    turso::Value::Integer(epoch_i64),
+                    turso::Value::Text(scope_key.clone()),
+                ],
+            );
+        }
+        TaskOutcome::Retry { retry_after_ms, .. } => {
+            runner.batch.push(
+                "UPDATE frontier_tasks SET state = 'retry_wait', lease_token = NULL, \
+                    lease_epoch = NULL, lease_expires_ms = NULL, retry_after_ms = ?1, \
+                    updated_at_ms = ?2 WHERE id = ?3 AND state = 'leased' \
+                    AND lease_token = ?4 AND lease_epoch = ?5 AND expected_rev = COALESCE( \
+                    (SELECT rev FROM scope_revisions WHERE scope_key = ?6), 0)",
+                vec![
+                    turso::Value::Integer(*retry_after_ms),
+                    turso::Value::Integer(now_ms),
+                    turso::Value::Text(task_id.clone()),
+                    turso::Value::Integer(claimed.token),
+                    turso::Value::Integer(epoch_i64),
+                    turso::Value::Text(scope_key.clone()),
+                ],
+            );
+        }
+        TaskOutcome::Parked { .. } => {
+            runner.batch.push(
+                "UPDATE frontier_tasks SET state = ?1, lease_token = NULL, lease_epoch = NULL, \
+                    lease_expires_ms = NULL, updated_at_ms = ?2 WHERE id = ?3 \
+                    AND state = 'leased' AND lease_token = ?4 AND lease_epoch = ?5 \
+                    AND expected_rev = COALESCE( \
+                    (SELECT rev FROM scope_revisions WHERE scope_key = ?6), 0)",
+                vec![
+                    turso::Value::Text(outcome_state.to_string()),
+                    turso::Value::Integer(now_ms),
+                    turso::Value::Text(task_id.clone()),
+                    turso::Value::Integer(claimed.token),
+                    turso::Value::Integer(epoch_i64),
+                    turso::Value::Text(scope_key.clone()),
+                ],
+            );
+        }
+    }
+    // Stale path: revision moved under the lease — requeue with the
+    // fresh revision (never marked complete), exactly the store's stale
+    // requeue. Guarded by the same lease plus the revision mismatch, so
+    // exactly one of the two task updates can match per flush.
+    runner.batch.push(
+        "UPDATE frontier_tasks SET state = 'pending', lease_token = NULL, lease_epoch = NULL, \
+            lease_expires_ms = NULL, expected_rev = COALESCE( \
+            (SELECT rev FROM scope_revisions WHERE scope_key = ?1), 0), updated_at_ms = ?2 \
+            WHERE id = ?3 AND state = 'leased' AND lease_token = ?4 AND lease_epoch = ?5 \
+            AND expected_rev != COALESCE( \
+            (SELECT rev FROM scope_revisions WHERE scope_key = ?6), 0)",
+        vec![
+            turso::Value::Text(scope_key.clone()),
+            turso::Value::Integer(now_ms),
+            turso::Value::Text(task_id.clone()),
+            turso::Value::Integer(claimed.token),
+            turso::Value::Integer(epoch_i64),
+            turso::Value::Text(scope_key.clone()),
+        ],
+    );
+    // Gap writes, gated on the applied path having landed (the outcome
+    // state plus our stamp, visible because the flush executes ops in
+    // order inside one transaction): a stale completion records and
+    // closes nothing, exactly like the store path.
+    match outcome {
+        TaskOutcome::Complete => {
+            runner.batch.push(
+                "UPDATE errors SET open = 0, last_seen_ms = ?1 WHERE id = ?2 AND open = 1 \
+                    AND EXISTS (SELECT 1 FROM frontier_tasks WHERE id = ?3 \
+                    AND state = 'complete' AND updated_at_ms = ?4)",
+                vec![
+                    turso::Value::Integer(now_ms),
+                    turso::Value::Text(gap_id),
+                    turso::Value::Text(task_id.clone()),
+                    turso::Value::Integer(now_ms),
+                ],
+            );
+        }
+        TaskOutcome::Retry {
+            category,
+            detail,
+            retry_after_ms,
+        } => {
+            buffer_completion_gap(
+                runner,
+                &gap_id,
+                &scope_key,
+                category,
+                detail,
+                Some(*retry_after_ms),
+                &task_id,
+                outcome_state,
+                now_ms,
+            );
+        }
+        TaskOutcome::Parked { reason, .. } => {
+            buffer_completion_gap(
+                runner,
+                &gap_id,
+                &scope_key,
+                outcome_state,
+                reason,
+                None,
+                &task_id,
+                outcome_state,
+                now_ms,
+            );
+        }
+    }
+    runner.pending_completions.push(PendingCompletion {
+        task_id,
+        token: claimed.token,
+        epoch,
+        scope_key,
+        outcome: outcome.clone(),
+        outcome_state,
+        now_ms,
+    });
+    Ok(runner.batch.should_flush())
+}
+
+/// Buffer the update-then-insert gap record for one applied `Retry`/`Parked`
+/// completion (mirrors `record_error`'s outcome), gated on the applied
+/// path: both statements no-op unless this completion's outcome write
+/// landed in the same transaction.
+#[allow(clippy::too_many_arguments)]
+fn buffer_completion_gap(
+    runner: &mut Runner,
+    gap_id: &str,
+    scope_key: &str,
+    category: &str,
+    detail: &str,
+    next_retry_ms: Option<i64>,
+    task_id: &str,
+    outcome_state: &str,
+    now_ms: i64,
+) {
+    runner.batch.push(
+        "UPDATE errors SET attempts = attempts + 1, detail = ?1, last_seen_ms = ?2, \
+            next_retry_ms = ?3, open = 1 WHERE id = ?4 AND EXISTS ( \
+            SELECT 1 FROM frontier_tasks WHERE id = ?5 AND state = ?6 AND updated_at_ms = ?7)",
+        vec![
+            turso::Value::Text(detail.to_string()),
+            turso::Value::Integer(now_ms),
+            next_retry_ms.map_or(turso::Value::Null, turso::Value::Integer),
+            turso::Value::Text(gap_id.to_string()),
+            turso::Value::Text(task_id.to_string()),
+            turso::Value::Text(outcome_state.to_string()),
+            turso::Value::Integer(now_ms),
+        ],
+    );
+    runner.batch.push(
+        "INSERT OR IGNORE INTO errors (id, scope_key, category, detail, attempts, \
+            first_seen_ms, last_seen_ms, next_retry_ms, open) \
+            SELECT ?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, 1 WHERE EXISTS ( \
+            SELECT 1 FROM frontier_tasks WHERE id = ?8 AND state = ?9 \
+            AND updated_at_ms = ?10) AND NOT EXISTS (SELECT 1 FROM errors WHERE id = ?11)",
+        vec![
+            turso::Value::Text(gap_id.to_string()),
+            turso::Value::Text(scope_key.to_string()),
+            turso::Value::Text(category.to_string()),
+            turso::Value::Text(detail.to_string()),
+            turso::Value::Integer(now_ms),
+            turso::Value::Integer(now_ms),
+            next_retry_ms.map_or(turso::Value::Null, turso::Value::Integer),
+            turso::Value::Text(task_id.to_string()),
+            turso::Value::Text(outcome_state.to_string()),
+            turso::Value::Integer(now_ms),
+            turso::Value::Text(gap_id.to_string()),
+        ],
+    );
+}
+
+/// Committed task row fields one completion classification reads.
+struct CompletionRowState {
+    state: String,
+    lease_token: Option<i64>,
+    lease_epoch: Option<i64>,
+    expected_rev: u64,
+    updated_at_ms: i64,
+}
+
+/// Read one task's completion-classification fields (`None` when the task
+/// row does not exist).
+async fn completion_row_state(
+    store: &TursoStore,
+    task_id: &str,
+) -> repo_scan::Result<Option<CompletionRowState>> {
+    let mut rows = store
+        .connection()
+        .query(
+            "SELECT state, lease_token, lease_epoch, expected_rev, updated_at_ms \
+                FROM frontier_tasks WHERE id = ?1",
+            vec![turso::Value::Text(task_id.to_string())],
+        )
         .await
+        .map_err(|e| repo_scan::Error::Store(e.to_string()))?;
+    let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| repo_scan::Error::Store(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let expected_rev = cell_int(&row, 3)?;
+    Ok(Some(CompletionRowState {
+        state: cell_text(&row, 0)?,
+        lease_token: cell_opt_int(&row, 1)?,
+        lease_epoch: cell_opt_int(&row, 2)?,
+        expected_rev: u64::try_from(expected_rev).map_err(|_| {
+            repo_scan::Error::Store(format!(
+                "task expected_rev {expected_rev} in catalog is not a valid u64"
+            ))
+        })?,
+        updated_at_ms: cell_int(&row, 4)?,
+    }))
+}
+
+/// Resolve every completion a flush just committed (Step 12 batched
+/// completion): each buffered entry's conditional SQL either applied its
+/// outcome, took the stale path, or matched nothing, and the observed
+/// committed rows decide — never the buffer-time prediction, so an
+/// invalidation committing between buffer and flush still requeues
+/// instead of completing. Returns per-entry verdicts in buffer order.
+/// Unknown tasks and lease mismatches abort loudly with the same errors
+/// as the retired per-task path; stale entries are already requeued by
+/// the committed flush and only count here. Applied entries journal
+/// their gap events into the writer batch (next flush).
+async fn classify_flushed_completions(
+    runner: &mut Runner,
+    store: &TursoStore,
+) -> repo_scan::Result<Vec<CompletionVerdict>> {
+    let pending = std::mem::take(&mut runner.pending_completions);
+    let mut verdicts = Vec::with_capacity(pending.len());
+    for item in &pending {
+        verdicts.push(classify_one_completion(runner, store, item).await?);
+    }
+    Ok(verdicts)
+}
+
+/// Classify one flushed completion against its committed task row.
+async fn classify_one_completion(
+    runner: &mut Runner,
+    store: &TursoStore,
+    item: &PendingCompletion,
+) -> repo_scan::Result<CompletionVerdict> {
+    let Some(row) = completion_row_state(store, &item.task_id).await? else {
+        return Err(repo_scan::Error::UnknownTask(format!(
+            "unknown-task: {}",
+            item.task_id
+        )));
+    };
+    if row.state == item.outcome_state
+        && row.lease_token.is_none()
+        && row.lease_epoch.is_none()
+        && row.updated_at_ms == item.now_ms
     {
-        Ok(delta) => {
-            runner.counters.db_transactions += 1;
-            journal_completion_delta(runner, store, &delta).await?;
-            Ok(CompletionApplied::Applied)
-        }
-        Err(repo_scan::Error::Scheduler(message)) if message.starts_with("stale-completion:") => {
-            runner.counters.db_transactions += 1;
-            Ok(CompletionApplied::StaleRequeued)
-        }
-        Err(repo_scan::Error::Scheduler(message)) if message.starts_with("lease-mismatch:") => {
-            Err(repo_scan::Error::LeaseMismatch(message))
-        }
-        Err(repo_scan::Error::Scheduler(message)) if message.starts_with("unknown-task:") => {
-            Err(repo_scan::Error::UnknownTask(message))
-        }
-        Err(e) => Err(e),
+        let delta = observed_completion_delta(item);
+        journal_observed_delta(runner, &delta)?;
+        return Ok(CompletionVerdict::Applied);
+    }
+    if row.state == "pending"
+        && row.lease_token.is_none()
+        && row.lease_epoch.is_none()
+        && row.updated_at_ms == item.now_ms
+        && row.expected_rev == store.scope_rev(&item.scope_key).await?
+    {
+        runner.counters.stale_requeued += 1;
+        eprintln!(
+            "repo-scan: stale completion requeued: {} (invalidation kept)",
+            item.task_id
+        );
+        return Ok(CompletionVerdict::StaleRequeued);
+    }
+    Err(repo_scan::Error::LeaseMismatch(format!(
+        "lease-mismatch: task {} is not leased to epoch {} token {}",
+        item.task_id, item.epoch, item.token
+    )))
+}
+
+/// Build the gap delta an applied completion caused, from the observed
+/// outcome (same shape the store used to return: the conditional gap SQL
+/// guarantees the recorded rows match exactly when the outcome applied).
+fn observed_completion_delta(item: &PendingCompletion) -> CompletionDelta {
+    let gap_id = format!("gap:{}", item.task_id);
+    match &item.outcome {
+        TaskOutcome::Complete => CompletionDelta {
+            opened: None,
+            closed: Some(gap_id),
+        },
+        TaskOutcome::Retry {
+            category, detail, ..
+        } => CompletionDelta {
+            opened: Some(CompletionGap {
+                id: gap_id,
+                scope_key: item.scope_key.clone(),
+                category: category.clone(),
+                detail: detail.clone(),
+            }),
+            closed: None,
+        },
+        TaskOutcome::Parked { reason, .. } => CompletionDelta {
+            opened: Some(CompletionGap {
+                id: gap_id,
+                scope_key: item.scope_key.clone(),
+                category: item.outcome_state.to_string(),
+                detail: reason.clone(),
+            }),
+            closed: None,
+        },
     }
 }
 
-/// Journal one completion gap delta: the opened row (if any) as an
-/// `error` event, then the open/close delta as `coverage_updated` — each
-/// in its own transaction. The gap rows are already durable (the
-/// completion committed before this runs); unit-test runners without a
-/// journal skip silently. The opened row always emits an `error`
-/// (point-in-time); the coverage delta fires only on genuine
-/// transitions against `open_gaps`.
-async fn journal_completion_delta(
-    runner: &mut Runner,
-    store: &TursoStore,
-    delta: &CompletionDelta,
-) -> repo_scan::Result<()> {
+/// Journal one observed completion gap delta: the opened row (if any) as
+/// an `error` event, then the open/close delta as `coverage_updated` —
+/// buffered into the writer batch (next flush), after the completion
+/// committed. The opened row always emits an `error` (point-in-time);
+/// the coverage delta fires only on genuine transitions against
+/// `open_gaps` (opens on newly opened rows; closes when the set held
+/// the id — the batched close cannot report its rowcount, so the open
+/// set is the authority, mirroring [`buffer_resolve_error`]).
+/// Unit-test runners without a journal skip silently.
+fn journal_observed_delta(runner: &mut Runner, delta: &CompletionDelta) -> repo_scan::Result<()> {
     if runner.journal.is_none() {
         return Ok(());
     }
-    // Transition gating before the journal borrow below: opens fire only
-    // for newly opened rows; closes are rowcount-gated by the store, so
-    // the set update just keeps this run's view accurate.
+    // Transition gating before the journal borrow below.
     let opened: Vec<String> = match delta.opened.as_ref() {
         Some(gap) if runner.open_gaps.insert(gap.id.clone()) => vec![gap.id.clone()],
         _ => Vec::new(),
     };
     let closed: Vec<String> = match delta.closed.as_ref() {
-        Some(id) => {
-            runner.open_gaps.remove(id.as_str());
-            vec![id.clone()]
-        }
-        None => Vec::new(),
+        Some(id) if runner.open_gaps.remove(id.as_str()) => vec![id.clone()],
+        _ => Vec::new(),
     };
     let journal = runner.journal.as_mut().expect("journal checked above");
-    // Counter increments hoisted past the last journal use (NLL): the
-    // journal borrow spans both emits.
-    let mut txns = 0u64;
     if let Some(gap) = delta.opened.as_ref() {
-        let records = error_records_value(&gap.id, &gap.scope_key, &gap.category, &gap.detail);
-        journal.emit(store, EventType::Error, &records).await?;
-        txns += 1;
+        let records = error_records(&gap.id, &gap.scope_key, &gap.category, &gap.detail)?;
+        journal.buffer_error(&mut runner.batch, &records)?;
     }
     if !opened.is_empty() || !closed.is_empty() {
-        let records = coverage_updated_value(&opened, &closed, &[]);
-        journal
-            .emit(store, EventType::CoverageUpdated, &records)
-            .await?;
-        txns += 1;
+        let records = coverage_updated_records(&opened, &closed, &[])?;
+        journal.buffer_coverage_updated(&mut runner.batch, &records)?;
     }
-    runner.counters.db_transactions += txns;
     Ok(())
 }
 
@@ -12092,12 +12694,197 @@ fn scan_still_running(state: &str) -> bool {
     state == "running" || state.starts_with("running:")
 }
 
+/// Where a scan replay starts (Step 12): an optional strictly-after
+/// `(catalog_rev, event_offset)` position plus whether the first
+/// delivered envelope must carry `reset:true`.
+struct ReplayPosition {
+    after: Option<(u64, u64)>,
+    reset_first: bool,
+}
+
+/// Resolve an `--after` cursor to its replay position (Step 12): seq 0
+/// replays from the start; otherwise the row at the cursor's seq
+/// classifies via [`classify_cursor`] — covered cursors resume strictly
+/// after the cursor's `(rev, off)` position (revision + event-offset
+/// replay position, so reconnecting between two events of one
+/// transaction loses nothing), while expired or diverged cursors replay
+/// the retained window from its start with `reset:true` first
+/// (explicit-reset snapshot, never a silent gap). Corrupt (undecodable)
+/// cursors stay a usage error.
+async fn resolve_after_cursor(
+    store: &TursoStore,
+    scan_id: &str,
+    after: &str,
+) -> repo_scan::Result<ReplayPosition> {
+    let Some(cursor) = Cursor::decode(after) else {
+        return Err(repo_scan::Error::InvalidArgs(format!(
+            "corrupt --after cursor for scan {scan_id}; replay from the start instead"
+        )));
+    };
+    if cursor.seq == 0 {
+        return Ok(ReplayPosition {
+            after: None,
+            reset_first: false,
+        });
+    }
+    let seq_i64 = i64::try_from(cursor.seq).map_err(|_| {
+        repo_scan::Error::Store(format!("cursor seq {} exceeds i64 range", cursor.seq))
+    })?;
+    let mut rows = store
+        .connection()
+        .query(
+            "SELECT event_type, catalog_rev, event_offset FROM scan_events \
+                WHERE scan_id = ?1 AND seq = ?2",
+            vec![
+                turso::Value::Text(scan_id.to_string()),
+                turso::Value::Integer(seq_i64),
+            ],
+        )
+        .await
+        .map_err(|e| repo_scan::Error::Store(e.to_string()))?;
+    let found = match rows
+        .next()
+        .await
+        .map_err(|e| repo_scan::Error::Store(e.to_string()))?
+    {
+        None => None,
+        Some(row) => {
+            let event_type: EventType = serde_json::from_value(serde_json::Value::String(
+                cell_text(&row, 0)?,
+            ))
+            .map_err(|e| {
+                repo_scan::Error::Report(format!(
+                    "scan_events row seq {} carries unknown class: {e}",
+                    cursor.seq,
+                ))
+            })?;
+            let rev = cell_int(&row, 1)?;
+            let off = cell_int(&row, 2)?;
+            Some((
+                event_type,
+                u64::try_from(rev).map_err(|_| {
+                    repo_scan::Error::Store(format!(
+                        "event catalog_rev {rev} in catalog is not a valid u64"
+                    ))
+                })?,
+                u64::try_from(off).map_err(|_| {
+                    repo_scan::Error::Store(format!(
+                        "event offset {off} in catalog is not a valid u64"
+                    ))
+                })?,
+            ))
+        }
+    };
+    match classify_cursor(&cursor, found) {
+        ResumeAction::ResumeAfterCursor => Ok(ReplayPosition {
+            after: Some((cursor.catalog_rev, cursor.event_offset)),
+            reset_first: false,
+        }),
+        ResumeAction::ResetSnapshot => Ok(ReplayPosition {
+            after: None,
+            reset_first: true,
+        }),
+    }
+}
+
+/// Parse one `scan_events` row (same column order and range checks as
+/// the store reader: negative seq/rev/off are catalog corruption).
+fn scan_event_row_from_cells(row: &turso::Row) -> repo_scan::Result<ScanEventRow> {
+    let seq = cell_int(row, 1)?;
+    let rev = cell_int(row, 2)?;
+    let off = cell_int(row, 3)?;
+    Ok(ScanEventRow {
+        scan_id: cell_text(row, 0)?,
+        seq: u64::try_from(seq).map_err(|_| {
+            repo_scan::Error::Store(format!("event seq {seq} in catalog is not a valid u64"))
+        })?,
+        catalog_rev: u64::try_from(rev).map_err(|_| {
+            repo_scan::Error::Store(format!(
+                "event catalog_rev {rev} in catalog is not a valid u64"
+            ))
+        })?,
+        event_offset: u64::try_from(off).map_err(|_| {
+            repo_scan::Error::Store(format!("event offset {off} in catalog is not a valid u64"))
+        })?,
+        event_type: cell_text(row, 4)?,
+        op: cell_text(row, 5)?,
+        reset: cell_int(row, 6)? != 0,
+        records: cell_blob(row, 7)?,
+    })
+}
+
+/// Replay journal rows for a scan in `(catalog_rev, event_offset)` order
+/// (served by `idx_scan_events_cursor`), optionally strictly after one
+/// position, oldest first, capped at `limit` rows (clamped to
+/// `[1, 10_000]`, mirroring `read_scan_events`).
+async fn read_scan_events_after_position(
+    store: &TursoStore,
+    scan_id: &str,
+    after: Option<(u64, u64)>,
+    limit: u64,
+) -> repo_scan::Result<Vec<ScanEventRow>> {
+    const COLUMNS: &str = "scan_id, seq, catalog_rev, event_offset, event_type, op, reset, records";
+    let limit_i64 = i64::try_from(limit.clamp(1, 10_000))
+        .map_err(|_| repo_scan::Error::Store(format!("event limit {limit} exceeds i64 range")))?;
+    let (sql, params) = match after {
+        None => (
+            format!(
+                "SELECT {COLUMNS} FROM scan_events WHERE scan_id = ?1 \
+                ORDER BY catalog_rev ASC, event_offset ASC LIMIT ?2"
+            ),
+            vec![
+                turso::Value::Text(scan_id.to_string()),
+                turso::Value::Integer(limit_i64),
+            ],
+        ),
+        Some((rev, off)) => {
+            let rev_i64 = i64::try_from(rev).map_err(|_| {
+                repo_scan::Error::Store(format!("event catalog_rev {rev} exceeds i64 range"))
+            })?;
+            let off_i64 = i64::try_from(off).map_err(|_| {
+                repo_scan::Error::Store(format!("event offset {off} exceeds i64 range"))
+            })?;
+            (
+                format!(
+                    "SELECT {COLUMNS} FROM scan_events WHERE scan_id = ?1 \
+                    AND (catalog_rev > ?2 OR (catalog_rev = ?2 AND event_offset > ?3)) \
+                    ORDER BY catalog_rev ASC, event_offset ASC LIMIT ?4"
+                ),
+                vec![
+                    turso::Value::Text(scan_id.to_string()),
+                    turso::Value::Integer(rev_i64),
+                    turso::Value::Integer(off_i64),
+                    turso::Value::Integer(limit_i64),
+                ],
+            )
+        }
+    };
+    let mut rows = store
+        .connection()
+        .query(sql.as_str(), params)
+        .await
+        .map_err(|e| repo_scan::Error::Store(e.to_string()))?;
+    let mut out = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| repo_scan::Error::Store(e.to_string()))?
+    {
+        out.push(scan_event_row_from_cells(&row)?);
+    }
+    Ok(out)
+}
+
 /// `query --scan SCAN_ID`: replay the scan's journaled event stream as
-/// JSONL envelopes, oldest first. `--after CURSOR` resumes strictly after
-/// the cursor's `seq`; `--follow` keeps polling a running scan until the
-/// terminal event, Ctrl-C (exit 130), or a broken pipe (quiet exit 0).
-/// Read-only: no owner lock, no epoch claim, servable while a scan holds
-/// the write lock. Unknown scan IDs exit 2 like `resume` on a missing ID.
+/// JSONL envelopes, oldest first, in `(catalog_rev, event_offset)` order.
+/// `--after CURSOR` resumes strictly after the cursor's position; a
+/// cursor the retained window no longer covers (or that diverges from
+/// the journaled row) replays the retained window from its start with
+/// `reset:true` on the first envelope. `--follow` keeps polling a
+/// running scan until the terminal event, Ctrl-C (exit 130), or a broken
+/// pipe (quiet exit 0). Read-only: no owner lock, no epoch claim,
+/// servable while a scan holds the write lock. Unknown scan IDs exit 2
+/// like `resume` on a missing ID.
 async fn run_query_scan_replay(
     cfg: &config::Config,
     args: &repo_scan::cli::QueryArgs,
@@ -12155,35 +12942,46 @@ async fn run_query_scan_replay(
             "no such scan: {scan_id}"
         )));
     };
-    let mut after_seq = 0u64;
-    if let Some(after) = &args.after {
-        let Some(cursor) = Cursor::decode(after) else {
-            let _ = store.close().await;
-            return Err(repo_scan::Error::InvalidArgs(format!(
-                "corrupt --after cursor for scan {scan_id}; replay from the start instead"
-            )));
-        };
-        after_seq = cursor.seq;
-    }
+    let start = match &args.after {
+        None => ReplayPosition {
+            after: None,
+            reset_first: false,
+        },
+        Some(after) => match resolve_after_cursor(&store, scan_id, after).await {
+            Ok(position) => position,
+            Err(e) => {
+                let _ = store.close().await;
+                return Err(e);
+            }
+        },
+    };
+    let mut after = start.after;
+    // Explicit-reset snapshots override `reset` on the first envelope
+    // actually delivered (even when the first rows arrive in the follow
+    // loop rather than the initial replay).
+    let mut reset_first = start.reset_first;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
     // Initial replay: page through committed rows; a short page (or an
     // empty one) means the reader caught up to the tip.
     let mut terminal_seen = false;
     loop {
-        let rows = store
-            .read_scan_events(scan_id, after_seq, REPLAY_PAGE_ROWS)
-            .await?;
+        let rows =
+            read_scan_events_after_position(&store, scan_id, after, REPLAY_PAGE_ROWS).await?;
         let short_page = rows.len() < REPLAY_PAGE_ROWS as usize;
         for row in &rows {
-            let env = envelope_for_row(row)?;
+            let mut env = envelope_for_row(row)?;
+            if reset_first {
+                env.reset = true;
+                reset_first = false;
+            }
             let line =
                 serde_json::to_string(&env).map_err(|e| repo_scan::Error::Report(e.to_string()))?;
             if !write_jsonl_line(&mut out, &line)? {
                 let _ = store.close().await;
                 return Ok(ExitCode::Success);
             }
-            after_seq = row.seq;
+            after = Some((row.catalog_rev, row.event_offset));
             terminal_seen |= is_terminal_event(env.event_type);
         }
         if short_page {
@@ -12235,18 +13033,21 @@ async fn run_query_scan_replay(
             );
             return Ok(ExitCode::Incomplete);
         }
-        let rows = store
-            .read_scan_events(scan_id, after_seq, REPLAY_PAGE_ROWS)
-            .await?;
+        let rows =
+            read_scan_events_after_position(&store, scan_id, after, REPLAY_PAGE_ROWS).await?;
         for row in &rows {
-            let env = envelope_for_row(row)?;
+            let mut env = envelope_for_row(row)?;
+            if reset_first {
+                env.reset = true;
+                reset_first = false;
+            }
             let line =
                 serde_json::to_string(&env).map_err(|e| repo_scan::Error::Report(e.to_string()))?;
             if !write_jsonl_line(&mut out, &line)? {
                 let _ = store.close().await;
                 return Ok(ExitCode::Success);
             }
-            after_seq = row.seq;
+            after = Some((row.catalog_rev, row.event_offset));
             terminal_seen |= is_terminal_event(env.event_type);
         }
         match out.flush() {
@@ -15140,7 +15941,7 @@ pub async fn test_reconcile_scripted(
             break;
         }
         for task in &claimed {
-            // Production completion semantics (`complete_claimed`):
+            // Production completion semantics (batched completion):
             // stale completions are routine — the store already requeued
             // the task with a fresh expected rev, and this loop reclaims
             // it. Only non-stale errors abort.
@@ -15484,6 +16285,247 @@ pub fn test_progress_timed() -> (bool, bool, bool) {
     std::thread::sleep(Duration::from_millis(600));
     let after_interval = runner.admission.progress_due();
     (first, immediate, after_interval)
+}
+
+// ---------------------------------------------------------------------------
+// Wave1d Step 12 hooks (`tests/events_impl.rs` includes this file as a
+// module): batched completion, progress coalescing, retention, and
+// cursor resolution through the production code the command paths use.
+// ---------------------------------------------------------------------------
+
+/// One scripted completion for [`test_drive_completions`].
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct TestCompletionItem {
+    /// Task id (claimed by the test before driving; completions carry the
+    /// claim token below).
+    pub task_id: String,
+    /// Lease token the completion presents.
+    pub token: i64,
+    /// Outcome to complete with.
+    pub outcome: TaskOutcome,
+    /// Child tasks to enqueue into the same batch before buffering this
+    /// completion (crash-rule coverage).
+    pub children: Vec<TestChildTask>,
+}
+
+/// One child task to enqueue (fields mirror `NewTask`; the idempotency
+/// key derives as `idem:<id>` like production enqueues).
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct TestChildTask {
+    pub id: String,
+    pub kind: String,
+    pub generation: u64,
+    pub scope_key: String,
+    pub expected_rev: u64,
+}
+
+/// Observed verdict for one driven completion.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestCompletionResult {
+    pub task_id: String,
+    pub stale: bool,
+}
+
+/// Drive scripted completions through the production batch path: buffer
+/// each item's children plus its conditional completion SQL into one
+/// writer batch, then (when `flush`) commit and classify exactly like
+/// the drain loop, followed by the Phase-B event flush. `flush = false`
+/// drops the batch uncommitted (a kill between buffer and flush: tasks
+/// stay leased, children stay absent). Unknown tasks, lease mismatches,
+/// bad epochs, and invalid parked states abort with the production
+/// errors.
+#[cfg(test)]
+pub async fn test_drive_completions(
+    store: &TursoStore,
+    scan_id: &str,
+    epoch: u64,
+    items: Vec<TestCompletionItem>,
+    flush: bool,
+) -> repo_scan::Result<Vec<TestCompletionResult>> {
+    let mut runner = Runner::new(&config::ResourceLimits::default());
+    let rev = store.next_revision().await?;
+    runner.journal = Some(ScanJournal::open(store, scan_id, rev).await?);
+    runner.open_gaps = store.list_open_error_ids().await?.into_iter().collect();
+    let now = store::now_ms();
+    for item in &items {
+        for child in &item.children {
+            let idempotency_key = format!("idem:{}", child.id);
+            let task = NewTask {
+                id: &child.id,
+                kind: &child.kind,
+                generation: child.generation,
+                dir_id: None,
+                scope_key: &child.scope_key,
+                expected_rev: child.expected_rev,
+                idempotency_key: &idempotency_key,
+            };
+            TursoStore::buffer_enqueue_task(&mut runner.batch, &task, now);
+        }
+        // Rebuild the claim the drain loop would hold; unknown tasks get
+        // a synthetic claim so the production unknown-task error fires.
+        let claimed = match store.get_task(&item.task_id).await? {
+            Some(task) => ClaimedTask {
+                task,
+                token: item.token,
+                expires_ms: 0,
+            },
+            None => ClaimedTask {
+                task: FrontierTask {
+                    id: item.task_id.clone(),
+                    kind: String::from("enumerate_dir"),
+                    generation: 1,
+                    dir_id: None,
+                    scope_key: String::from("dir:test"),
+                    expected_rev: 0,
+                    state: TaskState::Leased,
+                    lease_token: Some(item.token),
+                    lease_epoch: Some(epoch),
+                    lease_expires_ms: None,
+                    idempotency_key: String::from("idem:test"),
+                    retry_after_ms: None,
+                    attempts: 1,
+                },
+                token: item.token,
+                expires_ms: 0,
+            },
+        };
+        buffer_completion(&mut runner, store, &claimed, epoch, &item.outcome)?;
+    }
+    if !flush {
+        return Ok(Vec::new());
+    }
+    flush_runner_batch(&mut runner, store).await?;
+    // Phase-B gap events buffered by classification commit next (the
+    // drain flushes them with following work; the hook flushes now).
+    flush_runner_batch(&mut runner, store).await?;
+    let mut out = Vec::with_capacity(items.len());
+    for item in &items {
+        // Verdicts are observable committed state: the applied path
+        // leaves the outcome state, the stale path leaves `pending`.
+        let state = store.get_task(&item.task_id).await?.map(|task| task.state);
+        out.push(TestCompletionResult {
+            task_id: item.task_id.clone(),
+            stale: state == Some(TaskState::Pending),
+        });
+    }
+    Ok(out)
+}
+
+/// Observed prune outcome for [`test_prune_scan_events`].
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestPruneOutcome {
+    pub retained: u64,
+    pub cutoff: u64,
+    pub pruned: bool,
+}
+
+/// Enforce retention on one scan's journal with an explicit bound
+/// through the production prune (the scan path passes
+/// [`MAX_RETAINED_SCAN_EVENTS`]).
+#[cfg(test)]
+pub async fn test_prune_scan_events(
+    store: &TursoStore,
+    scan_id: &str,
+    keep_rows: u64,
+) -> repo_scan::Result<TestPruneOutcome> {
+    let rev = store.next_revision().await?;
+    let mut journal = ScanJournal::open(store, scan_id, rev).await?;
+    let pruned = maybe_prune_scan_journal(store, &mut journal, keep_rows).await?;
+    Ok(TestPruneOutcome {
+        retained: scan_event_count(store, scan_id).await?,
+        cutoff: journal.pruned_through,
+        pruned,
+    })
+}
+
+/// Observed cursor resolution for [`test_resolve_after_cursor`].
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestCursorResolution {
+    pub reset_first: bool,
+    pub after: Option<(u64, u64)>,
+}
+
+/// Resolve an `--after` cursor through the production resolver (`None`
+/// replays from the start like a cursor-less query).
+#[cfg(test)]
+pub async fn test_resolve_after_cursor(
+    store: &TursoStore,
+    scan_id: &str,
+    after: Option<String>,
+) -> repo_scan::Result<TestCursorResolution> {
+    match after {
+        None => Ok(TestCursorResolution {
+            reset_first: false,
+            after: None,
+        }),
+        Some(cursor) => {
+            let position = resolve_after_cursor(store, scan_id, &cursor).await?;
+            Ok(TestCursorResolution {
+                reset_first: position.reset_first,
+                after: position.after,
+            })
+        }
+    }
+}
+
+/// Observed coalescing outcome for [`test_journal_progress_ticks`].
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestProgressOutcome {
+    pub progress_rows: u64,
+    pub survivor_records: serde_json::Value,
+    pub error_rows: u64,
+}
+
+/// Journal `ticks` progress payloads plus one interleaved error event
+/// through the production journal + flush path (one flush per tick,
+/// like the drain), then report the surviving progress rows, the
+/// survivor payload, and the surviving error rows.
+#[cfg(test)]
+pub async fn test_journal_progress_ticks(
+    store: &TursoStore,
+    scan_id: &str,
+    ticks: u64,
+) -> repo_scan::Result<TestProgressOutcome> {
+    let mut runner = Runner::new(&config::ResourceLimits::default());
+    let rev = store.next_revision().await?;
+    runner.journal = Some(ScanJournal::open(store, scan_id, rev).await?);
+    for tick in 0..ticks {
+        let records = serde_json::json!({"tick": tick, "elapsed_s": tick});
+        let bytes =
+            serde_json::to_vec(&records).map_err(|e| repo_scan::Error::Report(e.to_string()))?;
+        journal_discovery_progress(&mut runner, store, &bytes).await?;
+        if tick == 0 {
+            // One record event interleaved: coalescing must never drop it.
+            let journal = runner.journal.as_mut().expect("journal opened above");
+            let error = error_records("gap:test", "scope:test", "test-cat", "test detail")?;
+            journal.buffer_error(&mut runner.batch, &error)?;
+        }
+        flush_runner_batch(&mut runner, store).await?;
+    }
+    let rows = store.read_scan_events(scan_id, 0, 10_000).await?;
+    let mut progress_rows = 0u64;
+    let mut survivor_records = serde_json::Value::Null;
+    let mut error_rows = 0u64;
+    for row in &rows {
+        if row.event_type == EventType::DiscoveryProgress.name() {
+            progress_rows += 1;
+            survivor_records = serde_json::from_slice(&row.records)
+                .map_err(|e| repo_scan::Error::Report(e.to_string()))?;
+        } else if row.event_type == EventType::Error.name() {
+            error_rows += 1;
+        }
+    }
+    Ok(TestProgressOutcome {
+        progress_rows,
+        survivor_records,
+        error_rows,
+    })
 }
 
 /// Progress line content through the real formatter

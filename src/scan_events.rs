@@ -215,6 +215,68 @@ impl Cursor {
     }
 }
 
+/// Bounded Step 12 retention: per-scan journal cap (contract D4,
+/// `scan_events.rs` owns retention per D8).
+///
+/// The writer keeps the newest [`MAX_RETAINED_SCAN_EVENTS`] rows per scan
+/// (position-based prefix prune; the tip row always survives, so a
+/// finished scan's terminal event is never pruned). A cursor the retained
+/// window no longer covers yields an explicit-reset snapshot, never a
+/// silent resume ([`classify_cursor`]).
+pub const MAX_RETAINED_SCAN_EVENTS: u64 = 50_000;
+
+/// Prune cutoff for [`MAX_RETAINED_SCAN_EVENTS`]: delete retained rows
+/// with `seq <= cutoff`. Pure so the writer and tests share the rule;
+/// keeps the newest `keep_rows` seqs. Callers pass `keep_rows >= 1`, so
+/// the tip row always survives (a finished scan's terminal event is the
+/// tip and is never pruned).
+#[must_use]
+pub fn retention_cutoff(tip_seq: u64, keep_rows: u64) -> u64 {
+    tip_seq.saturating_sub(keep_rows.max(1))
+}
+
+/// Resume decision for an `--after` [`Cursor`] (contract D4, Step 12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeAction {
+    /// Resume strictly after the cursor's `(catalog_rev, event_offset)`
+    /// position; the first delivered envelope keeps its stored flags.
+    ResumeAfterCursor,
+    /// Retained events no longer cover the cursor: replay the retained
+    /// window from its start with `reset:true` on the first envelope, so
+    /// the consumer drops buffered state instead of silently skipping.
+    ResetSnapshot,
+}
+
+/// Classify one `--after` [`Cursor`] against the journaled row at its
+/// `seq` (`None` when no row carries that seq).
+///
+/// - No row (pruned prefix, beyond-tip cursor, or empty journal) →
+///   [`ResumeAction::ResetSnapshot`]: resync, never silent.
+/// - Row found and [`is_progress_coalescible`] → `ResumeAfterCursor`: a
+///   coalescible row is a gauge, never divergence — the caller resumes
+///   after the *cursor's* position, so records journaled around it are
+///   still delivered. (Production gauge positions are immutable, so the
+///   fuzzy arm only fires on hand-mutated journals; routine ticks never
+///   resync followers either way.)
+/// - Row found, record class, `(rev, off)` matches → `ResumeAfterCursor`.
+/// - Row found, record class, `(rev, off)` differs (foreign scan's cursor
+///   or corruption) → `ResetSnapshot`.
+#[must_use]
+pub fn classify_cursor(cursor: &Cursor, found: Option<(EventType, u64, u64)>) -> ResumeAction {
+    match found {
+        None => ResumeAction::ResetSnapshot,
+        Some((event_type, _rev, _off)) if is_progress_coalescible(event_type) => {
+            ResumeAction::ResumeAfterCursor
+        }
+        Some((_event_type, rev, off))
+            if rev == cursor.catalog_rev && off == cursor.event_offset =>
+        {
+            ResumeAction::ResumeAfterCursor
+        }
+        Some(_) => ResumeAction::ResetSnapshot,
+    }
+}
+
 const B64URL_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
@@ -438,6 +500,55 @@ mod tests {
         assert!(s.len() % 4 == 1 || Cursor::decode(&s).is_none());
         let bad_len = "abcde"; // len % 4 == 1 is unrepresentable
         assert_eq!(Cursor::decode(bad_len), None);
+    }
+
+    #[test]
+    fn retention_cutoff_keeps_newest_and_tip() {
+        assert_eq!(retention_cutoff(100, 20), 80);
+        assert_eq!(retention_cutoff(20, 20), 0);
+        // Under the bound nothing prunes; keep clamps to >= 1 so the
+        // tip always survives even a degenerate bound.
+        assert_eq!(retention_cutoff(5, 50_000), 0);
+        assert_eq!(retention_cutoff(100, 0), 99);
+        const {
+            assert!(MAX_RETAINED_SCAN_EVENTS > 0);
+        }
+    }
+
+    #[test]
+    fn classify_cursor_matrix() {
+        let cursor = Cursor {
+            seq: 7,
+            catalog_rev: 3,
+            event_offset: 4,
+        };
+        // Missing row (pruned prefix, beyond tip, empty journal): reset.
+        assert_eq!(classify_cursor(&cursor, None), ResumeAction::ResetSnapshot);
+        // Record row, position matches: resume.
+        assert_eq!(
+            classify_cursor(&cursor, Some((EventType::LocationFound, 3, 4))),
+            ResumeAction::ResumeAfterCursor
+        );
+        // Record row, position differs (foreign cursor/corruption): reset.
+        assert_eq!(
+            classify_cursor(&cursor, Some((EventType::LocationFound, 3, 5))),
+            ResumeAction::ResetSnapshot
+        );
+        assert_eq!(
+            classify_cursor(&cursor, Some((EventType::LocationFound, 9, 4))),
+            ResumeAction::ResetSnapshot
+        );
+        // Coalescible gauge: resume even when its position drifted
+        // (seq-reuse coalescing moves it); the caller resumes after the
+        // cursor's own position so nothing between is skipped.
+        assert_eq!(
+            classify_cursor(&cursor, Some((EventType::DiscoveryProgress, 3, 4))),
+            ResumeAction::ResumeAfterCursor
+        );
+        assert_eq!(
+            classify_cursor(&cursor, Some((EventType::DiscoveryProgress, 9, 9))),
+            ResumeAction::ResumeAfterCursor
+        );
     }
 
     #[test]

@@ -652,6 +652,34 @@ pub fn non_utf8_tracking_repo(parent: &Path, name: &str) -> (PathBuf, Vec<u8>) {
     (dir, refname)
 }
 
+/// `n` normal clones side by side (`{prefix}-000`, …) for slow-scan
+/// timing windows (live discovery reads, progress coalescing). Returns
+/// every repo root created.
+pub fn many_repos(parent: &Path, prefix: &str, n: usize) -> Vec<PathBuf> {
+    (0..n)
+        .map(|i| normal_clone(parent, &format!("{prefix}-{i:03}")))
+        .collect()
+}
+
+/// Chain of `depth` nested repos: each level holds a repo plus the next
+/// level's directory, so parent/child enumeration tasks form a deep
+/// completion chain (interrupted-batch resumption must lose no child).
+/// Returns every repo root created, outermost first.
+pub fn deep_repo_chain(parent: &Path, depth: usize) -> Vec<PathBuf> {
+    let mut repos = Vec::with_capacity(depth);
+    let mut level = parent.join("chain");
+    private_dir_0700(&level).unwrap();
+    for i in 0..depth {
+        let repo = normal_clone(&level, &format!("repo-{i:02}"));
+        repos.push(repo);
+        level = level.join(format!("repo-{i:02}")).join("nested");
+        if i + 1 < depth {
+            private_dir_0700(&level).unwrap();
+        }
+    }
+    repos
+}
+
 /// Read a file to string; panics with the path on failure.
 pub fn read_to_string(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))

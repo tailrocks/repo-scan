@@ -89,6 +89,22 @@ Cursor: opaque; `scan seq` + `(catalog_rev, event offset)`. Snapshot cursor
 transaction commits. Cursor outside retention → fresh snapshot + `reset:true`.
 Duplicates: same `(seq)` re-delivery is idempotent; consumers dedupe by seq.
 
+Wave1d deltas (Step 12, branch `work/fast-complete-scan`):
+
+- Gauge coalescing is write-side seq-reuse: the first `discovery_progress`
+  tick takes a fresh seq; later ticks UPDATE its payload in place at the
+  immutable `(catalog_rev, event_offset)`. Exactly one progress row per scan
+  holds the NEWEST payload; record events are never dropped by coalescing.
+- Retention bound: newest 50,000 rows per scan journal
+  (`MAX_RETAINED_SCAN_EVENTS`); prefix prune in one transaction; the tip row
+  always survives. Cursors at/below the prune cutoff resync as a snapshot
+  with `reset:true` on the first envelope (never a silent resume).
+- Cursor classification: a covered record cursor with a drifted
+  `(catalog_rev, event_offset)` diverges (snapshot + `reset:true`); the
+  coalescible `discovery_progress` gauge NEVER diverges on position drift —
+  the reader resumes after its own position. Corrupt `--after` stays a usage
+  error (exit 2); pruned/beyond-tip cursors stay snapshots (exit 0).
+
 ## D5. Scope key and scheduling (Steps 7–9)
 
 Scope key = normalized roots + volume identities + exclusions + traversal
