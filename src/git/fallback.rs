@@ -1950,7 +1950,17 @@ impl FallbackGit {
             .arg("-c")
             .arg("core.fsmonitor=false")
             .arg("-c")
-            .arg("credential.interactive=never");
+            .arg("credential.interactive=never")
+            // Fetch must not trigger store rewrites behind the scan's
+            // back (Step 11: no automatic maintenance): `gc.auto=0`
+            // disables auto-gc, `maintenance.auto=false` disables auto
+            // maintenance. Older gits ignore the unknown keys; the
+            // read-only fetch-phase probes (config/ls-remote/for-each-ref)
+            // never gc, so sharing the base is harmless.
+            .arg("-c")
+            .arg("gc.auto=0")
+            .arg("-c")
+            .arg("maintenance.auto=false");
         command.env("GIT_PAGER", "cat");
         // AFTER sanitizing (XSEC-03): the prompt-killers must win.
         harden_no_prompt(&mut command);
@@ -1995,11 +2005,28 @@ impl FallbackGit {
         ))
     }
 
-    /// Fetch one remote: `git fetch --no-prune --no-recurse-submodules`,
-    /// prompts disabled, bounded by `timeout`. No prune, no
-    /// maintenance, no submodule recursion, no forced tag mode
-    /// (configured `tagOpt` honored). `Ok` on exit 0; the `Err` detail
-    /// is unscrubbed stderr — scrub before persisting.
+    /// Fetch-subcommand argv without the remote operand (single source
+    /// for [`FallbackGit::git_fetch_remote`] and its unit test): no
+    /// prune (deleted upstream branches keep their tracking refs), no
+    /// submodule recursion, no tag downloads (branch freshness needs
+    /// no tags; the CLI flag overrides a configured `tagOpt`).
+    fn fetch_argv() -> [&'static str; 4] {
+        [
+            "fetch",
+            "--no-prune",
+            "--no-recurse-submodules",
+            "--no-tags",
+        ]
+    }
+
+    /// Fetch one remote with its configured refspecs (the caller
+    /// verified them [`Safe`](crate::git::refspec::FetchVerdict::Safe)
+    /// first): prompts disabled, bounded by `timeout`. Writes
+    /// remote-tracking refs, `FETCH_HEAD`, and fetched objects only —
+    /// never checkout files or local branch tips. No prune, no
+    /// maintenance (see the `gc.auto`/`maintenance.auto` base config),
+    /// no submodule recursion, no tag downloads. `Ok` on exit 0; the
+    /// `Err` detail is unscrubbed stderr — scrub before persisting.
     pub fn git_fetch_remote(
         &self,
         dir: &Path,
@@ -2008,10 +2035,10 @@ impl FallbackGit {
         cap_bytes: u64,
     ) -> Result<(), String> {
         let mut cmd = self.fetch_command(dir)?;
-        cmd.arg("fetch")
-            .arg("--no-prune")
-            .arg("--no-recurse-submodules")
-            .arg(remote);
+        for arg in Self::fetch_argv() {
+            cmd.arg(arg);
+        }
+        cmd.arg(remote);
         let out = spawn_enveloped(&mut cmd, true, timeout, cap_bytes)?;
         if out.truncated {
             return Err("git fetch output exceeded capture cap".to_string());
@@ -2108,11 +2135,13 @@ impl FallbackGit {
     fn parse_tracking_refs(stdout: &[u8]) -> Result<Vec<TrackingRef>, String> {
         let parts: Vec<&[u8]> = stdout.split(|b| *b == 0).collect();
         let trailing_empty = parts.last().is_some_and(|p| p.is_empty());
-        if !trailing_empty || (parts.len() - 1) % 3 != 0 {
+        if !trailing_empty || !(parts.len() - 1).is_multiple_of(3) {
             return Err("git for-each-ref output is not NUL-terminated triples".to_string());
         }
-        Ok(parts[..parts.len() - 1]
-            .chunks_exact(3)
+        let (triples, rest) = parts[..parts.len() - 1].as_chunks::<3>();
+        debug_assert!(rest.is_empty(), "triple count checked above");
+        Ok(triples
+            .iter()
             .map(|c| TrackingRef {
                 name: c[0].to_vec(),
                 oid: c[1].to_vec(),
@@ -2706,6 +2735,12 @@ mod tests {
             argv.contains(&"credential.interactive=never".to_string()),
             "{argv:?}"
         );
+        // No automatic maintenance behind the scan's back (Step 11).
+        assert!(argv.contains(&"gc.auto=0".to_string()), "{argv:?}");
+        assert!(
+            argv.contains(&"maintenance.auto=false".to_string()),
+            "{argv:?}"
+        );
         // Probes neuter ssh; fetch needs the transport.
         assert!(!argv.iter().any(|a| a.contains("sshCommand")), "{argv:?}");
         assert_eq!(
@@ -2753,6 +2788,22 @@ mod tests {
             Some(v) => std::env::set_var("GIT_SSH", v),
             None => std::env::remove_var("GIT_SSH"),
         }
+    }
+
+    #[test]
+    fn fetch_argv_disables_prune_submodules_tags() {
+        // Step 11: deleted upstream branches keep their tracking refs,
+        // no submodule recursion, no tag downloads. `git_fetch_remote`
+        // builds from this single source; the assertion pins it.
+        assert_eq!(
+            FallbackGit::fetch_argv().as_slice(),
+            &[
+                "fetch",
+                "--no-prune",
+                "--no-recurse-submodules",
+                "--no-tags"
+            ]
+        );
     }
 
     #[test]
