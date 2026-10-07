@@ -300,7 +300,7 @@ static IDENTITY_IO_LIVE: AtomicUsize = AtomicUsize::new(0);
 /// advances once per resolve attempt whatever the outcome).
 static IDENTITY_IO_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-/// Total bounded identity-I/O calls so far (see [`IDENTITY_IO_CALLS`]).
+/// Total bounded identity-I/O calls so far (see `IDENTITY_IO_CALLS`).
 pub fn identity_io_calls() -> u64 {
     IDENTITY_IO_CALLS.load(Ordering::Relaxed) as u64
 }
@@ -364,7 +364,7 @@ where
 }
 
 /// Bounded physical identity for one coordinator path (R7 alias sharing:
-/// follows symlinks). Runs through [`bounded_identity_io`] (cap-2
+/// follows symlinks). Runs through `bounded_identity_io` (cap-2
 /// admission plus a 1 s timeout): `None` on stat failure, slot refusal,
 /// or timeout — the caller persists unknown/gap instead of silently
 /// substituting a path-derived identity. A hung path never stalls the

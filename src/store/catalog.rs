@@ -4196,7 +4196,7 @@ impl TursoStore {
     /// label untouched. The fetch phase pairs this with
     /// [`TursoStore::label_ref_freshness`] (existing row) or
     /// [`TursoStore::upsert_ref`] (fetch-created tracking branch).
-    /// Returns true when a row was updated. [`UPDATE_REF_OID_SQL`]
+    /// Returns true when a row was updated. `UPDATE_REF_OID_SQL`
     /// is the single source shared with
     /// [`TursoStore::buffer_update_ref_oid`].
     pub async fn update_ref_oid(
@@ -5754,7 +5754,7 @@ impl TursoStore {
     /// Buffer a ref oid re-observation (v3); see
     /// [`TursoStore::buffer_enqueue_task`] for the flush contract.
     /// Same `UPDATE` semantics as [`TursoStore::update_ref_oid`]
-    /// (shared [`UPDATE_REF_OID_SQL`]). Returns
+    /// (shared `UPDATE_REF_OID_SQL`). Returns
     /// `WriterBatch::should_flush`.
     pub fn buffer_update_ref_oid(
         batch: &mut WriterBatch,
@@ -5788,7 +5788,7 @@ impl TursoStore {
     /// [`TursoStore::buffer_enqueue_task`] for the flush contract.
     /// Same `UPDATE` semantics as
     /// [`TursoStore::update_ref_comparison`] (shared
-    /// [`UPDATE_REF_COMPARISON_SQL`]). Returns
+    /// `UPDATE_REF_COMPARISON_SQL`). Returns
     /// `WriterBatch::should_flush`. The caller MUST have verified
     /// [`TursoStore::supports_ref_comparison`] first: on a pre-v6
     /// catalog this statement would fail at flush, so pre-v6

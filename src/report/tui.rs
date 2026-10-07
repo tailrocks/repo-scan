@@ -24,7 +24,7 @@
 //! | esc | close overlay / stop search, or quit when nothing is open |
 //!
 //! Data enters through [`TuiSnapshot`], built either from a retained
-//! [`Report`][crate::report::model::Report] ([`TuiSnapshot::from_report`])
+//! [`crate::report::model::Report`] ([`TuiSnapshot::from_report`])
 //! or folded live from journal envelopes
 //! ([`TuiSnapshot::apply_envelope`]); the scan loop additionally
 //! refreshes rows from committed catalog state
