@@ -24,8 +24,13 @@ const TOTAL_REPO_BUILDS: u64 = 200;
 const LINKED_WORKTREES: u64 = 10;
 /// Spec §5/§18 bounds, re-checked from raw samples.
 const RSS_TARGET_BYTES: u64 = 256 * 1024 * 1024;
-const CPU_BOUND_CORES: f64 = 1.1;
+/// CPU bound re-scoped for the parallel engine (M3): 8 pinned workers at
+/// ~1 core each plus 10% headroom (matches `GATE_WORKERS` in the harness).
+const CPU_BOUND_CORES: f64 = 8.8;
+const GATE_WORKERS: u64 = 8;
 const MIN_MEASURED_S: f64 = 30.0;
+/// Sustained gate needs >= 3 measured iters AND the >= 30 s window (M2).
+const MIN_ITERS: usize = 3;
 /// Bounded waits (RSF-PERF-BLOCKED-TEST-001): overruns panic (FAIL),
 /// never skip. The harness self-bounds below [`HARNESS_TIMEOUT`]; the
 /// test backstop only fires if the harness itself hangs.
@@ -59,13 +64,13 @@ fn target_dir() -> PathBuf {
 
 fn harness_bin() -> PathBuf {
     target_dir()
-        .join("debug")
+        .join("release")
         .join(format!("perf_gates{}", std::env::consts::EXE_SUFFIX))
 }
 
 /// Primary locator: parse the `compiler-artifact` executable path out of
 /// `cargo build --message-format=json` stdout. `cargo build --bench` leaves
-/// the hashed binary under `debug/deps/`, never at `debug/perf_gates`.
+/// the hashed binary under `release/deps/`, never at `release/perf_gates`.
 fn harness_bin_from_message(build_stdout: &str) -> Option<PathBuf> {
     for line in build_stdout.lines() {
         let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -84,9 +89,9 @@ fn harness_bin_from_message(build_stdout: &str) -> Option<PathBuf> {
     None
 }
 
-/// Fallback locator: newest executable `perf_gates-*` entry in `debug/deps/`.
+/// Fallback locator: newest executable `perf_gates-*` entry in `release/deps/`.
 fn harness_bin_from_deps() -> Option<PathBuf> {
-    let deps = target_dir().join("debug").join("deps");
+    let deps = target_dir().join("release").join("deps");
     let mut best: Option<(SystemTime, PathBuf)> = None;
     for entry in std::fs::read_dir(&deps).ok()?.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -204,19 +209,28 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration, label: &str) -> Result<
     })
 }
 
-/// Build the harness bench (bounded wait that FAILS on timeout) and
-/// locate the harness plus repo-scan binaries. Returns
-/// `(harness, repo_scan, build_exit)`.
+/// Build the harness bench AND the measured binary in release (B4: a
+/// debug binary must never be measured) plus locate both. Bounded wait
+/// that FAILS on timeout. Returns `(harness, repo_scan, build_exit)`.
 fn build_harness() -> (PathBuf, PathBuf, Option<i32>) {
     let manifest = manifest_dir();
     let mut cmd = Command::new(cargo_bin());
-    cmd.args(["build", "--bench", "perf_gates", "--message-format=json"])
-        .current_dir(&manifest);
-    let build = run_with_timeout(cmd, BUILD_TIMEOUT, "cargo build --bench perf_gates")
+    cmd.args([
+        "build",
+        "--release",
+        "--bench",
+        "perf_gates",
+        "--bin",
+        "repo-scan",
+        "--message-format=json",
+    ])
+    .current_dir(&manifest);
+    let label = "cargo build --release --bench perf_gates --bin repo-scan";
+    let build = run_with_timeout(cmd, BUILD_TIMEOUT, label)
         .unwrap_or_else(|e| panic!("harness build timed out (failing, never skipping):\n{e}"));
     assert!(
         build.status.success(),
-        "cargo build --bench perf_gates failed (Cargo.toml needs [[bench]] name = \"perf_gates\", harness = false):\n{}",
+        "{label} failed (Cargo.toml needs [[bench]] name = \"perf_gates\", harness = false):\n{}",
         String::from_utf8_lossy(&build.stderr),
     );
     let build_stdout = String::from_utf8_lossy(&build.stdout).into_owned();
@@ -225,13 +239,30 @@ fn build_harness() -> (PathBuf, PathBuf, Option<i32>) {
         .unwrap_or_else(harness_bin);
     assert!(
         harness.is_file(),
-        "harness binary missing at {}",
+        "release harness binary missing at {}",
         harness.display()
     );
-    let repo_scan = PathBuf::from(env!("CARGO_BIN_EXE_repo-scan"));
+    assert!(
+        harness.to_string_lossy().contains("release"),
+        "harness must be a release binary, got {}",
+        harness.display()
+    );
+    let repo_scan = target_dir()
+        .join("release")
+        .join(format!("repo-scan{}", std::env::consts::EXE_SUFFIX));
+    let repo_scan = if repo_scan.is_file() {
+        repo_scan
+    } else {
+        // `target_dir()` may resolve through a symlink-free alias; fall back
+        // to the canonical release path under the manifest target dir.
+        manifest
+            .join("target")
+            .join("release")
+            .join(format!("repo-scan{}", std::env::consts::EXE_SUFFIX))
+    };
     assert!(
         repo_scan.is_file(),
-        "repo-scan binary missing at {}",
+        "release repo-scan binary missing at {}",
         repo_scan.display()
     );
     (harness, repo_scan, build.status.code())
@@ -421,6 +452,19 @@ fn perf_02_03_gates_hold() {
     );
     let env = one(&records, "env");
     assert_eq!(env["bench"].as_str(), Some("perf_gates"));
+    assert_eq!(
+        env["profile"].as_str(),
+        Some("release"),
+        "harness itself is release-built (numbers are never cited from debug)"
+    );
+
+    // Measured-binary provenance (B4): release profile, known sha256.
+    let binary = one(&records, "binary");
+    assert_eq!(binary["profile"].as_str(), Some("release"));
+    let bin_sha = binary["sha256"].as_str().expect("binary sha256");
+    assert!(is_hex(bin_sha, 64), "binary sha256 is 64-hex: {bin_sha}");
+    assert!(binary["bytes"].as_u64().expect("binary bytes") > 0);
+    assert_eq!(binary["workers"].as_u64(), Some(GATE_WORKERS));
 
     // Harness-side build fingerprint agrees with the test-side one (same
     // source) and is fully known.
@@ -482,15 +526,21 @@ fn perf_02_03_gates_hold() {
     assert!(corpus["repos_detached"].as_u64().expect("detached") > 0);
     assert!(corpus["repos_worktree_mains"].as_u64().expect("worktree") > 0);
 
-    // Every sustained iteration exited clean with a complete scan.
+    // Every sustained iteration exited clean with a complete scan; the
+    // gate needs >= 3 iters (M2) at the pinned worker count (M3).
     let iters = find(&records, "sustain_iter");
-    assert!(!iters.is_empty(), "at least one measured iteration");
+    assert!(
+        iters.len() >= MIN_ITERS,
+        "at least {MIN_ITERS} measured iterations, got {}",
+        iters.len()
+    );
     for iter in &iters {
         assert_eq!(iter["exit_code"].as_i64(), Some(0), "{iter}");
         assert_eq!(iter["timed_out"].as_bool(), Some(false), "{iter}");
         assert_eq!(iter["report_ok"].as_bool(), Some(true), "{iter}");
         assert_eq!(iter["scan_state"].as_str(), Some("complete"), "{iter}");
         assert_eq!(iter["tasks_pending"].as_u64(), Some(0), "{iter}");
+        assert_eq!(iter["workers"].as_u64(), Some(GATE_WORKERS), "{iter}");
     }
 
     // Evidence anchor covers warmup plus one report per iteration.
@@ -509,13 +559,53 @@ fn perf_02_03_gates_hold() {
         assert!(report["bytes"].as_u64().expect("report len") > 0);
     }
 
-    // Sustained window: >= 30 measured seconds, RSS + CPU bounds re-checked.
+    // Sustained window: >= 30 measured seconds AND >= 3 iters, RSS +
+    // CPU bounds and median/variance re-checked from the raw samples.
     let sustained = one(&records, "sustained");
     let measured = sustained["measured_wall_s"]
         .as_f64()
         .expect("measured wall");
     assert!(measured >= MIN_MEASURED_S, "measured {measured}s >= 30s");
     assert_eq!(sustained["iters"].as_u64(), Some(iters.len() as u64));
+    assert_eq!(
+        sustained["min_iters"].as_u64(),
+        Some(MIN_ITERS as u64),
+        "harness enforces the >= 3 iter floor"
+    );
+    assert_eq!(sustained["workers"].as_u64(), Some(GATE_WORKERS));
+    assert_eq!(
+        sustained["cpu_bound_cores"].as_f64(),
+        Some(CPU_BOUND_CORES),
+        "harness CPU bound matches the parallel-engine re-scope"
+    );
+    let mut walls: Vec<f64> = iters
+        .iter()
+        .map(|i| i["wall_ms"].as_f64().expect("iter wall_ms"))
+        .collect();
+    walls.sort_by(|a, b| a.total_cmp(b));
+    let mid = walls.len() / 2;
+    let expect_median = if walls.len() % 2 == 1 {
+        walls[mid]
+    } else {
+        (walls[mid - 1] + walls[mid]) / 2.0
+    };
+    let mean = walls.iter().sum::<f64>() / walls.len() as f64;
+    let expect_var = walls.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / walls.len() as f64;
+    let got_median = sustained["iter_wall_ms_median"]
+        .as_f64()
+        .expect("median recorded");
+    let got_var = sustained["iter_wall_ms_variance"]
+        .as_f64()
+        .expect("variance recorded");
+    assert!(
+        (got_median - expect_median).abs() <= 1e-6 * expect_median.max(1.0),
+        "median {got_median} recomputed as {expect_median}"
+    );
+    assert!(
+        (got_var - expect_var).abs() <= 1e-6 * expect_var.max(1.0),
+        "variance {got_var} recomputed as {expect_var}"
+    );
+    assert!(got_var >= 0.0, "variance non-negative");
     let peak = sustained["child_peak_rss_bytes"]
         .as_u64()
         .expect("child peak RSS measured");
@@ -524,7 +614,10 @@ fn perf_02_03_gates_hold() {
     let cores = sustained["mean_cores"]
         .as_f64()
         .expect("mean cores measured");
-    assert!(cores <= CPU_BOUND_CORES, "mean {cores} cores <= 1.1");
+    assert!(
+        cores <= CPU_BOUND_CORES,
+        "mean {cores} cores <= {CPU_BOUND_CORES} (8 pinned workers + headroom)"
+    );
     assert!(cores >= 0.0, "mean cores non-negative");
     assert!(sustained["total_entries"].as_u64().expect("entries") > 0);
     assert!(sustained["total_tx"].as_u64().expect("tx") > 0);
@@ -556,6 +649,7 @@ fn perf_02_03_gates_hold() {
 
     // Top-level verdict agrees with the re-checked bounds.
     let verdict = one(&records, "verdict");
+    assert_eq!(verdict["workers"].as_u64(), Some(GATE_WORKERS));
     assert_eq!(verdict["perf02_pass"].as_bool(), Some(true));
     assert_eq!(verdict["queue_pass"].as_bool(), Some(true));
     assert_eq!(verdict["perf03_pass"].as_bool(), Some(true));
