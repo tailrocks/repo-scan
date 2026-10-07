@@ -1692,3 +1692,119 @@ fn hex_of(bytes: &[u8]) -> String {
     }
     out
 }
+
+/// `coverage_updated` carries gap/candidate deltas only: the chmod-000 gap
+/// opens exactly once (re-records are not transitions), unconditional
+/// closes of never-open rows stay silent, and a remote-less clone joins
+/// as an unresolvable candidate.
+#[test]
+fn coverage_updated_reports_gap_deltas() {
+    use repo_scan::store::{Store, TursoStore};
+    use std::os::unix::fs::PermissionsExt;
+
+    struct Restore<'a> {
+        path: &'a Path,
+    }
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.path, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let env = Env::new();
+    // No remotes: `classify_remotes` with an empty set is
+    // `UnresolvableIdentity`, proven by git_impl's table test.
+    let noremote = fixture::normal_clone(&env.fixture, "noremote");
+    fixture::git(&noremote, &["remote", "remove", "origin"]);
+    assert!(
+        fixture::git_str(&noremote, &["remote"]).is_empty(),
+        "fixture has no remotes"
+    );
+    let blocked = env.fixture.join("blocked");
+    repo_scan::privacy::private_dir_0700(&blocked).expect("mkdir");
+    repo_scan::privacy::private_write_0600(&blocked.join("secret.txt"), b"x").expect("write");
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o0)).expect("chmod 000");
+    let _restore = Restore { path: &blocked };
+    if std::fs::read_dir(&blocked).is_ok() {
+        eprintln!("coverage_updated_reports_gap_deltas: chmod 000 ineffective; skipping");
+        return;
+    }
+
+    let out = env.scan(&["--report", "rep.json"], &env.cwd_a);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "permission gap is usable-but-incomplete; stderr: {}",
+        stderr_text(&out)
+    );
+    let scan_id = stdout_line(&out, "scan_id");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let db = env.state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        let rows = store
+            .read_scan_events(&scan_id, 0, 1_000)
+            .await
+            .expect("read");
+        let updates: Vec<_> = rows
+            .iter()
+            .filter(|r| r.event_type == "coverage_updated")
+            .collect();
+        assert!(!updates.is_empty(), "gap transitions journal deltas");
+        let mut opened = Vec::new();
+        let mut closed = Vec::new();
+        let mut unresolvable = Vec::new();
+        for row in &updates {
+            assert_eq!(row.op, "replace", "D4 op for coverage_updated");
+            let v: serde_json::Value = serde_json::from_slice(&row.records).expect("json");
+            for key in ["opened", "closed", "unresolvable_added"] {
+                assert!(v.get(key).is_some_and(|a| a.is_array()), "{key} present");
+            }
+            opened.extend(
+                v["opened"]
+                    .as_array()
+                    .expect("array")
+                    .iter()
+                    .map(|s| s.as_str().expect("str").to_string()),
+            );
+            closed.extend(
+                v["closed"]
+                    .as_array()
+                    .expect("array")
+                    .iter()
+                    .map(|s| s.as_str().expect("str").to_string()),
+            );
+            unresolvable.extend(
+                v["unresolvable_added"]
+                    .as_array()
+                    .expect("array")
+                    .iter()
+                    .map(|s| s.as_str().expect("str").to_string()),
+            );
+        }
+        // Exactly one open transition for the enum gap, whatever the
+        // retry/re-record count; every probe's unconditional close of a
+        // never-open row stays silent.
+        assert_eq!(opened.len(), 1, "one open transition: {opened:?}");
+        assert!(opened[0].starts_with("gap:"), "gap id: {}", opened[0]);
+        assert!(closed.is_empty(), "no genuine closes: {closed:?}");
+        let gap = store
+            .get_error(&opened[0])
+            .await
+            .expect("get")
+            .expect("gap row");
+        assert!(gap.open, "opened id names an open row");
+        // The remote-less clone joined as an unresolvable candidate.
+        assert_eq!(unresolvable.len(), 1, "{unresolvable:?}");
+        let instance = store
+            .get_git_instance(&unresolvable[0])
+            .await
+            .expect("get")
+            .expect("instance row");
+        assert_eq!(instance.disposition, "unresolvable_identity");
+        store.close().await.expect("close");
+    });
+}

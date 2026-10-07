@@ -25,7 +25,7 @@ use repo_scan::report::builder::{
 use repo_scan::scan_events::{is_terminal_event, Cursor, Envelope, EventType, Op};
 use repo_scan::scheduler::{backoff_for_attempt, Admission, CircuitBreaker, OpClass};
 use repo_scan::store::{
-    self, CheckpointCoordinator, CheckpointPolicy, ClaimedTask, CompletionGap, NewCheckout,
+    self, CheckpointCoordinator, CheckpointPolicy, ClaimedTask, CompletionDelta, NewCheckout,
     NewGitInstance, NewRef, NewRemote, NewScan, NewScanEvent, NewStatus, NewTask, NewVolume,
     OwnerGuard, ScanEventRow, Store, TaskOutcome, TursoStore, WriterBatch,
 };
@@ -957,6 +957,29 @@ impl ScanJournal {
         Ok(Some(TursoStore::buffer_scan_event(batch, &event)?))
     }
 
+    /// Buffer one `coverage_updated` into the writer batch: it commits
+    /// atomically with the gap rows it describes. No dedupe — each call
+    /// carries a genuine transition (callers gate on `Runner::open_gaps`),
+    /// and `replace` replays in seq order. Always `Some(should_flush)`.
+    fn buffer_coverage_updated(
+        &mut self,
+        batch: &mut WriterBatch,
+        records: &[u8],
+    ) -> repo_scan::Result<Option<bool>> {
+        let (seq, off) = self.assign();
+        let event = NewScanEvent {
+            scan_id: &self.scan_id,
+            seq,
+            catalog_rev: self.rev,
+            event_offset: off,
+            event_type: EventType::CoverageUpdated.name(),
+            op: EventType::CoverageUpdated.op().name(),
+            reset: false,
+            records,
+        };
+        Ok(Some(TursoStore::buffer_scan_event(batch, &event)?))
+    }
+
     /// Buffer one `branch_batch` into the writer batch: it commits
     /// atomically with the ref rows it describes. First batch per store is
     /// `add`; a re-persisted store (retry, resume re-run) resends as
@@ -1278,6 +1301,9 @@ async fn run_scan_inner(
     // `open` replays the committed prefix, so resumed scans continue
     // numbering (and found-event dedupe) without repeating `scan_started`.
     runner.journal = Some(ScanJournal::open(&store, &scan_id, run_rev).await?);
+    // Coverage-delta baseline (also on resume): gaps already open stay
+    // silent until they close; closes of pre-existing rows still report.
+    runner.open_gaps = store.list_open_error_ids().await?.into_iter().collect();
     if resumed.is_none() {
         let started = serde_json::json!({
             "scan_id": &scan_id,
@@ -3406,6 +3432,11 @@ struct Runner {
     /// scan (opened in `run_scan_inner` once the scan id exists); `None`
     /// only on unit-test runners, which persist without journaling.
     journal: Option<ScanJournal>,
+    /// Error ids currently open (D4 `coverage_updated` gating): preloaded
+    /// once per scan from the catalog, then tracked across buffered
+    /// records/resolves so deltas fire only on genuine transitions —
+    /// never for re-records or zero-row closes.
+    open_gaps: HashSet<String>,
 }
 
 impl Runner {
@@ -3438,6 +3469,7 @@ impl Runner {
             progress_last_total: None,
             pending_alias_checks: Vec::new(),
             journal: None,
+            open_gaps: HashSet::new(),
         }
     }
 
@@ -3733,7 +3765,7 @@ async fn run_until_boundary(
                         None,
                         stall_now,
                     )?;
-                    buffer_resolve_error(&mut runner.batch, &stall_id, stall_now);
+                    buffer_resolve_error(runner, &stall_id, stall_now)?;
                     let stall_due = runner.batch.should_flush();
                     flush_if_due(runner, store, stall_due).await?;
                     eprintln!(
@@ -4232,6 +4264,51 @@ async fn flush_if_due(runner: &mut Runner, store: &TursoStore, due: bool) -> rep
 /// `error` records (D4): the gap row's stable id, scope, category,
 /// and detail. Attempts are omitted: the UPDATE+INSERT pair means the
 /// final count is only knowable after commit (the catalog row has it).
+/// `coverage_updated` payload (D4): gap/candidate deltas only — opened
+/// gap ids, closed gap ids, newly unresolvable instance ids. All three
+/// keys are always present (possibly empty); consumers accumulate by id.
+/// Totals live on `inventory_ready` and terminal events, never here, so
+/// this path needs no aggregate queries.
+fn coverage_updated_value(
+    opened: &[String],
+    closed: &[String],
+    unresolvable_added: &[String],
+) -> serde_json::Value {
+    serde_json::json!({
+        "opened": opened,
+        "closed": closed,
+        "unresolvable_added": unresolvable_added,
+    })
+}
+
+fn coverage_updated_records(
+    opened: &[String],
+    closed: &[String],
+    unresolvable_added: &[String],
+) -> repo_scan::Result<Vec<u8>> {
+    let records = coverage_updated_value(opened, closed, unresolvable_added);
+    serde_json::to_vec(&records).map_err(|e| repo_scan::Error::Report(e.to_string()))
+}
+
+/// Buffer one `coverage_updated` delta (same journaling contract as
+/// [`journal_repository_found`]).
+async fn journal_coverage_updated(
+    runner: &mut Runner,
+    store: &TursoStore,
+    opened: &[String],
+    closed: &[String],
+    unresolvable_added: &[String],
+) -> repo_scan::Result<()> {
+    let Some(journal) = runner.journal.as_mut() else {
+        return Ok(());
+    };
+    let records = coverage_updated_records(opened, closed, unresolvable_added)?;
+    if let Some(due) = journal.buffer_coverage_updated(&mut runner.batch, &records)? {
+        flush_if_due(runner, store, due).await?;
+    }
+    Ok(())
+}
+
 fn error_records_value(
     id: &str,
     scope_key: &str,
@@ -4288,26 +4365,49 @@ fn buffer_record_error(
             next_retry_ms.map_or(turso::Value::Null, turso::Value::Integer),
         ],
     );
+    // Coverage delta only on a genuine open transition: re-records
+    // (attempts bump on an already-open row) are not coverage changes.
+    // Computed before the journal borrow below.
+    let fresh_open = runner.open_gaps.insert(id.to_string());
     // Same batch as the error rows: the event is only readable once its
     // cause has committed. Unit-test runners (journal: None) persist rows
     // without journaling.
     if let Some(journal) = runner.journal.as_mut() {
         let records = error_records(id, scope_key, category, detail)?;
         journal.buffer_error(&mut runner.batch, &records)?;
+        if fresh_open {
+            let opened = vec![id.to_string()];
+            let records = coverage_updated_records(&opened, &[], &[])?;
+            journal.buffer_coverage_updated(&mut runner.batch, &records)?;
+        }
     }
     Ok(runner.batch.should_flush())
 }
 
 /// Buffer a gap close (RSF-AC461500-609D-4D55-991E-09C60D382D67), mirroring
-/// `resolve_error`. Returns `WriterBatch::should_flush`.
-fn buffer_resolve_error(batch: &mut WriterBatch, id: &str, now_ms: i64) -> bool {
-    batch.push(
+/// `resolve_error`. Takes the runner (not the batch) so the close delta
+/// can gate on `open_gaps`: unconditional closes (e.g. every successful
+/// probe persist) report nothing when no row was open. Returns
+/// `WriterBatch::should_flush`.
+fn buffer_resolve_error(runner: &mut Runner, id: &str, now_ms: i64) -> repo_scan::Result<bool> {
+    runner.batch.push(
         "UPDATE errors SET open = 0, last_seen_ms = ?1 WHERE id = ?2",
         vec![
             turso::Value::Integer(now_ms),
             turso::Value::Text(id.to_string()),
         ],
-    )
+    );
+    // Transition first (see `buffer_record_error`): the batched UPDATE
+    // cannot report its rowcount, so the open set is the authority.
+    let was_open = runner.open_gaps.remove(id);
+    if let Some(journal) = runner.journal.as_mut() {
+        if was_open {
+            let closed = vec![id.to_string()];
+            let records = coverage_updated_records(&[], &closed, &[])?;
+            journal.buffer_coverage_updated(&mut runner.batch, &records)?;
+        }
+    }
+    Ok(runner.batch.should_flush())
 }
 
 impl Runner {
@@ -4520,8 +4620,9 @@ enum CompletionApplied {
 /// Complete one claimed task, translating the store's scheduler signals:
 /// stale completions (already requeued by the store) are routine; lease
 /// mismatches and unknown tasks become typed errors that abort the run.
-/// A gap the completion recorded is journaled as an `error` event after
-/// the completion transaction commits — never inside it.
+/// A gap delta the completion caused is journaled as `error` /
+/// `coverage_updated` events after the completion transaction commits —
+/// never inside it.
 async fn complete_claimed(
     store: &TursoStore,
     runner: &mut Runner,
@@ -4534,9 +4635,9 @@ async fn complete_claimed(
         .complete_task_report_gap(&claimed.task.id, claimed.token, epoch, outcome, now)
         .await
     {
-        Ok(gap) => {
+        Ok(delta) => {
             runner.counters.db_transactions += 1;
-            journal_completion_gap(runner, store, gap.as_ref()).await?;
+            journal_completion_delta(runner, store, &delta).await?;
             Ok(CompletionApplied::Applied)
         }
         Err(repo_scan::Error::Scheduler(message)) if message.starts_with("stale-completion:") => {
@@ -4553,20 +4654,52 @@ async fn complete_claimed(
     }
 }
 
-/// Journal one completion-recorded gap as an `error` event in its own
-/// transaction. The gap row is already durable (the completion committed
-/// before this runs); unit-test runners without a journal skip silently.
-async fn journal_completion_gap(
+/// Journal one completion gap delta: the opened row (if any) as an
+/// `error` event, then the open/close delta as `coverage_updated` — each
+/// in its own transaction. The gap rows are already durable (the
+/// completion committed before this runs); unit-test runners without a
+/// journal skip silently. The opened row always emits an `error`
+/// (point-in-time); the coverage delta fires only on genuine
+/// transitions against `open_gaps`.
+async fn journal_completion_delta(
     runner: &mut Runner,
     store: &TursoStore,
-    gap: Option<&CompletionGap>,
+    delta: &CompletionDelta,
 ) -> repo_scan::Result<()> {
-    let (Some(gap), Some(journal)) = (gap, runner.journal.as_mut()) else {
+    if runner.journal.is_none() {
         return Ok(());
+    }
+    // Transition gating before the journal borrow below: opens fire only
+    // for newly opened rows; closes are rowcount-gated by the store, so
+    // the set update just keeps this run's view accurate.
+    let opened: Vec<String> = match delta.opened.as_ref() {
+        Some(gap) if runner.open_gaps.insert(gap.id.clone()) => vec![gap.id.clone()],
+        _ => Vec::new(),
     };
-    let records = error_records_value(&gap.id, &gap.scope_key, &gap.category, &gap.detail);
-    journal.emit(store, EventType::Error, &records).await?;
-    runner.counters.db_transactions += 1;
+    let closed: Vec<String> = match delta.closed.as_ref() {
+        Some(id) => {
+            runner.open_gaps.remove(id.as_str());
+            vec![id.clone()]
+        }
+        None => Vec::new(),
+    };
+    let journal = runner.journal.as_mut().expect("journal checked above");
+    // Counter increments hoisted past the last journal use (NLL): the
+    // journal borrow spans both emits.
+    let mut txns = 0u64;
+    if let Some(gap) = delta.opened.as_ref() {
+        let records = error_records_value(&gap.id, &gap.scope_key, &gap.category, &gap.detail);
+        journal.emit(store, EventType::Error, &records).await?;
+        txns += 1;
+    }
+    if !opened.is_empty() || !closed.is_empty() {
+        let records = coverage_updated_value(&opened, &closed, &[]);
+        journal
+            .emit(store, EventType::CoverageUpdated, &records)
+            .await?;
+        txns += 1;
+    }
+    runner.counters.db_transactions += txns;
     Ok(())
 }
 
@@ -5977,7 +6110,7 @@ async fn exec_probe(
     .await
     {
         Ok(()) => {
-            let due = buffer_resolve_error(&mut runner.batch, &gap_id, store::now_ms());
+            let due = buffer_resolve_error(runner, &gap_id, store::now_ms())?;
             flush_if_due(runner, store, due).await?;
             Ok(TaskOutcome::Complete)
         }
@@ -6831,6 +6964,18 @@ async fn persist_probe(
     runner.counters.repos_found += 1;
     flush_if_due(runner, store, due).await?;
     journal_repository_found(runner, store, &instance_id, &remotes).await?;
+    // Unresolvable-identity candidates join the coverage delta stream in
+    // the same batch as the instance row. Repeat probes return early, so
+    // re-persist dupes are rare; consumers dedupe by id. (Report-time
+    // reclassification can flip dispositions later; those flips surface
+    // in the final report, not as live deltas.)
+    if matches!(
+        disposition,
+        identity::MatchDisposition::UnresolvableIdentity
+    ) {
+        journal_coverage_updated(runner, store, &[], &[], std::slice::from_ref(&instance_id))
+            .await?;
+    }
     for remote in &remotes {
         let role = match remote.role {
             git::RemoteRole::Fetch => "fetch",

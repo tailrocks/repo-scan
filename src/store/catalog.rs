@@ -578,6 +578,18 @@ pub struct CompletionGap {
     pub detail: String,
 }
 
+/// Gap delta of one task completion: the gap the outcome opened
+/// (`Retry`/`Parked`), if any, and the gap id a `Complete` outcome
+/// actually closed (rowcount-gated: tasks that never failed close
+/// nothing).
+#[derive(Debug, Clone, Default)]
+pub struct CompletionDelta {
+    /// Newly recorded open gap, when the outcome recorded one.
+    pub opened: Option<CompletionGap>,
+    /// Closed gap id, when the outcome closed a previously open row.
+    pub closed: Option<String>,
+}
+
 /// New task for [`TursoStore::enqueue_task`] (insert is idempotent).
 #[derive(Debug, Clone)]
 pub struct NewTask<'a> {
@@ -1649,10 +1661,10 @@ impl TursoStore {
     /// `stale-completion` scheduler error is returned. A token/epoch
     /// mismatch returns `lease-mismatch`. Stale results never erase
     /// newer invalidations (spec §12).
-    /// Complete one claimed task, discarding any gap the outcome
-    /// recorded. Production completion goes through
-    /// [`TursoStore::complete_task_report_gap`] so the recorded gap can be
-    /// journaled as an `error` event after the commit.
+    /// Complete one claimed task, discarding any gap delta the outcome
+    /// caused. Production completion goes through
+    /// [`TursoStore::complete_task_report_gap`] so the delta can be
+    /// journaled as `error` / `coverage_updated` events after the commit.
     pub async fn complete_task(
         &self,
         task_id: &str,
@@ -1666,9 +1678,10 @@ impl TursoStore {
             .map(|_| ())
     }
 
-    /// Complete one claimed task. Returns the gap row the outcome
-    /// recorded (`Retry`/`Parked`), if any, so the caller can journal the
-    /// matching `error` event after this transaction commits.
+    /// Complete one claimed task. Returns the gap delta the outcome
+    /// caused — opened row (`Retry`/`Parked`) and/or closed id
+    /// (`Complete`) — so the caller can journal the matching `error` /
+    /// `coverage_updated` events after this transaction commits.
     pub async fn complete_task_report_gap(
         &self,
         task_id: &str,
@@ -1676,9 +1689,9 @@ impl TursoStore {
         epoch: u64,
         outcome: &TaskOutcome,
         now_ms: i64,
-    ) -> crate::Result<Option<CompletionGap>> {
+    ) -> crate::Result<CompletionDelta> {
         self.check_owner_epoch(epoch, "complete_task")?;
-        let (stale, gap) = self
+        let (stale, delta) = self
             .with_tx(|conn| async move {
                 Self::complete_task_on(conn, task_id, token, epoch, outcome, now_ms).await
             })
@@ -1686,7 +1699,7 @@ impl TursoStore {
         // The stale requeue above committed; report it now. Returning the
         // error from inside the transaction would roll the requeue back.
         match stale {
-            None => Ok(gap),
+            None => Ok(delta),
             Some(message) => Err(Error::Scheduler(message)),
         }
     }
@@ -1771,7 +1784,7 @@ impl TursoStore {
         task: &FrontierTask,
         outcome: &TaskOutcome,
         now_ms: i64,
-    ) -> crate::Result<(Option<String>, Option<CompletionGap>)> {
+    ) -> crate::Result<(Option<String>, CompletionDelta)> {
         let current_rev = Self::scope_rev_on(conn, &task.scope_key).await?;
         if current_rev != task.expected_rev {
             conn.execute(
@@ -1792,7 +1805,7 @@ impl TursoStore {
                     is at rev {current_rev}; task requeued",
                     task.id, task.expected_rev, task.scope_key
                 )),
-                None,
+                CompletionDelta::default(),
             ));
         }
         let gap = match outcome {
@@ -1811,15 +1824,21 @@ impl TursoStore {
                 // never poison verdicts permanently. The row stays for
                 // audit (`open = 0`); tasks that never failed match zero
                 // rows (no-op).
-                conn.execute(
-                    "UPDATE errors SET open = 0, last_seen_ms = ?1 WHERE id = ?2",
-                    vec![v_int(now_ms), v_text(format!("gap:{}", task.id))],
-                )
-                .await
-                .map_err(store_err)?;
-                // Gap closes report nothing here: close deltas belong to
-                // `coverage_updated`, not `error`.
-                None
+                let gap_id = format!("gap:{}", task.id);
+                let closed_rows = conn
+                    .execute(
+                        "UPDATE errors SET open = 0, last_seen_ms = ?1 WHERE id = ?2 AND open = 1",
+                        vec![v_int(now_ms), v_text(gap_id.clone())],
+                    )
+                    .await
+                    .map_err(store_err)?;
+                // Rowcount-gated: only a genuinely open row reports a
+                // close. Close deltas belong to `coverage_updated`, not
+                // `error`.
+                CompletionDelta {
+                    opened: None,
+                    closed: if closed_rows > 0 { Some(gap_id) } else { None },
+                }
             }
             TaskOutcome::Retry {
                 category,
@@ -1849,12 +1868,15 @@ impl TursoStore {
                     now_ms,
                 )
                 .await?;
-                Some(CompletionGap {
-                    id: gap_id,
-                    scope_key: task.scope_key.clone(),
-                    category: (*category).clone(),
-                    detail: (*detail).clone(),
-                })
+                CompletionDelta {
+                    opened: Some(CompletionGap {
+                        id: gap_id,
+                        scope_key: task.scope_key.clone(),
+                        category: (*category).clone(),
+                        detail: (*detail).clone(),
+                    }),
+                    closed: None,
+                }
             }
             TaskOutcome::Parked { state, reason } => {
                 if !matches!(state, TaskState::Unavailable | TaskState::Unsupported) {
@@ -1885,12 +1907,15 @@ impl TursoStore {
                     now_ms,
                 )
                 .await?;
-                Some(CompletionGap {
-                    id: gap_id,
-                    scope_key: task.scope_key.clone(),
-                    category: task_state_as_str(*state).to_string(),
-                    detail: (*reason).clone(),
-                })
+                CompletionDelta {
+                    opened: Some(CompletionGap {
+                        id: gap_id,
+                        scope_key: task.scope_key.clone(),
+                        category: task_state_as_str(*state).to_string(),
+                        detail: (*reason).clone(),
+                    }),
+                    closed: None,
+                }
             }
         };
         Ok((None, gap))
@@ -1908,7 +1933,7 @@ impl TursoStore {
         epoch: u64,
         outcome: &TaskOutcome,
         now_ms: i64,
-    ) -> crate::Result<(Option<String>, Option<CompletionGap>)> {
+    ) -> crate::Result<(Option<String>, CompletionDelta)> {
         let task = Self::check_lease_on(conn, task_id, token, epoch).await?;
         Self::apply_completion_on(conn, &task, outcome, now_ms).await
     }
@@ -3714,6 +3739,22 @@ impl TursoStore {
             None => Ok(None),
             Some(row) => Ok(Some(ErrorRow::from_row(&row)?)),
         }
+    }
+
+    /// Ids of currently open error rows. The runner preloads this once
+    /// per scan so buffered gap closes report `coverage_updated` deltas
+    /// only for genuine open→closed transitions.
+    pub async fn list_open_error_ids(&self) -> crate::Result<Vec<String>> {
+        let mut rows = self
+            .conn
+            .query("SELECT id FROM errors WHERE open = 1 ORDER BY id ASC", ())
+            .await
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            out.push(req_text(&row, 0)?);
+        }
+        Ok(out)
     }
 
     /// Append an event-journal record idempotently
