@@ -32,6 +32,9 @@ freshness stay separate properties.
 
 - Report `1.0.0` → `1.1.0` (additive: `groups[]`, `totals`, branch
   comparison fields, freshness basis; no field removed/renamed).
+- Report `1.1.0` → `1.2.0` (additive, Step 11: branch `freshness` /
+  `freshness_at`, remote `refresh` summary; no field removed/renamed;
+  pre-1.2 snapshots deserialize with `unknown` / `None`).
 - NEW scan-event stream schema `1.0.0` (JSONL).
 - Catalog migration v2: `github_groups`, `scan_events` journal,
   `scan_requests` multi-target columns, full scope key (D5). v1 data migrates.

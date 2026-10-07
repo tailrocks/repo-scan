@@ -8,8 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Report schema version. Must equal `schemas/report-v1.1.schema.json`.
-pub const SCHEMA_VERSION: &str = "1.1.0";
+/// Report schema version. Must equal `schemas/report-v1.2.schema.json`.
+pub const SCHEMA_VERSION: &str = "1.2.0";
 
 /// Tool name recorded in every envelope.
 pub const TOOL_NAME: &str = "repo-scan";
@@ -253,6 +253,23 @@ pub struct Branch {
     pub state: String,
     pub observed_at: String,
     pub error_ids: Vec<String>,
+    /// Remote freshness (report 1.2.0, Step 11): `current` (observed
+    /// by this scan's `--fetch`), `stale` (fetch ran but did not
+    /// cover this ref, or an older observation), or `unknown` (no
+    /// successful fetch covered it). Only `remote_tracking` rows are
+    /// ever labeled; local branches always read `unknown`. Missing in
+    /// pre-1.2 snapshots, which deserialize as `unknown`.
+    #[serde(default = "default_branch_freshness")]
+    pub freshness: String,
+    /// When the freshness label was assigned (report 1.2.0); `None`
+    /// for `unknown`/legacy rows.
+    #[serde(default)]
+    pub freshness_at: Option<String>,
+}
+
+/// Default branch freshness for pre-1.2 snapshots.
+fn default_branch_freshness() -> String {
+    String::from("unknown")
 }
 
 /// Working-state observation. Cross-field rules: `metadata` mode has null
@@ -292,6 +309,27 @@ pub struct Remote {
     pub url: String,
     pub canonical_url: Option<String>,
     pub observed_at: String,
+    /// Latest `--fetch` attempt for this store + remote name (report
+    /// 1.2.0, Step 11); `None` when never attempted and in pre-1.2
+    /// snapshots. Keyed by remote NAME, so `fetch` and `push` rows
+    /// for one remote share the same attempt (only fetch-role
+    /// remotes trigger a fetch, but the attempt refreshed the name).
+    #[serde(default)]
+    pub refresh: Option<RemoteRefresh>,
+}
+
+/// Latest remote-refresh attempt summary (report 1.2.0, Step 11).
+/// Names observed current / deleted upstream travel on the
+/// `remote_updated` event and branch freshness labels, not here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteRefresh {
+    /// `success`, `failed`, or `unsupported`.
+    pub status: String,
+    pub observed_at: String,
+    /// Attempt duration in milliseconds, when measured.
+    pub duration_ms: Option<i64>,
+    /// Tracking refs the fetch updated (new or changed oid).
+    pub refs_updated: u64,
 }
 
 /// Shared-storage relationship edge. A dependency edge, not a merged clone.

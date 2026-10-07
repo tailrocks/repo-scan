@@ -228,6 +228,31 @@ fn check_envelope(report: &Report, problems: &mut Vec<String>) {
             &["valid", "unborn", "invalid", "unsupported"],
             problems,
         );
+        // Report 1.2.0: remote freshness (pre-1.2 snapshots
+        // deserialize missing `freshness` as `unknown`).
+        check_enum(
+            &format!("branch {} freshness", branch.id),
+            &branch.freshness,
+            &["current", "stale", "unknown"],
+            problems,
+        );
+        if branch.freshness == "unknown" && branch.freshness_at.is_some() {
+            problems.push(format!(
+                "branch {} freshness is unknown but freshness_at is set",
+                branch.id
+            ));
+        }
+        if branch.freshness != "unknown" && branch.freshness_at.is_none() {
+            problems.push(format!(
+                "branch {} freshness is {:?} but freshness_at is missing",
+                branch.id, branch.freshness
+            ));
+        }
+        check_opt_time(
+            &format!("branch {} freshness_at", branch.id),
+            &branch.freshness_at,
+            problems,
+        );
         if let Some(oid) = &branch.oid {
             if let Some(reason) = object_id_error(oid) {
                 problems.push(format!("branch {} oid: {reason}", branch.id));
@@ -252,6 +277,27 @@ fn check_envelope(report: &Report, problems: &mut Vec<String>) {
                 "remote {} observed_at {:?} is not RFC 3339",
                 remote.id, remote.observed_at
             ));
+        }
+        // Report 1.2.0: latest `--fetch` attempt summary.
+        if let Some(refresh) = &remote.refresh {
+            check_enum(
+                &format!("remote {} refresh status", remote.id),
+                &refresh.status,
+                &["success", "failed", "unsupported"],
+                problems,
+            );
+            if !is_rfc3339_shape(&refresh.observed_at) {
+                problems.push(format!(
+                    "remote {} refresh observed_at {:?} is not RFC 3339",
+                    remote.id, refresh.observed_at
+                ));
+            }
+            if refresh.duration_ms.is_some_and(|v| v < 0) {
+                problems.push(format!(
+                    "remote {} refresh duration_ms is negative",
+                    remote.id
+                ));
+            }
         }
     }
     for link in &report.storage_links {

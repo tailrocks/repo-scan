@@ -25,8 +25,8 @@ use crate::report::encode::{
 };
 use crate::report::model::{
     Alias, Branch, Candidate, Checkout, Coverage, ErrorRecord, GeneratedArtifact, Head, ObjectId,
-    PathRecord, Remote, Report, Repository, Resources, Root, Scan, ScanTarget, Status, StorageLink,
-    Tool, Volume,
+    PathRecord, Remote, RemoteRefresh, Report, Repository, Resources, Root, Scan, ScanTarget,
+    Status, StorageLink, Tool, Volume,
 };
 use crate::report::publish::{
     check_report_id, check_staged_memory_budget, publish_bound, retain_bound, BoundStaged,
@@ -615,6 +615,9 @@ struct PrePass {
     unresolvable_repo: bool,
     checkout_repos: HashMap<String, String>,
     statuses: HashMap<String, Status>,
+    /// Latest `--fetch` attempt per (store id, remote name bytes),
+    /// scoped to emitted repositories (report 1.2.0).
+    refreshes: HashMap<(String, Vec<u8>), RemoteRefresh>,
     stub_volumes: Vec<String>,
     interner: PathInterner,
     open_errors: u64,
@@ -848,6 +851,36 @@ async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Res
         }
     };
 
+    // Latest `--fetch` attempt per store + remote name (report
+    // 1.2.0), scoped to emitted repositories like `statuses`.
+    let mut refreshes = HashMap::new();
+    {
+        let mut rows = conn
+            .query(
+                "SELECT store_id, remote_name, status, observed_at_ms, duration_ms, \
+                    refs_updated FROM remote_refreshes",
+                (),
+            )
+            .await
+            .map_err(store_err)?;
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            let store_id = req_text(&row, 0)?;
+            if !included_repos.contains(&store_id) {
+                continue;
+            }
+            let remote_name = req_blob(&row, 1)?;
+            refreshes.insert(
+                (store_id, remote_name),
+                RemoteRefresh {
+                    status: req_text(&row, 2)?,
+                    observed_at: ms_to_rfc3339(req_i64(&row, 3)?),
+                    duration_ms: opt_i64(&row, 4)?,
+                    refs_updated: req_i64(&row, 5)?.max(0) as u64,
+                },
+            );
+        }
+    }
+
     // Resource gate: the interned-path peak is real report memory;
     // refuse loudly when it already exceeds the caller's RSS target
     // instead of streaming a report built over budget.
@@ -863,6 +896,7 @@ async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Res
         unresolvable_repo,
         checkout_repos,
         statuses,
+        refreshes,
         stub_volumes,
         interner,
         open_errors,
@@ -1353,7 +1387,8 @@ async fn stream_with_pre_pass<W: Write>(
         let mut rows = reader
             .query(
                 "SELECT id, instance_id, checkout_scope_id, kind, name, oid, algo, \
-                    symbolic_target, upstream, state, observed_at_ms \
+                    symbolic_target, upstream, state, observed_at_ms, freshness, \
+                    freshness_at_ms \
                     FROM refs ORDER BY id ASC",
                 (),
             )
@@ -1378,6 +1413,9 @@ async fn stream_with_pre_pass<W: Write>(
                 state: req_text(&row, 9)?,
                 observed_at: ms_to_rfc3339(req_i64(&row, 10)?),
                 error_ids: Vec::new(),
+                // Report 1.2.0: NULL (legacy/unlabeled) reads `unknown`.
+                freshness: opt_text(&row, 11)?.unwrap_or_else(|| String::from("unknown")),
+                freshness_at: opt_i64(&row, 12)?.map(ms_to_rfc3339),
             })?;
             stats.branches += 1;
         }
@@ -1405,11 +1443,12 @@ async fn stream_with_pre_pass<W: Write>(
                 continue;
             }
             let scope = opt_text(&row, 2)?.filter(|id| pre.checkout_repos.contains_key(id));
+            let name_bytes = req_blob(&row, 3)?;
             stream.array_item(&Remote {
                 id: req_text(&row, 0)?,
-                repository_id: instance_id,
+                repository_id: instance_id.clone(),
                 checkout_scope_id: scope,
-                name: encode_name(&req_blob(&row, 3)?),
+                name: encode_name(&name_bytes),
                 role: req_text(&row, 4)?,
                 url: cap_report_field(&redact_remote_url(&String::from_utf8_lossy(&req_blob(
                     &row, 5,
@@ -1418,6 +1457,10 @@ async fn stream_with_pre_pass<W: Write>(
                     cap_report_field(&redact_remote_url(&String::from_utf8_lossy(&bytes)))
                 }),
                 observed_at: ms_to_rfc3339(req_i64(&row, 7)?),
+                // Report 1.2.0: latest attempt for this store + remote
+                // name (`None` when never attempted). Name-keyed, so
+                // both role rows for one remote share the attempt.
+                refresh: pre.refreshes.get(&(instance_id, name_bytes)).cloned(),
             })?;
             stats.remotes += 1;
         }

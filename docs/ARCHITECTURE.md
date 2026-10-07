@@ -1,6 +1,6 @@
 # repo-scan architecture
 
-Design contract and architecture for repo-scan. Qualification evidence: `docs/*_QUAL.md`. Report schema: `schemas/report-v1.1.schema.json`.
+Design contract and architecture for repo-scan. Qualification evidence: `docs/*_QUAL.md`. Report schema: `schemas/report-v1.2.schema.json`.
 Gate record: `docs/GATE_DECISION.md` (do not edit).
 
 ## Ownership and process model (as shipped)
@@ -76,14 +76,14 @@ Gate record: `docs/GATE_DECISION.md` (do not edit).
    aggregate RSS each loop and calls `set_pressure` past the 512 MiB
    threshold (`src/main.rs`); the PERF-02/03 gate harness lives in
    `benches/perf_gates.rs`, asserted by `tests/accept_perf.rs:362`.
-7. **Reports.** Draft 2020-12 schema at `schemas/report-v1.1.schema.json`;
+7. **Reports.** Draft 2020-12 schema at `schemas/report-v1.2.schema.json`;
    illustrative example at `tests/data/example-report.json`. The binary
    stages through the lib pipeline: stream from the store, verify, retain
    an immutable snapshot, then atomic publish (`src/main.rs`,
    `src/report/publish.rs`, `ReportPipeline` at
    `src/report/builder.rs`). Failed publication marks the snapshot and
    retries from it without repeating discovery
-   (`src/main.rs`, `docs/TURSO_QUAL.md`, `schemas/report-v1.1.schema.json`).
+   (`src/main.rs`, `docs/TURSO_QUAL.md`, `schemas/report-v1.2.schema.json`).
 
 ## Shipped hardening (not in the Phase-1 sketch)
 

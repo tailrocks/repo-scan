@@ -1,6 +1,6 @@
 //! Report publication (spec §§3, 15–16).
 //!
-//! Every emitted report validates against `schemas/report-v1.1.schema.json`
+//! Every emitted report validates against `schemas/report-v1.2.schema.json`
 //! (JSON Schema Draft 2020-12). JSON to a file is streamed from one
 //! consistent catalog revision with bounded memory into controlled local
 //! staging; readers are released; then an admitted helper publishes via a

@@ -803,7 +803,7 @@ fn caller_owned_sections_stream() {
 fn schema_validator() -> jsonschema::Validator {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/schemas/report-v1.1.schema.json"
+        "/schemas/report-v1.2.schema.json"
     );
     let bytes = std::fs::read(path).expect("read shipped schema");
     let schema: serde_json::Value = serde_json::from_slice(&bytes).expect("schema parses");
