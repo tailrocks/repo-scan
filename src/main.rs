@@ -40,7 +40,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Set by the SIGINT handler; the scan loop polls it between tasks and
@@ -3536,8 +3536,10 @@ struct Runner {
     /// `None` only on unit-test runners, which keep the legacy open.
     fence: Option<ScopeFence>,
     inspector: git::GixInspector,
-    fallback: Option<git::fallback::FallbackGit>,
-    fallback_probed: bool,
+    /// Lazily discovered installed-git fallback, shared with worker
+    /// read contexts: discovery runs at most once per run, on first
+    /// need, from either side (P3a; replaces the `&mut`-gated probe).
+    fallback: Arc<OnceLock<Option<git::fallback::FallbackGit>>>,
     counters: RunCounters,
     /// Pathname aliases observed this run (R7), emitted as `Alias` records.
     /// Insert-deduped via `alias_seen` (RSF-751/AC46/F06D): memory holds
@@ -3618,8 +3620,7 @@ impl Runner {
             topology: Topology::new(),
             fence: None,
             inspector: git::GixInspector::new(),
-            fallback: None,
-            fallback_probed: false,
+            fallback: Arc::new(OnceLock::new()),
             counters: RunCounters::default(),
             aliases: Vec::new(),
             alias_seen: HashSet::new(),
@@ -3644,33 +3645,39 @@ impl Runner {
         }
     }
 
-    /// Installed-git fallback, discovered once per run (probe-once-per-identity).
-    fn fallback(&mut self) -> Option<&git::fallback::FallbackGit> {
-        if !self.fallback_probed {
-            self.fallback_probed = true;
-            self.fallback = git::fallback::FallbackGit::discover(&[]);
-            if let Some(found) = &self.fallback {
-                eprintln!(
-                    "repo-scan: installed-git fallback: {} ({})",
-                    identity::scrub_text(&found.path().display().to_string()),
-                    found.capabilities().version,
-                );
-            }
-        }
-        self.fallback.as_ref()
+    /// Installed-git fallback, discovered once per run
+    /// (probe-once-per-identity), shared with worker read contexts.
+    fn fallback(&self) -> Option<&git::fallback::FallbackGit> {
+        self.fallback.get_or_init(discover_fallback).as_ref()
     }
 
     /// Worker-owned read inputs for one task: everything the `collect_*`
     /// halves need, nothing they must not touch. The coordinator keeps
     /// `&mut Runner` (batch, journal, counters, dedupe maps); the read
-    /// half reports counts through its outcome.
+    /// half reports heartbeat counts through its `renewals` out-param.
     fn read_context(&self) -> ReadContext {
         ReadContext {
             fence: self.fence.clone(),
+            inspector: self.inspector,
+            fallback: Arc::clone(&self.fallback),
             watchdog_grace: self.watchdog.grace,
             pressure: Arc::clone(&self.pressure),
         }
     }
+}
+
+/// Discover the installed-git fallback once (shared initializer for the
+/// coordinator and worker read contexts; at most one discovery per run).
+fn discover_fallback() -> Option<git::fallback::FallbackGit> {
+    let found = git::fallback::FallbackGit::discover(&[]);
+    if let Some(found) = &found {
+        eprintln!(
+            "repo-scan: installed-git fallback: {} ({})",
+            identity::scrub_text(&found.path().display().to_string()),
+            found.capabilities().version,
+        );
+    }
+    found
 }
 
 /// Worker-owned read inputs for the `collect_*` halves (goal Step 8).
@@ -3682,6 +3689,11 @@ impl Runner {
 struct ReadContext {
     /// Traversal fence (`None` = legacy unfenced open in unit tests).
     fence: Option<ScopeFence>,
+    /// Git inspector (zero-size `Copy` handle).
+    inspector: git::GixInspector,
+    /// Lazily discovered installed-git fallback (shared with the
+    /// coordinator; discovery runs at most once per run).
+    fallback: Arc<OnceLock<Option<git::fallback::FallbackGit>>>,
     /// No-progress watchdog grace (trip counts stay coordinator-side).
     watchdog_grace: Duration,
     /// Live mirror of admission memory pressure.
@@ -3693,6 +3705,11 @@ impl ReadContext {
     /// `Admission::under_pressure`, readable from worker threads).
     fn under_pressure(&self) -> bool {
         self.pressure.load(Ordering::SeqCst)
+    }
+
+    /// Installed-git fallback, discovered on first need.
+    fn fallback(&self) -> Option<&git::fallback::FallbackGit> {
+        self.fallback.get_or_init(discover_fallback).as_ref()
     }
 }
 
@@ -5146,9 +5163,6 @@ struct EnumScan {
     entries_seen: u64,
     mid_error: Option<String>,
     now_ms: i64,
-    /// Lease heartbeats applied during collection; the coordinator adds
-    /// these to `db_transactions` (workers never touch counters).
-    renewals: u64,
 }
 
 /// Pre-listing fence/stat outcomes that bypass the child loop.
@@ -5178,6 +5192,7 @@ async fn collect_enum_reads(
     claimed: &ClaimedTask,
     path: &Path,
     deadline: &OpDeadline,
+    renewals: &mut u64,
 ) -> repo_scan::Result<EnumCollected> {
     // Finding 12: fenced runners open the task directory through
     // pinned descriptors and verify scope before touching it; unfenced
@@ -5270,7 +5285,6 @@ async fn collect_enum_reads(
     let mut last_progress = Instant::now();
     let mut progress_mark = 0u64;
     let mut last_lease_renewal = Instant::now();
-    let mut renewals = 0u64;
     for item in listing {
         // R04 / SR-STATE-01 lease bound: renew our own lease on the initial entry
         // (entries_seen == 0) and whenever elapsed time reaches or exceeds 20 seconds
@@ -5307,7 +5321,7 @@ async fn collect_enum_reads(
                 .await;
             match renewed {
                 Ok(true) => {
-                    renewals += 1;
+                    *renewals += 1;
                     last_lease_renewal = Instant::now();
                 }
                 Ok(_) => {
@@ -5398,7 +5412,6 @@ async fn collect_enum_reads(
         entries_seen,
         mid_error,
         now_ms: now,
-        renewals,
     }))
 }
 
@@ -5548,13 +5561,13 @@ async fn exec_enumerate(
     };
     // Step 8 worker seam: the read half collects names/kinds without
     // catalog writes; the single writer replays enqueues + observations.
-    // Heartbeats applied during collection report back through the
-    // outcome and land in the counters here, on the coordinator.
+    // Heartbeats replay into the counters before `result` is unwrapped
+    // (see `exec_probe`).
     let ctx = runner.read_context();
-    let collected = collect_enum_reads(&ctx, store, claimed, &path, deadline).await?;
-    if let EnumCollected::Scan(scan) = &collected {
-        runner.counters.db_transactions += scan.renewals;
-    }
+    let mut renewals = 0u64;
+    let result = collect_enum_reads(&ctx, store, claimed, &path, deadline, &mut renewals).await;
+    runner.counters.db_transactions += renewals;
+    let collected = result?;
     persist_enumeration(runner, store, generation, claimed, &path, collected).await
 }
 
@@ -6228,10 +6241,12 @@ const LEASE_WINDOW_MARGIN_MS: i64 = 15_000;
 /// the lease is gone (expired, reclaimed, or superseded) — the caller
 /// must stop touching the scope and preserve a gap via [`fail_task`],
 /// never race a completion. Never touches another owner's lease. One
-/// transaction when the lease is held.
+/// transaction counted through `renewals` when the lease is held (the
+/// coordinator passes its counter; read halves pass a local that the
+/// coordinator replays, so the count survives early returns and errors).
 async fn renew_claim_lease(
     store: &TursoStore,
-    counters: &mut RunCounters,
+    renewals: &mut u64,
     claimed: &ClaimedTask,
 ) -> repo_scan::Result<bool> {
     let lease_epoch = claimed.task.lease_epoch.unwrap_or(u64::MAX);
@@ -6245,7 +6260,7 @@ async fn renew_claim_lease(
         )
         .await?;
     if renewed {
-        counters.db_transactions += 1;
+        *renewals += 1;
     }
     Ok(renewed)
 }
@@ -6352,7 +6367,7 @@ async fn exec_probe(
     // the read stages below. A lost lease stops the op: nothing is
     // observed yet, so retry with a fresh lease instead of racing a
     // completion.
-    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+    if !renew_claim_lease(store, &mut runner.counters.db_transactions, claimed).await? {
         return retry_on_lease_lost(
             runner,
             store,
@@ -6399,17 +6414,26 @@ async fn exec_probe(
     if !poll.ok_now() {
         return Ok(park_on_identity_change("probe", &path));
     }
-    let reads = match collect_probe_reads(
-        runner,
+    // Step 8 worker seam: worker-owned reads; heartbeats applied
+    // during collection replay into the counters here, on the
+    // coordinator — the replay runs before `result` is unwrapped so the
+    // count survives early returns and read errors exactly as immediate
+    // counting did.
+    let ctx = runner.read_context();
+    let mut renewals = 0u64;
+    let result = collect_probe_reads(
+        &ctx,
         store,
         claimed,
         &validated.instance,
         &path,
         &mut poll,
         deadline,
+        &mut renewals,
     )
-    .await
-    {
+    .await;
+    runner.counters.db_transactions += renewals;
+    let reads = match result {
         Ok(CollectOutcome::Reads(reads)) => reads,
         Ok(CollectOutcome::IdentityChanged) => {
             return Ok(park_on_identity_change("probe", &path));
@@ -6457,7 +6481,7 @@ async fn exec_probe(
     // a Git stage may have consumed the window without tripping the
     // identity polls. Observations under a lost lease are discarded and
     // the scope retries with a fresh lease.
-    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+    if !renew_claim_lease(store, &mut runner.counters.db_transactions, claimed).await? {
         return retry_on_lease_lost(
             runner,
             store,
@@ -6669,14 +6693,16 @@ pub fn test_set_mid_inspection_hook(hook: impl FnOnce() + Send + 'static) {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn collect_probe_reads(
-    runner: &mut Runner,
+    ctx: &ReadContext,
     store: &TursoStore,
     claimed: &ClaimedTask,
     instance: &git::GitInstance,
     path: &Path,
     poll: &mut IdentityPoll,
     deadline: &OpDeadline,
+    renewals: &mut u64,
 ) -> repo_scan::Result<CollectOutcome> {
     if deadline.expired() {
         return Ok(CollectOutcome::TimedOut);
@@ -6691,9 +6717,9 @@ async fn collect_probe_reads(
         .ok()
         .map(|md| dir_identity(&md))
         .filter(|key| *key != (0, 0));
-    let config_dep_count = runner.inspector.config_dependencies(instance).len();
+    let config_dep_count = ctx.inspector.config_dependencies(instance).len();
     let mut remotes_note = None;
-    let remotes = match runner.inspector.remotes(instance) {
+    let remotes = match ctx.inspector.remotes(instance) {
         Ok(remotes) => remotes,
         Err(e) if git::is_unsupported_error(&e) => {
             remotes_note = Some(format!("remotes unsupported, treated as no remotes: {e}"));
@@ -6719,7 +6745,7 @@ async fn collect_probe_reads(
     // yield point so a slow-but-advancing probe never lets its 60 s lease
     // lapse mid-operation. A lost lease abandons the collection: the
     // caller discards every observation and retries with a fresh lease.
-    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+    if !renew_claim_lease(store, renewals, claimed).await? {
         return Ok(CollectOutcome::LeaseLost);
     }
     if deadline.expired() {
@@ -6727,7 +6753,7 @@ async fn collect_probe_reads(
     }
     // F2: HEAD/refs reads moved to the post-`inventory_ready` analyze
     // task; discovery probes keep only identity/relationship reads.
-    let relationship = match runner.inspector.checkout_kind(instance) {
+    let relationship = match ctx.inspector.checkout_kind(instance) {
         Ok(git::CheckoutKind::Main) => "main",
         Ok(git::CheckoutKind::Linked) => "linked",
         Ok(git::CheckoutKind::Submodule) => "submodule",
@@ -6737,16 +6763,16 @@ async fn collect_probe_reads(
         return Ok(CollectOutcome::IdentityChanged);
     }
     // R4 heartbeat at this yield point (see above).
-    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+    if !renew_claim_lease(store, renewals, claimed).await? {
         return Ok(CollectOutcome::LeaseLost);
     }
     let work_present = instance.work_dir.as_ref().map(|root| root.exists());
-    let worktrees = runner.inspector.worktrees(instance).unwrap_or_default();
+    let worktrees = ctx.inspector.worktrees(instance).unwrap_or_default();
     if !poll.ok_throttled() {
         return Ok(CollectOutcome::IdentityChanged);
     }
     // R4 heartbeat at this yield point (see above).
-    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+    if !renew_claim_lease(store, renewals, claimed).await? {
         return Ok(CollectOutcome::LeaseLost);
     }
     if deadline.expired() {
@@ -7644,13 +7670,13 @@ async fn enqueue_probe_task_for_path(
 
 /// HEAD observation with installed-git fallback on structural gaps only.
 fn observed_head(
-    runner: &mut Runner,
+    ctx: &ReadContext,
     instance: &git::GitInstance,
 ) -> repo_scan::Result<git::HeadState> {
-    match runner.inspector.head(instance) {
+    match ctx.inspector.head(instance) {
         Ok(head) => Ok(head),
         Err(e) if git::is_unsupported_error(&e) => {
-            if let Some(fallback) = runner.fallback() {
+            if let Some(fallback) = ctx.fallback() {
                 match fallback.head(&instance.git_dir, instance.work_dir.as_deref()) {
                     Ok(head) => return Ok(head),
                     Err(fe) => {
@@ -7669,14 +7695,14 @@ fn observed_head(
 
 /// Ref observations with installed-git fallback on structural gaps only.
 fn observed_refs(
-    runner: &mut Runner,
+    ctx: &ReadContext,
     instance: &git::GitInstance,
     evidence: &mut Vec<String>,
 ) -> repo_scan::Result<Vec<git::RefObservation>> {
-    match runner.inspector.refs(instance) {
+    match ctx.inspector.refs(instance) {
         Ok(refs) => Ok(refs),
         Err(e) if git::is_unsupported_error(&e) => {
-            if let Some(fallback) = runner.fallback() {
+            if let Some(fallback) = ctx.fallback() {
                 match fallback.refs(&instance.git_dir, instance.work_dir.as_deref()) {
                     Ok(refs) => {
                         evidence.push(String::from("refs via installed-git fallback"));
@@ -7825,7 +7851,7 @@ enum AnalysisOutcome {
 /// observation.
 #[allow(clippy::too_many_arguments)]
 async fn collect_analysis_reads(
-    runner: &mut Runner,
+    ctx: &ReadContext,
     store: &TursoStore,
     claimed: &ClaimedTask,
     instance: &git::GitInstance,
@@ -7834,11 +7860,12 @@ async fn collect_analysis_reads(
     is_bare: bool,
     poll: &mut IdentityPoll,
     deadline: &OpDeadline,
+    renewals: &mut u64,
 ) -> repo_scan::Result<AnalysisOutcome> {
     if deadline.expired() {
         return Ok(AnalysisOutcome::TimedOut);
     }
-    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+    if !renew_claim_lease(store, renewals, claimed).await? {
         return Ok(AnalysisOutcome::LeaseLost);
     }
     let task_deadline = *deadline;
@@ -7850,19 +7877,18 @@ async fn collect_analysis_reads(
     // at the first-seen git dir, exactly the read the discovery probe
     // used to make — one execution instead of one per checkout.
     let mut refs_notes = Vec::new();
-    let refs = git::fallback::with_wait_cancel(&cancel, || {
-        observed_refs(runner, instance, &mut refs_notes)
-    })?;
+    let refs =
+        git::fallback::with_wait_cancel(&cancel, || observed_refs(ctx, instance, &mut refs_notes))?;
     if !poll.ok_now() {
         return Ok(AnalysisOutcome::IdentityChanged);
     }
-    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+    if !renew_claim_lease(store, renewals, claimed).await? {
         return Ok(AnalysisOutcome::LeaseLost);
     }
     if deadline.expired() {
         return Ok(AnalysisOutcome::TimedOut);
     }
-    let ref_errors = runner.inspector.reference_errors(instance);
+    let ref_errors = ctx.inspector.reference_errors(instance);
     let branch_upstreams = load_branch_upstreams(&instance.common_dir);
     if !poll.ok_throttled() {
         return Ok(AnalysisOutcome::IdentityChanged);
@@ -7889,13 +7915,13 @@ async fn collect_analysis_reads(
             object_format: object_format.to_string(),
         };
         let head =
-            git::fallback::with_wait_cancel(&cancel, || observed_head(runner, &checkout_instance))?;
+            git::fallback::with_wait_cancel(&cancel, || observed_head(ctx, &checkout_instance))?;
         heads.push((checkout.id.clone(), head));
         if !poll.ok_throttled() {
             return Ok(AnalysisOutcome::IdentityChanged);
         }
     }
-    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+    if !renew_claim_lease(store, renewals, claimed).await? {
         return Ok(AnalysisOutcome::LeaseLost);
     }
     Ok(AnalysisOutcome::Reads(AnalysisReads {
@@ -7955,7 +7981,7 @@ async fn exec_analysis(
             path.display()
         )));
     }
-    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+    if !renew_claim_lease(store, &mut runner.counters.db_transactions, claimed).await? {
         return retry_on_lease_lost(
             runner,
             store,
@@ -8007,8 +8033,12 @@ async fn exec_analysis(
         return Ok(park_on_identity_change("analyze", &path));
     }
     let checkouts = list_store_checkouts(store, &instance_id).await?;
-    let reads = match collect_analysis_reads(
-        runner,
+    // Step 8 worker seam: worker-owned reads; heartbeats replay into
+    // the counters before `result` is unwrapped (see `exec_probe`).
+    let ctx = runner.read_context();
+    let mut renewals = 0u64;
+    let result = collect_analysis_reads(
+        &ctx,
         store,
         claimed,
         &validated.instance,
@@ -8017,9 +8047,11 @@ async fn exec_analysis(
         instance_row.bare.unwrap_or(false),
         &mut poll,
         deadline,
+        &mut renewals,
     )
-    .await
-    {
+    .await;
+    runner.counters.db_transactions += renewals;
+    let reads = match result {
         Ok(AnalysisOutcome::Reads(reads)) => reads,
         Ok(AnalysisOutcome::IdentityChanged) => {
             return Ok(park_on_identity_change("analyze", &path));
@@ -8060,7 +8092,7 @@ async fn exec_analysis(
     if !poll.ok_now() {
         return Ok(park_on_identity_change("analyze", &path));
     }
-    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+    if !renew_claim_lease(store, &mut runner.counters.db_transactions, claimed).await? {
         return retry_on_lease_lost(
             runner,
             store,
@@ -8354,11 +8386,12 @@ struct StatusCollected {
 /// the pool slice); the writer applies everything via
 /// [`persist_status`].
 async fn collect_status_reads(
-    runner: &mut Runner,
+    ctx: &ReadContext,
     store: &TursoStore,
     claimed: &ClaimedTask,
     target: &StatusTarget,
     deadline: &OpDeadline,
+    renewals: &mut u64,
 ) -> repo_scan::Result<StatusCollected> {
     let git_path = &target.git_path;
     let mode = target.mode;
@@ -8366,7 +8399,7 @@ async fn collect_status_reads(
     // Refusals park with a preserved gap; nothing is persisted.
     let schedule = ProbeSchedule::status_legacy();
     let pinned: Option<PinnedDir> =
-        match verify_probe_path(runner.fence.as_ref(), "status", git_path, &schedule) {
+        match verify_probe_path(ctx.fence.as_ref(), "status", git_path, &schedule) {
             ProbeFence::Unfenced => None,
             ProbeFence::Pinned(pinned) | ProbeFence::Relationship(pinned) => Some(pinned),
             ProbeFence::Refused { state, reason } => {
@@ -8400,7 +8433,7 @@ async fn collect_status_reads(
     // pre-run pin above and the DURING/post-run re-verification below, so a
     // path swapped mid-run discards every observation. Inspection keeps
     // the scheduling spelling, so persisted rows stay spelling-stable.
-    let mut poll = IdentityPoll::new(runner.fence.as_ref(), git_path, pinned.as_ref());
+    let mut poll = IdentityPoll::new(ctx.fence.as_ref(), git_path, pinned.as_ref());
     let finish = |outcome: StatusReadOutcome| StatusCollected {
         target: StatusTarget {
             checkout_id: target.checkout_id.clone(),
@@ -8412,7 +8445,7 @@ async fn collect_status_reads(
         },
         outcome,
     };
-    let instance = match runner.inspector.open_exact(git_path) {
+    let instance = match ctx.inspector.open_exact(git_path) {
         Ok(instance) => instance,
         Err(e) if git::is_unsupported_error(&e) => {
             return Ok(finish(StatusReadOutcome::UnsupportedOpen {
@@ -8431,7 +8464,7 @@ async fn collect_status_reads(
     }
     // R4 heartbeat: renew before the blocking call below, which has no
     // in-call yield point. A lost lease stops the op before any Git read.
-    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+    if !renew_claim_lease(store, renewals, claimed).await? {
         return Ok(finish(StatusReadOutcome::LeaseRetry {
             detail: format!(
                 "lease lost before status of {}; retrying with a fresh lease",
@@ -8454,14 +8487,13 @@ async fn collect_status_reads(
     // call are the guarantee — even if gix ignores the flag, an expired
     // or swapped observation never records.
     let guard = spawn_status_guard(
-        runner.fence.clone(),
+        ctx.fence.clone(),
         git_path.clone(),
         pinned.as_ref().map(snapshot_of),
         call_deadline,
     );
     let status_result =
-        runner
-            .inspector
+        ctx.inspector
             .status_interruptible(&instance, mode, Some(guard.interrupt_flag()));
     let identity_changed = guard.finish();
     if identity_changed {
@@ -8493,7 +8525,7 @@ async fn collect_status_reads(
     // R4 heartbeat: the blocking call consumed most of the window renewed
     // above — renew again so the fallback and submodule reads below run
     // under a fresh lease instead of racing its expiry.
-    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+    if !renew_claim_lease(store, renewals, claimed).await? {
         return Ok(finish(StatusReadOutcome::LeaseRetry {
             detail: format!(
                 "lease lost during status of {}; observation discarded",
@@ -8513,7 +8545,7 @@ async fn collect_status_reads(
                 None,
             );
             git::fallback::with_wait_cancel(&cancel, || {
-                fallback_status_counts(runner, &instance, mode, &e)
+                fallback_status_counts(ctx, &instance, mode, &e)
             })
         }
         Err(e) => {
@@ -8526,7 +8558,7 @@ async fn collect_status_reads(
     // Submodule coverage (R16): examined through the inspector alongside
     // the status probe — `checked` when the submodule relationships were
     // actually read, `unknown` when they could not be.
-    let submodules = match runner.inspector.submodules(&instance) {
+    let submodules = match ctx.inspector.submodules(&instance) {
         Ok(_) => "checked",
         Err(_) => "unknown",
     };
@@ -8539,7 +8571,7 @@ async fn collect_status_reads(
     // verify the lease before any status row is recorded. A lost lease
     // discards the observation and the scope retries with a fresh lease
     // instead of racing a completion.
-    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+    if !renew_claim_lease(store, renewals, claimed).await? {
         return Ok(finish(StatusReadOutcome::LeaseRetry {
             detail: format!(
                 "lease lost during status of {}; observation discarded",
@@ -8552,7 +8584,7 @@ async fn collect_status_reads(
     // observation is discarded and the scope parks. Relationship pins
     // re-verify through the unscoped descriptor walk.
     if let Some(pinned) = &pinned {
-        let fence_ok = match runner.fence.as_ref() {
+        let fence_ok = match ctx.fence.as_ref() {
             None => true,
             Some(fence) => fence.reverify_pinned(git_path, pinned),
         };
@@ -8767,6 +8799,8 @@ async fn exec_status(
     }
     // Step 8 worker seam: the read half runs the guarded Git inspection
     // without catalog writes; the single writer applies the outcome.
+    // Heartbeats replay into the counters before `result` is unwrapped
+    // (see `exec_probe`).
     let target = StatusTarget {
         checkout_id: checkout_id.clone(),
         instance_id: checkout.instance_id.clone(),
@@ -8775,7 +8809,11 @@ async fn exec_status(
         now_ms: now,
         observed_rev,
     };
-    let collected = collect_status_reads(runner, store, claimed, &target, deadline).await?;
+    let ctx = runner.read_context();
+    let mut renewals = 0u64;
+    let result = collect_status_reads(&ctx, store, claimed, &target, deadline, &mut renewals).await;
+    runner.counters.db_transactions += renewals;
+    let collected = result?;
     persist_status(runner, store, claimed, collected).await
 }
 
@@ -8803,12 +8841,12 @@ fn status_state_of(obs: &git::StatusObservation) -> &'static str {
 /// Installed-git status counts on structural gaps; `None` when no fallback
 /// can serve the probe.
 fn fallback_status_counts(
-    runner: &mut Runner,
+    ctx: &ReadContext,
     instance: &git::GitInstance,
     mode: StatusMode,
     cause: &repo_scan::Error,
 ) -> Option<git::StatusObservation> {
-    let fallback = runner.fallback()?;
+    let fallback = ctx.fallback()?;
     let (staged, unstaged, untracked) = fallback
         .status_counts(
             &instance.git_dir,
