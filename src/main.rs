@@ -5237,33 +5237,31 @@ async fn collect_enum_reads(
         // touching the scope and preserve a partial gap instead of racing
         // a completion. A truly blocked `next()` never reaches this line,
         // so the lease still expires on schedule and bounds the wedge from
-        // the store side. (TTL mirrors LEASE_TTL_MS; the WHERE clause
-        // mirrors `release_claim` and never touches another owner's lease.)
+        // the store side. (P3a: the heartbeat goes through the store
+        // renewal API — the same call the coordinator's scheduled
+        // renewal uses — and never touches another owner's lease.)
         let renewal_interval = Duration::from_secs(20);
-        if let Some(new_expiry) = repo_scan::scheduler::admission::lease_renewal_expiry_elapsed(
+        let renewal_due = repo_scan::scheduler::admission::lease_renewal_expiry_elapsed(
             entries_seen,
             last_lease_renewal.elapsed(),
             renewal_interval,
             store::now_ms(),
-            60_000,
-        ) {
+            LEASE_TTL_MS,
+        )
+        .is_some();
+        if renewal_due {
             let lease_epoch = claimed.task.lease_epoch.unwrap_or(u64::MAX);
             let renewed = store
-                .connection()
-                .execute(
-                    "UPDATE frontier_tasks SET lease_expires_ms = ?1, updated_at_ms = ?1 \
-                     WHERE id = ?2 AND state = 'leased' AND lease_token = ?3 \
-                     AND lease_epoch = ?4",
-                    vec![
-                        turso::Value::Integer(new_expiry),
-                        turso::Value::Text(claimed.task.id.clone()),
-                        turso::Value::Integer(claimed.token),
-                        turso::Value::Integer(lease_epoch as i64),
-                    ],
+                .renew_lease(
+                    &claimed.task.id,
+                    claimed.token,
+                    lease_epoch,
+                    LEASE_TTL_MS,
+                    store::now_ms(),
                 )
                 .await;
             match renewed {
-                Ok(matched) if matched > 0 => {
+                Ok(true) => {
                     runner.counters.db_transactions += 1;
                     last_lease_renewal = Instant::now();
                 }
@@ -6173,39 +6171,31 @@ const LEASE_WINDOW_MARGIN_MS: i64 = 15_000;
 
 /// Renew one claimed task's lease (R4 heartbeat for probe/status paths):
 /// extends `lease_expires_ms` by [`LEASE_TTL_MS`] iff the exact
-/// token/epoch lease is still held. Mirrors the enumeration heartbeat's
-/// `WHERE` clause: a zero-row renewal means the lease is gone (expired,
-/// reclaimed, or superseded) — the caller must stop touching the scope
-/// and preserve a gap via [`fail_task`], never race a completion. Never
-/// touches another owner's lease. One transaction when the lease is held.
+/// token/epoch lease is still held. Goes through the store renewal API
+/// (same call as the enumeration heartbeat): a `false` renewal means
+/// the lease is gone (expired, reclaimed, or superseded) — the caller
+/// must stop touching the scope and preserve a gap via [`fail_task`],
+/// never race a completion. Never touches another owner's lease. One
+/// transaction when the lease is held.
 async fn renew_claim_lease(
     store: &TursoStore,
     counters: &mut RunCounters,
     claimed: &ClaimedTask,
 ) -> repo_scan::Result<bool> {
     let lease_epoch = claimed.task.lease_epoch.unwrap_or(u64::MAX);
-    let new_expiry = store::now_ms().saturating_add(LEASE_TTL_MS);
-    let matched = store
-        .connection()
-        .execute(
-            "UPDATE frontier_tasks SET lease_expires_ms = ?1, updated_at_ms = ?1 \
-             WHERE id = ?2 AND state = 'leased' AND lease_token = ?3 \
-             AND lease_epoch = ?4",
-            vec![
-                turso::Value::Integer(new_expiry),
-                turso::Value::Text(claimed.task.id.clone()),
-                turso::Value::Integer(claimed.token),
-                turso::Value::Integer(lease_epoch as i64),
-            ],
+    let renewed = store
+        .renew_lease(
+            &claimed.task.id,
+            claimed.token,
+            lease_epoch,
+            LEASE_TTL_MS,
+            store::now_ms(),
         )
-        .await
-        .map_err(store_err)?;
-    if matched > 0 {
+        .await?;
+    if renewed {
         counters.db_transactions += 1;
-        Ok(true)
-    } else {
-        Ok(false)
     }
+    Ok(renewed)
 }
 
 /// Retry outcome for a probe/status op that outlived its lease (R4):
