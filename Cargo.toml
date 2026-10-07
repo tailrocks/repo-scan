@@ -29,6 +29,11 @@ name = "perf_gates"
 harness = false
 test = false
 
+[[bench]]
+name = "corpus"
+harness = false
+test = false
+
 [features]
 default = []
 # Phase 1: no optional runtime features. Platform backends are cfg-gated
