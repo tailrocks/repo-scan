@@ -4224,15 +4224,17 @@ async fn run_until_boundary(
                                 (id.as_str(), *token, *lease_epoch)
                             })
                             .collect();
-                        let renewed = store
+                        // `renew_leases_batch` returns the ids it could NOT
+                        // renew (lost leases); the rest renewed.
+                        let lost = store
                             .renew_leases_batch(&tickets, LEASE_TTL_MS, store::now_ms())
                             .await?;
                         runner.counters.db_transactions += 1;
-                        if renewed.len() != tickets.len() {
+                        if !lost.is_empty() {
                             eprintln!(
                                 "repo-scan: renewal tick renewed {}/{} in-flight leases; \
                                  unrenewed results stop at the pre-persist gate",
-                                renewed.len(),
+                                tickets.len() - lost.len(),
                                 tickets.len(),
                             );
                         }
@@ -4299,21 +4301,8 @@ async fn release_claim(
     epoch: u64,
 ) -> repo_scan::Result<()> {
     store
-        .connection()
-        .execute(
-            "UPDATE frontier_tasks SET state = 'pending', lease_token = NULL, \
-             lease_epoch = NULL, lease_expires_ms = NULL, updated_at_ms = ?1 \
-             WHERE id = ?2 AND state = 'leased' AND lease_token = ?3 \
-             AND lease_epoch = ?4",
-            vec![
-                turso::Value::Integer(store::now_ms()),
-                turso::Value::Text(claimed.task.id.clone()),
-                turso::Value::Integer(claimed.token),
-                turso::Value::Integer(epoch as i64),
-            ],
-        )
-        .await
-        .map_err(store_err)?;
+        .release_claim(&claimed.task.id, claimed.token, epoch, store::now_ms())
+        .await?;
     counters.db_transactions += 1;
     Ok(())
 }

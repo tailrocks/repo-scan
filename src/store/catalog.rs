@@ -1812,6 +1812,40 @@ impl TursoStore {
             .map(|_| ())
     }
 
+    /// Release a claim that never ran (breaker/admission denial, R4):
+    /// the task returns to `pending` immediately instead of leaking
+    /// until lease TTL. Compensates the claim's `attempts + 1` — a
+    /// denied claim did no work, so it must not burn the retry budget
+    /// (`fail_task` exhausts and backs off on attempts). Token/epoch
+    /// mismatch releases nothing. Returns whether a lease was held.
+    pub async fn release_claim(
+        &self,
+        task_id: &str,
+        token: i64,
+        epoch: u64,
+        now_ms: i64,
+    ) -> crate::Result<bool> {
+        self.forbid_write("release_claim")?;
+        let rows = self
+            .connection()
+            .execute(
+                "UPDATE frontier_tasks SET state = 'pending', lease_token = NULL, \
+                 lease_epoch = NULL, lease_expires_ms = NULL, updated_at_ms = ?1, \
+                 attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END \
+                 WHERE id = ?2 AND state = 'leased' AND lease_token = ?3 \
+                 AND lease_epoch = ?4",
+                vec![
+                    v_int(now_ms),
+                    v_text(task_id),
+                    v_int(token),
+                    v_int(u64_to_i64(epoch, "lease epoch")?),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(rows == 1)
+    }
+
     /// Complete one claimed task. Returns the gap delta the outcome
     /// caused — opened row (`Retry`/`Parked`) and/or closed id
     /// (`Complete`) — so the caller can journal the matching `error` /
@@ -2890,9 +2924,10 @@ impl ScanRow {
             format: opt_text(row, 12)?,
             all_targets: opt_i64(row, 13)?.map(|v| v != 0),
             fetch: opt_i64(row, 14)?.map(|v| v != 0),
-            workers: opt_i64(row, 15)?
-                .map(|v| i64_to_u64(v, "scan workers"))
-                .transpose()?,
+            // A corrupt negative resolves to `None` (runtime default via
+            // `restore_workers`) instead of failing the whole read —
+            // resume stays resilient to a bad stored value.
+            workers: opt_i64(row, 15)?.and_then(|v| u64::try_from(v).ok()),
         })
     }
 }

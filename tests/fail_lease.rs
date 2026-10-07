@@ -394,3 +394,62 @@ fn store_stale_enum_lease_retries_before_persist() {
         store.close().await.unwrap();
     });
 }
+
+/// R4: releasing a denied claim returns the task to `pending` AND
+/// compensates the claim's `attempts + 1` — a claim that never ran
+/// must not burn the retry budget `fail_task` exhausts on. A
+/// token/epoch mismatch releases nothing.
+#[test]
+fn release_claim_compensates_unrun_attempt() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = db_in(&dir);
+        let store = TursoStore::open(&db).await.expect("open");
+        let epoch = store.epoch();
+        let t0 = now_ms();
+        store
+            .enqueue_task(
+                &NewTask {
+                    id: "t-denied",
+                    kind: "probe_git",
+                    generation: 1,
+                    dir_id: None,
+                    scope_key: "s",
+                    expected_rev: 0,
+                    idempotency_key: "idem-denied",
+                },
+                t0,
+            )
+            .await
+            .expect("enqueue");
+        let claimed = store
+            .claim_tasks(epoch, 10, 60_000, t0)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1);
+        let token = claimed[0].token;
+        let row = store.get_task("t-denied").await.expect("get").expect("row");
+        assert_eq!(row.attempts, 1);
+        assert!(store
+            .release_claim("t-denied", token, epoch, t0 + 1)
+            .await
+            .expect("release"));
+        let row = store.get_task("t-denied").await.expect("get").expect("row");
+        assert_eq!(row.state, TaskState::Pending);
+        assert_eq!(row.attempts, 0, "denied claim burns no attempt");
+        assert!(row.lease_token.is_none());
+        // Mismatch releases nothing and reports false.
+        let claimed = store
+            .claim_tasks(epoch, 10, 60_000, t0 + 2)
+            .await
+            .expect("reclaim");
+        assert!(!store
+            .release_claim("t-denied", claimed[0].token + 1, epoch, t0 + 3)
+            .await
+            .expect("mismatch release"));
+        let row = store.get_task("t-denied").await.expect("get").expect("row");
+        assert_ne!(row.state, TaskState::Pending);
+        store.close().await.unwrap();
+    });
+}

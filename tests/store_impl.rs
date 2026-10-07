@@ -898,3 +898,48 @@ fn completion_delta_reports_open_then_close() {
         store.close().await.expect("close");
     });
 }
+
+/// v4 resilience: a corrupt negative `workers` value resolves to `None`
+/// (runtime default) instead of failing the scan-request read — resume
+/// never breaks on a bad stored value.
+#[test]
+fn negative_workers_reads_as_none() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = db_in(&dir);
+        let store = TursoStore::open(&db).await.expect("open");
+        let now = now_ms();
+        store
+            .create_scan_request(
+                &NewScan {
+                    id: "scan-neg",
+                    url_raw: b"https://github.com/OWNER/REPO",
+                    url_canonical: None,
+                    scope: "machine",
+                    status_mode: "summary",
+                    report_dest: None,
+                    targets_json: None,
+                    format: None,
+                    all_targets: None,
+                    fetch: None,
+                    workers: Some(4),
+                },
+                now,
+            )
+            .await
+            .expect("scan");
+        store
+            .connection()
+            .execute(
+                "UPDATE scan_requests SET workers = -1 WHERE id = 'scan-neg'",
+                (),
+            )
+            .await
+            .expect("corrupt workers");
+        let row = store.get_scan("scan-neg").await.expect("get").expect("row");
+        assert_eq!(row.workers, None);
+        assert_eq!(repo_scan::config::restore_workers(row.workers), None);
+        store.close().await.expect("close");
+    });
+}
