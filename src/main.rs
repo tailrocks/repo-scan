@@ -5078,58 +5078,90 @@ async fn fail_list_open(
     .await
 }
 
-/// Enumerate one directory's immediate children: upsert the directory row,
-/// enqueue unseen child directories (identity-deduped), resolve symlinks
-/// through the topology layer, detect Git candidates by marker evidence
-/// (`.git` entry; `HEAD`+`objects`+`refs` for bare stores) for exact-path
-/// validation, and record the observation. Races are gaps, never absence.
-/// `deadline` (SR-STATE-01) bounds the item loop: expiry abandons the
-/// remainder and parks the scope instead of wedging the run.
-async fn exec_enumerate(
+/// One listed child: raw name + observed kind (Step 8 worker seam: the
+/// read half collects these, the single writer replays enqueues from them).
+#[derive(Debug, Clone)]
+struct EnumChild {
+    name: std::ffi::OsString,
+    kind: ChildKind,
+}
+
+/// Filesystem read half of one enumeration: every observation collected
+/// without catalog writes. P1 collects inline; the pool slice moves
+/// collection onto worker threads. (The only store touch left in the
+/// read loop is the in-loop lease renewal, which moves to the
+/// coordinator's scheduled renewal then; the only admission touch is
+/// the pressure abort, which becomes feed control.)
+struct EnumScan {
+    dev: u64,
+    ino: u64,
+    volume_tag: String,
+    dir_id: i64,
+    ino_str: String,
+    incarnation: String,
+    component: Vec<u8>,
+    display: String,
+    children: Vec<EnumChild>,
+    entries_seen: u64,
+    mid_error: Option<String>,
+    now_ms: i64,
+}
+
+/// Pre-listing fence/stat outcomes that bypass the child loop.
+enum EnumCollected {
+    Scan(EnumScan),
+    /// Task path resolves to a symlink: enqueue its target, complete.
+    Link,
+    Refused {
+        state: TaskState,
+        reason: String,
+    },
+    StatFailed(std::io::Error),
+    ListFailed {
+        dir_id: i64,
+        now_ms: i64,
+        error: std::io::Error,
+    },
+}
+
+/// Read half of [`exec_enumerate`]: fenced open, stat, and child
+/// names/kinds. Applies no catalog writes (lease renewal excepted, see
+/// [`EnumScan`]); the writer applies everything via
+/// [`persist_enumeration`].
+async fn collect_enum_reads(
     runner: &mut Runner,
     store: &TursoStore,
-    generation: u64,
     claimed: &ClaimedTask,
+    path: &Path,
     deadline: &OpDeadline,
-) -> repo_scan::Result<TaskOutcome> {
-    let Some(config::ScopeRef::Dir(path)) = config::parse_scope_key(&claimed.task.scope_key) else {
-        return Ok(TaskOutcome::Parked {
-            state: TaskState::Unsupported,
-            reason: format!("malformed dir scope key: {}", claimed.task.scope_key),
-        });
-    };
+) -> repo_scan::Result<EnumCollected> {
     // Finding 12: fenced runners open the task directory through
     // pinned descriptors and verify scope before touching it; unfenced
     // runners (unit tests) keep the legacy pathname stat.
-    let pinned: Option<PinnedDir> = match open_dir_fenced(runner.fence.as_ref(), &path) {
+    let pinned: Option<PinnedDir> = match open_dir_fenced(runner.fence.as_ref(), path) {
         FencedDir::Unfenced => None,
         FencedDir::Pinned(pinned) => Some(pinned),
         FencedDir::Link => {
-            // The task path resolves to a symlink (swapped since
-            // scheduling): resolve it through the topology layer like any
-            // symlink child instead of following it blindly. The link
-            // itself needs no enumeration.
-            enqueue_symlink_target(store, runner, generation, &path, store::now_ms()).await?;
-            return Ok(TaskOutcome::Complete);
+            return Ok(EnumCollected::Link);
         }
         FencedDir::Refused { state, reason } => {
-            return Ok(TaskOutcome::Parked { state, reason });
+            return Ok(EnumCollected::Refused { state, reason });
         }
         FencedDir::StatFailed(e) => {
-            return fail_stat_open(runner, store, claimed, &path, &e).await;
+            return Ok(EnumCollected::StatFailed(e));
         }
     };
     let opened_meta: OpenDirMeta = match &pinned {
         Some(pinned) => OpenDirMeta::Pinned(pinned.stat()),
-        None => match std::fs::symlink_metadata(&path) {
+        None => match std::fs::symlink_metadata(path) {
             Ok(md) => OpenDirMeta::Legacy(md),
-            Err(e) => return fail_stat_open(runner, store, claimed, &path, &e).await,
+            Err(e) => return Ok(EnumCollected::StatFailed(e)),
         },
     };
     let dir_path: &Path = if let Some(pinned) = &pinned {
         pinned.true_path()
     } else {
-        &path
+        path
     };
     let (dev, ino, incarnation) = match &opened_meta {
         OpenDirMeta::Pinned(stat) => {
@@ -5148,11 +5180,6 @@ async fn exec_enumerate(
         }
     };
     let volume_tag = format!("dev:{dev}");
-    runner.topology.observe(PhysicalDirId {
-        dev,
-        ino,
-        namespace: volume_tag.clone(),
-    });
     let now = store::now_ms();
     let component = dir_path
         .file_name()
@@ -5162,46 +5189,39 @@ async fn exec_enumerate(
     // no immediate flush is needed to retrieve an autoincrement id.
     let ino_str = ino.to_string();
     let dir_id = store::dir_identity_id(&volume_tag, &ino_str, &incarnation);
-    let due = TursoStore::buffer_dir_upsert(
-        &mut runner.batch,
-        None,
-        &component,
-        &escape_display(&config::path_as_bytes(dir_path)),
-        &volume_tag,
-        &ino_str,
-        &incarnation,
-        now,
-    );
-    flush_if_due(runner, store, due).await?;
+    let display = escape_display(&config::path_as_bytes(dir_path));
 
     let adapter = repo_scan::walk::primary_adapter();
     let listing: Box<dyn Iterator<Item = WalkItem> + '_> = match pinned {
         Some(pinned) => match pinned.into_children(true) {
             Ok(children) => Box::new(children),
             Err(e) => {
-                return fail_list_open(runner, store, claimed, dir_id, generation, &path, now, &e)
-                    .await;
+                return Ok(EnumCollected::ListFailed {
+                    dir_id,
+                    now_ms: now,
+                    error: e,
+                });
             }
         },
         None => match adapter.list_dir(
-            &path,
+            path,
             ListOptions {
                 skip_metadata: true,
             },
         ) {
             Ok(listing) => listing,
             Err(e) => {
-                return fail_list_open(runner, store, claimed, dir_id, generation, &path, now, &e)
-                    .await;
+                return Ok(EnumCollected::ListFailed {
+                    dir_id,
+                    now_ms: now,
+                    error: e,
+                });
             }
         },
     };
+    let mut children = Vec::new();
     let mut entries_seen = 0u64;
     let mut mid_error: Option<String> = None;
-    let mut saw_head = false;
-    let mut saw_objects = false;
-    let mut saw_refs = false;
-    let mut probed_self_for_dot_git = false;
     let watchdog_grace = runner.watchdog.grace;
     let mut last_progress = Instant::now();
     let mut progress_mark = 0u64;
@@ -5317,74 +5337,175 @@ async fn exec_enumerate(
         entries_seen += 1;
         progress_mark = entries_seen;
         last_progress = Instant::now();
-        let name = child.name.clone();
-        let is_dot_git = name.as_os_str() == std::ffi::OsStr::new(".git");
-        if is_dot_git && !probed_self_for_dot_git {
-            probed_self_for_dot_git = true;
-            enqueue_probe_task(store, runner, generation, claimed, &path, now).await?;
-        }
-        track_bare_markers(
-            &name,
-            child.kind,
-            &mut saw_head,
-            &mut saw_objects,
-            &mut saw_refs,
-        );
-        let child_path = path.join(&name);
-        match child.kind {
-            ChildKind::Directory => {
-                enqueue_enum_child(store, runner, generation, &child_path, now).await?;
-            }
-            ChildKind::Symlink => {
-                enqueue_symlink_target(store, runner, generation, &child_path, now).await?;
-            }
-            ChildKind::File | ChildKind::Other => {}
-        }
+        children.push(EnumChild {
+            name: child.name,
+            kind: child.kind,
+        });
     }
-    runner.counters.entries += entries_seen;
-    if saw_head && saw_objects && saw_refs {
-        // Bare-store marker evidence: exact-path validation decides.
-        enqueue_probe_task(store, runner, generation, claimed, &path, now).await?;
-    }
-    let completed = mid_error.is_none();
-    // RSF-751/AC46/F06D: read-free observation; the attempt counts in SQL,
-    // so this write never needs a flush to observe buffered rows first.
-    let due = TursoStore::buffer_record_dir_observation_bumped(
-        &mut runner.batch,
+    Ok(EnumCollected::Scan(EnumScan {
+        dev,
+        ino,
+        volume_tag,
         dir_id,
-        generation,
-        completed,
+        ino_str,
+        incarnation,
+        component,
+        display,
+        children,
         entries_seen,
-        mid_error.as_deref(),
-        store::now_ms(),
-    );
-    flush_if_due(runner, store, due).await?;
-    if completed {
-        runner.counters.dirs_complete += 1;
-        Ok(TaskOutcome::Complete)
-    } else {
-        let detail = mid_error.unwrap_or_else(|| String::from("partial enumeration"));
-        // SR-STATE-01: a deadline abandonment parks (never retries into
-        // the same wedge); `complete_task` records the loud gap row.
-        if detail.starts_with("timeout-abandoned:") {
-            return Ok(park_on_timeout(&detail));
+        mid_error,
+        now_ms: now,
+    }))
+}
+
+/// Write half of [`exec_enumerate`]: directory upsert, child enqueues
+/// replayed from the collected names/kinds, observation row, and outcome
+/// mapping. Runs on the single writer.
+async fn persist_enumeration(
+    runner: &mut Runner,
+    store: &TursoStore,
+    generation: u64,
+    claimed: &ClaimedTask,
+    path: &Path,
+    collected: EnumCollected,
+) -> repo_scan::Result<TaskOutcome> {
+    match collected {
+        EnumCollected::Link => {
+            // The task path resolves to a symlink (swapped since
+            // scheduling): resolve it through the topology layer like any
+            // symlink child instead of following it blindly. The link
+            // itself needs no enumeration.
+            enqueue_symlink_target(store, runner, generation, path, store::now_ms()).await?;
+            Ok(TaskOutcome::Complete)
         }
-        let category = if detail.starts_with("watchdog:") {
-            "watchdog-no-progress"
-        } else {
-            "enumerate-error"
-        };
-        fail_task(
-            runner,
-            store,
-            claimed,
-            ExecFail {
-                category: String::from(category),
-                detail,
-            },
-        )
-        .await
+        EnumCollected::Refused { state, reason } => Ok(TaskOutcome::Parked { state, reason }),
+        EnumCollected::StatFailed(e) => fail_stat_open(runner, store, claimed, path, &e).await,
+        EnumCollected::ListFailed {
+            dir_id,
+            now_ms,
+            error: e,
+        } => fail_list_open(runner, store, claimed, dir_id, generation, path, now_ms, &e).await,
+        EnumCollected::Scan(scan) => {
+            runner.topology.observe(PhysicalDirId {
+                dev: scan.dev,
+                ino: scan.ino,
+                namespace: scan.volume_tag.clone(),
+            });
+            let now = scan.now_ms;
+            let due = TursoStore::buffer_dir_upsert(
+                &mut runner.batch,
+                None,
+                &scan.component,
+                &scan.display,
+                &scan.volume_tag,
+                &scan.ino_str,
+                &scan.incarnation,
+                now,
+            );
+            flush_if_due(runner, store, due).await?;
+            let mut saw_head = false;
+            let mut saw_objects = false;
+            let mut saw_refs = false;
+            let mut probed_self_for_dot_git = false;
+            for child in &scan.children {
+                let name = &child.name;
+                let is_dot_git = name.as_os_str() == std::ffi::OsStr::new(".git");
+                if is_dot_git && !probed_self_for_dot_git {
+                    probed_self_for_dot_git = true;
+                    enqueue_probe_task(store, runner, generation, claimed, path, now).await?;
+                }
+                track_bare_markers(
+                    name,
+                    child.kind,
+                    &mut saw_head,
+                    &mut saw_objects,
+                    &mut saw_refs,
+                );
+                let child_path = path.join(name);
+                match child.kind {
+                    ChildKind::Directory => {
+                        enqueue_enum_child(store, runner, generation, &child_path, now).await?;
+                    }
+                    ChildKind::Symlink => {
+                        enqueue_symlink_target(store, runner, generation, &child_path, now).await?;
+                    }
+                    ChildKind::File | ChildKind::Other => {}
+                }
+            }
+            runner.counters.entries += scan.entries_seen;
+            if saw_head && saw_objects && saw_refs {
+                // Bare-store marker evidence: exact-path validation decides.
+                enqueue_probe_task(store, runner, generation, claimed, path, now).await?;
+            }
+            let completed = scan.mid_error.is_none();
+            // RSF-751/AC46/F06D: read-free observation; the attempt counts in SQL,
+            // so this write never needs a flush to observe buffered rows first.
+            let due = TursoStore::buffer_record_dir_observation_bumped(
+                &mut runner.batch,
+                scan.dir_id,
+                generation,
+                completed,
+                scan.entries_seen,
+                scan.mid_error.as_deref(),
+                store::now_ms(),
+            );
+            flush_if_due(runner, store, due).await?;
+            if completed {
+                runner.counters.dirs_complete += 1;
+                Ok(TaskOutcome::Complete)
+            } else {
+                let detail = scan
+                    .mid_error
+                    .unwrap_or_else(|| String::from("partial enumeration"));
+                // SR-STATE-01: a deadline abandonment parks (never retries into
+                // the same wedge); `complete_task` records the loud gap row.
+                if detail.starts_with("timeout-abandoned:") {
+                    return Ok(park_on_timeout(&detail));
+                }
+                let category = if detail.starts_with("watchdog:") {
+                    "watchdog-no-progress"
+                } else {
+                    "enumerate-error"
+                };
+                fail_task(
+                    runner,
+                    store,
+                    claimed,
+                    ExecFail {
+                        category: String::from(category),
+                        detail,
+                    },
+                )
+                .await
+            }
+        }
     }
+}
+
+/// Enumerate one directory's immediate children: upsert the directory row,
+/// enqueue unseen child directories (identity-deduped), resolve symlinks
+/// through the topology layer, detect Git candidates by marker evidence
+/// (`.git` entry; `HEAD`+`objects`+`refs` for bare stores) for exact-path
+/// validation, and record the observation. Races are gaps, never absence.
+/// `deadline` (SR-STATE-01) bounds the item loop: expiry abandons the
+/// remainder and parks the scope instead of wedging the run.
+async fn exec_enumerate(
+    runner: &mut Runner,
+    store: &TursoStore,
+    generation: u64,
+    claimed: &ClaimedTask,
+    deadline: &OpDeadline,
+) -> repo_scan::Result<TaskOutcome> {
+    let Some(config::ScopeRef::Dir(path)) = config::parse_scope_key(&claimed.task.scope_key) else {
+        return Ok(TaskOutcome::Parked {
+            state: TaskState::Unsupported,
+            reason: format!("malformed dir scope key: {}", claimed.task.scope_key),
+        });
+    };
+    // Step 8 worker seam: the read half collects names/kinds without
+    // catalog writes; the single writer replays enqueues + observations.
+    let collected = collect_enum_reads(runner, store, claimed, &path, deadline).await?;
+    persist_enumeration(runner, store, generation, claimed, &path, collected).await
 }
 
 /// Incarnation guard from explicit parts (link count + mtime + size).
