@@ -3525,6 +3525,10 @@ struct PendingAliasCheck {
 /// guard, and one lazily discovered installed-git fallback.
 struct Runner {
     admission: Admission,
+    /// Shared mirror of admission memory pressure for worker-owned
+    /// [`ReadContext`]s (stored wherever the coordinator calls
+    /// `set_pressure`; `Admission` itself stays single-threaded).
+    pressure: Arc<AtomicBool>,
     breakers: HashMap<String, CircuitBreaker>,
     topology: Topology,
     /// Descriptor-relative traversal fence (finding 12): `Some` on every
@@ -3609,6 +3613,7 @@ impl Runner {
     fn new(limits: &config::ResourceLimits) -> Self {
         Self {
             admission: Admission::new(limits.clone()),
+            pressure: Arc::new(AtomicBool::new(false)),
             breakers: HashMap::new(),
             topology: Topology::new(),
             fence: None,
@@ -3653,6 +3658,41 @@ impl Runner {
             }
         }
         self.fallback.as_ref()
+    }
+
+    /// Worker-owned read inputs for one task: everything the `collect_*`
+    /// halves need, nothing they must not touch. The coordinator keeps
+    /// `&mut Runner` (batch, journal, counters, dedupe maps); the read
+    /// half reports counts through its outcome.
+    fn read_context(&self) -> ReadContext {
+        ReadContext {
+            fence: self.fence.clone(),
+            watchdog_grace: self.watchdog.grace,
+            pressure: Arc::clone(&self.pressure),
+        }
+    }
+}
+
+/// Worker-owned read inputs for the `collect_*` halves (goal Step 8).
+/// `Clone + Send + Sync`: the pool hands one per task to worker threads
+/// while the coordinator keeps `&mut Runner`. The only store touch left
+/// in the read halves is the lease heartbeat, which moves to the
+/// coordinator's scheduled renewal with the pool (P3b).
+#[derive(Debug, Clone)]
+struct ReadContext {
+    /// Traversal fence (`None` = legacy unfenced open in unit tests).
+    fence: Option<ScopeFence>,
+    /// No-progress watchdog grace (trip counts stay coordinator-side).
+    watchdog_grace: Duration,
+    /// Live mirror of admission memory pressure.
+    pressure: Arc<AtomicBool>,
+}
+
+impl ReadContext {
+    /// True while memory pressure stops admission (mirror of
+    /// `Admission::under_pressure`, readable from worker threads).
+    fn under_pressure(&self) -> bool {
+        self.pressure.load(Ordering::SeqCst)
     }
 }
 
@@ -4093,6 +4133,7 @@ fn sample_footprint(runner: &mut Runner) {
     let pressured = sample.aggregate_rss_bytes > runner.pressure_threshold_bytes;
     let rising = pressured && !runner.admission.under_pressure();
     runner.admission.set_pressure(pressured);
+    runner.pressure.store(pressured, Ordering::SeqCst);
     // CPU governor (spec §5): sustained rolling-core excess reduces
     // admission and paces work; hysteresis lives in `observe_cpu`.
     let was_throttled = runner.admission.cpu_throttled();
@@ -5105,6 +5146,9 @@ struct EnumScan {
     entries_seen: u64,
     mid_error: Option<String>,
     now_ms: i64,
+    /// Lease heartbeats applied during collection; the coordinator adds
+    /// these to `db_transactions` (workers never touch counters).
+    renewals: u64,
 }
 
 /// Pre-listing fence/stat outcomes that bypass the child loop.
@@ -5125,11 +5169,11 @@ enum EnumCollected {
 }
 
 /// Read half of [`exec_enumerate`]: fenced open, stat, and child
-/// names/kinds. Applies no catalog writes (lease renewal excepted, see
-/// [`EnumScan`]); the writer applies everything via
-/// [`persist_enumeration`].
+/// names/kinds. Worker-owned inputs only ([`ReadContext`]); applies no
+/// catalog writes (lease renewal excepted, see [`EnumScan`]); the
+/// writer applies everything via [`persist_enumeration`].
 async fn collect_enum_reads(
-    runner: &mut Runner,
+    ctx: &ReadContext,
     store: &TursoStore,
     claimed: &ClaimedTask,
     path: &Path,
@@ -5138,7 +5182,7 @@ async fn collect_enum_reads(
     // Finding 12: fenced runners open the task directory through
     // pinned descriptors and verify scope before touching it; unfenced
     // runners (unit tests) keep the legacy pathname stat.
-    let pinned: Option<PinnedDir> = match open_dir_fenced(runner.fence.as_ref(), path) {
+    let pinned: Option<PinnedDir> = match open_dir_fenced(ctx.fence.as_ref(), path) {
         FencedDir::Unfenced => None,
         FencedDir::Pinned(pinned) => Some(pinned),
         FencedDir::Link => {
@@ -5222,10 +5266,11 @@ async fn collect_enum_reads(
     let mut children = Vec::new();
     let mut entries_seen = 0u64;
     let mut mid_error: Option<String> = None;
-    let watchdog_grace = runner.watchdog.grace;
+    let watchdog_grace = ctx.watchdog_grace;
     let mut last_progress = Instant::now();
     let mut progress_mark = 0u64;
     let mut last_lease_renewal = Instant::now();
+    let mut renewals = 0u64;
     for item in listing {
         // R04 / SR-STATE-01 lease bound: renew our own lease on the initial entry
         // (entries_seen == 0) and whenever elapsed time reaches or exceeds 20 seconds
@@ -5262,7 +5307,7 @@ async fn collect_enum_reads(
                 .await;
             match renewed {
                 Ok(true) => {
-                    runner.counters.db_transactions += 1;
+                    renewals += 1;
                     last_lease_renewal = Instant::now();
                 }
                 Ok(_) => {
@@ -5283,7 +5328,7 @@ async fn collect_enum_reads(
         // SR-STATE-01 lifetime bound: under memory pressure stop admitting
         // more enumeration work between items; the partial result below is
         // preserved and the task retries after pressure clears.
-        if runner.admission.under_pressure() {
+        if ctx.under_pressure() {
             mid_error = Some(format!(
                 "memory pressure after {entries_seen} entries; partial enumeration",
             ));
@@ -5353,6 +5398,7 @@ async fn collect_enum_reads(
         entries_seen,
         mid_error,
         now_ms: now,
+        renewals,
     }))
 }
 
@@ -5502,7 +5548,13 @@ async fn exec_enumerate(
     };
     // Step 8 worker seam: the read half collects names/kinds without
     // catalog writes; the single writer replays enqueues + observations.
-    let collected = collect_enum_reads(runner, store, claimed, &path, deadline).await?;
+    // Heartbeats applied during collection report back through the
+    // outcome and land in the counters here, on the coordinator.
+    let ctx = runner.read_context();
+    let collected = collect_enum_reads(&ctx, store, claimed, &path, deadline).await?;
+    if let EnumCollected::Scan(scan) = &collected {
+        runner.counters.db_transactions += scan.renewals;
+    }
     persist_enumeration(runner, store, generation, claimed, &path, collected).await
 }
 
