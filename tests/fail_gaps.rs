@@ -16,7 +16,10 @@ use repo_scan::walk::topology::{bounded_dir_identity, ScopeFence};
 use std::path::PathBuf;
 
 fn runtime() -> tokio::runtime::Runtime {
+    // All drivers on: the pooled drain needs the timer (renewal ticks)
+    // and the blocking pool (worker threads).
     tokio::runtime::Builder::new_current_thread()
+        .enable_all()
         .build()
         .expect("runtime")
 }

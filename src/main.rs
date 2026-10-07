@@ -23,7 +23,7 @@ use repo_scan::report::builder::{
     ReportInputs as LibReportInputs, ReportPipeline, RootInput, StorageLinkInput,
 };
 use repo_scan::scan_events::{is_terminal_event, Cursor, Envelope, EventType, Op};
-use repo_scan::scheduler::{backoff_for_attempt, Admission, CircuitBreaker, OpClass};
+use repo_scan::scheduler::{backoff_for_attempt, Admission, CircuitBreaker, OpClass, Permit};
 use repo_scan::store::{
     self, CheckpointCoordinator, CheckpointPolicy, ClaimedTask, CompletionDelta, NewCheckout,
     NewGitInstance, NewRef, NewRemote, NewRemoteRefresh, NewScan, NewScanEvent, NewStatus, NewTask,
@@ -188,7 +188,12 @@ fn dispatch() -> ExitCode {
     };
     // Single-threaded owner: no backend thread pool can bypass the §5
     // admission gates, and all database work stays on this one context.
-    let rt = match tokio::runtime::Builder::new_current_thread().build() {
+    // All drivers on: the pooled drain needs the timer (renewal ticks)
+    // and the blocking pool (worker threads).
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => {
             return fail(&repo_scan::Error::Store(format!(
@@ -2453,6 +2458,23 @@ async fn enqueue_analysis_refresh(
     Ok(())
 }
 
+/// Canonical execution path for a fenced task input. Observed
+/// spellings may name a store or checkout through a symlink: the
+/// instance row keeps the first-persisting probe's spelling (goal
+/// Step 7), and under the pooled drain either spelling can win —
+/// while the fence never follows links. Scheduling or executing at
+/// the canonical path keeps the scope pinnable and deterministic
+/// regardless of persist order. Mirrors the instance-id derivation
+/// in [`persist_probe`]: absolute paths canonicalize with an
+/// observed-spelling fallback, relative paths pass through.
+fn canonical_exec_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    }
+}
+
 async fn enqueue_analysis_task(
     store: &TursoStore,
     runner: &mut Runner,
@@ -2462,7 +2484,9 @@ async fn enqueue_analysis_task(
     common_dir: &Path,
     now_ms: i64,
 ) -> repo_scan::Result<()> {
-    let scope_key = config::scope_key_for_git(common_dir);
+    // Analysis addresses the store object, not the scheduling probe's
+    // spelling: a symlinked `.git` spelling would refuse at the fence.
+    let scope_key = config::scope_key_for_git(&canonical_exec_path(common_dir));
     let id = format!("analyze:{instance_id}:{run_rev}");
     let idempotency = format!("idem:{id}");
     let expected_rev = store.scope_rev(&scope_key).await?;
@@ -3851,6 +3875,161 @@ fn park_on_timeout(detail: &str) -> TaskOutcome {
     }
 }
 
+/// Complete one finished task (flush + verified completion) and apply
+/// the per-task accounting the sequential drain did inline: permit
+/// release, slow-task log, watchdog verdict, breaker update, claimed /
+/// probe counters, and progress emission. `finished` is the finish
+/// output — coordinator-completed (`Done`) outcomes arrive as
+/// `Ok((outcome, 0))`. A finished outcome that fails to complete, or a
+/// finish error, aborts the run loudly — same as the sequential drain.
+#[allow(clippy::too_many_arguments)]
+async fn account_task(
+    runner: &mut Runner,
+    store: &TursoStore,
+    epoch: u64,
+    scan_id: &str,
+    generation: u64,
+    record: &PrepRecord,
+    finished: repo_scan::Result<(TaskOutcome, u64)>,
+) -> repo_scan::Result<()> {
+    let task_id = record.claimed.task.id.clone();
+    let volume = record.volume.clone();
+    let scope_key = record.claimed.task.scope_key.clone();
+    let is_probe = record.claimed.task.kind == KIND_PROBE;
+    let started = record.started;
+    // RSF-AC461500-609D-4D55-991E-09C60D382D67: children commit in
+    // earlier batches; completion verifies against committed rows.
+    let units = match finished {
+        Ok((outcome, units)) => {
+            flush_runner_batch(runner, store).await?;
+            match complete_claimed(store, runner, &record.claimed, epoch, &outcome).await? {
+                CompletionApplied::Applied => {}
+                CompletionApplied::StaleRequeued => {
+                    runner.counters.stale_requeued += 1;
+                    eprintln!(
+                        "repo-scan: stale completion requeued: {task_id} (invalidation kept)",
+                    );
+                }
+            }
+            runner.admission.release(&record.permit);
+            if is_probe {
+                runner.counters.probes_complete += 1;
+            }
+            units
+        }
+        Err(e) => {
+            // The permit still releases and the watchdog still evaluates
+            // before the run aborts loudly. No outcome was produced, so
+            // advancement is false.
+            runner.admission.release(&record.permit);
+            let elapsed = started.elapsed();
+            if elapsed > Duration::from_secs(SLOW_TASK_SECS) {
+                eprintln!("repo-scan: slow task: {task_id} ({}s)", elapsed.as_secs());
+            }
+            apply_watchdog_with_scope(
+                runner, store, &task_id, &volume, &scope_key, started, elapsed, false,
+            )
+            .await?;
+            return Err(e);
+        }
+    };
+    let elapsed = started.elapsed();
+    if elapsed > Duration::from_secs(SLOW_TASK_SECS) {
+        eprintln!("repo-scan: slow task: {task_id} ({}s)", elapsed.as_secs());
+    }
+    // RSF-AD9D4AF7-3CC3-4B37-8168-E78DD6375C5B: a contained (timed-out,
+    // non-advancing) task must never clear its containment via
+    // success-after-timeout.
+    let advanced = units > 0;
+    let contained = apply_watchdog_with_scope(
+        runner, store, &task_id, &volume, &scope_key, started, elapsed, advanced,
+    )
+    .await?;
+    if !contained {
+        runner.breaker_success(&volume);
+    }
+    runner.counters.claimed += 1;
+    // At-most-2 Hz token-timer gate (RSF-CHAINARGOS-PROGRESS-001):
+    // progress lines carry position, pending, and elapsed.
+    // R06: Also emit promptly on probe completions to surface discovered repositories.
+    if is_probe || runner.admission.progress_due() {
+        emit_progress(runner, store, scan_id, generation).await?;
+    }
+    Ok(())
+}
+
+/// Post-task watchdog verdict for one finished task
+/// (RSF-AD9D4AF7-3CC3-4B37-8168-E78DD6375C5B, SR-STATE-01):
+/// distinguishes blocked from advancing tasks. Progress reported
+/// during the task counts even past grace; only a past-grace task with
+/// no observed progress trips. `advanced` is the worker's own progress
+/// report — parallel tasks share the global counters, so per-task
+/// growth cannot be inferred from them. The operation already returned,
+/// so the breaker below is re-admission delay for a slow volume, NOT
+/// containment of the returned operation (nothing was stopped); the
+/// stall itself is recorded durably as a gap so the run carries
+/// evidence instead of stderr alone. Returns `contained`.
+#[allow(clippy::too_many_arguments)]
+async fn apply_watchdog_with_scope(
+    runner: &mut Runner,
+    store: &TursoStore,
+    task_id: &str,
+    volume: &str,
+    scope_key: &str,
+    started: Instant,
+    elapsed: Duration,
+    advanced: bool,
+) -> repo_scan::Result<bool> {
+    let timed_out = runner.watchdog.exceeded(started, Instant::now());
+    match watchdog_verdict(timed_out, advanced) {
+        WatchdogVerdict::WithinGrace => {}
+        WatchdogVerdict::Advancing => {
+            runner.watchdog.tripped += 1;
+            eprintln!(
+                "repo-scan: watchdog: {task_id} slow ({}s) but advancing; not contained",
+                elapsed.as_secs(),
+            );
+        }
+        WatchdogVerdict::Contained => {
+            runner.watchdog.tripped += 1;
+            runner.breaker_failure(volume);
+            runner.breaker_failure(volume);
+            runner.breaker_failure(volume);
+            // SR-STATE-01: durable stall evidence. A past-grace
+            // no-progress task that still completed did its work,
+            // so the stall row is recorded then closed (auditable
+            // in the catalog, not a false open gap); a failed task
+            // keeps its own failure gap alongside.
+            let stall_id = format!("watchdog-no-progress:{task_id}");
+            let stall_detail = format!(
+                "watchdog: {task_id} made no progress within {}s (elapsed {}s); \
+                 volume {volume} breaker opened",
+                runner.watchdog.grace.as_secs(),
+                elapsed.as_secs(),
+            );
+            let stall_now = store::now_ms();
+            buffer_record_error(
+                runner,
+                &stall_id,
+                scope_key,
+                "watchdog-no-progress",
+                &stall_detail,
+                None,
+                stall_now,
+            )?;
+            buffer_resolve_error(runner, &stall_id, stall_now)?;
+            let stall_due = runner.batch.should_flush();
+            flush_if_due(runner, store, stall_due).await?;
+            eprintln!(
+                "repo-scan: watchdog: {task_id} made no progress within {}s; \
+                 volume {volume} breaker opened (re-admission delayed), stall recorded",
+                runner.watchdog.grace.as_secs(),
+            );
+        }
+    }
+    Ok(timed_out && !advanced)
+}
+
 /// Claim and execute tasks until the boundary: no claimable work remains
 /// (only future backoffs, parked scopes, or nothing), or SIGINT arrives.
 /// Every completion goes through the store's epoch/lease/revision guards.
@@ -3892,6 +4071,16 @@ async fn run_until_boundary(
             break;
         }
         let mut progressed = false;
+        // Phase 1: admit, prepare, and spawn. Workers run filesystem/Git
+        // reads on pool threads while the coordinator keeps the store.
+        // Phase 2 (below) joins every spawned worker before the next
+        // claim, so the boundary always sees an empty in-flight set:
+        // an empty queue never reads as completion while workers can
+        // still add results.
+        let mut set: tokio::task::JoinSet<(PrepRecord, repo_scan::Result<WorkerOut>)> =
+            tokio::task::JoinSet::new();
+        // In-flight lease tickets for the renewal tick, keyed by task id.
+        let mut inflight: HashMap<String, (i64, u64)> = HashMap::new();
         for item in &claimed {
             if interrupted() {
                 break;
@@ -3925,28 +4114,20 @@ async fn run_until_boundary(
             runner.current_scope = item.task.scope_key.clone();
             runner.current_volume = volume.clone();
             let started = Instant::now();
-            let entries_before = runner.counters.entries;
-            let dirs_before = runner.counters.dirs_complete;
             // SR-STATE-01: one wall budget per admitted task, enforced at
-            // every yield point inside `execute_task`.
+            // every yield point of the worker and its finish.
             let deadline = OpDeadline::new(Duration::from_secs(OP_DEADLINE_SECS));
-            let is_probe = item.task.kind == KIND_PROBE;
-            let result = execute_task(
+            let prepared = prepare_task(
                 runner,
                 store,
-                epoch,
-                generation,
-                run_rev,
-                canonical,
                 status_mode,
                 item,
+                permit,
+                volume,
+                started,
                 &deadline,
             )
-            .await;
-            runner.admission.release(&permit);
-            if is_probe && result.is_ok() {
-                runner.counters.probes_complete += 1;
-            }
+            .await?;
             // RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1: at-most-1 Hz
             // footprint sample with pressure response.
             if runner.admission.telemetry_due() {
@@ -3958,98 +4139,105 @@ async fn run_until_boundary(
             if !pace.is_zero() {
                 std::thread::sleep(pace);
             }
-            let elapsed = started.elapsed();
-            if elapsed > Duration::from_secs(SLOW_TASK_SECS) {
-                eprintln!(
-                    "repo-scan: slow task: {} ({}s)",
-                    item.task.id,
-                    elapsed.as_secs()
-                );
-            }
-            // RSF-AD9D4AF7-3CC3-4B37-8168-E78DD6375C5B + SR-STATE-01: the
-            // watchdog distinguishes blocked from advancing. Entries or
-            // completed directories observed during the task are progress
-            // even past grace; only a past-grace task with no observed
-            // progress trips. The operation already returned, so the
-            // breaker below is re-admission delay for a slow volume, NOT
-            // containment of the returned operation (nothing was stopped);
-            // the stall itself is recorded durably as a gap so the run
-            // carries evidence instead of stderr alone.
-            let advanced = runner.counters.entries > entries_before
-                || runner.counters.dirs_complete > dirs_before;
-            let timed_out = runner.watchdog.exceeded(started, Instant::now());
-            match watchdog_verdict(timed_out, advanced) {
-                WatchdogVerdict::WithinGrace => {}
-                WatchdogVerdict::Advancing => {
-                    runner.watchdog.tripped += 1;
-                    eprintln!(
-                        "repo-scan: watchdog: {} slow ({}s) but advancing; not contained",
-                        item.task.id,
-                        elapsed.as_secs(),
-                    );
-                }
-                WatchdogVerdict::Contained => {
-                    runner.watchdog.tripped += 1;
-                    runner.breaker_failure(&volume);
-                    runner.breaker_failure(&volume);
-                    runner.breaker_failure(&volume);
-                    // SR-STATE-01: durable stall evidence. A past-grace
-                    // no-progress task that still completed did its work,
-                    // so the stall row is recorded then closed (auditable
-                    // in the catalog, not a false open gap); a failed task
-                    // keeps its own failure gap alongside.
-                    let stall_id = format!("watchdog-no-progress:{}", item.task.id);
-                    let stall_detail = format!(
-                        "watchdog: {} made no progress within {}s (elapsed {}s); \
-                         volume {volume} breaker opened",
-                        item.task.id,
-                        runner.watchdog.grace.as_secs(),
-                        elapsed.as_secs(),
-                    );
-                    let stall_now = store::now_ms();
-                    buffer_record_error(
+            match prepared.action {
+                PrepAction::Done(outcome) => {
+                    account_task(
                         runner,
-                        &stall_id,
-                        &item.task.scope_key,
-                        "watchdog-no-progress",
-                        &stall_detail,
-                        None,
-                        stall_now,
-                    )?;
-                    buffer_resolve_error(runner, &stall_id, stall_now)?;
-                    let stall_due = runner.batch.should_flush();
-                    flush_if_due(runner, store, stall_due).await?;
-                    eprintln!(
-                        "repo-scan: watchdog: {} made no progress within {}s; \
-                         volume {volume} breaker opened (re-admission delayed), stall recorded",
-                        item.task.id,
-                        runner.watchdog.grace.as_secs(),
+                        store,
+                        epoch,
+                        scan_id,
+                        generation,
+                        &prepared.record,
+                        Ok((outcome, 0)),
+                    )
+                    .await?;
+                }
+                PrepAction::Spawn(job) => {
+                    let record = prepared.record;
+                    inflight.insert(
+                        record.claimed.task.id.clone(),
+                        (
+                            record.claimed.token,
+                            record.claimed.task.lease_epoch.unwrap_or(u64::MAX),
+                        ),
                     );
+                    set.spawn_blocking(move || (record, run_worker(job)));
                 }
             }
-            let contained = timed_out && !advanced;
-            match result {
-                Ok(()) => {
-                    // RSF-AD9D4AF7-3CC3-4B37-8168-E78DD6375C5B: a
-                    // contained (timed-out, non-advancing) task must never
-                    // clear its containment via success-after-timeout.
-                    if !contained {
-                        runner.breaker_success(&volume);
+        }
+        // Phase 2: join every spawned worker, renewing in-flight leases
+        // on schedule (Step 9) until the set drains.
+        if !set.is_empty() {
+            let mut ticker = tokio::time::interval(Duration::from_secs(RENEW_TICK_SECS));
+            // The first interval tick completes immediately; consume it
+            // so renewals run on cadence, not at join start.
+            ticker.tick().await;
+            while !set.is_empty() {
+                if interrupted() {
+                    // Stop admission: finish what already completed
+                    // (bounded — no waiting), then detach the rest.
+                    // Detached leases lapse without the tick and a resume
+                    // reclaims them; committed work saves below.
+                    while let Some(joined) = set.try_join_next() {
+                        let (record, result) = joined.map_err(|join_err| {
+                            repo_scan::Error::Scheduler(format!("worker task failed: {join_err}"))
+                        })?;
+                        inflight.remove(&record.claimed.task.id);
+                        let finished = finish_task(
+                            runner, store, generation, run_rev, canonical, &record, result,
+                        )
+                        .await;
+                        account_task(runner, store, epoch, scan_id, generation, &record, finished)
+                            .await?;
+                    }
+                    break;
+                }
+                tokio::select! {
+                    joined = set.join_next() => {
+                        let (record, result) = joined
+                            .expect("drain JoinSet held a live task")
+                            .map_err(|join_err| {
+                                // A panicking worker is a scheduler bug,
+                                // not a scope gap: abort the run loudly
+                                // instead of hiding unfinished work.
+                                repo_scan::Error::Scheduler(format!(
+                                    "worker task failed: {join_err}"
+                                ))
+                            })?;
+                        inflight.remove(&record.claimed.task.id);
+                        let finished = finish_task(
+                            runner, store, generation, run_rev, canonical, &record, result,
+                        )
+                        .await;
+                        account_task(
+                            runner, store, epoch, scan_id, generation, &record, finished,
+                        )
+                        .await?;
+                    }
+                    _ = ticker.tick() => {
+                        if inflight.is_empty() {
+                            continue;
+                        }
+                        let tickets: Vec<(&str, i64, u64)> = inflight
+                            .iter()
+                            .map(|(id, (token, lease_epoch))| {
+                                (id.as_str(), *token, *lease_epoch)
+                            })
+                            .collect();
+                        let renewed = store
+                            .renew_leases_batch(&tickets, LEASE_TTL_MS, store::now_ms())
+                            .await?;
+                        runner.counters.db_transactions += 1;
+                        if renewed.len() != tickets.len() {
+                            eprintln!(
+                                "repo-scan: renewal tick renewed {}/{} in-flight leases; \
+                                 unrenewed results stop at the pre-persist gate",
+                                renewed.len(),
+                                tickets.len(),
+                            );
+                        }
                     }
                 }
-                Err(e) => {
-                    // Lease/unknown-task failures are scheduler bugs, not
-                    // scope gaps: abort the run loudly instead of hiding
-                    // unfinished work behind a parked task.
-                    return Err(e);
-                }
-            }
-            runner.counters.claimed += 1;
-            // At-most-2 Hz token-timer gate (RSF-CHAINARGOS-PROGRESS-001):
-            // progress lines carry position, pending, and elapsed.
-            // R06: Also emit promptly on probe completions to surface discovered repositories.
-            if is_probe || runner.admission.progress_due() {
-                emit_progress(runner, store, scan_id, generation).await?;
             }
         }
         if !progressed {
@@ -4802,17 +4990,149 @@ struct ExecFail {
 /// the task's wall budget (SR-STATE-01), enforced at each op's yield
 /// points as abandon-and-park, never as silent overrun.
 #[allow(clippy::too_many_arguments)]
-async fn execute_task(
+/// Coordinator renewal tick (Step 9): while workers hold tasks, the
+/// drain re-renews every in-flight lease on this cadence — one batch
+/// transaction per tick, well inside the 60 s TTL.
+const RENEW_TICK_SECS: u64 = 15;
+
+/// Worker-side job: every input a pool thread needs, and no store
+/// handle. (Step 8: filesystem and Git reads run here, off the
+/// coordinator thread.)
+enum WorkerJob {
+    Enumerate {
+        ctx: ReadContext,
+        path: PathBuf,
+        deadline: OpDeadline,
+    },
+    Probe {
+        ctx: ReadContext,
+        task_id: String,
+        path: PathBuf,
+        deadline: OpDeadline,
+    },
+    Analysis {
+        ctx: ReadContext,
+        path: PathBuf,
+        common_dir: PathBuf,
+        checkouts: Vec<store::CheckoutRow>,
+        object_format: String,
+        bare: bool,
+        deadline: OpDeadline,
+    },
+    Status {
+        ctx: ReadContext,
+        target: StatusTarget,
+        deadline: OpDeadline,
+    },
+}
+
+/// Worker-side result, one variant per [`WorkerJob`].
+enum WorkerOut {
+    Enumerate(EnumCollected),
+    Probe(ProbeCollected),
+    Analysis(AnalysisCollected),
+    Status(StatusCollected),
+}
+
+/// What [`prepare_task`] decided: the outcome is already complete on
+/// the coordinator, or a worker must run first.
+enum PrepAction {
+    Done(TaskOutcome),
+    Spawn(WorkerJob),
+}
+
+/// Per-kind finish inputs carried from prepare to finish on the
+/// coordinator (never crossing to the worker).
+enum PrepExtra {
+    Enumerate {
+        path: PathBuf,
+    },
+    Probe {
+        path: PathBuf,
+    },
+    Analysis {
+        path: PathBuf,
+        instance_id: String,
+        instance_row: Box<store::GitInstanceRow>,
+    },
+    Status,
+    /// Coordinator-completed; no finish inputs.
+    Done,
+}
+
+/// One admitted task's coordinator-side record: the claim, the held
+/// admission permit, accounting inputs, and the kind's finish inputs.
+struct PrepRecord {
+    claimed: ClaimedTask,
+    permit: Permit,
+    volume: String,
+    started: Instant,
+    extra: PrepExtra,
+}
+
+/// One prepared task: the coordinator record plus the action.
+struct PreparedTask {
+    record: PrepRecord,
+    action: PrepAction,
+}
+
+/// Run one worker job synchronously on a pool thread. No store handle
+/// crosses here: the coordinator's scheduled tick owns lease renewal
+/// and the pre-persist gates own staleness.
+fn run_worker(job: WorkerJob) -> repo_scan::Result<WorkerOut> {
+    match job {
+        WorkerJob::Enumerate {
+            ctx,
+            path,
+            deadline,
+        } => collect_enum_reads(&ctx, &path, &deadline).map(WorkerOut::Enumerate),
+        WorkerJob::Probe {
+            ctx,
+            task_id,
+            path,
+            deadline,
+        } => run_probe_job(&ctx, &task_id, &path, &deadline).map(WorkerOut::Probe),
+        WorkerJob::Analysis {
+            ctx,
+            path,
+            common_dir,
+            checkouts,
+            object_format,
+            bare,
+            deadline,
+        } => run_analysis_job(
+            &ctx,
+            &path,
+            &common_dir,
+            &checkouts,
+            &object_format,
+            bare,
+            &deadline,
+        )
+        .map(WorkerOut::Analysis),
+        WorkerJob::Status {
+            ctx,
+            target,
+            deadline,
+        } => collect_status_reads(&ctx, &target, &deadline).map(WorkerOut::Status),
+    }
+}
+
+/// Coordinator half of one claimed task: scope decode, catalog reads,
+/// and the pre-run lease renewal, dispatching to the kind's prepare.
+/// Returns the record (claim, permit, accounting, finish inputs) plus
+/// the action (already done, or spawn a worker).
+#[allow(clippy::too_many_arguments)]
+async fn prepare_task(
     runner: &mut Runner,
     store: &TursoStore,
-    epoch: u64,
-    generation: u64,
-    run_rev: u64,
-    canonical: &str,
     status_mode: StatusMode,
     claimed: &ClaimedTask,
+    permit: Permit,
+    volume: String,
+    started: Instant,
     deadline: &OpDeadline,
-) -> repo_scan::Result<()> {
+) -> repo_scan::Result<PreparedTask> {
     // Event-continuity marker scopes (R5: `volume:`/`mounts:`) carry no
     // directory to re-enumerate; the enclosing traversal (or the fresh
     // generation a history loss forced) satisfies them, so they complete
@@ -4823,29 +5143,22 @@ async fn execute_task(
             Some(config::ScopeRef::Dir(_))
         )
     {
-        // RSF-AC461500-609D-4D55-991E-09C60D382D67: buffered rows commit
-        // before verified completion.
-        flush_runner_batch(runner, store).await?;
-        match complete_claimed(store, runner, claimed, epoch, &TaskOutcome::Complete).await? {
-            CompletionApplied::Applied => {}
-            CompletionApplied::StaleRequeued => {
-                runner.counters.stale_requeued += 1;
-            }
-        }
-        return Ok(());
+        return Ok(PreparedTask {
+            record: PrepRecord {
+                claimed: claimed.clone(),
+                permit,
+                volume,
+                started,
+                extra: PrepExtra::Done,
+            },
+            action: PrepAction::Done(TaskOutcome::Complete),
+        });
     }
-    let outcome = match claimed.task.kind.as_str() {
-        KIND_ENUM | KIND_RECONCILE => {
-            exec_enumerate(runner, store, generation, claimed, deadline).await?
-        }
-        KIND_PROBE => {
-            exec_probe(
-                runner, store, generation, run_rev, canonical, claimed, deadline,
-            )
-            .await?
-        }
-        KIND_STATUS => exec_status(runner, store, status_mode, claimed, deadline).await?,
-        KIND_ANALYZE => exec_analysis(runner, store, claimed, deadline).await?,
+    let (extra, action) = match claimed.task.kind.as_str() {
+        KIND_ENUM | KIND_RECONCILE => prepare_enumerate(runner, claimed, deadline),
+        KIND_PROBE => prepare_probe(runner, store, claimed, deadline).await?,
+        KIND_STATUS => prepare_status(runner, store, status_mode, claimed, deadline).await?,
+        KIND_ANALYZE => prepare_analysis(runner, store, claimed, deadline).await?,
         other => {
             let detail = format!("unknown task kind: {other}");
             let due = buffer_record_error(
@@ -4858,26 +5171,131 @@ async fn execute_task(
                 store::now_ms(),
             )?;
             flush_if_due(runner, store, due).await?;
-            TaskOutcome::Parked {
-                state: TaskState::Unsupported,
-                reason: detail,
-            }
+            (
+                PrepExtra::Done,
+                PrepAction::Done(TaskOutcome::Parked {
+                    state: TaskState::Unsupported,
+                    reason: detail,
+                }),
+            )
         }
     };
-    // RSF-AC461500-609D-4D55-991E-09C60D382D67: children commit in
-    // earlier batches; completion verifies against committed rows.
-    flush_runner_batch(runner, store).await?;
-    match complete_claimed(store, runner, claimed, epoch, &outcome).await? {
-        CompletionApplied::Applied => {}
-        CompletionApplied::StaleRequeued => {
-            runner.counters.stale_requeued += 1;
-            eprintln!(
-                "repo-scan: stale completion requeued: {} (invalidation kept)",
-                claimed.task.id,
-            );
+    Ok(PreparedTask {
+        record: PrepRecord {
+            claimed: claimed.clone(),
+            permit,
+            volume,
+            started,
+            extra,
+        },
+        action,
+    })
+}
+
+/// Coordinator write half of one prepared task: applies a worker result
+/// through the kind's finish (pre-persist gate plus persist). Returns
+/// the outcome plus the worker's progress units for the watchdog
+/// verdict. Task completion stays with the caller (the drain flushes
+/// the batch, then completes with verification).
+async fn finish_task(
+    runner: &mut Runner,
+    store: &TursoStore,
+    generation: u64,
+    run_rev: u64,
+    canonical: &str,
+    record: &PrepRecord,
+    result: repo_scan::Result<WorkerOut>,
+) -> repo_scan::Result<(TaskOutcome, u64)> {
+    let claimed = &record.claimed;
+    match &record.extra {
+        PrepExtra::Enumerate { path } => {
+            finish_enumerate(runner, store, generation, claimed, path, result).await
         }
+        PrepExtra::Probe { path } => {
+            finish_probe(
+                runner, store, generation, run_rev, canonical, claimed, path, result,
+            )
+            .await
+        }
+        PrepExtra::Analysis {
+            path,
+            instance_id,
+            instance_row,
+        } => {
+            finish_analysis(
+                runner,
+                store,
+                claimed,
+                path,
+                instance_id,
+                instance_row,
+                result,
+            )
+            .await
+        }
+        PrepExtra::Status => finish_status(runner, store, claimed, result).await,
+        PrepExtra::Done => Err(repo_scan::Error::Scheduler(String::from(
+            "finish called for a coordinator-completed task",
+        ))),
     }
-    Ok(())
+}
+
+/// Sequential task driver (prepare, run inline, finish — no worker
+/// pool, no completion): the regression hooks and unit tests execute
+/// single tasks through the same prepare/worker/finish path the pooled
+/// drain uses. Test-only: production always goes through
+/// [`run_until_boundary`].
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn execute_task(
+    runner: &mut Runner,
+    store: &TursoStore,
+    generation: u64,
+    run_rev: u64,
+    canonical: &str,
+    status_mode: StatusMode,
+    claimed: &ClaimedTask,
+    deadline: &OpDeadline,
+) -> repo_scan::Result<TaskOutcome> {
+    let class = match claimed.task.kind.as_str() {
+        KIND_ENUM | KIND_RECONCILE => OpClass::Enumerate,
+        KIND_PROBE | KIND_STATUS | KIND_ANALYZE => OpClass::GitProbe,
+        _ => OpClass::Other,
+    };
+    let permit = runner.admission.try_acquire(class).ok_or_else(|| {
+        repo_scan::Error::Scheduler(String::from("test driver: admission denied"))
+    })?;
+    let volume = breaker_key_for_task(&claimed.task.scope_key);
+    let prepared = prepare_task(
+        runner,
+        store,
+        status_mode,
+        claimed,
+        permit,
+        volume,
+        Instant::now(),
+        deadline,
+    )
+    .await?;
+    let outcome = match prepared.action {
+        PrepAction::Done(outcome) => outcome,
+        PrepAction::Spawn(job) => {
+            let result = run_worker(job);
+            finish_task(
+                runner,
+                store,
+                generation,
+                run_rev,
+                canonical,
+                &prepared.record,
+                result,
+            )
+            .await?
+            .0
+        }
+    };
+    runner.admission.release(&prepared.record.permit);
+    Ok(outcome)
 }
 
 enum CompletionApplied {
@@ -5164,11 +5582,10 @@ struct EnumChild {
 }
 
 /// Filesystem read half of one enumeration: every observation collected
-/// without catalog writes. P1 collects inline; the pool slice moves
-/// collection onto worker threads. (The only store touch left in the
-/// read loop is the in-loop lease renewal, which moves to the
-/// coordinator's scheduled renewal then; the only admission touch is
-/// the pressure abort, which becomes feed control.)
+/// without catalog writes, on a worker thread. (The lease renewal that
+/// once ran in this loop moved to the coordinator's scheduled tick; the
+/// only admission touch left is the pressure abort, which stays as feed
+/// control through the shared pressure mirror.)
 struct EnumScan {
     dev: u64,
     ino: u64,
@@ -5201,17 +5618,15 @@ enum EnumCollected {
     },
 }
 
-/// Read half of [`exec_enumerate`]: fenced open, stat, and child
+/// Read half of enumeration ([`prepare_enumerate`]/[`finish_enumerate`]): fenced open, stat, and child
 /// names/kinds. Worker-owned inputs only ([`ReadContext`]); applies no
-/// catalog writes (lease renewal excepted, see [`EnumScan`]); the
-/// writer applies everything via [`persist_enumeration`].
-async fn collect_enum_reads(
+/// catalog writes — lease renewal moved to the coordinator's scheduled
+/// tick (Step 9), so this runs synchronously on a worker thread while
+/// the writer applies everything via [`persist_enumeration`].
+fn collect_enum_reads(
     ctx: &ReadContext,
-    store: &TursoStore,
-    claimed: &ClaimedTask,
     path: &Path,
     deadline: &OpDeadline,
-    renewals: &mut u64,
 ) -> repo_scan::Result<EnumCollected> {
     // Finding 12: fenced runners open the task directory through
     // pinned descriptors and verify scope before touching it; unfenced
@@ -5303,61 +5718,15 @@ async fn collect_enum_reads(
     let watchdog_grace = ctx.watchdog_grace;
     let mut last_progress = Instant::now();
     let mut progress_mark = 0u64;
-    let mut last_lease_renewal = Instant::now();
     for item in listing {
-        // R04 / SR-STATE-01 lease bound: renew our own lease on the initial entry
-        // (entries_seen == 0) and whenever elapsed time reaches or exceeds 20 seconds
-        // (well within the 60s lease TTL). This ensures a slow-but-advancing
-        // enumeration on slow network mounts or high-latency disks renews before the
-        // lease lapses, while avoiding thousands of redundant database updates on
-        // fast/large directories.
-        // A renewal matching zero rows means the lease is gone: stop
-        // touching the scope and preserve a partial gap instead of racing
-        // a completion. A truly blocked `next()` never reaches this line,
-        // so the lease still expires on schedule and bounds the wedge from
-        // the store side. (P3a: the heartbeat goes through the store
-        // renewal API — the same call the coordinator's scheduled
-        // renewal uses — and never touches another owner's lease.)
-        let renewal_interval = Duration::from_secs(20);
-        let renewal_due = repo_scan::scheduler::admission::lease_renewal_expiry_elapsed(
-            entries_seen,
-            last_lease_renewal.elapsed(),
-            renewal_interval,
-            store::now_ms(),
-            LEASE_TTL_MS,
-        )
-        .is_some();
-        if renewal_due {
-            let lease_epoch = claimed.task.lease_epoch.unwrap_or(u64::MAX);
-            let renewed = store
-                .renew_lease(
-                    &claimed.task.id,
-                    claimed.token,
-                    lease_epoch,
-                    LEASE_TTL_MS,
-                    store::now_ms(),
-                )
-                .await;
-            match renewed {
-                Ok(true) => {
-                    *renewals += 1;
-                    last_lease_renewal = Instant::now();
-                }
-                Ok(_) => {
-                    mid_error = Some(format!(
-                        "lease lost after {entries_seen} entries; partial enumeration",
-                    ));
-                    break;
-                }
-                Err(e) => {
-                    mid_error = Some(format!(
-                        "lease renewal failed after {entries_seen} entries ({e}); \
-                         partial enumeration",
-                    ));
-                    break;
-                }
-            }
-        }
+        // R04 / SR-STATE-01 lease bound: the coordinator's scheduled
+        // renewal tick (Step 9, one batch for every in-flight task) keeps
+        // this listing's lease alive — no in-loop heartbeat here, so the
+        // worker never touches the store. A truly blocked `next()` wedges
+        // its worker exactly like the old sequential drain; interruption
+        // still stops admission (the tick stops with the drain, so the
+        // lease lapses and a resume reclaims it), and the pre-persist
+        // gate re-verifies before anything is written.
         // SR-STATE-01 lifetime bound: under memory pressure stop admitting
         // more enumeration work between items; the partial result below is
         // preserved and the task retries after pressure clears.
@@ -5434,7 +5803,7 @@ async fn collect_enum_reads(
     }))
 }
 
-/// Write half of [`exec_enumerate`]: directory upsert, child enqueues
+/// Write half of enumeration ([`finish_enumerate`]): directory upsert, child enqueues
 /// replayed from the collected names/kinds, observation row, and outcome
 /// mapping. Runs on the single writer.
 async fn persist_enumeration(
@@ -5565,34 +5934,62 @@ async fn persist_enumeration(
 /// validation, and record the observation. Races are gaps, never absence.
 /// `deadline` (SR-STATE-01) bounds the item loop: expiry abandons the
 /// remainder and parks the scope instead of wedging the run.
-async fn exec_enumerate(
+/// Coordinator half of one enumeration task: scope decode. The
+/// fenced listing runs on a pool thread ([`collect_enum_reads`]); the
+/// outcome is applied by [`finish_enumerate`].
+fn prepare_enumerate(
+    runner: &Runner,
+    claimed: &ClaimedTask,
+    deadline: &OpDeadline,
+) -> (PrepExtra, PrepAction) {
+    let Some(config::ScopeRef::Dir(path)) = config::parse_scope_key(&claimed.task.scope_key) else {
+        return (
+            PrepExtra::Done,
+            PrepAction::Done(TaskOutcome::Parked {
+                state: TaskState::Unsupported,
+                reason: format!("malformed dir scope key: {}", claimed.task.scope_key),
+            }),
+        );
+    };
+    let job = WorkerJob::Enumerate {
+        ctx: runner.read_context(),
+        path: path.clone(),
+        deadline: *deadline,
+    };
+    (PrepExtra::Enumerate { path }, PrepAction::Spawn(job))
+}
+
+/// Coordinator write half of one enumeration task: applies a worker
+/// result ([`EnumCollected`]) through the pre-persist lease gate and
+/// [`persist_enumeration`]. Returns the outcome plus the listing's
+/// child count for the watchdog verdict.
+async fn finish_enumerate(
     runner: &mut Runner,
     store: &TursoStore,
     generation: u64,
     claimed: &ClaimedTask,
-    deadline: &OpDeadline,
-) -> repo_scan::Result<TaskOutcome> {
-    let Some(config::ScopeRef::Dir(path)) = config::parse_scope_key(&claimed.task.scope_key) else {
-        return Ok(TaskOutcome::Parked {
-            state: TaskState::Unsupported,
-            reason: format!("malformed dir scope key: {}", claimed.task.scope_key),
-        });
+    path: &Path,
+    result: repo_scan::Result<WorkerOut>,
+) -> repo_scan::Result<(TaskOutcome, u64)> {
+    let collected = match result {
+        Ok(WorkerOut::Enumerate(collected)) => collected,
+        Ok(_) => {
+            return Err(repo_scan::Error::Scheduler(String::from(
+                "enumeration finish received a non-enumeration worker result",
+            )));
+        }
+        Err(e) => return Err(e),
     };
-    // Step 8 worker seam: the read half collects names/kinds without
-    // catalog writes; the single writer replays enqueues + observations.
-    // Heartbeats replay into the counters before `result` is unwrapped
-    // (see `exec_probe`).
-    let ctx = runner.read_context();
-    let mut renewals = 0u64;
-    let result = collect_enum_reads(&ctx, store, claimed, &path, deadline, &mut renewals).await;
-    runner.counters.db_transactions += renewals;
-    let collected = result?;
+    let units = match &collected {
+        EnumCollected::Scan(scan) => scan.children.len() as u64,
+        _ => 0,
+    };
     // R4 heartbeat: re-verify the lease before the first buffered write —
-    // listing after the last in-loop renewal may have consumed the window.
+    // the listing may have consumed the window since the claim.
     // Observations under a lost lease are discarded and the scope retries
     // with a fresh lease (same pre-persist gate as probe/analysis/status).
     if !renew_claim_lease(store, &mut runner.counters.db_transactions, claimed).await? {
-        return retry_on_lease_lost(
+        let outcome = retry_on_lease_lost(
             runner,
             store,
             claimed,
@@ -5601,9 +5998,11 @@ async fn exec_enumerate(
                 path.display()
             ),
         )
-        .await;
+        .await?;
+        return Ok((outcome, units));
     }
-    persist_enumeration(runner, store, generation, claimed, &path, collected).await
+    let outcome = persist_enumeration(runner, store, generation, claimed, path, collected).await?;
+    Ok((outcome, units))
 }
 
 /// Incarnation guard from explicit parts (link count + mtime + size).
@@ -6343,67 +6742,46 @@ pub fn test_lease_call_budget(wall_remaining_ms: u64) -> (u64, bool) {
     lease_call_budget(wall_remaining_ms)
 }
 
-/// Validate one Git candidate at its exact path and persist the instance,
-/// checkouts, remotes, refs, and HEAD observations. Marker evidence that
-/// fails validation becomes a preserved `probe-failed` gap (terminal for
-/// this probe; re-probe only after invalidation or rescan), never a fake
-/// absence and never an endless retry. Git reads run under DURING-inspection
-/// identity polls (XSEC-01) with all observations collected before the first
-/// buffered write, and under the task wall budget (SR-STATE-01).
-async fn exec_probe(
+/// Coordinator half of one probe task: scope decode plus the pre-run
+/// lease renewal. Filesystem and Git reads (fence verify, validate,
+/// identity-polled collection) run on a pool thread
+/// ([`run_probe_job`]); the outcome is applied by [`finish_probe`].
+/// Marker evidence that fails validation becomes a preserved
+/// `probe-failed` gap (terminal for this probe; re-probe only after
+/// invalidation or rescan), never a fake absence and never an endless
+/// retry. Git reads run under DURING-inspection identity polls
+/// (XSEC-01) with all observations collected before the first buffered
+/// write, and under the task wall budget (SR-STATE-01).
+async fn prepare_probe(
     runner: &mut Runner,
     store: &TursoStore,
-    generation: u64,
-    run_rev: u64,
-    canonical: &str,
     claimed: &ClaimedTask,
     deadline: &OpDeadline,
-) -> repo_scan::Result<TaskOutcome> {
+) -> repo_scan::Result<(PrepExtra, PrepAction)> {
+    let done = |outcome: TaskOutcome| (PrepExtra::Done, PrepAction::Done(outcome));
     let Some(config::ScopeRef::Git(path)) = config::parse_scope_key(&claimed.task.scope_key) else {
-        return Ok(TaskOutcome::Parked {
+        return Ok(done(TaskOutcome::Parked {
             state: TaskState::Unsupported,
             reason: format!("malformed git scope key: {}", claimed.task.scope_key),
-        });
+        }));
     };
-    let now = store::now_ms();
-    let gap_id = format!(
-        "probe:{}",
-        config::encode_hex(&config::path_as_bytes(&path))
-    );
-    // Probe fence (pre-run, PG-01): verify the scheduled path against the
-    // schedule-time identity carried in the task id — a swapped pin or an
-    // unprovenanced out-of-scope spelling refuses before Git runs.
-    // Explicitly scheduled out-of-scope relationship paths proceed on
-    // their own descriptor pin (spec §8); refusals park with a preserved
-    // gap and persist nothing.
-    let schedule = parse_probe_schedule(&claimed.task.id).unwrap_or(ProbeSchedule::legacy_enum());
-    let pinned: Option<PinnedDir> =
-        match verify_probe_path(runner.fence.as_ref(), "probe", &path, &schedule) {
-            ProbeFence::Unfenced => None,
-            ProbeFence::Pinned(pinned) | ProbeFence::Relationship(pinned) => Some(pinned),
-            ProbeFence::Refused { state, reason } => {
-                return Ok(TaskOutcome::Parked { state, reason });
-            }
-            ProbeFence::StatFailed(e) => {
-                return fail_stat_open(runner, store, claimed, &path, &e).await;
-            }
-        };
     // SR-STATE-01: abandon before the first Git read when the budget is
-    // already gone.
+    // already gone. (The worker re-checks on arrival — a race the same
+    // message covers — but the common expired case never spawns.)
     if deadline.expired() {
-        return Ok(park_on_timeout(&format!(
+        return Ok(done(park_on_timeout(&format!(
             "timeout-abandoned: probe of {} exceeded the {OP_DEADLINE_SECS}s execution \
              budget; no Git reads ran",
             path.display()
-        )));
+        ))));
     }
     // R4 heartbeat: the claim may have aged in the batch before this op
-    // started — renew before the first Git read so the 60 s lease covers
+    // started — renew before the worker spawns so the 60 s lease covers
     // the read stages below. A lost lease stops the op: nothing is
     // observed yet, so retry with a fresh lease instead of racing a
     // completion.
     if !renew_claim_lease(store, &mut runner.counters.db_transactions, claimed).await? {
-        return retry_on_lease_lost(
+        let outcome = retry_on_lease_lost(
             runner,
             store,
             claimed,
@@ -6412,16 +6790,72 @@ async fn exec_probe(
                 path.display()
             ),
         )
-        .await;
+        .await?;
+        return Ok(done(outcome));
     }
-    // The pin binds the execution (XSEC-01): Git runs between the
-    // pre-run pin above and the DURING/post-run re-verification below, so a
-    // path swapped mid-run discards every observation. Inspection keeps
-    // the scheduling spelling, so persisted rows stay spelling-stable.
-    let validated = match runner.inspector.validate(&path) {
-        Ok(validated) => validated,
-        Err(e) => {
-            let category = if git::is_unsupported_error(&e) {
+    let job = WorkerJob::Probe {
+        ctx: runner.read_context(),
+        task_id: claimed.task.id.clone(),
+        path: path.clone(),
+        deadline: *deadline,
+    };
+    Ok((PrepExtra::Probe { path }, PrepAction::Spawn(job)))
+}
+/// Coordinator write half of one probe task: applies a worker result
+/// ([`ProbeCollected`]) through the pre-persist lease gate and
+/// [`persist_probe`]. Returns the outcome plus the worker's progress
+/// units for the watchdog verdict.
+#[allow(clippy::too_many_arguments)]
+async fn finish_probe(
+    runner: &mut Runner,
+    store: &TursoStore,
+    generation: u64,
+    run_rev: u64,
+    canonical: &str,
+    claimed: &ClaimedTask,
+    path: &Path,
+    result: repo_scan::Result<WorkerOut>,
+) -> repo_scan::Result<(TaskOutcome, u64)> {
+    let collected = match result {
+        Ok(WorkerOut::Probe(collected)) => collected,
+        Ok(_) => {
+            return Err(repo_scan::Error::Scheduler(String::from(
+                "probe finish received a non-probe worker result",
+            )));
+        }
+        // Operational Git read failures retry with backoff, then park with
+        // the gap preserved; store failures abort the run (exit 1).
+        Err(repo_scan::Error::Git(detail)) => {
+            let outcome = fail_task(
+                runner,
+                store,
+                claimed,
+                ExecFail {
+                    category: String::from("probe-read-error"),
+                    detail,
+                },
+            )
+            .await?;
+            return Ok((outcome, 0));
+        }
+        Err(e) => return Err(e),
+    };
+    let units = collected.progress_units();
+    let now = store::now_ms();
+    let gap_id = format!("probe:{}", config::encode_hex(&config::path_as_bytes(path)));
+    let outcome = match collected {
+        ProbeCollected::Refused { state, reason } => TaskOutcome::Parked { state, reason },
+        ProbeCollected::StatFailed(e) => fail_stat_open(runner, store, claimed, path, &e).await?,
+        ProbeCollected::TimeoutBeforeReads => park_on_timeout(&format!(
+            "timeout-abandoned: probe of {} exceeded the {OP_DEADLINE_SECS}s execution \
+             budget; no Git reads ran",
+            path.display()
+        )),
+        ProbeCollected::ValidateFailed {
+            detail,
+            unsupported,
+        } => {
+            let category = if unsupported {
                 "unsupported-git-format"
             } else {
                 "probe-failed"
@@ -6431,135 +6865,76 @@ async fn exec_probe(
                 &gap_id,
                 &claimed.task.scope_key,
                 category,
-                &e.to_string(),
+                &detail,
                 None,
                 now,
             )?;
             flush_if_due(runner, store, due).await?;
-            return Ok(TaskOutcome::Complete);
+            TaskOutcome::Complete
         }
-    };
-    // Probe fence (DURING + post-run, XSEC-01): re-verify after validate,
-    // between every Git read stage in `collect_probe_reads`, and before
-    // the first buffered write. A path swapped mid-run discards every
-    // observation — nothing reaches the batch — and parks the scope
-    // instead of persisting foreign rows. Relationship pins re-verify
-    // through the unscoped descriptor walk.
-    let mut poll = IdentityPoll::new(runner.fence.as_ref(), &path, pinned.as_ref());
-    if !poll.ok_now() {
-        return Ok(park_on_identity_change("probe", &path));
-    }
-    // Step 8 worker seam: worker-owned reads; heartbeats applied
-    // during collection replay into the counters here, on the
-    // coordinator — the replay runs before `result` is unwrapped so the
-    // count survives early returns and read errors exactly as immediate
-    // counting did.
-    let ctx = runner.read_context();
-    let mut renewals = 0u64;
-    let result = collect_probe_reads(
-        &ctx,
-        store,
-        claimed,
-        &validated.instance,
-        &path,
-        &mut poll,
-        deadline,
-        &mut renewals,
-    )
-    .await;
-    runner.counters.db_transactions += renewals;
-    let reads = match result {
-        Ok(CollectOutcome::Reads(reads)) => reads,
-        Ok(CollectOutcome::IdentityChanged) => {
-            return Ok(park_on_identity_change("probe", &path));
-        }
-        Ok(CollectOutcome::TimedOut) => {
-            return Ok(park_on_timeout(&format!(
+        ProbeCollected::Collected { validated, outcome } => match outcome {
+            CollectOutcome::Reads(reads) => {
+                // R4 heartbeat: re-verify the lease before the first
+                // buffered write — a Git stage may have consumed the
+                // window without tripping the identity polls.
+                // Observations under a lost lease are discarded and the
+                // scope retries with a fresh lease.
+                if !renew_claim_lease(store, &mut runner.counters.db_transactions, claimed).await? {
+                    let outcome = retry_on_lease_lost(
+                        runner,
+                        store,
+                        claimed,
+                        &format!(
+                            "lease lost before persisting probe of {}; observations discarded",
+                            path.display()
+                        ),
+                    )
+                    .await?;
+                    return Ok((outcome, units));
+                }
+                match persist_probe(
+                    runner, store, generation, run_rev, canonical, path, &validated, *reads, now,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        let due = buffer_resolve_error(runner, &gap_id, store::now_ms())?;
+                        flush_if_due(runner, store, due).await?;
+                        TaskOutcome::Complete
+                    }
+                    // Operational Git failures retry with backoff, then park
+                    // with the gap preserved; store failures abort the run
+                    // (exit 1).
+                    Err(repo_scan::Error::Git(detail)) => {
+                        fail_task(
+                            runner,
+                            store,
+                            claimed,
+                            ExecFail {
+                                category: String::from("probe-persist-error"),
+                                detail,
+                            },
+                        )
+                        .await?
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            CollectOutcome::IdentityChanged => park_on_identity_change("probe", path),
+            CollectOutcome::TimedOut => park_on_timeout(&format!(
                 "timeout-abandoned: probe of {} exceeded the {OP_DEADLINE_SECS}s execution \
                  budget during Git reads; observations discarded",
                 path.display()
-            )));
-        }
-        Ok(CollectOutcome::LeaseLost) => {
-            return retry_on_lease_lost(
-                runner,
-                store,
-                claimed,
-                &format!(
-                    "lease lost during probe of {}; observations discarded",
-                    path.display()
-                ),
-            )
-            .await;
-        }
-        // Operational Git read failures retry with backoff, then park with
-        // the gap preserved; store failures abort the run (exit 1).
-        Err(repo_scan::Error::Git(detail)) => {
-            return fail_task(
-                runner,
-                store,
-                claimed,
-                ExecFail {
-                    category: String::from("probe-read-error"),
-                    detail,
-                },
-            )
-            .await;
-        }
-        Err(e) => return Err(e),
+            )),
+        },
     };
-    // Pre-store gate: the last poll before the first buffered write.
-    if !poll.ok_now() {
-        return Ok(park_on_identity_change("probe", &path));
-    }
-    // R4 heartbeat: re-verify the lease before the first buffered write —
-    // a Git stage may have consumed the window without tripping the
-    // identity polls. Observations under a lost lease are discarded and
-    // the scope retries with a fresh lease.
-    if !renew_claim_lease(store, &mut runner.counters.db_transactions, claimed).await? {
-        return retry_on_lease_lost(
-            runner,
-            store,
-            claimed,
-            &format!(
-                "lease lost before persisting probe of {}; observations discarded",
-                path.display()
-            ),
-        )
-        .await;
-    }
-    match persist_probe(
-        runner, store, generation, run_rev, canonical, &path, &validated, *reads, now,
-    )
-    .await
-    {
-        Ok(()) => {
-            let due = buffer_resolve_error(runner, &gap_id, store::now_ms())?;
-            flush_if_due(runner, store, due).await?;
-            Ok(TaskOutcome::Complete)
-        }
-        // Operational Git failures retry with backoff, then park with the
-        // gap preserved; store failures abort the run (exit 1).
-        Err(repo_scan::Error::Git(detail)) => {
-            fail_task(
-                runner,
-                store,
-                claimed,
-                ExecFail {
-                    category: String::from("probe-persist-error"),
-                    detail,
-                },
-            )
-            .await
-        }
-        Err(e) => Err(e),
-    }
+    Ok((outcome, units))
 }
 
 /// Execute one probe task under a fenced runner (probe-fence wiring
 /// proof): the fence is built from `fence_roots` exactly like the scan
 /// path builds it from the planned roots, then the production
-/// `exec_probe` runs against `scope_path`. `before_exec` runs between
+/// the production task path runs against `scope_path`. `before_exec` runs between
 /// claim and execution so the test can swap the scheduled path first —
 /// the production schedule/execute race in miniature. Returns the
 /// production outcome for the caller to match on.
@@ -6662,12 +7037,15 @@ async fn test_probe_outcome_impl(
     if let Some(swap) = before_exec {
         swap();
     }
-    let outcome = exec_probe(
+    // The sequential test driver runs the production prepare/worker/finish
+    // path inline; the status mode only matters for status tasks.
+    let outcome = execute_task(
         &mut runner,
         store,
         generation,
         run_rev,
         canonical,
+        StatusMode::default(),
         &claimed,
         &deadline,
     )
@@ -6731,7 +7109,19 @@ pub async fn test_enumerate_stale_outcome(
         "rival reclaim must mint a new token"
     );
     let deadline = OpDeadline::new(Duration::from_secs(OP_DEADLINE_SECS));
-    let outcome = exec_enumerate(&mut runner, store, generation, &claimed, &deadline).await?;
+    // The sequential test driver runs the production prepare/worker/finish
+    // path inline; run_rev/canonical only matter for probe tasks.
+    let outcome = execute_task(
+        &mut runner,
+        store,
+        generation,
+        0,
+        "test",
+        StatusMode::default(),
+        &claimed,
+        &deadline,
+    )
+    .await?;
     flush_runner_batch(&mut runner, store).await?;
     Ok(outcome)
 }
@@ -6758,13 +7148,115 @@ struct ProbeReads {
 }
 
 /// Outcome of [`collect_probe_reads`]: full reads, or an abandon signal.
-/// `IdentityChanged`/`TimedOut` mean "park, persist nothing";
-/// `LeaseLost` means "retry with a fresh lease, persist nothing".
+/// `IdentityChanged`/`TimedOut` mean "park, persist nothing". (Lease
+/// liveness is the coordinator's job now — the scheduled tick renews
+/// in-flight leases and the pre-persist gate discards stale results —
+/// so there is no worker-side `LeaseLost` anymore.)
 enum CollectOutcome {
     Reads(Box<ProbeReads>),
     IdentityChanged,
     TimedOut,
-    LeaseLost,
+}
+
+/// Worker-side result of one probe task (Step 8 worker seam): every
+/// terminal mid-read condition as data, like [`StatusCollected`]. The
+/// fence verify, open, and validate run on the pool thread; the single
+/// writer applies rows/gaps/retries via [`finish_probe`].
+enum ProbeCollected {
+    Refused {
+        state: TaskState,
+        reason: String,
+    },
+    StatFailed(std::io::Error),
+    TimeoutBeforeReads,
+    ValidateFailed {
+        detail: String,
+        unsupported: bool,
+    },
+    Collected {
+        validated: git::ValidatedCandidate,
+        outcome: CollectOutcome,
+    },
+}
+
+impl ProbeCollected {
+    /// Observations produced, for the watchdog's per-task advancement
+    /// verdict (parallel tasks share the global counters, so the drain
+    /// cannot infer per-task progress from them).
+    fn progress_units(&self) -> u64 {
+        match self {
+            ProbeCollected::Collected {
+                outcome: CollectOutcome::Reads(_),
+                ..
+            } => 1,
+            _ => 0,
+        }
+    }
+}
+
+/// Worker-side probe execution: schedule parse, fence verify, validate,
+/// identity-poll envelope, and [`collect_probe_reads`]. Synchronous —
+/// runs on a pool thread with worker-owned inputs only. The pre-run
+/// lease renewal stays on the coordinator ([`prepare_probe`]); the
+/// pre-persist gate stays on the coordinator ([`finish_probe`]).
+fn run_probe_job(
+    ctx: &ReadContext,
+    task_id: &str,
+    path: &Path,
+    deadline: &OpDeadline,
+) -> repo_scan::Result<ProbeCollected> {
+    // Probe fence (pre-run, PG-01): verify the scheduled path against the
+    // schedule-time identity carried in the task id — a swapped pin or an
+    // unprovenanced out-of-scope spelling refuses before Git runs.
+    // Explicitly scheduled out-of-scope relationship paths proceed on
+    // their own descriptor pin (spec §8); refusals park with a preserved
+    // gap and persist nothing.
+    let schedule = parse_probe_schedule(task_id).unwrap_or(ProbeSchedule::legacy_enum());
+    let pinned: Option<PinnedDir> =
+        match verify_probe_path(ctx.fence.as_ref(), "probe", path, &schedule) {
+            ProbeFence::Unfenced => None,
+            ProbeFence::Pinned(pinned) | ProbeFence::Relationship(pinned) => Some(pinned),
+            ProbeFence::Refused { state, reason } => {
+                return Ok(ProbeCollected::Refused { state, reason });
+            }
+            ProbeFence::StatFailed(e) => return Ok(ProbeCollected::StatFailed(e)),
+        };
+    // SR-STATE-01: abandon before the first Git read when the budget is
+    // already gone.
+    if deadline.expired() {
+        return Ok(ProbeCollected::TimeoutBeforeReads);
+    }
+    // The pin binds the execution (XSEC-01): Git runs between the
+    // pre-run pin above and the DURING/post-run re-verification below, so a
+    // path swapped mid-run discards every observation. Inspection keeps
+    // the scheduling spelling, so persisted rows stay spelling-stable.
+    let validated = match ctx.inspector.validate(path) {
+        Ok(validated) => validated,
+        Err(e) => {
+            return Ok(ProbeCollected::ValidateFailed {
+                detail: e.to_string(),
+                unsupported: git::is_unsupported_error(&e),
+            });
+        }
+    };
+    // Probe fence (DURING + post-run, XSEC-01): re-verify after validate,
+    // between every Git read stage in `collect_probe_reads`, and before
+    // the first buffered write. A path swapped mid-run discards every
+    // observation — nothing reaches the batch — and parks the scope
+    // instead of persisting foreign rows. Relationship pins re-verify
+    // through the unscoped descriptor walk.
+    let mut poll = IdentityPoll::new(ctx.fence.as_ref(), path, pinned.as_ref());
+    if !poll.ok_now() {
+        return Ok(ProbeCollected::Collected {
+            validated,
+            outcome: CollectOutcome::IdentityChanged,
+        });
+    }
+    let outcome = collect_probe_reads(ctx, &validated.instance, path, &mut poll, deadline)?;
+    // Pre-store gate, worker side: the collection ends with a final
+    // unthrottled poll, so no second coordinator poll is needed — no Git
+    // read runs between the collection return and the persist gate.
+    Ok(ProbeCollected::Collected { validated, outcome })
 }
 
 // One-shot mid-inspection swap hook for the XSEC-01 regression test:
@@ -6809,16 +7301,17 @@ fn fire_mid_inspection_hook(path: &Path) {
     }
 }
 
+/// Synchronous Git read worker: runs on a pool thread with no store
+/// handle. Lease freshness comes from the coordinator's scheduled tick;
+/// if the lease is gone by finish time, the pre-persist gate discards
+/// these reads and the task retries with a fresh lease.
 #[allow(clippy::too_many_arguments)]
-async fn collect_probe_reads(
+fn collect_probe_reads(
     ctx: &ReadContext,
-    store: &TursoStore,
-    claimed: &ClaimedTask,
     instance: &git::GitInstance,
     path: &Path,
     poll: &mut IdentityPoll,
     deadline: &OpDeadline,
-    renewals: &mut u64,
 ) -> repo_scan::Result<CollectOutcome> {
     if deadline.expired() {
         return Ok(CollectOutcome::TimedOut);
@@ -6853,13 +7346,8 @@ async fn collect_probe_reads(
     if !poll.ok_now() {
         return Ok(CollectOutcome::IdentityChanged);
     }
-    // R4 heartbeat: the stage above consumed lease time — renew at this
-    // yield point so a slow-but-advancing probe never lets its 60 s lease
-    // lapse mid-operation. A lost lease abandons the collection: the
-    // caller discards every observation and retries with a fresh lease.
-    if !renew_claim_lease(store, renewals, claimed).await? {
-        return Ok(CollectOutcome::LeaseLost);
-    }
+    // R4 heartbeat point retired: the coordinator's scheduled tick owns
+    // lease renewal now; the pre-persist gate retries on a lost lease.
     if deadline.expired() {
         return Ok(CollectOutcome::TimedOut);
     }
@@ -6874,18 +7362,10 @@ async fn collect_probe_reads(
     if !poll.ok_throttled() {
         return Ok(CollectOutcome::IdentityChanged);
     }
-    // R4 heartbeat at this yield point (see above).
-    if !renew_claim_lease(store, renewals, claimed).await? {
-        return Ok(CollectOutcome::LeaseLost);
-    }
     let work_present = instance.work_dir.as_ref().map(|root| root.exists());
     let worktrees = ctx.inspector.worktrees(instance).unwrap_or_default();
     if !poll.ok_throttled() {
         return Ok(CollectOutcome::IdentityChanged);
-    }
-    // R4 heartbeat at this yield point (see above).
-    if !renew_claim_lease(store, renewals, claimed).await? {
-        return Ok(CollectOutcome::LeaseLost);
     }
     if deadline.expired() {
         return Ok(CollectOutcome::TimedOut);
@@ -7948,37 +8428,32 @@ struct AnalysisReads {
 }
 
 /// Outcome of [`collect_analysis_reads`]: full reads, or an abandon
-/// signal with probe-identical meaning (park/retry, persist nothing).
+/// signal with probe-identical meaning (park, persist nothing). Lease
+/// liveness moved to the coordinator's scheduled tick (see
+/// [`CollectOutcome`]).
 enum AnalysisOutcome {
     Reads(AnalysisReads),
     IdentityChanged,
     TimedOut,
-    LeaseLost,
 }
 
 /// Collect one store's analysis reads with DURING-inspection identity
-/// polls (XSEC-01), lease heartbeats (R4), and deadline checks
-/// (SR-STATE-01) between stages — the probe collection discipline,
-/// analysis stages only. Buffers nothing: abandonment drops every
-/// observation.
+/// polls (XSEC-01) and deadline checks (SR-STATE-01) between stages —
+/// the probe collection discipline, analysis stages only. Synchronous:
+/// runs on a pool thread with no store handle. Buffers nothing:
+/// abandonment drops every observation.
 #[allow(clippy::too_many_arguments)]
-async fn collect_analysis_reads(
+fn collect_analysis_reads(
     ctx: &ReadContext,
-    store: &TursoStore,
-    claimed: &ClaimedTask,
     instance: &git::GitInstance,
     checkouts: &[store::CheckoutRow],
     object_format: &str,
     is_bare: bool,
     poll: &mut IdentityPoll,
     deadline: &OpDeadline,
-    renewals: &mut u64,
 ) -> repo_scan::Result<AnalysisOutcome> {
     if deadline.expired() {
         return Ok(AnalysisOutcome::TimedOut);
-    }
-    if !renew_claim_lease(store, renewals, claimed).await? {
-        return Ok(AnalysisOutcome::LeaseLost);
     }
     let task_deadline = *deadline;
     let cancel = git::fallback::WaitCancel::new(
@@ -7993,9 +8468,6 @@ async fn collect_analysis_reads(
         git::fallback::with_wait_cancel(&cancel, || observed_refs(ctx, instance, &mut refs_notes))?;
     if !poll.ok_now() {
         return Ok(AnalysisOutcome::IdentityChanged);
-    }
-    if !renew_claim_lease(store, renewals, claimed).await? {
-        return Ok(AnalysisOutcome::LeaseLost);
     }
     if deadline.expired() {
         return Ok(AnalysisOutcome::TimedOut);
@@ -8033,9 +8505,6 @@ async fn collect_analysis_reads(
             return Ok(AnalysisOutcome::IdentityChanged);
         }
     }
-    if !renew_claim_lease(store, renewals, claimed).await? {
-        return Ok(AnalysisOutcome::LeaseLost);
-    }
     Ok(AnalysisOutcome::Reads(AnalysisReads {
         refs,
         refs_notes,
@@ -8045,56 +8514,134 @@ async fn collect_analysis_reads(
     }))
 }
 
-/// Execute one store-analysis task: the probe execution discipline
-/// (fence, lease, identity polls, deadline, error mapping) with
-/// analysis reads only. The instance row must exist (discovery
-/// persisted it); a missing row completes with an explicit gap.
-async fn exec_analysis(
-    runner: &mut Runner,
-    store: &TursoStore,
-    claimed: &ClaimedTask,
+/// Worker-side result of one analysis task (Step 8 worker seam): every
+/// terminal mid-read condition as data, like [`StatusCollected`]. The
+/// fence verify, open, and validate run on the pool thread; the single
+/// writer applies rows/gaps/retries via [`finish_analysis`].
+enum AnalysisCollected {
+    Refused { state: TaskState, reason: String },
+    StatFailed(std::io::Error),
+    TimeoutBeforeReads,
+    ValidateFailed { detail: String, unsupported: bool },
+    Collected { outcome: AnalysisOutcome },
+}
+
+impl AnalysisCollected {
+    /// Observations produced, for the watchdog's per-task advancement
+    /// verdict (parallel tasks share the global counters, so the drain
+    /// cannot infer per-task progress from them).
+    fn progress_units(&self) -> u64 {
+        match self {
+            AnalysisCollected::Collected {
+                outcome: AnalysisOutcome::Reads(reads),
+            } => reads.refs.len() as u64 + reads.heads.len() as u64,
+            _ => 0,
+        }
+    }
+}
+
+/// Worker-side analysis execution: fence verify, validate, the
+/// identity-poll envelope, and [`collect_analysis_reads`]. Synchronous —
+/// runs on a pool thread with worker-owned inputs only. The instance
+/// row and checkout list come from the coordinator's catalog reads
+/// ([`prepare_analysis`]); the pre-persist gate stays on the
+/// coordinator ([`finish_analysis`]).
+#[allow(clippy::too_many_arguments)]
+fn run_analysis_job(
+    ctx: &ReadContext,
+    path: &Path,
+    common_dir: &Path,
+    checkouts: &[store::CheckoutRow],
+    object_format: &str,
+    is_bare: bool,
     deadline: &OpDeadline,
-) -> repo_scan::Result<TaskOutcome> {
-    let Some(config::ScopeRef::Git(path)) = config::parse_scope_key(&claimed.task.scope_key) else {
-        return Ok(TaskOutcome::Parked {
-            state: TaskState::Unsupported,
-            reason: format!("malformed git scope key: {}", claimed.task.scope_key),
-        });
-    };
-    let now = store::now_ms();
-    let gap_id = format!(
-        "analyze:{}",
-        config::encode_hex(&config::path_as_bytes(&path))
-    );
-    let Some(instance_id) = parse_analysis_instance(&claimed.task.id) else {
-        return Ok(TaskOutcome::Parked {
-            state: TaskState::Unsupported,
-            reason: format!("malformed analysis task id: {}", claimed.task.id),
-        });
-    };
+) -> repo_scan::Result<AnalysisCollected> {
     // Analysis ids carry no PG-01 schedule suffix; the store row is a Git
     // observation, so relationship routing applies (as for status).
     let schedule = ProbeSchedule::analysis_legacy();
     let pinned: Option<PinnedDir> =
-        match verify_probe_path(runner.fence.as_ref(), "analyze", &path, &schedule) {
+        match verify_probe_path(ctx.fence.as_ref(), "analyze", path, &schedule) {
             ProbeFence::Unfenced => None,
             ProbeFence::Pinned(pinned) | ProbeFence::Relationship(pinned) => Some(pinned),
             ProbeFence::Refused { state, reason } => {
-                return Ok(TaskOutcome::Parked { state, reason });
+                return Ok(AnalysisCollected::Refused { state, reason });
             }
-            ProbeFence::StatFailed(e) => {
-                return fail_stat_open(runner, store, claimed, &path, &e).await;
-            }
+            ProbeFence::StatFailed(e) => return Ok(AnalysisCollected::StatFailed(e)),
         };
     if deadline.expired() {
-        return Ok(park_on_timeout(&format!(
+        return Ok(AnalysisCollected::TimeoutBeforeReads);
+    }
+    let validated = match ctx.inspector.validate(common_dir) {
+        Ok(validated) => validated,
+        Err(e) => {
+            return Ok(AnalysisCollected::ValidateFailed {
+                detail: e.to_string(),
+                unsupported: git::is_unsupported_error(&e),
+            });
+        }
+    };
+    let mut poll = IdentityPoll::new(ctx.fence.as_ref(), path, pinned.as_ref());
+    if !poll.ok_now() {
+        return Ok(AnalysisCollected::Collected {
+            outcome: AnalysisOutcome::IdentityChanged,
+        });
+    }
+    let outcome = collect_analysis_reads(
+        ctx,
+        &validated.instance,
+        checkouts,
+        object_format,
+        is_bare,
+        &mut poll,
+        deadline,
+    )?;
+    // Pre-store gate, worker side: the collection's last poll ran inside
+    // the checkout loop (or never, for a checkout-less store), so
+    // re-verify here before the result crosses back to the writer.
+    if matches!(outcome, AnalysisOutcome::Reads(_)) && !poll.ok_now() {
+        return Ok(AnalysisCollected::Collected {
+            outcome: AnalysisOutcome::IdentityChanged,
+        });
+    }
+    Ok(AnalysisCollected::Collected { outcome })
+}
+
+/// Coordinator half of one store-analysis task: scope decode, the
+/// pre-run lease renewal, and the instance-row/checkout catalog reads.
+/// Fence verify, validate, and the identity-polled Git reads run on a
+/// pool thread ([`run_analysis_job`]); the outcome is applied by
+/// [`finish_analysis`]. The instance row must exist (discovery
+/// persisted it); a missing row completes with an explicit gap.
+async fn prepare_analysis(
+    runner: &mut Runner,
+    store: &TursoStore,
+    claimed: &ClaimedTask,
+    deadline: &OpDeadline,
+) -> repo_scan::Result<(PrepExtra, PrepAction)> {
+    let done = |outcome: TaskOutcome| (PrepExtra::Done, PrepAction::Done(outcome));
+    let Some(config::ScopeRef::Git(path)) = config::parse_scope_key(&claimed.task.scope_key) else {
+        return Ok(done(TaskOutcome::Parked {
+            state: TaskState::Unsupported,
+            reason: format!("malformed git scope key: {}", claimed.task.scope_key),
+        }));
+    };
+    let Some(instance_id) = parse_analysis_instance(&claimed.task.id) else {
+        return Ok(done(TaskOutcome::Parked {
+            state: TaskState::Unsupported,
+            reason: format!("malformed analysis task id: {}", claimed.task.id),
+        }));
+    };
+    // SR-STATE-01: abandon before the first Git read when the budget is
+    // already gone. (The worker re-checks on arrival; see `prepare_probe`.)
+    if deadline.expired() {
+        return Ok(done(park_on_timeout(&format!(
             "timeout-abandoned: analysis of {} exceeded the {OP_DEADLINE_SECS}s execution \
              budget; no Git reads ran",
             path.display()
-        )));
+        ))));
     }
     if !renew_claim_lease(store, &mut runner.counters.db_transactions, claimed).await? {
-        return retry_on_lease_lost(
+        let outcome = retry_on_lease_lost(
             runner,
             store,
             claimed,
@@ -8103,8 +8650,13 @@ async fn exec_analysis(
                 path.display()
             ),
         )
-        .await;
+        .await?;
+        return Ok(done(outcome));
     }
+    let gap_id = format!(
+        "analyze:{}",
+        config::encode_hex(&config::path_as_bytes(&path))
+    );
     let Some(instance_row) = store.get_git_instance(&instance_id).await? else {
         let due = buffer_record_error(
             runner,
@@ -8113,16 +8665,84 @@ async fn exec_analysis(
             "unknown-instance",
             &format!("analysis task names unknown instance {instance_id}; dropping"),
             None,
-            now,
+            store::now_ms(),
         )?;
         flush_if_due(runner, store, due).await?;
-        return Ok(TaskOutcome::Complete);
+        return Ok(done(TaskOutcome::Complete));
     };
-    let common_dir = config::path_from_bytes(instance_row.common_path.clone());
-    let validated = match runner.inspector.validate(&common_dir) {
-        Ok(validated) => validated,
-        Err(e) => {
-            let category = if git::is_unsupported_error(&e) {
+    let checkouts = list_store_checkouts(store, &instance_id).await?;
+    let job = WorkerJob::Analysis {
+        ctx: runner.read_context(),
+        path: path.clone(),
+        common_dir: config::path_from_bytes(instance_row.common_path.clone()),
+        checkouts,
+        object_format: instance_row.object_format.clone(),
+        bare: instance_row.bare.unwrap_or(false),
+        deadline: *deadline,
+    };
+    let extra = PrepExtra::Analysis {
+        path,
+        instance_id,
+        instance_row: Box::new(instance_row),
+    };
+    Ok((extra, PrepAction::Spawn(job)))
+}
+/// Coordinator write half of one analysis task: applies a worker
+/// result ([`AnalysisCollected`]) through the pre-persist lease gate
+/// and [`persist_analysis`]. Returns the outcome plus the worker's
+/// progress units for the watchdog verdict.
+async fn finish_analysis(
+    runner: &mut Runner,
+    store: &TursoStore,
+    claimed: &ClaimedTask,
+    path: &Path,
+    instance_id: &str,
+    instance_row: &store::GitInstanceRow,
+    result: repo_scan::Result<WorkerOut>,
+) -> repo_scan::Result<(TaskOutcome, u64)> {
+    let collected = match result {
+        Ok(WorkerOut::Analysis(collected)) => collected,
+        Ok(_) => {
+            return Err(repo_scan::Error::Scheduler(String::from(
+                "analysis finish received a non-analysis worker result",
+            )));
+        }
+        Err(repo_scan::Error::Git(detail)) => {
+            let outcome = fail_task(
+                runner,
+                store,
+                claimed,
+                ExecFail {
+                    category: String::from("analysis-read-error"),
+                    detail,
+                },
+            )
+            .await?;
+            return Ok((outcome, 0));
+        }
+        Err(e) => return Err(e),
+    };
+    let units = collected.progress_units();
+    let now = store::now_ms();
+    let gap_id = format!(
+        "analyze:{}",
+        config::encode_hex(&config::path_as_bytes(path))
+    );
+    let outcome = match collected {
+        AnalysisCollected::Refused { state, reason } => TaskOutcome::Parked { state, reason },
+        AnalysisCollected::StatFailed(e) => {
+            fail_stat_open(runner, store, claimed, path, &e).await?
+        }
+        AnalysisCollected::TimeoutBeforeReads => park_on_timeout(&format!(
+            "timeout-abandoned: analysis of {} exceeded the {OP_DEADLINE_SECS}s execution \
+             budget; no Git reads ran",
+            path.display()
+        )),
+        AnalysisCollected::ValidateFailed {
+            detail,
+            unsupported,
+        } => {
+            let category = if unsupported {
                 "unsupported-git-format"
             } else {
                 "analysis-failed"
@@ -8132,120 +8752,60 @@ async fn exec_analysis(
                 &gap_id,
                 &claimed.task.scope_key,
                 category,
-                &e.to_string(),
+                &detail,
                 None,
                 now,
             )?;
             flush_if_due(runner, store, due).await?;
-            return Ok(TaskOutcome::Complete);
+            TaskOutcome::Complete
         }
-    };
-    let mut poll = IdentityPoll::new(runner.fence.as_ref(), &path, pinned.as_ref());
-    if !poll.ok_now() {
-        return Ok(park_on_identity_change("analyze", &path));
-    }
-    let checkouts = list_store_checkouts(store, &instance_id).await?;
-    // Step 8 worker seam: worker-owned reads; heartbeats replay into
-    // the counters before `result` is unwrapped (see `exec_probe`).
-    let ctx = runner.read_context();
-    let mut renewals = 0u64;
-    let result = collect_analysis_reads(
-        &ctx,
-        store,
-        claimed,
-        &validated.instance,
-        &checkouts,
-        &instance_row.object_format,
-        instance_row.bare.unwrap_or(false),
-        &mut poll,
-        deadline,
-        &mut renewals,
-    )
-    .await;
-    runner.counters.db_transactions += renewals;
-    let reads = match result {
-        Ok(AnalysisOutcome::Reads(reads)) => reads,
-        Ok(AnalysisOutcome::IdentityChanged) => {
-            return Ok(park_on_identity_change("analyze", &path));
-        }
-        Ok(AnalysisOutcome::TimedOut) => {
-            return Ok(park_on_timeout(&format!(
+        AnalysisCollected::Collected { outcome } => match outcome {
+            AnalysisOutcome::Reads(reads) => {
+                if !renew_claim_lease(store, &mut runner.counters.db_transactions, claimed).await? {
+                    let outcome = retry_on_lease_lost(
+                        runner,
+                        store,
+                        claimed,
+                        &format!(
+                            "lease lost before persisting analysis of {}; observations discarded",
+                            path.display()
+                        ),
+                    )
+                    .await?;
+                    return Ok((outcome, units));
+                }
+                match persist_analysis(runner, store, instance_id, instance_row, reads, path, now)
+                    .await
+                {
+                    Ok(()) => {
+                        let due = buffer_resolve_error(runner, &gap_id, store::now_ms())?;
+                        flush_if_due(runner, store, due).await?;
+                        TaskOutcome::Complete
+                    }
+                    Err(repo_scan::Error::Git(detail)) => {
+                        fail_task(
+                            runner,
+                            store,
+                            claimed,
+                            ExecFail {
+                                category: String::from("analysis-persist-error"),
+                                detail,
+                            },
+                        )
+                        .await?
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            AnalysisOutcome::IdentityChanged => park_on_identity_change("analyze", path),
+            AnalysisOutcome::TimedOut => park_on_timeout(&format!(
                 "timeout-abandoned: analysis of {} exceeded the {OP_DEADLINE_SECS}s execution \
                  budget during Git reads; observations discarded",
                 path.display()
-            )));
-        }
-        Ok(AnalysisOutcome::LeaseLost) => {
-            return retry_on_lease_lost(
-                runner,
-                store,
-                claimed,
-                &format!(
-                    "lease lost during analysis of {}; observations discarded",
-                    path.display()
-                ),
-            )
-            .await;
-        }
-        Err(repo_scan::Error::Git(detail)) => {
-            return fail_task(
-                runner,
-                store,
-                claimed,
-                ExecFail {
-                    category: String::from("analysis-read-error"),
-                    detail,
-                },
-            )
-            .await;
-        }
-        Err(e) => return Err(e),
+            )),
+        },
     };
-    if !poll.ok_now() {
-        return Ok(park_on_identity_change("analyze", &path));
-    }
-    if !renew_claim_lease(store, &mut runner.counters.db_transactions, claimed).await? {
-        return retry_on_lease_lost(
-            runner,
-            store,
-            claimed,
-            &format!(
-                "lease lost before persisting analysis of {}; observations discarded",
-                path.display()
-            ),
-        )
-        .await;
-    }
-    match persist_analysis(
-        runner,
-        store,
-        &instance_id,
-        &instance_row,
-        reads,
-        &path,
-        now,
-    )
-    .await
-    {
-        Ok(()) => {
-            let due = buffer_resolve_error(runner, &gap_id, store::now_ms())?;
-            flush_if_due(runner, store, due).await?;
-            Ok(TaskOutcome::Complete)
-        }
-        Err(repo_scan::Error::Git(detail)) => {
-            fail_task(
-                runner,
-                store,
-                claimed,
-                ExecFail {
-                    category: String::from("analysis-persist-error"),
-                    detail,
-                },
-            )
-            .await
-        }
-        Err(e) => Err(e),
-    }
+    Ok((outcome, units))
 }
 
 /// Instance id from an analysis task id (`analyze:{instance}:{run}`).
@@ -8491,19 +9051,15 @@ struct StatusCollected {
     outcome: StatusReadOutcome,
 }
 
-/// Read half of [`exec_status`]: fence verify, open, guarded blocking
+/// Read half of status ([`prepare_status`]/[`finish_status`]): fence verify, open, guarded blocking
 /// status call, fallback counts, submodule coverage, and post-run
-/// re-verification. Applies no catalog writes (lease heartbeats
-/// excepted, which move to the coordinator's scheduled renewal with
-/// the pool slice); the writer applies everything via
-/// [`persist_status`].
-async fn collect_status_reads(
+/// re-verification. Applies no catalog writes — lease renewal moved to
+/// the coordinator's scheduled tick — so this runs synchronously on a
+/// worker thread; the writer applies everything via [`persist_status`].
+fn collect_status_reads(
     ctx: &ReadContext,
-    store: &TursoStore,
-    claimed: &ClaimedTask,
     target: &StatusTarget,
     deadline: &OpDeadline,
-    renewals: &mut u64,
 ) -> repo_scan::Result<StatusCollected> {
     let git_path = &target.git_path;
     let mode = target.mode;
@@ -8574,22 +9130,12 @@ async fn collect_status_reads(
     if !poll.ok_now() {
         return Ok(finish(StatusReadOutcome::IdentityChanged));
     }
-    // R4 heartbeat: renew before the blocking call below, which has no
-    // in-call yield point. A lost lease stops the op before any Git read.
-    if !renew_claim_lease(store, renewals, claimed).await? {
-        return Ok(finish(StatusReadOutcome::LeaseRetry {
-            detail: format!(
-                "lease lost before status of {}; retrying with a fresh lease",
-                git_path.display()
-            ),
-        }));
-    }
     let started = store::now_ms();
     // R4: the blocking status call has no in-call yield point, so it runs
-    // under the tighter of the wall budget and the lease window just
-    // renewed above — the guard trips the interrupt strictly before the
-    // lease can lapse, and a window abandonment retries (fresh lease)
-    // instead of parking valid-but-slow work.
+    // under the tighter of the wall budget and the lease window — the
+    // coordinator's tick keeps the lease itself alive, while the guard
+    // trips the interrupt at the window so a window-truncated call
+    // retries instead of parking valid-but-slow work.
     let (call_ms, lease_bound) =
         lease_call_budget(deadline.remaining().as_millis().min(u128::from(u64::MAX)) as u64);
     let call_deadline = OpDeadline::new(Duration::from_millis(call_ms));
@@ -8621,8 +9167,8 @@ async fn collect_status_reads(
     }
     if lease_bound && call_deadline.expired() {
         // R4: the lease window (not the wall budget) ended the call — the
-        // observation is discarded and the scope retries with a fresh
-        // lease. The lease itself never lapsed, so no reclaim or duplicate
+        // observation is discarded and the scope retries. The coordinator
+        // tick keeps the lease itself alive, so no reclaim or duplicate
         // is possible; parking here would strand valid-but-slow work.
         return Ok(finish(StatusReadOutcome::LeaseRetry {
             detail: format!(
@@ -8633,17 +9179,6 @@ async fn collect_status_reads(
     }
     if !poll.ok_now() {
         return Ok(finish(StatusReadOutcome::IdentityChanged));
-    }
-    // R4 heartbeat: the blocking call consumed most of the window renewed
-    // above — renew again so the fallback and submodule reads below run
-    // under a fresh lease instead of racing its expiry.
-    if !renew_claim_lease(store, renewals, claimed).await? {
-        return Ok(finish(StatusReadOutcome::LeaseRetry {
-            detail: format!(
-                "lease lost during status of {}; observation discarded",
-                git_path.display()
-            ),
-        }));
     }
     let observation = match status_result {
         Ok(obs) => Some(obs),
@@ -8678,19 +9213,9 @@ async fn collect_status_reads(
     if !poll.ok_now() {
         return Ok(finish(StatusReadOutcome::IdentityChanged));
     }
-    // R4 heartbeat: the blocking call and fallback reads above may have
-    // outrun the lease window (the interrupt flag is best-effort) —
-    // verify the lease before any status row is recorded. A lost lease
-    // discards the observation and the scope retries with a fresh lease
-    // instead of racing a completion.
-    if !renew_claim_lease(store, renewals, claimed).await? {
-        return Ok(finish(StatusReadOutcome::LeaseRetry {
-            detail: format!(
-                "lease lost during status of {}; observation discarded",
-                git_path.display()
-            ),
-        }));
-    }
+    // R4: the pre-persist gate on the coordinator verifies the lease
+    // before any status row is recorded — a lost lease discards the
+    // observation and the scope retries instead of racing a completion.
     // Status fence (post-run): every Git read above is done; re-verify
     // identity before any status row is recorded. On mismatch the
     // observation is discarded and the scope parks. Relationship pins
@@ -8712,7 +9237,7 @@ async fn collect_status_reads(
     }))
 }
 
-/// Write half of [`exec_status`]: status rows, gaps, and retries for one
+/// Write half of status ([`finish_status`]): status rows, gaps, and retries for one
 /// collected outcome. Runs on the single writer.
 async fn persist_status(
     runner: &mut Runner,
@@ -8856,20 +9381,25 @@ async fn persist_status(
     }
 }
 
-async fn exec_status(
+/// Coordinator half of one status task: scope decode, the checkout
+/// catalog read, and the metadata-mode shortcut. The guarded Git
+/// inspection runs on a pool thread ([`collect_status_reads`]); the
+/// outcome is applied by [`finish_status`].
+async fn prepare_status(
     runner: &mut Runner,
     store: &TursoStore,
     mode: StatusMode,
     claimed: &ClaimedTask,
     deadline: &OpDeadline,
-) -> repo_scan::Result<TaskOutcome> {
+) -> repo_scan::Result<(PrepExtra, PrepAction)> {
+    let done = |outcome: TaskOutcome| (PrepExtra::Done, PrepAction::Done(outcome));
     let Some(config::ScopeRef::Status(checkout_id)) =
         config::parse_scope_key(&claimed.task.scope_key)
     else {
-        return Ok(TaskOutcome::Parked {
+        return Ok(done(TaskOutcome::Parked {
             state: TaskState::Unsupported,
             reason: format!("malformed status scope key: {}", claimed.task.scope_key),
-        });
+        }));
     };
     let now = store::now_ms();
     let Some(checkout) = store.get_checkout(&checkout_id).await? else {
@@ -8883,7 +9413,7 @@ async fn exec_status(
             now,
         )?;
         flush_if_due(runner, store, due).await?;
-        return Ok(TaskOutcome::Complete);
+        return Ok(done(TaskOutcome::Complete));
     };
     // Observation revision: the run revision would need threading through;
     // the current committed revision is the stable per-run key instead.
@@ -8907,43 +9437,69 @@ async fn exec_status(
             observed_rev,
         )
         .await?;
-        return Ok(TaskOutcome::Complete);
+        return Ok(done(TaskOutcome::Complete));
     }
-    // Step 8 worker seam: the read half runs the guarded Git inspection
-    // without catalog writes; the single writer applies the outcome.
-    // Heartbeats replay into the counters before `result` is unwrapped
-    // (see `exec_probe`).
     let target = StatusTarget {
         checkout_id: checkout_id.clone(),
         instance_id: checkout.instance_id.clone(),
-        git_path: config::path_from_bytes(checkout.git_path.clone()),
+        // The worker fences this path: execute at the canonical
+        // spelling so a symlinked checkout `.git` stays pinnable
+        // (the row keeps the observed spelling; joins use the id).
+        git_path: canonical_exec_path(&config::path_from_bytes(checkout.git_path.clone())),
         mode,
         now_ms: now,
         observed_rev,
     };
-    let ctx = runner.read_context();
-    let mut renewals = 0u64;
-    let result = collect_status_reads(&ctx, store, claimed, &target, deadline, &mut renewals).await;
-    runner.counters.db_transactions += renewals;
-    let collected = result?;
+    let job = WorkerJob::Status {
+        ctx: runner.read_context(),
+        target,
+        deadline: *deadline,
+    };
+    Ok((PrepExtra::Status, PrepAction::Spawn(job)))
+}
+
+/// Coordinator write half of one status task: applies a worker result
+/// ([`StatusCollected`]) through the pre-persist lease gate and
+/// [`persist_status`]. Returns the outcome plus the observation flag
+/// for the watchdog verdict.
+async fn finish_status(
+    runner: &mut Runner,
+    store: &TursoStore,
+    claimed: &ClaimedTask,
+    result: repo_scan::Result<WorkerOut>,
+) -> repo_scan::Result<(TaskOutcome, u64)> {
+    let collected = match result {
+        Ok(WorkerOut::Status(collected)) => collected,
+        Ok(_) => {
+            return Err(repo_scan::Error::Scheduler(String::from(
+                "status finish received a non-status worker result",
+            )));
+        }
+        Err(e) => return Err(e),
+    };
+    let units = match &collected.outcome {
+        StatusReadOutcome::Observed { .. } => 1,
+        _ => 0,
+    };
     // R4 heartbeat: re-verify the lease before the first buffered write —
-    // a status stage may have consumed the window without tripping the
-    // in-collect heartbeats. Observations under a lost lease are discarded
-    // and the scope retries with a fresh lease (same pre-persist gate as
-    // probe/analysis/enumeration).
+    // a status stage may have consumed the window. Observations under a
+    // lost lease are discarded and the scope retries with a fresh lease
+    // (same pre-persist gate as probe/analysis/enumeration).
     if !renew_claim_lease(store, &mut runner.counters.db_transactions, claimed).await? {
-        return retry_on_lease_lost(
+        let outcome = retry_on_lease_lost(
             runner,
             store,
             claimed,
             &format!(
                 "lease lost before persisting status of {}; observation discarded",
-                target.git_path.display()
+                collected.target.git_path.display()
             ),
         )
-        .await;
+        .await?;
+        return Ok((outcome, units));
     }
-    persist_status(runner, store, claimed, collected).await
+    let outcome = persist_status(runner, store, claimed, collected).await?;
+    Ok((outcome, units))
 }
 
 fn status_units(mode: StatusMode) -> &'static str {
@@ -14696,7 +15252,7 @@ pub fn test_subtree_fanout() -> usize {
 /// Execute one enum task under a fenced runner (finding-12 wiring
 /// proof): the fence is built from `fence_roots` exactly like the scan
 /// path builds it from the planned roots, then the production
-/// `exec_enumerate` runs against `scope_path`. Returns the production
+/// the production task path runs against `scope_path`. Returns the production
 /// outcome for the caller to match on.
 #[cfg(test)]
 pub async fn test_enum_fenced_outcome(
@@ -14728,7 +15284,19 @@ pub async fn test_enum_fenced_outcome(
         repo_scan::Error::Store(String::from("fenced enum hook: claim returned no task"))
     })?;
     let deadline = OpDeadline::new(Duration::from_secs(OP_DEADLINE_SECS));
-    exec_enumerate(&mut runner, store, generation, &claimed, &deadline).await
+    // The sequential test driver runs the production prepare/worker/finish
+    // path inline; run_rev/canonical only matter for probe tasks.
+    execute_task(
+        &mut runner,
+        store,
+        generation,
+        0,
+        "test",
+        StatusMode::default(),
+        &claimed,
+        &deadline,
+    )
+    .await
 }
 
 /// PG-03 wiring proof (all platforms): the enum fence-error mapping must

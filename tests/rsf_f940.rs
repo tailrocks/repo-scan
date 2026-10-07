@@ -20,7 +20,10 @@ use repo_scan::store::{now_ms, Store, TursoStore};
 use std::path::PathBuf;
 
 fn runtime() -> tokio::runtime::Runtime {
+    // All drivers on: the pooled drain needs the timer (renewal ticks)
+    // and the blocking pool (worker threads).
     tokio::runtime::Builder::new_current_thread()
+        .enable_all()
         .build()
         .expect("runtime")
 }
