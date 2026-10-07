@@ -567,6 +567,42 @@ impl FallbackGit {
         Ok(refs)
     }
 
+    /// Ahead/behind counts via `rev-list --left-right --count A...B`
+    /// (graph fallback for stores gix cannot walk; see
+    /// [`super::graph`]). Read-only commit walk: no worktree content
+    /// is read, so no filter driver can execute. Output parses
+    /// strictly as `"<ahead>\t<behind>"` with nothing else —
+    /// anything unparseable fails loudly, never as partial counts.
+    /// Returns `(ahead, behind)`: commits reachable from `a_hex`
+    /// but not `b_hex`, and the reverse.
+    pub fn rev_list_count(
+        &self,
+        git_dir: &Path,
+        work_tree: Option<&Path>,
+        a_hex: &str,
+        b_hex: &str,
+    ) -> crate::Result<(u64, u64)> {
+        if a_hex.is_empty() || b_hex.is_empty() {
+            return Err(crate::Error::Git(String::from(
+                "installed git: rev-list refuses empty tip OID",
+            )));
+        }
+        let spec = format!("{a_hex}...{b_hex}");
+        // One argv element, no shell: hostile OID text cannot escape
+        // into options or paths (and git re-validates the revision).
+        let out = self.run(
+            git_dir,
+            work_tree,
+            &["rev-list", "--left-right", "--count", &spec],
+        )?;
+        parse_rev_list_count(&out).ok_or_else(|| {
+            crate::Error::Git(format!(
+                "installed git: unparseable rev-list --count output: {:?}",
+                String::from_utf8_lossy(&out)
+            ))
+        })
+    }
+
     /// Observe HEAD via `symbolic-ref` + `rev-parse` (no checkout touched).
     /// Ref names keep exact bytes (ASCII-whitespace trimmed, no lossy
     /// round-trip); oids must be ASCII hex (branch oid `None`, detached
@@ -1001,7 +1037,7 @@ impl FallbackGit {
     /// neutralized via [`apply_repo_neutralization`], and proxy/helpful
     /// network variables are stripped. Only read-only subcommands are
     /// ever passed by this module (for-each-ref, symbolic-ref, rev-parse,
-    /// status, config). The spawn runs inside the shared envelope
+    /// rev-list --left-right --count, status, config). The spawn runs inside the shared envelope
     /// (timeout+kill, capture cap, sanitized config environment,
     /// scoped wait token); over-cap output and unexpected status fail
     /// rather than returning partial data.
@@ -1902,6 +1938,19 @@ fn oid_from_ascii_hex(algorithm: &str, hex: &[u8]) -> Option<Oid> {
     std::str::from_utf8(hex)
         .ok()
         .map(|hex| oid_from_hex(algorithm, hex))
+}
+
+/// Parse `rev-list --left-right --count` output: exactly two
+/// whitespace-separated decimal counts and nothing else.
+fn parse_rev_list_count(out: &[u8]) -> Option<(u64, u64)> {
+    let text = std::str::from_utf8(out).ok()?;
+    let mut parts = text.split_whitespace();
+    let ahead = parts.next()?.parse::<u64>().ok()?;
+    let behind = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((ahead, behind))
 }
 
 /// Build an [`Oid`] from hex, tolerating either hash length.

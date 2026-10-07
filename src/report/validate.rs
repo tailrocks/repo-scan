@@ -35,11 +35,16 @@ pub fn validate_report(report: &Report) -> crate::Result<()> {
 }
 
 fn check_envelope(report: &Report, problems: &mut Vec<String>) {
-    if report.schema_version != crate::report::model::SCHEMA_VERSION {
+    // Report 1.4.0 is additive over 1.3.0 (comparison fields default
+    // to `pending`/null), so both versions validate.
+    if report.schema_version != crate::report::model::SCHEMA_VERSION
+        && report.schema_version != crate::report::model::PREVIOUS_SCHEMA_VERSION
+    {
         problems.push(format!(
-            "schema_version is {:?}, want {:?}",
+            "schema_version is {:?}, want {:?} or {:?}",
             report.schema_version,
-            crate::report::model::SCHEMA_VERSION
+            crate::report::model::SCHEMA_VERSION,
+            crate::report::model::PREVIOUS_SCHEMA_VERSION
         ));
     }
     if report.report_id.is_empty() {
@@ -253,6 +258,44 @@ fn check_envelope(report: &Report, problems: &mut Vec<String>) {
             &branch.freshness_at,
             problems,
         );
+        // Report 1.4.0: branch comparison (pre-1.4 snapshots
+        // deserialize missing fields as `pending`/null, which
+        // validates). Counts are Some only for the four counted
+        // states, with the exact zero/nonzero shape each state
+        // derives from; every other state carries null counts —
+        // unknown is never zero.
+        check_enum(
+            &format!("branch {} comparison", branch.id),
+            &branch.comparison,
+            &[
+                "equal",
+                "ahead",
+                "behind",
+                "diverged",
+                "no_upstream",
+                "upstream_missing",
+                "pending",
+                "incomplete_history",
+                "error",
+            ],
+            problems,
+        );
+        let counts_ok = match branch.comparison.as_str() {
+            "equal" => branch.ahead == Some(0) && branch.behind == Some(0),
+            "ahead" => branch.ahead.is_some_and(|n| n > 0) && branch.behind == Some(0),
+            "behind" => branch.ahead == Some(0) && branch.behind.is_some_and(|n| n > 0),
+            "diverged" => {
+                branch.ahead.is_some_and(|n| n > 0) && branch.behind.is_some_and(|n| n > 0)
+            }
+            _ => branch.ahead.is_none() && branch.behind.is_none(),
+        };
+        if !counts_ok {
+            problems.push(format!(
+                "branch {} comparison {:?} carries ahead={:?} behind={:?}: \
+                 counted states need exact counts, other states need nulls",
+                branch.id, branch.comparison, branch.ahead, branch.behind
+            ));
+        }
         if let Some(oid) = &branch.oid {
             if let Some(reason) = object_id_error(oid) {
                 problems.push(format!("branch {} oid: {reason}", branch.id));

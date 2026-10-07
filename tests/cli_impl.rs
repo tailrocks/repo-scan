@@ -457,7 +457,7 @@ fn binary_scan_resume_query_lifecycle() {
     assert!(report_path.exists());
     let report: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&report_path).expect("read")).expect("json");
-    assert_eq!(report["schema_version"].as_str(), Some("1.3.0"));
+    assert_eq!(report["schema_version"].as_str(), Some("1.4.0"));
     assert_eq!(report["tool"]["name"].as_str(), Some("repo-scan"));
     assert_eq!(report["scan"]["scope"].as_str(), Some("roots"));
     assert_eq!(report["scan"]["state"].as_str(), Some("complete"));

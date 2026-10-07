@@ -2663,10 +2663,19 @@ pub struct RefRow {
     pub freshness: Option<String>,
     /// v3: when the freshness label was assigned.
     pub freshness_at_ms: Option<i64>,
+    /// v6: branch comparison state (D7 vocabulary); `None` = legacy
+    /// pre-v6 row, a ref kind that is never compared, or a catalog
+    /// whose v6 columns are absent — all read as `pending`.
+    pub comparison_state: Option<String>,
+    /// v6: ahead count; `None` = unknown (never zero-by-default).
+    pub ahead: Option<i64>,
+    /// v6: behind count; `None` = unknown (never zero-by-default).
+    pub behind: Option<i64>,
 }
 
 impl RefRow {
-    fn from_row(row: &turso::Row) -> crate::Result<Self> {
+    /// v5 column shape (indices 0–12); comparison fields read `None`.
+    fn from_row_v5(row: &turso::Row) -> crate::Result<Self> {
         Ok(Self {
             id: req_text(row, 0)?,
             instance_id: req_text(row, 1)?,
@@ -2681,8 +2690,58 @@ impl RefRow {
             observed_at_ms: req_i64(row, 10)?,
             freshness: opt_text(row, 11)?,
             freshness_at_ms: opt_i64(row, 12)?,
+            comparison_state: None,
+            ahead: None,
+            behind: None,
         })
     }
+
+    /// v6 column shape (indices 0–15): v5 columns plus
+    /// `comparison_state`, `ahead`, `behind`.
+    fn from_row_v6(row: &turso::Row) -> crate::Result<Self> {
+        Ok(Self {
+            id: req_text(row, 0)?,
+            instance_id: req_text(row, 1)?,
+            checkout_scope_id: opt_text(row, 2)?,
+            kind: req_text(row, 3)?,
+            name: req_blob(row, 4)?,
+            oid: opt_blob(row, 5)?,
+            algo: opt_text(row, 6)?,
+            symbolic_target: opt_blob(row, 7)?,
+            upstream: opt_blob(row, 8)?,
+            state: req_text(row, 9)?,
+            observed_at_ms: req_i64(row, 10)?,
+            freshness: opt_text(row, 11)?,
+            freshness_at_ms: opt_i64(row, 12)?,
+            comparison_state: opt_text(row, 13)?,
+            ahead: opt_i64(row, 14)?,
+            behind: opt_i64(row, 15)?,
+        })
+    }
+}
+
+/// True when the `refs` table physically carries the v6 comparison
+/// columns (`comparison_state`, `ahead`, `behind`). Gates every
+/// comparison read/write until the coordinator wires migration v6:
+/// v5 catalogs take the legacy path (reads `pending`/null, writes
+/// skipped) instead of failing on missing columns. Plain
+/// `sqlite_master` SELECT — no exotic syntax.
+pub async fn refs_has_comparison(conn: &turso::Connection) -> crate::Result<bool> {
+    let mut rows = conn
+        .query(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'refs'",
+            (),
+        )
+        .await
+        .map_err(store_err)?;
+    let Some(row) = rows.next().await.map_err(store_err)? else {
+        return Ok(false);
+    };
+    let sql = match row.get_value(0).map_err(store_err)? {
+        turso::Value::Text(sql) => sql,
+        _ => return Ok(false),
+    };
+    Ok(sql.contains("comparison_state") && sql.contains("ahead") && sql.contains("behind"))
 }
 
 /// One row of the v3 `remote_refreshes` table: the last `--fetch`
@@ -3292,6 +3351,12 @@ impl GroupMemberRow {
 /// test covers the buffered statement text too.
 const UPDATE_REF_OID_SQL: &str = "UPDATE refs SET oid = ?2, observed_at_ms = ?3 WHERE id = ?1";
 
+/// Label one ref's branch comparison (v6 analysis phase): single
+/// source for [`TursoStore::update_ref_comparison`] and
+/// [`TursoStore::buffer_update_ref_comparison`].
+const UPDATE_REF_COMPARISON_SQL: &str =
+    "UPDATE refs SET comparison_state = ?2, ahead = ?3, behind = ?4 WHERE id = ?1";
+
 impl TursoStore {
     /// Idempotent directory upsert keyed by physical identity
     /// (`volume_id`, `object_id`, `incarnation`). Returns the row id.
@@ -3674,24 +3739,80 @@ impl TursoStore {
         Ok(())
     }
 
-    /// List refs for one instance, ordered by id.
+    /// List refs for one instance, ordered by id. Reads the v6
+    /// comparison columns when physically present; on v5 catalogs
+    /// the comparison fields read `None` (`pending`/null).
     pub async fn list_refs(&self, instance_id: &str) -> crate::Result<Vec<RefRow>> {
+        let v6 = self.supports_ref_comparison().await?;
+        let sql = if v6 {
+            "SELECT id, instance_id, checkout_scope_id, kind, name, oid, algo, \
+                symbolic_target, upstream, state, observed_at_ms, freshness, \
+                freshness_at_ms, comparison_state, ahead, behind FROM refs \
+                WHERE instance_id = ?1 ORDER BY id ASC"
+        } else {
+            "SELECT id, instance_id, checkout_scope_id, kind, name, oid, algo, \
+                symbolic_target, upstream, state, observed_at_ms, freshness, \
+                freshness_at_ms FROM refs \
+                WHERE instance_id = ?1 ORDER BY id ASC"
+        };
         let mut rows = self
             .conn
-            .query(
-                "SELECT id, instance_id, checkout_scope_id, kind, name, oid, algo, \
-                    symbolic_target, upstream, state, observed_at_ms, freshness, \
-                    freshness_at_ms FROM refs \
-                    WHERE instance_id = ?1 ORDER BY id ASC",
-                vec![v_text(instance_id)],
-            )
+            .query(sql, vec![v_text(instance_id)])
             .await
             .map_err(store_err)?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await.map_err(store_err)? {
-            out.push(RefRow::from_row(&row)?);
+            if v6 {
+                out.push(RefRow::from_row_v6(&row)?);
+            } else {
+                out.push(RefRow::from_row_v5(&row)?);
+            }
         }
         Ok(out)
+    }
+
+    /// True when this catalog's `refs` table carries the v6
+    /// comparison columns. Gates comparison writes until the
+    /// coordinator wires migration v6.
+    pub async fn supports_ref_comparison(&self) -> crate::Result<bool> {
+        refs_has_comparison(&self.conn).await
+    }
+
+    /// Label one ref's branch comparison (v6): updates
+    /// `comparison_state` + `ahead`/`behind` only, leaving
+    /// attribution, oid, upstream, state, and freshness untouched.
+    /// Counts past `i64::MAX` fail loudly (caller defect), like
+    /// every other catalog `u64` write. Returns true when a row was
+    /// updated; on a pre-v6 catalog returns false WITHOUT executing
+    /// (the columns do not exist yet) — callers treat false as
+    /// "comparison not persisted", never as an error.
+    pub async fn update_ref_comparison(
+        &self,
+        ref_id: &str,
+        state: &str,
+        ahead: Option<u64>,
+        behind: Option<u64>,
+    ) -> crate::Result<bool> {
+        self.forbid_write("update_ref_comparison")?;
+        if !self.supports_ref_comparison().await? {
+            return Ok(false);
+        }
+        let ahead = ahead.map(|v| u64_to_i64(v, "ref ahead")).transpose()?;
+        let behind = behind.map(|v| u64_to_i64(v, "ref behind")).transpose()?;
+        let changed = self
+            .conn
+            .execute(
+                UPDATE_REF_COMPARISON_SQL,
+                vec![
+                    v_text(ref_id),
+                    v_text(state),
+                    v_opt_int(ahead),
+                    v_opt_int(behind),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(changed > 0)
     }
 
     /// Re-observe one persisted ref's object id after a `--fetch`
@@ -5255,6 +5376,35 @@ impl TursoStore {
         batch.push(
             "UPDATE refs SET freshness = ?2, freshness_at_ms = ?3 WHERE id = ?1",
             vec![v_text(ref_id), v_text(freshness), v_int(at_ms)],
+        )
+    }
+
+    /// Buffer a ref comparison label (v6); see
+    /// [`TursoStore::buffer_enqueue_task`] for the flush contract.
+    /// Same `UPDATE` semantics as
+    /// [`TursoStore::update_ref_comparison`] (shared
+    /// [`UPDATE_REF_COMPARISON_SQL`]). Returns
+    /// `WriterBatch::should_flush`. The caller MUST have verified
+    /// [`TursoStore::supports_ref_comparison`] first: on a pre-v6
+    /// catalog this statement would fail at flush, so pre-v6
+    /// callers skip buffering entirely.
+    pub fn buffer_update_ref_comparison(
+        batch: &mut WriterBatch,
+        ref_id: &str,
+        state: &str,
+        ahead: Option<u64>,
+        behind: Option<u64>,
+    ) -> bool {
+        let ahead = ahead.map(|v| u64_to_i64_buf(v, "ref ahead"));
+        let behind = behind.map(|v| u64_to_i64_buf(v, "ref behind"));
+        batch.push(
+            UPDATE_REF_COMPARISON_SQL,
+            vec![
+                v_text(ref_id),
+                v_text(state),
+                v_opt_int(ahead),
+                v_opt_int(behind),
+            ],
         )
     }
 

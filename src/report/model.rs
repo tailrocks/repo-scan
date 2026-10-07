@@ -8,8 +8,13 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Report schema version. Must equal `schemas/report-v1.3.schema.json`.
-pub const SCHEMA_VERSION: &str = "1.3.0";
+/// Report schema version. Must equal `schemas/report-v1.4.schema.json`.
+pub const SCHEMA_VERSION: &str = "1.4.0";
+
+/// Previous report schema version, still accepted by
+/// [`crate::report::validate`] (additive 1.3.0 → 1.4.0: comparison
+/// fields default to `pending`/null).
+pub const PREVIOUS_SCHEMA_VERSION: &str = "1.3.0";
 
 /// Tool name recorded in every envelope.
 pub const TOOL_NAME: &str = "repo-scan";
@@ -265,6 +270,28 @@ pub struct Branch {
     /// for `unknown`/legacy rows.
     #[serde(default)]
     pub freshness_at: Option<String>,
+    /// Branch-vs-upstream comparison state (report 1.4.0, Step 10):
+    /// `equal`, `ahead`, `behind`, `diverged`, `no_upstream`,
+    /// `upstream_missing`, `pending`, `incomplete_history`, or
+    /// `error`. Missing in pre-1.4 snapshots, which deserialize as
+    /// `pending`.
+    #[serde(default = "default_branch_comparison")]
+    pub comparison: String,
+    /// Commits the branch has that the upstream lacks (report 1.4.0);
+    /// `Some` only for the four counted states, `None` otherwise and
+    /// in pre-1.4 snapshots. Unknown is never zero.
+    #[serde(default)]
+    pub ahead: Option<u64>,
+    /// Commits the upstream has that the branch lacks (report 1.4.0);
+    /// `Some` only for the four counted states, `None` otherwise and
+    /// in pre-1.4 snapshots. Unknown is never zero.
+    #[serde(default)]
+    pub behind: Option<u64>,
+}
+
+/// Default branch comparison for pre-1.4 snapshots.
+fn default_branch_comparison() -> String {
+    String::from("pending")
 }
 
 /// Default branch freshness for pre-1.2 snapshots.

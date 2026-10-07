@@ -224,7 +224,7 @@ fn cli01_command_table_end_to_end() {
     let report_path = env.cwd_a.join("rep.json");
     assert!(report_path.exists(), "report published");
     let report = read_report(&report_path);
-    assert_eq!(report["schema_version"].as_str(), Some("1.3.0"));
+    assert_eq!(report["schema_version"].as_str(), Some("1.4.0"));
     assert_eq!(report["tool"]["name"].as_str(), Some("repo-scan"));
     assert_eq!(report["scan"]["id"].as_str(), Some(scan_id.as_str()));
     assert_eq!(report["scan"]["scope"].as_str(), Some("roots"));
@@ -701,7 +701,7 @@ fn step6_multi_target_union_single_pass() {
     );
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
     let report = read_report(&env.cwd_a.join("rep.json"));
-    assert_eq!(report["schema_version"], "1.3.0");
+    assert_eq!(report["schema_version"], "1.4.0");
     // Full target set in request order with per-target match counts.
     let targets = report["scan"]["targets"].as_array().expect("targets array");
     assert_eq!(targets.len(), 2);

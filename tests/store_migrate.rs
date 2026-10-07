@@ -28,7 +28,7 @@ async fn build_v1_catalog(db: &std::path::Path) {
         .connect()
         .expect("turso connect");
     let chain = repo_scan::store::migrations();
-    assert!(chain.len() >= 5, "v5 chain wired");
+    assert!(chain.len() >= 6, "v6 chain wired");
     assert_eq!(chain[0].version, 1);
     conn.execute_batch(chain[0].sql).await.expect("v1 sql");
     conn.execute(
@@ -68,14 +68,14 @@ async fn build_v1_catalog(db: &std::path::Path) {
 }
 
 #[test]
-fn fresh_open_is_v5_with_working_tables() {
+fn fresh_open_is_v6_with_working_tables() {
     let rt = runtime();
     rt.block_on(async {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("catalog.db");
         let store = TursoStore::open(&db).await.expect("open");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 5);
-        assert_eq!(store.schema_version().expect("version"), 5);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 6);
+        assert_eq!(store.schema_version().expect("version"), 6);
 
         // v2 request columns persist through the extended insert.
         let now = now_ms();
@@ -137,9 +137,9 @@ fn v1_catalog_upgrades_preserving_v1_rows() {
         build_v1_catalog(&db).await;
 
         let store = TursoStore::open(&db).await.expect("open upgrades");
-        assert_eq!(store.schema_version().expect("version"), 5);
+        assert_eq!(store.schema_version().expect("version"), 6);
 
-        // v1 rows survive byte-identical; v2..v5 columns read NULL (legacy).
+        // v1 rows survive byte-identical; v2..v6 columns read NULL (legacy).
         let scan = store.get_scan("scan-v1").await.expect("get").expect("row");
         assert_eq!(scan.url_raw, b"https://github.com/o/r");
         assert_eq!(scan.state, "complete");
@@ -178,9 +178,9 @@ fn v1_catalog_upgrades_preserving_v1_rows() {
             .expect("append"));
         store.close().await.expect("close");
 
-        // Reopen is idempotent: still v5, rows intact.
+        // Reopen is idempotent: still v6, rows intact.
         let store = TursoStore::open(&db).await.expect("reopen");
-        assert_eq!(store.schema_version().expect("version"), 5);
+        assert_eq!(store.schema_version().expect("version"), 6);
         assert!(store.get_scan("scan-v1").await.expect("get").is_some());
         assert_eq!(store.last_event_seq("scan-v1").await.expect("seq"), Some(1));
         store.close().await.expect("close");

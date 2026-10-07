@@ -260,6 +260,19 @@ fn opt_blob(row: &turso::Row, idx: usize) -> crate::Result<Option<Vec<u8>>> {
     }
 }
 
+/// Nullable count column (`refs.ahead`/`refs.behind`, report 1.4.0):
+/// NULL reads `None`; a negative stored value is catalog corruption
+/// and fails loudly instead of wrapping.
+fn opt_count(row: &turso::Row, idx: usize, what: &str) -> crate::Result<Option<u64>> {
+    match opt_i64(row, idx)? {
+        None => Ok(None),
+        Some(value) if value >= 0 => Ok(Some(value as u64)),
+        Some(value) => Err(Error::Store(format!(
+            "report: refs {what} {value} is negative: catalog corruption"
+        ))),
+    }
+}
+
 /// Maximum raw bytes accepted for one stored JSON string array
 /// (RSP-010): bounds the input before any parse work begins.
 const MAX_STRING_ARRAY_RAW_BYTES: usize = 256 * 1024;
@@ -1390,16 +1403,22 @@ async fn stream_with_pre_pass<W: Write>(
     // Branches (refs scoped to emitted repositories and checkouts).
     stream.begin_array_field("branches")?;
     {
-        let mut rows = reader
-            .query(
-                "SELECT id, instance_id, checkout_scope_id, kind, name, oid, algo, \
-                    symbolic_target, upstream, state, observed_at_ms, freshness, \
-                    freshness_at_ms \
-                    FROM refs ORDER BY id ASC",
-                (),
-            )
-            .await
-            .map_err(store_err)?;
+        // Report 1.4.0: the v6 comparison columns ride the SELECT
+        // when physically present; pre-v6 catalogs emit
+        // `pending`/null (same legacy read as pre-1.4 snapshots).
+        let v6 = crate::store::catalog::refs_has_comparison(reader).await?;
+        let sql = if v6 {
+            "SELECT id, instance_id, checkout_scope_id, kind, name, oid, algo, \
+                symbolic_target, upstream, state, observed_at_ms, freshness, \
+                freshness_at_ms, comparison_state, ahead, behind \
+                FROM refs ORDER BY id ASC"
+        } else {
+            "SELECT id, instance_id, checkout_scope_id, kind, name, oid, algo, \
+                symbolic_target, upstream, state, observed_at_ms, freshness, \
+                freshness_at_ms \
+                FROM refs ORDER BY id ASC"
+        };
+        let mut rows = reader.query(sql, ()).await.map_err(store_err)?;
         while let Some(row) = rows.next().await.map_err(store_err)? {
             let instance_id = req_text(&row, 1)?;
             if !pre.included_repos.contains(&instance_id) {
@@ -1407,6 +1426,15 @@ async fn stream_with_pre_pass<W: Write>(
                 continue;
             }
             let scope = opt_text(&row, 2)?.filter(|id| pre.checkout_repos.contains_key(id));
+            let (comparison, ahead, behind) = if v6 {
+                (
+                    opt_text(&row, 13)?.unwrap_or_else(|| String::from("pending")),
+                    opt_count(&row, 14, "ahead")?,
+                    opt_count(&row, 15, "behind")?,
+                )
+            } else {
+                (String::from("pending"), None, None)
+            };
             stream.array_item(&Branch {
                 id: req_text(&row, 0)?,
                 repository_id: instance_id,
@@ -1422,6 +1450,9 @@ async fn stream_with_pre_pass<W: Write>(
                 // Report 1.2.0: NULL (legacy/unlabeled) reads `unknown`.
                 freshness: opt_text(&row, 11)?.unwrap_or_else(|| String::from("unknown")),
                 freshness_at: opt_i64(&row, 12)?.map(ms_to_rfc3339),
+                comparison,
+                ahead,
+                behind,
             })?;
             stats.branches += 1;
         }

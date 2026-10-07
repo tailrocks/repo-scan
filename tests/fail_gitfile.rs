@@ -110,7 +110,7 @@ fn runtime() -> tokio::runtime::Runtime {
 fn schema_validator() -> jsonschema::Validator {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/schemas/report-v1.3.schema.json"
+        "/schemas/report-v1.4.schema.json"
     );
     let bytes = std::fs::read(path).expect("read shipped schema");
     let schema: Value = serde_json::from_slice(&bytes).expect("schema parses");

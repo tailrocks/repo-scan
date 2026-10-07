@@ -38,6 +38,11 @@ freshness stay separate properties.
 - Report `1.2.0` → `1.3.0` (additive, Step 10: status `conflicts` /
   `working_state` vocabulary; no field removed/renamed; pre-1.3
   snapshots deserialize with `None` / `unknown`).
+- Report `1.3.0` → `1.4.0` (additive, Step 10: branch `comparison` /
+  `ahead` / `behind`; no field removed/renamed; pre-1.4 snapshots
+  deserialize as `pending` / null; validator accepts `1.3.0` + `1.4.0`).
+- Catalog migration v6: `refs.comparison_state` / `ahead` / `behind`
+  (Step 10); legacy rows read `NULL` (`pending` / null counts).
 - NEW scan-event stream schema `1.0.0` (JSONL).
 - Catalog migration v2: `github_groups`, `scan_events` journal,
   `scan_requests` multi-target columns, full scope key (D5). v1 data migrates.
@@ -144,6 +149,29 @@ diverged|no_upstream|upstream_missing|pending|incomplete_history|error`
 (counts null when unknown; no-upstream ≠ synced; never default-compare to
 main). Working states: `clean|dirty|conflicted|pending|partial|unstable|
 unknown|error|not_applicable` (never `clean` for metadata-only/failed).
+
+Wave2a deltas (Step 10 branch comparison, branch `work/fast-complete-scan`):
+
+- Backend: equal-OID fast path (0/0, no walk) → gix `rev_walk`
+  primary (isolated open) → installed-git `rev-list --left-right
+  --count` fallback ONLY when gix cannot open the store, a needed
+  object is missing from a non-shallow store, or the traversal
+  errors. Result cache keyed `(store-id, oid-a, oid-b, algo)`,
+  ordered tips, bounded 1024 entries (FIFO); only successful count
+  pairs cached.
+- Shallow: a walk yielding a shallow-boundary commit is
+  `incomplete_history` (null counts); walks staying above the cut
+  report exact counts. Grafted stores (`info/grafts` live entries)
+  are `incomplete_history` outright (gix 0.88 honors no grafts).
+  Missing objects: `error` in full stores, `incomplete_history` in
+  shallow stores.
+- Scope: local (`refs/heads/`) branches only; unborn/dangling
+  branches and oidless upstreams are `error`, never `equal`.
+  `upstream_missing` is defensive-only under D10's
+  existence-checked resolution. Non-local ref kinds persist no
+  comparison and read `pending` (comparison never runs for them).
+- `--fetch` does NOT recompute comparisons: post-fetch labels may
+  read stale until the next analysis pass.
 Default probes offline + read-only (no helper exec, fetch, hooks, fsmonitor,
 index writes); porcelain-v2 unmerged records parsed byte-safe (NUL-delimited).
 

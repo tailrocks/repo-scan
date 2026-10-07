@@ -694,3 +694,83 @@ pub fn assert_is_repo(path: &Path) {
         path.display()
     );
 }
+
+/// Local `main` vs `origin/main` with an exact ahead/behind shape
+/// (Step 10 comparison tests): `behind` commits land on
+/// `refs/remotes/origin/main` past the base, `ahead` commits land on
+/// `main` past the base, and `branch.main` tracks `origin/main`
+/// through the default fetch refspec. Returns the repo root.
+/// `git rev-list --left-right --count main...origin/main` prints
+/// `"{ahead}\t{behind}"`.
+pub fn comparison_pair(parent: &Path, name: &str, ahead: u32, behind: u32) -> PathBuf {
+    let dir = normal_clone(parent, name);
+    let base = git_str(&dir, &["rev-parse", "HEAD"]);
+    if behind > 0 {
+        git(&dir, &["checkout", "-q", "-b", "tmp-upstream"]);
+        for i in 0..behind {
+            commit_file(
+                &dir,
+                &format!("up{i}.txt"),
+                "upstream\n",
+                &format!("upstream {i}"),
+            );
+        }
+        let tip = git_str(&dir, &["rev-parse", "HEAD"]);
+        git(&dir, &["checkout", "-q", "main"]);
+        git(&dir, &["branch", "-q", "-D", "tmp-upstream"]);
+        git(&dir, &["update-ref", "refs/remotes/origin/main", &tip]);
+    } else {
+        git(&dir, &["update-ref", "refs/remotes/origin/main", &base]);
+    }
+    for i in 0..ahead {
+        commit_file(
+            &dir,
+            &format!("local{i}.txt"),
+            "local\n",
+            &format!("local {i}"),
+        );
+    }
+    git(&dir, &["config", "branch.main.remote", "origin"]);
+    git(&dir, &["config", "branch.main.merge", "refs/heads/main"]);
+    dir
+}
+
+/// Shallow clone (`--depth`) of a seed with `1 + extra_commits`
+/// linear commits on `main`. The seed is removed after cloning, so
+/// the returned clone is self-contained. Returns the clone root.
+pub fn shallow_clone(parent: &Path, name: &str, extra_commits: u32, depth: u32) -> PathBuf {
+    let seed = normal_clone(parent, &format!(".seed-{name}"));
+    for i in 0..extra_commits {
+        commit_file(&seed, &format!("s{i}.txt"), "seed\n", &format!("seed {i}"));
+    }
+    private_dir_0700(parent).unwrap();
+    // `file://` (not a plain path): plain-path clones ignore
+    // `--depth` and copy everything; the hermetic env already sets
+    // `protocol.file.allow=always` for local file transports.
+    let seed_arg = format!("file://{}", seed.to_string_lossy());
+    let depth_arg = depth.to_string();
+    git(
+        parent,
+        &["clone", "-q", "--depth", &depth_arg, &seed_arg, name],
+    );
+    fs::remove_dir_all(&seed).unwrap();
+    parent.join(name)
+}
+
+/// Repo with `n` linear commits on `main` (`n >= 1`). Returns the
+/// repo root plus tip OIDs oldest-first (index 0 is the initial
+/// commit). Missing-object tests delete one OID's object file.
+pub fn commit_chain(parent: &Path, name: &str, n: u32) -> (PathBuf, Vec<String>) {
+    assert!(n >= 1, "commit_chain needs n >= 1");
+    let dir = normal_clone(parent, name);
+    let mut oids = vec![git_str(&dir, &["rev-parse", "HEAD"])];
+    for i in 1..n {
+        oids.push(commit_file(
+            &dir,
+            &format!("c{i}.txt"),
+            "data\n",
+            &format!("commit {i}"),
+        ));
+    }
+    (dir, oids)
+}

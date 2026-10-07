@@ -9680,6 +9680,10 @@ struct AnalysisReads {
     branch_upstreams: HashMap<Vec<u8>, Vec<u8>>,
     /// `(checkout_id, HEAD)` per checkout of the store.
     heads: Vec<(String, git::HeadState)>,
+    /// Branch-vs-upstream comparisons keyed by full local ref name
+    /// (Step 10; local `refs/heads/` branches only — other kinds are
+    /// never compared and persist no comparison).
+    comparisons: HashMap<Vec<u8>, git::graph::Comparison>,
 }
 
 /// Outcome of [`collect_analysis_reads`]: full reads, or an abandon
@@ -9729,6 +9733,14 @@ fn collect_analysis_reads(
     }
     let ref_errors = ctx.inspector.reference_errors(instance);
     let branch_upstreams = load_branch_upstreams(instance, checkouts, &refs);
+    // Branch comparisons (Step 10): local branches against their
+    // resolved full upstream refs, sharing one per-store result
+    // cache (equal OID pairs reuse saved walks). Runs before the
+    // checkout loop so identity-poll abandonment drops comparisons
+    // together with the reads they derive from.
+    let graph_cache = git::graph::ComparisonCache::new();
+    let comparisons =
+        compute_branch_comparisons(ctx, instance, &refs, &branch_upstreams, &graph_cache);
     if !poll.ok_throttled() {
         return Ok(AnalysisOutcome::IdentityChanged);
     }
@@ -9766,7 +9778,84 @@ fn collect_analysis_reads(
         ref_errors,
         branch_upstreams,
         heads,
+        comparisons,
     }))
+}
+
+/// Compare every local (`refs/heads/`) branch against its resolved
+/// full upstream ref (goal Step 10, Step 15 case 9). The OID map
+/// carries direct tips plus peeled symbolic tips; a branch or
+/// upstream without an OID (unborn, dangling symbolic, broken ref)
+/// compares as `error` via [`git::graph::compare_branch`] — never
+/// `equal`. Non-local refs are skipped (they carry no upstream, so
+/// no comparison is persisted and they read `pending`). Offline and
+/// read-only: object walks only, with the installed-git `rev-list`
+/// fallback behind the existing spawn guards.
+fn compute_branch_comparisons(
+    ctx: &ReadContext,
+    instance: &git::GitInstance,
+    refs: &[git::RefObservation],
+    upstreams: &HashMap<Vec<u8>, Vec<u8>>,
+    cache: &git::graph::ComparisonCache,
+) -> HashMap<Vec<u8>, git::graph::Comparison> {
+    let mut oids: HashMap<&[u8], (&str, &str)> = HashMap::new();
+    for reference in refs {
+        match &reference.target {
+            git::RefTarget::Object(oid) => {
+                oids.insert(
+                    reference.name.as_slice(),
+                    (oid.hex.as_str(), oid.algorithm.as_str()),
+                );
+            }
+            git::RefTarget::Symbolic(_) => {
+                if let Some(peeled) = reference.peeled.as_ref() {
+                    oids.insert(
+                        reference.name.as_slice(),
+                        (peeled.hex.as_str(), peeled.algorithm.as_str()),
+                    );
+                }
+            }
+        }
+    }
+    // Cache store key: the common dir identifies this object
+    // database for the cache's lifetime (one analysis pass).
+    let store_key = instance.common_dir.to_string_lossy().into_owned();
+    let graph_ctx = git::graph::CompareContext {
+        git_dir: &instance.git_dir,
+        common_dir: &instance.common_dir,
+        store_id: &store_key,
+        work_tree: instance.work_dir.as_deref(),
+        cache: Some(cache),
+        fallback: ctx.fallback(),
+    };
+    let mut out = HashMap::new();
+    for reference in refs {
+        if !reference.name.starts_with(b"refs/heads/") {
+            continue;
+        }
+        let upstream = upstream_for_ref(upstreams, &reference.name);
+        let local = oids.get(reference.name.as_slice()).copied();
+        let (upstream_hex, upstream_algo, upstream_known) = match upstream.as_deref() {
+            None => (None, None, false),
+            Some(name) => match oids.get(name).copied() {
+                Some((hex, algo)) => (Some(hex), Some(algo), true),
+                None => (None, None, false),
+            },
+        };
+        let tips = git::graph::BranchTips {
+            local_hex: local.map(|(hex, _)| hex),
+            local_algo: local.map(|(_, algo)| algo),
+            upstream: upstream.as_deref(),
+            upstream_hex,
+            upstream_algo,
+            upstream_known,
+        };
+        out.insert(
+            reference.name.clone(),
+            git::graph::compare_branch(&graph_ctx, &tips),
+        );
+    }
+    out
 }
 
 /// Worker-side result of one analysis task (Step 8 worker seam): every
@@ -10119,6 +10208,9 @@ async fn persist_analysis(
         .map(str::to_string)
         .unwrap_or_else(|| config::encode_hex(&instance_row.common_path));
     let known: HashSet<&[u8]> = reads.refs.iter().map(|r| r.name.as_slice()).collect();
+    // v6 comparison columns, once per store: pre-v6 catalogs skip
+    // comparison writes (branches read `pending`/null there).
+    let persist_comparison = store.supports_ref_comparison().await?;
     let mut branch_values = Vec::with_capacity(reads.refs.len());
     for reference in &reads.refs {
         let name_text = String::from_utf8_lossy(&reference.name);
@@ -10161,6 +10253,20 @@ async fn persist_analysis(
         };
         let due = TursoStore::buffer_upsert_ref(&mut runner.batch, &new_ref, now_ms);
         flush_if_due(runner, store, due).await?;
+        // Step 10 comparison label (local branches only; the map
+        // holds no entry for other kinds).
+        if persist_comparison {
+            if let Some(comparison) = reads.comparisons.get(&reference.name) {
+                let due = TursoStore::buffer_update_ref_comparison(
+                    &mut runner.batch,
+                    &ref_id,
+                    comparison.state,
+                    comparison.ahead,
+                    comparison.behind,
+                );
+                flush_if_due(runner, store, due).await?;
+            }
+        }
         branch_values.push(branch_record_value(
             &ref_id,
             kind,
@@ -11865,9 +11971,10 @@ async fn fetch_one_store(
 /// (N=1 bounded worker); every spawn carries `FETCH_TIMEOUT` plus
 /// the SIGINT-aware cancel scope, and `interrupted()` is polled
 /// between stores and remotes. Comparison recompute after fetch is a
-/// no-op: branch comparison is not implemented yet (see the
-/// `load_branch_upstreams` analysis path), so freshness labels plus
-/// re-observed oids ARE the fetch output.
+/// no-op: comparisons persist from the analysis pass
+/// (`compute_branch_comparisons`) and fetch does not refresh them,
+/// so freshness labels plus re-observed oids ARE the fetch output.
+/// A post-fetch comparison may read stale until the next analysis.
 async fn run_fetch_phase(
     runner: &mut Runner,
     store: &TursoStore,
