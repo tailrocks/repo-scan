@@ -1609,67 +1609,109 @@ impl TursoStore {
             .await
     }
 
-    /// One R06 class stream: top-`limit` pending rows of one kind in
-    /// window-partition order. Served by `idx_tasks_claim` as a single
-    /// index range with `LIMIT` short-circuit (no whole-queue scan or
-    /// sort).
+    /// One R06 class stream: top-`limit` rows of one kind over the
+    /// pending + eligible-`retry_wait` union in window-partition order
+    /// (DB-M2: no whole-generation window fallback just because one
+    /// retry turned eligible). Two indexed top-`limit` SELECTs (one per
+    /// state, each a single `idx_tasks_claim` range with `LIMIT`
+    /// short-circuit) merged in Rust by the partition key
+    /// (`attempts, updated_at_ms, id`) — the merge reproduces the
+    /// window's in-class order row for row, since both inputs arrive
+    /// in that order and the union's top-`limit` needs at most
+    /// `limit` rows from either side.
     async fn claim_class_top_on(
         conn: &turso::Connection,
         generation_i64: i64,
         kind: &str,
         limit: usize,
+        now_ms: i64,
     ) -> crate::Result<Vec<FrontierTask>> {
         // Bound literal is interpolated (numeric, owner-controlled) so
         // the query needs no bound LIMIT support; kind stays a parameter.
-        let sql = format!(
-            "SELECT {TASK_COLUMNS} FROM frontier_tasks WHERE generation = ?1 \
+        // `updated_at_ms` rides along (column 13, past the
+        // `FrontierTask::from_row` shape) as the merge key.
+        let pending_sql = format!(
+            "SELECT {TASK_COLUMNS}, updated_at_ms FROM frontier_tasks WHERE generation = ?1 \
                 AND state = 'pending' AND kind = ?2 \
                 ORDER BY attempts ASC, updated_at_ms ASC, id ASC LIMIT {limit}"
         );
         let mut rows = conn
-            .query(sql.as_str(), vec![v_int(generation_i64), v_text(kind)])
+            .query(
+                pending_sql.as_str(),
+                vec![v_int(generation_i64), v_text(kind)],
+            )
             .await
             .map_err(store_err)?;
-        let mut tasks = Vec::new();
+        let mut pending: Vec<(FrontierTask, i64)> = Vec::new();
         while let Some(row) = rows.next().await.map_err(store_err)? {
-            tasks.push(FrontierTask::from_row(&row)?);
+            pending.push((FrontierTask::from_row(&row)?, req_i64(&row, 13)?));
+        }
+        // Eligible-retry arm: exactly the window query's predicate
+        // (`retry_after_ms IS NOT NULL AND retry_after_ms <= now`).
+        let retry_sql = format!(
+            "SELECT {TASK_COLUMNS}, updated_at_ms FROM frontier_tasks WHERE generation = ?1 \
+                AND state = 'retry_wait' AND kind = ?2 \
+                AND retry_after_ms IS NOT NULL AND retry_after_ms <= ?3 \
+                ORDER BY attempts ASC, updated_at_ms ASC, id ASC LIMIT {limit}"
+        );
+        let mut rows = conn
+            .query(
+                retry_sql.as_str(),
+                vec![v_int(generation_i64), v_text(kind), v_int(now_ms)],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut retry: Vec<(FrontierTask, i64)> = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            retry.push((FrontierTask::from_row(&row)?, req_i64(&row, 13)?));
+        }
+        // Sorted-merge the two partition-ordered inputs, keeping the
+        // first `limit` rows of the union.
+        let key = |task: &FrontierTask, updated: i64| (task.attempts, updated);
+        let mut tasks = Vec::new();
+        let (mut i, mut j) = (0usize, 0usize);
+        while tasks.len() < limit && (i < pending.len() || j < retry.len()) {
+            let take_pending = match (pending.get(i), retry.get(j)) {
+                (Some((p, pu)), Some((r, ru))) => {
+                    (key(p, *pu), p.id.as_str()) <= (key(r, *ru), r.id.as_str())
+                }
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            if take_pending {
+                tasks.push(pending[i].0.clone());
+                i += 1;
+            } else {
+                tasks.push(retry[j].0.clone());
+                j += 1;
+            }
         }
         Ok(tasks)
     }
 
-    /// True when the generation holds an eligible `retry_wait` row, in
-    /// which case the window query stays authoritative. One indexed
-    /// existence probe (`LIMIT 1`), never a scan-and-sort.
-    async fn retry_eligible_present_on(
+    /// One-time (per process) skew probe over the claimed
+    /// generation's rows: true when a pending/`retry_wait` row's id
+    /// prefix pulls it into an earlier R06 class than its kind (the
+    /// [`task_class_skewed`] mirror in SQL). Scoped to `generation`
+    /// (DB-m1): the verdict only gates this generation's fast claim,
+    /// and the `generation` equality resolves to the claim index
+    /// prefix instead of a whole-DB scan. The once-per-process cache
+    /// stays sound across generations: every insert path marks via
+    /// [`note_task_class`] before its row can commit, and rows
+    /// committed before this process came from the same binary,
+    /// whose enqueue sites never emit skewed pairs — so a later
+    /// generation can only gain skew through a self-marking insert.
+    /// Runs inside the claiming transaction, so it observes a
+    /// consistent snapshot.
+    async fn task_class_skew_present_on(
         conn: &turso::Connection,
         generation: u64,
-        now_ms: i64,
     ) -> crate::Result<bool> {
         let mut rows = conn
             .query(
                 "SELECT 1 FROM frontier_tasks WHERE generation = ?1 \
-                    AND state = 'retry_wait' AND retry_after_ms IS NOT NULL \
-                    AND retry_after_ms <= ?2 LIMIT 1",
-                vec![
-                    v_int(u64_to_i64(generation, "task generation")?),
-                    v_int(now_ms),
-                ],
-            )
-            .await
-            .map_err(store_err)?;
-        Ok(rows.next().await.map_err(store_err)?.is_some())
-    }
-
-    /// One-time (per process) skew probe over claim-relevant rows: true
-    /// when a pending/`retry_wait` row's id prefix pulls it into an
-    /// earlier R06 class than its kind (the [`task_class_skewed`] mirror
-    /// in SQL). Runs at most once per process — the verdict is cached in
-    /// [`TASK_CLASS_SKEW`] while every later insert marks itself — inside
-    /// the claiming transaction, so it observes a consistent snapshot.
-    async fn task_class_skew_present_on(conn: &turso::Connection) -> crate::Result<bool> {
-        let mut rows = conn
-            .query(
-                "SELECT 1 FROM frontier_tasks WHERE (state = 'pending' OR state = 'retry_wait') \
+                    AND (state = 'pending' OR state = 'retry_wait') \
                     AND ((kind = 'reconcile' AND id LIKE 'probe:%') \
                     OR (kind = 'enumerate_dir' \
                         AND (id LIKE 'probe:%' OR id LIKE 'reconcile:%')) \
@@ -1678,27 +1720,28 @@ impl TursoStore {
                     OR (kind NOT IN ('probe_git', 'reconcile', 'enumerate_dir', 'status') \
                         AND (id LIKE 'probe:%' OR id LIKE 'reconcile:%' \
                         OR id LIKE 'enum:%' OR id LIKE 'status:%'))) LIMIT 1",
-                (),
+                vec![v_int(u64_to_i64(generation, "task generation")?)],
             )
             .await
             .map_err(store_err)?;
         Ok(rows.next().await.map_err(store_err)?.is_some())
     }
 
-    /// Step 9 bounded claim selection: one indexed top-`limit` SELECT per
-    /// R06 class plus a Rust round-robin merge. Returns `None` when the
-    /// legacy window query must run instead (unfiltered claims, eligible
-    /// `retry_wait` rows, possible kind/id class skew, or a multi-kind
-    /// else-class) — identical sequence either way.
+    /// Step 9 bounded claim selection: indexed top-`limit` SELECTs per
+    /// R06 class (pending + eligible-`retry_wait` union streams,
+    /// [`TursoStore::claim_class_top_on`]) plus a Rust round-robin
+    /// merge. Returns `None` when the legacy window query must run
+    /// instead (unfiltered claims, possible kind/id class skew, or a
+    /// multi-kind else-class) — identical sequence either way.
     ///
-    /// Exactness: with no eligible `retry_wait` row and no skew, each
-    /// class stream holds that class's rows in partition order
-    /// (`attempts, updated_at_ms, id`), and the overall `LIMIT` prefix of
-    /// the `(_rn, _cls)` round-robin needs at most `limit` rows from any
-    /// one class — so interleaving per-class top-`limit` streams
-    /// reproduces the window query's sequence row for row. (`_rn` is
-    /// unique within a class, so the window's trailing `id` tiebreak
-    /// never fires.)
+    /// Exactness: with no skew, each class stream holds that class's
+    /// pending + eligible-retry rows in partition order
+    /// (`attempts, updated_at_ms, id`), and the overall `LIMIT` prefix
+    /// of the `(_rn, _cls)` round-robin needs at most `limit` rows
+    /// from any one class — so interleaving per-class top-`limit`
+    /// streams reproduces the window query's sequence row for row.
+    /// (`_rn` is unique within a class, so the window's trailing `id`
+    /// tiebreak never fires.)
     async fn claim_select_fast(
         conn: &turso::Connection,
         generation: u64,
@@ -1713,22 +1756,21 @@ impl TursoStore {
             return Ok(None);
         };
         if TASK_CLASS_SKEW.load(Ordering::Relaxed) != 1 {
-            if Self::task_class_skew_present_on(conn).await? {
+            if Self::task_class_skew_present_on(conn, generation).await? {
                 TASK_CLASS_SKEW.store(2, Ordering::Relaxed);
                 return Ok(None);
             }
             TASK_CLASS_SKEW.store(1, Ordering::Relaxed);
-        }
-        if Self::retry_eligible_present_on(conn, generation, now_ms).await? {
-            return Ok(None);
         }
         let generation_i64 = u64_to_i64(generation, "task generation")?;
         const NAMED: [&str; 4] = ["probe_git", "reconcile", "enumerate_dir", "status"];
         let mut streams: Vec<Vec<FrontierTask>> = Vec::with_capacity(5);
         for class_kind in NAMED {
             if kinds.contains(&class_kind) {
-                streams
-                    .push(Self::claim_class_top_on(conn, generation_i64, class_kind, limit).await?);
+                streams.push(
+                    Self::claim_class_top_on(conn, generation_i64, class_kind, limit, now_ms)
+                        .await?,
+                );
             } else {
                 streams.push(Vec::new());
             }
@@ -1736,7 +1778,7 @@ impl TursoStore {
         let else_kinds: Vec<&&str> = kinds.iter().filter(|kind| !NAMED.contains(*kind)).collect();
         streams.push(match else_kinds.as_slice() {
             [] => Vec::new(),
-            [only] => Self::claim_class_top_on(conn, generation_i64, only, limit).await?,
+            [only] => Self::claim_class_top_on(conn, generation_i64, only, limit, now_ms).await?,
             // Multi-kind else-class: the window query stays authoritative.
             _ => return Ok(None),
         });
@@ -1845,9 +1887,9 @@ impl TursoStore {
             Self::expire_leases_in_generation_on(conn, generation, now_ms).await?;
             // Step 9: bounded indexed selection first; the window query
             // stays authoritative whenever the fast path declines
-            // (unfiltered claims, eligible `retry_wait` rows, R06 class
-            // skew, or a multi-kind else-class) — identical sequence
-            // either way. Lease issue below is unchanged.
+            // (unfiltered claims, R06 class skew, or a multi-kind
+            // else-class) — identical sequence either way. Lease
+            // issue below is unchanged.
             let tasks = match Self::claim_select_fast(conn, generation, kinds, limit, now_ms)
                 .await?
             {
@@ -2062,6 +2104,13 @@ impl TursoStore {
     /// denied claim did no work, so it must not burn the retry budget
     /// (`fail_task` exhausts and backs off on attempts). Token/epoch
     /// mismatch releases nothing. Returns whether a lease was held.
+    ///
+    /// Deliberate per-task-transaction exception to the D5 batching
+    /// rule (DB-m3): releases fire only on the rare denial path (a
+    /// closed breaker or a full admission gate), never per completed
+    /// task — batching them would hold denied leases (and their
+    /// attempts compensation) until the next flush for no measurable
+    /// gain. Production counts each release as its own transaction.
     pub async fn release_claim(
         &self,
         task_id: &str,
@@ -2410,6 +2459,15 @@ impl TursoStore {
     /// [`TursoStore::invalidate_scope`] and the atomic event ingest
     /// [`TursoStore::ingest_event_batch`] so both paths schedule identical
     /// work. Returns the new revision.
+    ///
+    /// Spelling fan-out (DB-M1): scope keys keep observed spellings
+    /// (execution derives task paths from keys), so the same object
+    /// may hold keys under several spellings. After the literal bump,
+    /// every live-task key denoting the same object (compared through
+    /// the shared [`crate::config::canonical_scope_path`]) is bumped
+    /// from its own revision too — otherwise an invalidate issued
+    /// under one spelling silently misses live tasks scheduled under
+    /// another. One reconcile task still suffices (same object).
     async fn invalidate_scope_on(
         conn: &turso::Connection,
         scope_key: &str,
@@ -2435,6 +2493,27 @@ impl TursoStore {
         // (§11): `dir:` keys carry hex-encoded path bytes, never row ids,
         // so the directory rows are looked up by path, not parsed.
         Self::mirror_dir_invalidation(conn, scope_key, next).await?;
+        // Cross-spelling fan-out (DB-M1): live tasks under another
+        // spelling of this object requeue like directly-invalidated
+        // ones. Each key bumps from its own revision with its own
+        // mirror; failures are loud (caller's transaction rolls back).
+        for fan_key in Self::same_object_live_keys(conn, scope_key).await? {
+            let fan_next = Self::scope_rev_on(conn, &fan_key)
+                .await?
+                .checked_add(1)
+                .ok_or_else(|| Error::Store("scope revision overflow".to_string()))?;
+            let fan_next_i64 = i64::try_from(fan_next).map_err(|_| {
+                Error::Store(format!("scope revision {fan_next} exceeds i64 range"))
+            })?;
+            conn.execute(
+                "INSERT OR REPLACE INTO scope_revisions (scope_key, rev, updated_at_ms) \
+                    VALUES (?1, ?2, ?3)",
+                vec![v_text(fan_key.as_str()), v_int(fan_next_i64), v_int(now_ms)],
+            )
+            .await
+            .map_err(store_err)?;
+            Self::mirror_dir_invalidation(conn, &fan_key, fan_next).await?;
+        }
         let task_id = format!("reconcile:{scope_key}:{next}");
         let idempotency = format!("idem:{task_id}");
         // Step 9: class-skew mark (no-op for this consistent pair; kept
@@ -2457,6 +2536,55 @@ impl TursoStore {
         .await
         .map_err(store_err)?;
         Ok(next)
+    }
+
+    /// Live-task scope keys denoting the same object as `scope_key`
+    /// under a different spelling (DB-M1 fan-out set). Only `dir:` and
+    /// `git:` keys participate (other families carry no paths); only
+    /// keys with live (`pending`/`leased`/`retry_wait`) tasks are
+    /// returned — completed work needs no requeue, and future tasks
+    /// read the bumped revision at creation. Identity compares
+    /// through [`crate::config::canonical_scope_path`]; unparseable
+    /// keys and unresolvable paths never match. The input key itself
+    /// is excluded (the caller already bumped it). Runs inside the
+    /// caller's transaction.
+    async fn same_object_live_keys(
+        conn: &turso::Connection,
+        scope_key: &str,
+    ) -> crate::Result<Vec<String>> {
+        use crate::config::ScopeRef;
+        let target = match crate::config::parse_scope_key(scope_key) {
+            Some(ScopeRef::Dir(path)) | Some(ScopeRef::Git(path)) => {
+                crate::config::canonical_scope_path(&path)
+            }
+            Some(ScopeRef::Status(_)) | None => return Ok(Vec::new()),
+        };
+        let mut rows = conn
+            .query(
+                "SELECT DISTINCT scope_key FROM frontier_tasks \
+                    WHERE state IN ('pending', 'leased', 'retry_wait') \
+                    AND (scope_key LIKE 'dir:%' OR scope_key LIKE 'git:%')",
+                (),
+            )
+            .await
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            let key = req_text(&row, 0)?;
+            if key == scope_key {
+                continue;
+            }
+            let same = match crate::config::parse_scope_key(&key) {
+                Some(ScopeRef::Dir(path)) | Some(ScopeRef::Git(path)) => {
+                    crate::config::canonical_scope_path(&path) == target
+                }
+                Some(ScopeRef::Status(_)) | None => false,
+            };
+            if same {
+                out.push(key);
+            }
+        }
+        Ok(out)
     }
 
     /// Mirror a `dir:` scope invalidation into every matching
@@ -4565,6 +4693,32 @@ impl TursoStore {
         Ok(out)
     }
 
+    /// Open task-completion gaps owned by `generation` (DB-m5): open
+    /// `errors` rows whose id names a task of that generation
+    /// (`gap:<task id>` joined to `frontier_tasks`, so volume/batch
+    /// gaps — journaled inline, never post-commit — are excluded).
+    /// The runner diffs this against the scan journal on resume and
+    /// re-buffers `error` events for rows a crash left unjournaled.
+    pub async fn list_open_task_gaps(&self, generation: u64) -> crate::Result<Vec<ErrorRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT e.id, e.scope_key, e.category, e.detail, e.attempts, \
+                    e.first_seen_ms, e.last_seen_ms, e.next_retry_ms, e.open \
+                    FROM errors e JOIN frontier_tasks t ON t.id = substr(e.id, 5) \
+                    WHERE e.open = 1 AND e.id LIKE 'gap:%' AND t.generation = ?1 \
+                    ORDER BY e.id ASC",
+                vec![v_int(u64_to_i64(generation, "task generation")?)],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            out.push(ErrorRow::from_row(&row)?);
+        }
+        Ok(out)
+    }
+
     /// Append an event-journal record idempotently
     /// (dedup key: volume, history UUID, cursor). Returns true when new.
     pub async fn append_event(
@@ -5797,5 +5951,62 @@ impl crate::store::Store for TursoStore {
 
     async fn durability_proof(&self) -> crate::Result<crate::store::DurabilityProof> {
         Self::proof_on(&self.conn).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+    }
+
+    /// DB-m1: the skew probe is scoped to the claimed generation — a
+    /// skewed pair in another generation neither forces this claim's
+    /// fallback nor hides from its own generation's probe.
+    #[test]
+    fn skew_probe_ignores_other_generations() {
+        let rt = runtime();
+        rt.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db = dir.path().join("payload").join("catalog.db");
+            let store = TursoStore::open(&db).await.expect("open");
+            let now = crate::store::now_ms();
+            // Skewed pair (kind/status pulled into the probe class by
+            // its id) in generation 2 only.
+            let idem = "idem:probe:2:skew".to_string();
+            store
+                .enqueue_task(
+                    &NewTask {
+                        id: "probe:2:skew",
+                        kind: "status",
+                        generation: 2,
+                        dir_id: None,
+                        scope_key: "status:skew",
+                        expected_rev: 0,
+                        idempotency_key: &idem,
+                    },
+                    now,
+                )
+                .await
+                .expect("enqueue");
+            assert!(
+                !TursoStore::task_class_skew_present_on(store.connection(), 1)
+                    .await
+                    .expect("probe gen 1"),
+                "other-generation skew must not gate this claim"
+            );
+            assert!(
+                TursoStore::task_class_skew_present_on(store.connection(), 2)
+                    .await
+                    .expect("probe gen 2"),
+                "own-generation skew must still be found"
+            );
+            store.close().await.expect("close");
+        });
     }
 }

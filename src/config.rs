@@ -525,17 +525,49 @@ pub enum ScopeRef {
     Status(String),
 }
 
+/// Shared scope-path canonicalizer (DB-M1): absolute paths resolve
+/// through the filesystem (`std::fs::canonicalize`, so symlink
+/// spellings collapse onto the physical path); failures (missing
+/// paths, permission errors) and relative paths pass through
+/// unchanged. The generation key, execution paths, and invalidation
+/// fan-out share this one spelling rule — while scope keys
+/// themselves keep observed spellings (execution derives task paths
+/// from keys, and reports show observed paths per goal Step 7).
+pub fn canonical_scope_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    }
+}
+
 /// Scope key for directory enumeration / reconciliation of `path`.
+/// Keeps the observed spelling: execution derives task paths from
+/// keys, and cross-spelling invalidation is closed by fan-out (see
+/// `invalidate_scope_on`), not by collapsing spellings here.
 pub fn scope_key_for_dir(path: &Path) -> String {
     format!("dir:{}", encode_hex(&path_as_bytes(path)))
 }
 
-/// Scope key for a Git probe at `path`.
+/// Scope key for a Git probe at `path`. Keeps the observed spelling
+/// like [`scope_key_for_dir`].
+///
+/// Never DIRECTLY invalidated (DB-m7): Git probes and status probes
+/// are idempotent point reads — each generation enqueues its own
+/// probe tasks, and a probe executes and completes under one
+/// short-held lease. Only `dir:`/`volume:`/`mounts` scopes
+/// (traversal coverage) invalidate directly; the DB-M1 spelling
+/// fan-out may additionally bump a live probe's `git:` key when the
+/// same object invalidates under another spelling (the probe then
+/// requeues like any stale task — same gate, no special case).
 pub fn scope_key_for_git(path: &Path) -> String {
     format!("git:{}", encode_hex(&path_as_bytes(path)))
 }
 
 /// Scope key for a working-state probe of `checkout_id`.
+///
+/// Intentionally never invalidated (DB-m7): see
+/// [`scope_key_for_git`].
 pub fn scope_key_for_status(checkout_id: &str) -> String {
     format!("status:{checkout_id}")
 }
@@ -643,5 +675,43 @@ mod tests {
                 base.writer_rows,
             )
         );
+    }
+
+    /// DB-M1: the shared canonicalizer collapses symlink spellings
+    /// onto the physical path (symlink and target agree); scope keys
+    /// themselves keep observed spellings (execution derives task
+    /// paths from keys) while invalidation fan-out closes the miss.
+    /// Missing paths fall back lexically, relative paths pass through
+    /// untouched.
+    #[cfg(unix)]
+    #[test]
+    fn canonical_scope_path_collapses_symlink_spellings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).expect("mkdir");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        assert_eq!(canonical_scope_path(&link), canonical_scope_path(&real));
+        // Keys keep observed spellings (execution + reports show what
+        // the user scheduled, per goal Step 7).
+        assert_ne!(scope_key_for_dir(&link), scope_key_for_dir(&real));
+        assert_eq!(
+            parse_scope_key(&scope_key_for_dir(&link)),
+            Some(ScopeRef::Dir(link.clone())),
+            "keys round-trip the observed spelling"
+        );
+        // Missing paths fall back to the lexical spelling (never an
+        // error): a dangling link canonicalizes to itself.
+        let missing = dir.path().join("missing");
+        let missing_link = dir.path().join("missing-link");
+        std::os::unix::fs::symlink(&missing, &missing_link).expect("symlink");
+        assert_eq!(canonical_scope_path(&missing_link), missing_link);
+        assert_ne!(
+            canonical_scope_path(&missing_link),
+            canonical_scope_path(&real)
+        );
+        // Relative paths pass through (no cwd consult at key time).
+        let relative = PathBuf::from("some/relative/dir");
+        assert_eq!(canonical_scope_path(&relative), relative);
     }
 }

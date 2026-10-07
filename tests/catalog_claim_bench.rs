@@ -204,6 +204,36 @@ async fn seed_mixed(store: &TursoStore, base: i64) {
         .await
         .expect("expire");
     assert_eq!(expired, 40);
+    // Retry diversity (DB-M2): 30 eligible retries (`retry_after` in
+    // the past at drain time — they must interleave with pending rows
+    // in partition order) and 30 future retries (never eligible
+    // during the drain — claimed by neither path).
+    let retry_claimed = store
+        .claim_tasks_in_generation(1, epoch, 60, 60_000, base + 1_000)
+        .await
+        .expect("retry diversity claim");
+    assert_eq!(retry_claimed.len(), 60);
+    for (i, claimed) in retry_claimed.iter().enumerate() {
+        let retry_after_ms = if i < 30 {
+            base + 150_000
+        } else {
+            base + 300_000
+        };
+        store
+            .complete_task_report_gap(
+                &claimed.task.id,
+                claimed.token,
+                epoch,
+                &TaskOutcome::Retry {
+                    category: "seed".to_string(),
+                    detail: "seed".to_string(),
+                    retry_after_ms,
+                },
+                base + 1_001,
+            )
+            .await
+            .expect("retry complete");
+    }
 }
 
 /// Drain one store with `limit`-sized filtered claims, returning the
@@ -258,7 +288,9 @@ fn fast_claim_matches_window_sequence() {
             let seq_fast = drain_filtered(&a, limit, base + 200_000).await;
             let seq_win = drain_window(&b, limit, base + 200_000).await;
             assert_eq!(seq_fast, seq_win, "limit={limit}");
-            assert_eq!(seq_fast.len(), 300, "limit={limit}");
+            // 240 pending + 30 eligible retries; the 30 future retries
+            // stay unclaimed on both paths.
+            assert_eq!(seq_fast.len(), 270, "limit={limit}");
             a.close().await.expect("close");
             b.close().await.expect("close");
         }

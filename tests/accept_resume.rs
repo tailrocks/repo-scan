@@ -919,6 +919,107 @@ fn resume_multi_target_scan_keeps_full_target_set() {
     assert_eq!(targets[1]["raw"], URL_B);
 }
 
+/// DB-M1 follow-on: a resumed run re-discovers unresolvable
+/// candidates but must not re-emit their coverage delta — one
+/// `unresolvable_added` transition per id per scan, across the crash.
+/// (Repeat persists upsert fresh evidence; only the delta dedupes.)
+#[cfg(unix)]
+#[test]
+fn resume_rediscovery_does_not_reemit_unresolvable_delta() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct Restore<'a> {
+        path: &'a Path,
+    }
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.path, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    fixture::normal_clone(&root, "repo");
+    let noremote = fixture::normal_clone(&root, "noremote");
+    fixture::git(&noremote, &["remote", "remove", "origin"]);
+    let blocked = root.join("blocked");
+    repo_scan::privacy::private_dir_0700(&blocked).expect("mkdir");
+    repo_scan::privacy::private_write_0600(&blocked.join("secret.txt"), b"x").expect("write");
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o0)).expect("chmod 000");
+    let _restore = Restore { path: &blocked };
+    if std::fs::read_dir(&blocked).is_ok() {
+        eprintln!("resume_unresolvable_dedupe: chmod 000 ineffective; skipping");
+        return;
+    }
+
+    let report = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report.to_str().expect("utf8"),
+            "--format",
+            "human",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "permission gap is usable-but-incomplete; stderr: {}",
+        stderr_text(&out)
+    );
+    let scan_id = stdout_line(&out, "scan_id");
+    let out = run(
+        &["resume", scan_id.as_str(), "--format", "human"],
+        tmp.path(),
+        &state,
+    );
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr_text(&out));
+
+    let rt = runtime();
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("reopen");
+        let mut after = 0u64;
+        let mut added = Vec::new();
+        loop {
+            let rows = store
+                .read_scan_events(&scan_id, after, 500)
+                .await
+                .expect("read journal");
+            if rows.is_empty() {
+                break;
+            }
+            for row in &rows {
+                after = after.max(row.seq);
+                if row.event_type == "coverage_updated" {
+                    let v: serde_json::Value =
+                        serde_json::from_slice(&row.records).expect("records JSON");
+                    added.extend(
+                        v["unresolvable_added"]
+                            .as_array()
+                            .expect("array")
+                            .iter()
+                            .map(|s| s.as_str().expect("str").to_string()),
+                    );
+                }
+            }
+            if rows.len() < 500 {
+                break;
+            }
+        }
+        assert_eq!(added.len(), 1, "one transition across resume: {added:?}");
+        store.close().await.expect("close");
+    });
+}
+
 /// OUTPUTS-m4: the `--format json` failure tail mirrors the journaled
 /// `scan_failed` payload — cursor, scrubbed error, resume capability +
 /// command — instead of a thin id triple. The cursor agrees with the

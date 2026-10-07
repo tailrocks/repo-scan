@@ -838,6 +838,17 @@ struct ScanJournal {
     /// the scan row carries the live verdict while a stale journal
     /// terminal may stand, same as a retried publication).
     terminal_seq: Option<u64>,
+    /// Gap ids already carrying an `error` event in this journal
+    /// (DB-m5: resume-time DB-vs-journal reconciliation re-buffers
+    /// only rows missing here — never a duplicate).
+    error_ids: HashSet<String>,
+    /// Instance ids already reported via `coverage_updated`
+    /// `unresolvable_added` in this journal. A repeat persist of the
+    /// same store (reconcile re-probe, resume re-discovery) upserts
+    /// fresh evidence but must not re-emit the candidate delta —
+    /// `repository_found` dedupes the same way, and the coverage
+    /// stream promises one transition per id.
+    emitted_unresolvable: HashSet<String>,
     /// Highest seq known pruned by retention (heuristic for the
     /// over-bound check; the `COUNT(*)` confirm is authoritative).
     pruned_through: u64,
@@ -852,6 +863,8 @@ impl ScanJournal {
         let mut emitted_stores = HashSet::new();
         let mut emitted_checkouts = HashSet::new();
         let mut emitted_branch_stores = HashSet::new();
+        let mut error_ids = HashSet::new();
+        let mut emitted_unresolvable = HashSet::new();
         let mut progress_seq = None;
         let mut ready_seq = None;
         let mut terminal_seq = None;
@@ -878,6 +891,7 @@ impl ScanJournal {
                     "repository_found" => Some((&mut emitted_stores, "store_id")),
                     "location_found" => Some((&mut emitted_checkouts, "checkout_id")),
                     "branch_batch" => Some((&mut emitted_branch_stores, "store_id")),
+                    "error" => Some((&mut error_ids, "id")),
                     _ => None,
                 };
                 if let Some((set, key)) = id_key {
@@ -890,6 +904,20 @@ impl ScanJournal {
                         })?;
                     if let Some(id) = v.get(key).and_then(|v| v.as_str()) {
                         set.insert(id.to_string());
+                    }
+                }
+                if row.event_type == "coverage_updated" {
+                    let v: serde_json::Value =
+                        serde_json::from_slice(&row.records).map_err(|e| {
+                            repo_scan::Error::Report(format!(
+                                "scan_events row seq {} carries corrupt records: {e}",
+                                row.seq,
+                            ))
+                        })?;
+                    if let Some(added) = v.get("unresolvable_added").and_then(|v| v.as_array()) {
+                        for id in added.iter().filter_map(|v| v.as_str()) {
+                            emitted_unresolvable.insert(id.to_string());
+                        }
                     }
                 }
             }
@@ -907,6 +935,8 @@ impl ScanJournal {
             emitted_stores,
             emitted_checkouts,
             emitted_branch_stores,
+            error_ids,
+            emitted_unresolvable,
             progress_seq,
             ready_seq,
             terminal_seq,
@@ -1915,6 +1945,14 @@ async fn run_scan_inner(
     // Coverage-delta baseline (also on resume): gaps already open stay
     // silent until they close; closes of pre-existing rows still report.
     runner.open_gaps = store.list_open_error_ids().await?.into_iter().collect();
+    // Crash-loss catch-up (DB-m5, resume only): completion gap events
+    // journal after their completion commits, so a kill between the
+    // two flushes leaves durable gaps with no `error` event —
+    // re-buffer them now (the next flush commits them).
+    if resumed.is_some() {
+        let caught_up = reconcile_missing_gap_events(&mut runner, &store, generation).await?;
+        flush_if_due(&mut runner, &store, caught_up > 0).await?;
+    }
     if resumed.is_none() {
         let started = serde_json::json!({
             "scan_id": &scan_id,
@@ -2979,6 +3017,16 @@ fn plan_roots(
 /// carry unknown root sets and never satisfy a keyed request; the lineage
 /// `prior` stays the newest same-policy row. Fresh generations record the
 /// requesting key before any seeding.
+///
+/// Provisional findings (DB-m9: informal definition, no observable
+/// flag): findings served from a superseded generation stay readable
+/// (cached queries, retained snapshots) until the fresh generation
+/// replaces them — "provisional" means "not yet re-verified under the
+/// current generation", not "unreliable". No report/snapshot field
+/// marks them; the stderr notice ("prior findings stay provisional
+/// until replaced") plus the generation ids on old and new reports
+/// are the whole signal. Pinned by the force-rescan notice assertion
+/// in `tests/accept_cli.rs`.
 async fn pick_generation(
     store: &TursoStore,
     policy: &str,
@@ -3394,15 +3442,11 @@ async fn enqueue_analysis_refresh(
 /// Step 7), and under the pooled drain either spelling can win —
 /// while the fence never follows links. Scheduling or executing at
 /// the canonical path keeps the scope pinnable and deterministic
-/// regardless of persist order. Mirrors the instance-id derivation
-/// in [`persist_probe`]: absolute paths canonicalize with an
-/// observed-spelling fallback, relative paths pass through.
+/// regardless of persist order. One shared spelling rule
+/// ([`config::canonical_scope_path`], DB-M1) with the scope-key
+/// constructors and the generation key.
 fn canonical_exec_path(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-    } else {
-        path.to_path_buf()
-    }
+    config::canonical_scope_path(path)
 }
 
 async fn enqueue_analysis_task(
@@ -3937,6 +3981,15 @@ async fn apply_event_batch(
     applied.batches += 1;
     let now = store::now_ms();
     if outcome.history_invalid {
+        // Mid-run history loss stays in this generation (DB-m6: safe
+        // anyway): the volume scope invalidation above schedules a
+        // reconcile that the current traversal still covers, so no
+        // finding is lost — the traversal is the source of truth,
+        // events only schedule work. The persisted journal
+        // invalidation additionally forces the NEXT run onto a fresh
+        // generation (see the run-start `history_invalid` force), so
+        // a volume that lost history never silently reuses a
+        // generation whose event coverage had holes.
         session.history_invalid = true;
         let scope = events::volume_scope_key(&outcome.volume_key);
         store.invalidate_scope(&scope, generation, now).await?;
@@ -5145,9 +5198,15 @@ async fn run_until_boundary(
             while !set.is_empty() {
                 if interrupted() {
                     // Stop admission: finish what already completed
-                    // (bounded — no waiting), then detach the rest.
-                    // Detached leases lapse without the tick and a resume
-                    // reclaims them; committed work saves below.
+                    // (bounded — no waiting), then abort the rest
+                    // explicitly (DB-m8: never rely on `JoinSet` drop
+                    // for this — the abort is the documented control
+                    // flow, drop is only the backstop). Aborted
+                    // blocking workers that already started run to
+                    // completion detached (their results are dropped,
+                    // never persisted); unstarted ones never run.
+                    // Aborted leases lapse without the tick and a
+                    // resume reclaims them; committed work saves below.
                     while let Some(joined) = set.try_join_next() {
                         let (record, result) = joined.map_err(|join_err| {
                             repo_scan::Error::Scheduler(format!("worker task failed: {join_err}"))
@@ -5162,6 +5221,7 @@ async fn run_until_boundary(
                         )
                         .await?;
                     }
+                    set.abort_all();
                     break;
                 }
                 tokio::select! {
@@ -5831,8 +5891,12 @@ async fn flush_runner_batch(runner: &mut Runner, store: &TursoStore) -> repo_sca
     runner.counters.db_transactions += 1;
     // Step 12 batched completion: resolve every completion this flush
     // committed, in buffer order (unknown-tasks and lease mismatches
-    // abort loudly; stale entries only count).
-    classify_flushed_completions(runner, store).await?;
+    // abort loudly; stale entries only count). Re-buffered gap events
+    // that trip a spec §5 limit flush again immediately (DB-m4) —
+    // a single shot must never return holding an over-cap batch.
+    // Boxed: flush_runner_batch -> flush_if_due -> flush_runner_batch.
+    let (_, journal_due) = classify_flushed_completions(runner, store).await?;
+    Box::pin(flush_if_due(runner, store, journal_due)).await?;
     // Step 12 bounded retention (unit-test runners have no journal).
     if let Some(journal) = runner.journal.as_mut() {
         if maybe_prune_scan_journal(store, journal, MAX_RETAINED_SCAN_EVENTS).await? {
@@ -6509,6 +6573,21 @@ enum CompletionVerdict {
 /// committed rows after the flush. The owner-epoch and parked-state
 /// checks run here (both are buffer-time facts). Returns
 /// `WriterBatch::should_flush`: row/byte/age caps bound the transaction.
+///
+/// Child-record guard (DB-M3): this path deliberately does not call
+/// `complete_task_with_children` — the child check there guards direct
+/// per-task completions, while the buffered path gets the same
+/// property structurally: execution buffers every discovered child
+/// BEFORE its completion SQL joins the batch, the batch executes
+/// FIFO inside one transaction (or an earlier one after a limit
+/// split), and the single owner writes these rows alone — so a
+/// parent can never commit `complete` while its buffered children
+/// are still uncommitted. The residual hole is a finish path that
+/// discovers a child without buffering it at all (a caller bug no
+/// store guard can catch without child ids — threading those through
+/// every finish path is deferred); the batch-ordering half is pinned
+/// by `wave1d_batch_children_commit_with_parent_completion` and the
+/// crash half by `wave1d_batch_interruption_commits_nothing_partial`.
 fn buffer_completion(
     runner: &mut Runner,
     store: &TursoStore,
@@ -6516,6 +6595,16 @@ fn buffer_completion(
     epoch: u64,
     outcome: &TaskOutcome,
 ) -> repo_scan::Result<bool> {
+    // Audit: one entry per task per batch — a double-buffered
+    // completion would journal twice (same-ms) or misclassify.
+    debug_assert!(
+        !runner
+            .pending_completions
+            .iter()
+            .any(|p| p.task_id == claimed.task.id),
+        "double-buffered completion for {}",
+        claimed.task.id
+    );
     // Owner check first (SR-STATE-08, same refusal as the store gate):
     // neither this handle's epoch nor the run epoch changes mid-run, so
     // buffer-time refusal is exactly commit-time refusal.
@@ -6784,7 +6873,9 @@ async fn completion_row_state(
 /// outcome, took the stale path, or matched nothing, and the observed
 /// committed rows decide — never the buffer-time prediction, so an
 /// invalidation committing between buffer and flush still requeues
-/// instead of completing. Returns per-entry verdicts in buffer order.
+/// instead of completing. Returns per-entry verdicts in buffer order
+/// plus whether the re-buffered gap events tripped a spec §5 limit
+/// (DB-m4: the caller flushes again instead of overshooting).
 /// Unknown tasks and lease mismatches abort loudly with the same errors
 /// as the retired per-task path; stale entries are already requeued by
 /// the committed flush and only count here. Applied entries journal
@@ -6792,21 +6883,35 @@ async fn completion_row_state(
 async fn classify_flushed_completions(
     runner: &mut Runner,
     store: &TursoStore,
-) -> repo_scan::Result<Vec<CompletionVerdict>> {
+) -> repo_scan::Result<(Vec<CompletionVerdict>, bool)> {
     let pending = std::mem::take(&mut runner.pending_completions);
     let mut verdicts = Vec::with_capacity(pending.len());
+    let mut due = false;
     for item in &pending {
-        verdicts.push(classify_one_completion(runner, store, item).await?);
+        let (verdict, item_due) = classify_one_completion(runner, store, item).await?;
+        verdicts.push(verdict);
+        due |= item_due;
     }
-    Ok(verdicts)
+    Ok((verdicts, due))
 }
 
 /// Classify one flushed completion against its committed task row.
+///
+/// Same-ms safety (DB-m2): the `updated_at_ms` equality looks like a
+/// collision risk, but under the single-owner model it cannot
+/// misclassify. Lease expiry runs only inside claim transactions, and
+/// the drain loop always flushes (classifying and draining every
+/// pending entry) before the next claim — so between one
+/// `buffer_completion` and its flush, nothing else can write the
+/// task row, and the observed row is necessarily this flush's own
+/// write for this entry (applied vs. stale paths land disjoint
+/// states). The stamp is a consistency check, not a discriminator;
+/// no monotonic sequence is needed.
 async fn classify_one_completion(
     runner: &mut Runner,
     store: &TursoStore,
     item: &PendingCompletion,
-) -> repo_scan::Result<CompletionVerdict> {
+) -> repo_scan::Result<(CompletionVerdict, bool)> {
     let Some(row) = completion_row_state(store, &item.task_id).await? else {
         return Err(repo_scan::Error::UnknownTask(format!(
             "unknown-task: {}",
@@ -6819,8 +6924,8 @@ async fn classify_one_completion(
         && row.updated_at_ms == item.now_ms
     {
         let delta = observed_completion_delta(item);
-        journal_observed_delta(runner, &delta)?;
-        return Ok(CompletionVerdict::Applied);
+        let due = journal_observed_delta(runner, &delta)?;
+        return Ok((CompletionVerdict::Applied, due));
     }
     if row.state == "pending"
         && row.lease_token.is_none()
@@ -6833,7 +6938,7 @@ async fn classify_one_completion(
             "repo-scan: stale completion requeued: {} (invalidation kept)",
             item.task_id
         );
-        return Ok(CompletionVerdict::StaleRequeued);
+        return Ok((CompletionVerdict::StaleRequeued, false));
     }
     Err(repo_scan::Error::LeaseMismatch(format!(
         "lease-mismatch: task {} is not leased to epoch {} token {}",
@@ -6874,6 +6979,45 @@ fn observed_completion_delta(item: &PendingCompletion) -> CompletionDelta {
     }
 }
 
+/// Resume-time DB-vs-journal reconciliation (DB-m5): completion gap
+/// events journal AFTER their completion commits (the applied/stale
+/// verdict is only knowable post-commit), so a crash between the two
+/// flushes leaves a durable open gap with no `error` event. On resume,
+/// diff this generation's open task gaps against the scan journal and
+/// re-buffer the missing point-in-time `error` events (from the
+/// committed gap rows, never reconstructed). No `coverage_updated`:
+/// the rows were already open before this run, so there is no
+/// transition — `open_gaps` (rebuilt from the same table) stays the
+/// transition authority going forward. Returns the re-buffered count.
+/// Fresh scans skip this (an empty journal plus old-generation gaps
+/// is history, not crash loss — those rows belong to older scans).
+async fn reconcile_missing_gap_events(
+    runner: &mut Runner,
+    store: &TursoStore,
+    generation: u64,
+) -> repo_scan::Result<usize> {
+    let Some(journal) = runner.journal.as_mut() else {
+        return Ok(0);
+    };
+    let gaps = store.list_open_task_gaps(generation).await?;
+    let mut caught_up = 0usize;
+    for gap in &gaps {
+        if !journal.error_ids.insert(gap.id.clone()) {
+            continue;
+        }
+        // Newly inserted above = missing from the journal prefix.
+        // (A re-buffered id stays inserted, so a second pass over the
+        // same runner never duplicates.)
+        let records = error_records(&gap.id, &gap.scope_key, &gap.category, &gap.detail)?;
+        journal.buffer_error(&mut runner.batch, &records)?;
+        caught_up += 1;
+    }
+    if caught_up > 0 {
+        eprintln!("repo-scan: resume: re-journaled {caught_up} gap event(s) lost to the crash");
+    }
+    Ok(caught_up)
+}
+
 /// Journal one observed completion gap delta: the opened row (if any) as
 /// an `error` event, then the open/close delta as `coverage_updated` —
 /// buffered into the writer batch (next flush), after the completion
@@ -6883,9 +7027,11 @@ fn observed_completion_delta(item: &PendingCompletion) -> CompletionDelta {
 /// the id — the batched close cannot report its rowcount, so the open
 /// set is the authority, mirroring [`buffer_resolve_error`]).
 /// Unit-test runners without a journal skip silently.
-fn journal_observed_delta(runner: &mut Runner, delta: &CompletionDelta) -> repo_scan::Result<()> {
+/// Returns `WriterBatch::should_flush` (DB-m4): gap events re-buffered
+/// behind a flush must not overshoot the spec §5 caps unnoticed.
+fn journal_observed_delta(runner: &mut Runner, delta: &CompletionDelta) -> repo_scan::Result<bool> {
     if runner.journal.is_none() {
-        return Ok(());
+        return Ok(false);
     }
     // Transition gating before the journal borrow below.
     let opened: Vec<String> = match delta.opened.as_ref() {
@@ -6905,7 +7051,7 @@ fn journal_observed_delta(runner: &mut Runner, delta: &CompletionDelta) -> repo_
         let records = coverage_updated_records(&opened, &closed, &[])?;
         journal.buffer_coverage_updated(&mut runner.batch, &records)?;
     }
-    Ok(())
+    Ok(runner.batch.should_flush())
 }
 
 /// Translate an [`ExecFail`] into a retry (backoff from the attempt count)
@@ -9476,16 +9622,24 @@ async fn persist_probe(
     flush_if_due(runner, store, due).await?;
     journal_repository_found(runner, store, &instance_id, &remotes).await?;
     // Unresolvable-identity candidates join the coverage delta stream in
-    // the same batch as the instance row. Repeat probes return early, so
-    // re-persist dupes are rare; consumers dedupe by id. (Report-time
-    // reclassification can flip dispositions later; those flips surface
-    // in the final report, not as live deltas.)
+    // the same batch as the instance row — exactly once per scan: a
+    // repeat persist (reconcile re-probe at a merged spelling, resume
+    // re-discovery) upserts fresh evidence above but must not re-emit
+    // the candidate delta. (Report-time reclassification can flip
+    // dispositions later; those flips surface in the final report, not
+    // as live deltas.)
     if matches!(
         disposition,
         identity::MatchDisposition::UnresolvableIdentity
     ) {
-        journal_coverage_updated(runner, store, &[], &[], std::slice::from_ref(&instance_id))
-            .await?;
+        let fresh = runner
+            .journal
+            .as_mut()
+            .is_some_and(|journal| journal.emitted_unresolvable.insert(instance_id.clone()));
+        if fresh {
+            journal_coverage_updated(runner, store, &[], &[], std::slice::from_ref(&instance_id))
+                .await?;
+        }
     }
     for remote in &remotes {
         let role = match remote.role {
@@ -18730,28 +18884,22 @@ pub struct TestCompletionResult {
     pub stale: bool,
 }
 
-/// Drive scripted completions through the production batch path: buffer
-/// each item's children plus its conditional completion SQL into one
-/// writer batch, then (when `flush`) commit and classify exactly like
-/// the drain loop, followed by the Phase-B event flush. `flush = false`
-/// drops the batch uncommitted (a kill between buffer and flush: tasks
-/// stay leased, children stay absent). Unknown tasks, lease mismatches,
-/// bad epochs, and invalid parked states abort with the production
-/// errors.
+/// Buffer one completion drive's children + completions into a fresh
+/// test runner (shared by [`test_drive_completions`] and
+/// [`test_drive_first_flush_residue`]).
 #[cfg(test)]
-pub async fn test_drive_completions(
+async fn drive_completions_buffer(
     store: &TursoStore,
     scan_id: &str,
     epoch: u64,
-    items: Vec<TestCompletionItem>,
-    flush: bool,
-) -> repo_scan::Result<Vec<TestCompletionResult>> {
+    items: &[TestCompletionItem],
+) -> repo_scan::Result<Runner> {
     let mut runner = Runner::new(&config::ResourceLimits::default());
     let rev = store.next_revision().await?;
     runner.journal = Some(ScanJournal::open(store, scan_id, rev).await?);
     runner.open_gaps = store.list_open_error_ids().await?.into_iter().collect();
     let now = store::now_ms();
-    for item in &items {
+    for item in items {
         for child in &item.children {
             let idempotency_key = format!("idem:{}", child.id);
             let task = NewTask {
@@ -18795,6 +18943,26 @@ pub async fn test_drive_completions(
         };
         buffer_completion(&mut runner, store, &claimed, epoch, &item.outcome)?;
     }
+    Ok(runner)
+}
+
+/// Drive scripted completions through the production batch path: buffer
+/// each item's children plus its conditional completion SQL into one
+/// writer batch, then (when `flush`) commit and classify exactly like
+/// the drain loop, followed by the Phase-B event flush. `flush = false`
+/// drops the batch uncommitted (a kill between buffer and flush: tasks
+/// stay leased, children stay absent). Unknown tasks, lease mismatches,
+/// bad epochs, and invalid parked states abort with the production
+/// errors.
+#[cfg(test)]
+pub async fn test_drive_completions(
+    store: &TursoStore,
+    scan_id: &str,
+    epoch: u64,
+    items: Vec<TestCompletionItem>,
+    flush: bool,
+) -> repo_scan::Result<Vec<TestCompletionResult>> {
+    let mut runner = drive_completions_buffer(store, scan_id, epoch, &items).await?;
     if !flush {
         return Ok(Vec::new());
     }
@@ -18813,6 +18981,38 @@ pub async fn test_drive_completions(
         });
     }
     Ok(out)
+}
+
+/// Ops still held after the FIRST production flush of a completion
+/// drive (DB-m4): an over-cap re-buffered tail must flush eagerly
+/// inside that first flush, never sit over the spec §5 caps.
+#[cfg(test)]
+pub async fn test_drive_first_flush_residue(
+    store: &TursoStore,
+    scan_id: &str,
+    epoch: u64,
+    items: Vec<TestCompletionItem>,
+) -> repo_scan::Result<usize> {
+    let mut runner = drive_completions_buffer(store, scan_id, epoch, &items).await?;
+    flush_runner_batch(&mut runner, store).await?;
+    Ok(runner.batch.len())
+}
+
+/// Run the production resume-time gap-event reconciliation (DB-m5) on
+/// a fresh test runner and commit: returns the re-buffered count.
+#[cfg(test)]
+pub async fn test_reconcile_gap_events(
+    store: &TursoStore,
+    scan_id: &str,
+    generation: u64,
+) -> repo_scan::Result<usize> {
+    let mut runner = Runner::new(&config::ResourceLimits::default());
+    let rev = store.next_revision().await?;
+    runner.journal = Some(ScanJournal::open(store, scan_id, rev).await?);
+    runner.open_gaps = store.list_open_error_ids().await?.into_iter().collect();
+    let caught_up = reconcile_missing_gap_events(&mut runner, store, generation).await?;
+    flush_runner_batch(&mut runner, store).await?;
+    Ok(caught_up)
 }
 
 /// Observed prune outcome for [`test_prune_scan_events`].

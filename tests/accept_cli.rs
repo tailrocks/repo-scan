@@ -2201,3 +2201,42 @@ fn case12_no_analysis_before_inventory_ready_fetch() {
         store.close().await.expect("close");
     });
 }
+
+/// DB-M1: invalidating a symlinked root by either spelling schedules
+/// reconciliation (the invalidate path resolves both spellings onto
+/// the same object). Keys keep observed spellings; the cross-spelling
+/// live-task fan-out is pinned at the store level by
+/// `dbm1_cross_spelling_invalidate_hits_live_task`.
+#[cfg(unix)]
+#[test]
+fn dbm1_symlink_root_invalidate_schedules_reconcile() {
+    let env = Env::new();
+    let link = env._dir.path().join("fixture-link");
+    std::os::unix::fs::symlink(&env.fixture, &link).expect("symlink");
+    let link_str = link.to_str().expect("utf8").to_string();
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            link_str.as_str(),
+            "--format",
+            "human",
+        ],
+        &env.cwd_a,
+        &env.state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    // Invalidate via the physical path: durable, with no completion
+    // claim (exit 0), exactly like a same-spelling invalidate.
+    let out = run(
+        &["cache", "invalidate", "--root", env.fixture_str.as_str()],
+        &env.cwd_b,
+        &env.state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    assert!(
+        stdout_text(&out).contains("not complete"),
+        "no completion claim"
+    );
+}

@@ -114,7 +114,10 @@ pub fn generation_scope_key(policy: &str, roots: &[PlannedRoot]) -> String {
     let mut entries: Vec<Vec<u8>> = roots
         .iter()
         .map(|root| {
-            let canonical = std::fs::canonicalize(&root.path).unwrap_or_else(|_| root.path.clone());
+            // One shared spelling rule (DB-M1) with the scope-key
+            // constructors: symlink spellings collapse onto the
+            // physical path, so task keys and generation keys agree.
+            let canonical = crate::config::canonical_scope_path(&root.path);
             let mut entry = Vec::new();
             entry.extend_from_slice(root.namespace.as_bytes());
             entry.push(0);

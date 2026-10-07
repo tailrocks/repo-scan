@@ -1091,32 +1091,51 @@ fn wave1d_confirmed_repos(report: &serde_json::Value) -> Vec<String> {
 
 /// Committed scan ids, oldest first (empty when no catalog is readable
 /// yet). Read-only: servable while a scan holds the write lock.
+///
+/// A live writer can tear a concurrent read-only open/query (Turso WAL
+/// `short read on WAL frame`); both callers read after rows were already
+/// observed, so transient failures retry briefly instead of reporting an
+/// empty catalog. A committed query that returns zero rows still returns
+/// empty immediately (no masking of a genuinely missing scan row).
 async fn wave1d_scan_ids(db: &Path) -> Vec<String> {
-    let mut out = Vec::new();
-    if !db.exists() {
-        return out;
+    for _ in 0..40 {
+        if !db.exists() {
+            return Vec::new();
+        }
+        let attempt = wave1d_scan_ids_once(db).await;
+        match attempt {
+            Ok(ids) => return ids,
+            Err(()) => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
     }
-    let Ok(store) = repo_scan::store::TursoStore::open_read_only(db).await else {
-        return out;
-    };
-    let Ok(mut rows) = store
+    Vec::new()
+}
+
+async fn wave1d_scan_ids_once(db: &Path) -> Result<Vec<String>, ()> {
+    let mut out = Vec::new();
+    let store = repo_scan::store::TursoStore::open_read_only(db)
+        .await
+        .map_err(|_| ())?;
+    let mut rows = store
         .connection()
         .query(
             "SELECT id FROM scan_requests ORDER BY created_at_ms ASC",
             (),
         )
         .await
-    else {
-        return out;
-    };
-    while let Ok(Some(row)) = rows.next().await {
-        let Ok(turso::Value::Text(id)) = row.get_value(0) else {
-            break;
-        };
-        out.push(id);
+        .map_err(|_| ())?;
+    loop {
+        match rows.next().await {
+            Ok(Some(row)) => match row.get_value(0) {
+                Ok(turso::Value::Text(id)) => out.push(id),
+                _ => return Err(()),
+            },
+            Ok(None) => break,
+            Err(_) => return Err(()),
+        }
     }
     let _ = store.close().await;
-    out
+    Ok(out)
 }
 
 /// Committed event-type histogram (`None` when no catalog is readable
@@ -1263,7 +1282,23 @@ fn wave1d_live_reader_sees_progress_and_found_while_discovery_active() {
         .into_iter()
         .next()
         .expect("scan row committed mid-scan");
-    let replay = env.run_query(&["query", "--scan", &scan_id, "--format", "jsonl"]);
+    // A live writer can tear a concurrent read-only query (Turso WAL
+    // `short read on WAL frame`); that engine transient retries while the
+    // scan is active. Any other failure (or a torn read after exit) still
+    // fails below — no masking of genuine query breakage.
+    let mut replay = None;
+    for _ in 0..40 {
+        let attempt = env.run_query(&["query", "--scan", &scan_id, "--format", "jsonl"]);
+        let torn = !attempt.status.success()
+            && String::from_utf8_lossy(&attempt.stderr).contains("short read on WAL frame")
+            && child.try_wait().expect("try_wait").is_none();
+        replay = Some(attempt);
+        if !torn {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let replay = replay.expect("query attempts exhausted");
     assert_eq!(
         replay.status.code(),
         Some(0),
@@ -1888,6 +1923,224 @@ fn wave1d_batch_stale_completion_requeues_without_gap() {
             "stale completions journal no error event"
         );
     });
+}
+
+/// DB-m2: applied + stale entries buffered back-to-back in one flush
+/// (routinely the same wall-clock ms) classify exactly: the applied
+/// entry lands its outcome and journals its gap event, the stale
+/// entry requeues with the fresh revision and journals nothing. The
+/// shared stamp cannot confuse the two — the observed row is
+/// necessarily this flush's own write per entry.
+#[test]
+fn wave1d_batch_mixed_applied_stale_classifies_exactly() {
+    let hook = Wave1dHookStore::new();
+    let e = hook.enqueue_claim("task:e", "enumerate_dir", "dir:e");
+    let f = hook.enqueue_claim("task:f", "enumerate_dir", "dir:f");
+    hook.rt.block_on(async {
+        hook.store
+            .invalidate_scope("dir:f", 1, repo_scan::store::now_ms())
+            .await
+            .expect("invalidate");
+    });
+    let now = repo_scan::store::now_ms();
+    let results = hook
+        .rt
+        .block_on(main_under_test::test_drive_completions(
+            &hook.store,
+            "scan-hook-1",
+            hook.epoch,
+            vec![
+                wave1d_item(
+                    "task:e",
+                    e.token,
+                    TaskOutcome::Retry {
+                        category: "retry-cat".to_string(),
+                        detail: "retry detail".to_string(),
+                        retry_after_ms: now + 60_000,
+                    },
+                    vec![],
+                ),
+                wave1d_item("task:f", f.token, TaskOutcome::Complete, vec![]),
+            ],
+            true,
+        ))
+        .expect("drive");
+    assert_eq!(
+        results,
+        vec![
+            main_under_test::TestCompletionResult {
+                task_id: "task:e".to_string(),
+                stale: false,
+            },
+            main_under_test::TestCompletionResult {
+                task_id: "task:f".to_string(),
+                stale: true,
+            },
+        ]
+    );
+    hook.rt.block_on(async {
+        let row = hook
+            .store
+            .get_task("task:e")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.state, TaskState::RetryWait);
+        assert!(
+            hook.store
+                .get_error("gap:task:e")
+                .await
+                .expect("get")
+                .is_some_and(|gap| gap.open),
+            "applied retry records its gap"
+        );
+        let row = hook
+            .store
+            .get_task("task:f")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.state, TaskState::Pending);
+        assert!(
+            hook.store
+                .get_error("gap:task:f")
+                .await
+                .expect("get")
+                .is_none(),
+            "stale completion records no gap"
+        );
+        let rows = hook
+            .store
+            .read_scan_events("scan-hook-1", 0, 100)
+            .await
+            .expect("read");
+        let errors: Vec<_> = rows.iter().filter(|r| r.event_type == "error").collect();
+        assert_eq!(errors.len(), 1, "exactly the applied entry journals");
+    });
+}
+
+/// DB-m4: a flush whose classification re-buffers an over-cap gap-event
+/// tail flushes eagerly inside that same flush — the first flush never
+/// returns holding more than the spec §5 row cap (260 retries journal
+/// 520 event ops; without the eager tail flush all 520 would sit held).
+#[test]
+fn wave1d_batch_overcap_journal_tail_flushes_eagerly() {
+    const N: usize = 260;
+    let hook = Wave1dHookStore::new();
+    let mut items = Vec::with_capacity(N);
+    let now = repo_scan::store::now_ms();
+    for i in 0..N {
+        let id = format!("task:m4-{i}");
+        let scope = format!("dir:m4-{i}");
+        let claimed = hook.enqueue_claim(&id, "enumerate_dir", &scope);
+        items.push(wave1d_item(
+            &id,
+            claimed.token,
+            TaskOutcome::Retry {
+                category: "retry-cat".to_string(),
+                detail: "retry detail".to_string(),
+                retry_after_ms: now + 60_000,
+            },
+            vec![],
+        ));
+    }
+    let residue = hook
+        .rt
+        .block_on(main_under_test::test_drive_first_flush_residue(
+            &hook.store,
+            "scan-hook-1",
+            hook.epoch,
+            items,
+        ))
+        .expect("drive");
+    assert!(
+        residue < repo_scan::store::WRITER_BATCH_ROWS,
+        "over-cap tail must flush eagerly, residue={residue}"
+    );
+    hook.rt.block_on(async {
+        let rows = hook
+            .store
+            .read_scan_events("scan-hook-1", 0, 2000)
+            .await
+            .expect("read");
+        let errors = rows.iter().filter(|r| r.event_type == "error").count();
+        assert_eq!(errors, N, "every retry journals its error event");
+    });
+}
+
+/// DB-m5: a crash between the completion commit and the Phase-B
+/// event flush leaves a durable open gap with no `error` event;
+/// resume-time reconciliation re-buffers it from the committed gap
+/// row (idempotent: a second pass finds nothing missing). No
+/// `coverage_updated`: the row was already open, so there is no
+/// transition — only the point-in-time record is restored.
+#[test]
+fn wave1d_resume_reconciles_unjournaled_gap_events() {
+    let hook = Wave1dHookStore::new();
+    let x = hook.enqueue_claim("task:x", "enumerate_dir", "dir:x");
+    let now = repo_scan::store::now_ms();
+    // Crash simulation: the store-level completion commits the gap
+    // row but journals nothing — exactly what a kill in that window
+    // leaves behind.
+    hook.rt.block_on(async {
+        hook.store
+            .complete_task_report_gap(
+                "task:x",
+                x.token,
+                hook.epoch,
+                &TaskOutcome::Retry {
+                    category: "retry-cat".to_string(),
+                    detail: "retry detail".to_string(),
+                    retry_after_ms: now + 60_000,
+                },
+                now,
+            )
+            .await
+            .expect("complete");
+        let rows = hook
+            .store
+            .read_scan_events("scan-hook-1", 0, 100)
+            .await
+            .expect("read");
+        assert!(rows.is_empty(), "crash left no journal rows");
+    });
+    let caught = hook
+        .rt
+        .block_on(main_under_test::test_reconcile_gap_events(
+            &hook.store,
+            "scan-hook-1",
+            1,
+        ))
+        .expect("reconcile");
+    assert_eq!(caught, 1);
+    hook.rt.block_on(async {
+        let rows = hook
+            .store
+            .read_scan_events("scan-hook-1", 0, 100)
+            .await
+            .expect("read");
+        let errors: Vec<_> = rows.iter().filter(|r| r.event_type == "error").collect();
+        assert_eq!(errors.len(), 1, "exactly the missing event is restored");
+        let records: serde_json::Value =
+            serde_json::from_slice(&errors[0].records).expect("records JSON");
+        assert_eq!(records["id"], "gap:task:x");
+        assert_eq!(records["scope_key"], "dir:x");
+        assert_eq!(records["category"], "retry-cat");
+        assert_eq!(records["detail"], "retry detail");
+        assert!(
+            rows.iter().all(|r| r.event_type != "coverage_updated"),
+            "pre-existing opens emit no coverage delta"
+        );
+    });
+    let caught = hook
+        .rt
+        .block_on(main_under_test::test_reconcile_gap_events(
+            &hook.store,
+            "scan-hook-1",
+            1,
+        ))
+        .expect("reconcile again");
+    assert_eq!(caught, 0, "second pass finds nothing missing");
 }
 
 /// A completion presenting a superseded lease token aborts loudly with
