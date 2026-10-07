@@ -740,3 +740,158 @@ fn owner_lock_is_exclusive_and_epochs_fence() {
         store.close().await.expect("close");
     });
 }
+
+/// `complete_task_report_gap` reports the gap delta each outcome caused:
+/// `Retry`/`Parked` open, `Complete` closes only a genuinely open row,
+/// and a clean task reports nothing.
+#[test]
+fn completion_delta_reports_open_then_close() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = db_in(&dir);
+        let store = TursoStore::open(&db).await.expect("open");
+        let epoch = store.epoch();
+        let base = now_ms();
+
+        for (id, idem) in [("t-delta", "idem-delta"), ("t-park", "idem-park")] {
+            assert!(store
+                .enqueue_task(
+                    &NewTask {
+                        id,
+                        kind: "probe_git",
+                        generation: 1,
+                        dir_id: None,
+                        scope_key: "s",
+                        expected_rev: 0,
+                        idempotency_key: idem,
+                    },
+                    base,
+                )
+                .await
+                .expect("enqueue"));
+        }
+        let claimed = store
+            .claim_tasks(epoch, 10, 60_000, base)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 2);
+        let token_for = |id: &str| {
+            claimed
+                .iter()
+                .find(|entry| entry.task.id == id)
+                .unwrap_or_else(|| panic!("claimed {id}"))
+                .token
+        };
+
+        // Retry opens `gap:t-delta`; nothing closes.
+        let delta = store
+            .complete_task_report_gap(
+                "t-delta",
+                token_for("t-delta"),
+                epoch,
+                &TaskOutcome::Retry {
+                    category: "stalled".to_string(),
+                    detail: "helper stuck".to_string(),
+                    retry_after_ms: base + 1_000,
+                },
+                base,
+            )
+            .await
+            .expect("retry");
+        let opened = delta.opened.expect("retry opens");
+        assert_eq!(opened.id, "gap:t-delta");
+        assert_eq!(opened.category, "stalled");
+        assert!(delta.closed.is_none());
+        let row = store
+            .get_error("gap:t-delta")
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(row.open);
+
+        // Parked opens `gap:t-park` the same way.
+        let delta = store
+            .complete_task_report_gap(
+                "t-park",
+                token_for("t-park"),
+                epoch,
+                &TaskOutcome::Parked {
+                    state: TaskState::Unavailable,
+                    reason: "volume offline".to_string(),
+                },
+                base,
+            )
+            .await
+            .expect("park");
+        assert_eq!(delta.opened.expect("park opens").id, "gap:t-park");
+        assert!(delta.closed.is_none());
+
+        // Reclaim after backoff; success closes the open row.
+        let claimed = store
+            .claim_tasks(epoch, 10, 60_000, base + 1_001)
+            .await
+            .expect("reclaim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].task.id, "t-delta");
+        let delta = store
+            .complete_task_report_gap(
+                "t-delta",
+                claimed[0].token,
+                epoch,
+                &TaskOutcome::Complete,
+                base + 1_001,
+            )
+            .await
+            .expect("complete");
+        assert!(delta.opened.is_none());
+        assert_eq!(delta.closed.as_deref(), Some("gap:t-delta"));
+        let row = store
+            .get_error("gap:t-delta")
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(!row.open);
+
+        // A task that never failed reports no delta at all.
+        assert!(store
+            .enqueue_task(
+                &NewTask {
+                    id: "t-clean",
+                    kind: "probe_git",
+                    generation: 1,
+                    dir_id: None,
+                    scope_key: "s",
+                    expected_rev: 0,
+                    idempotency_key: "idem-clean",
+                },
+                base + 1_001,
+            )
+            .await
+            .expect("enqueue"));
+        let claimed = store
+            .claim_tasks(epoch, 10, 60_000, base + 1_001)
+            .await
+            .expect("claim clean");
+        assert_eq!(claimed.len(), 1);
+        let delta = store
+            .complete_task_report_gap(
+                "t-clean",
+                claimed[0].token,
+                epoch,
+                &TaskOutcome::Complete,
+                base + 1_001,
+            )
+            .await
+            .expect("complete clean");
+        assert!(delta.opened.is_none());
+        assert!(delta.closed.is_none());
+
+        // Only the parked gap stays open.
+        assert_eq!(
+            store.list_open_error_ids().await.expect("list"),
+            vec!["gap:t-park".to_string()]
+        );
+        store.close().await.expect("close");
+    });
+}
