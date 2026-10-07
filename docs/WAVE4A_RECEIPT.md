@@ -5,16 +5,19 @@
 A rep counts as COMPLETE when ALL hold:
 
 - `coverage.filesystem == "complete"` AND `coverage.tasks_pending == 0`
-- recall: discovered stores == manifest expected paths (222/222 on
-  `/tmp/corpus16`: 221 manifest paths + 1 submodule gitdir)
-- exit 3 with EXACTLY the 4 known unresolvable candidates
-  (`bare_one.store`, `bare_two` — remote-less by construction in
-  `benches/corpus.rs:235-252` — plus the unborn repo and the
-  submodule `.git/modules` gitdir, all `unresolvable_identity`).
-  Exit 3 is the ACCEPTED terminal state on this corpus: the bare
-  stores deliberately exercise the unknown-identity path (the
-  `perf_gates` corpus instead adds origins; see
-  `benches/perf_gates.rs:616-618`). Exit 0 is unachievable here.
+- recall: discovered stores cover all 221 manifest expected paths
+  plus the 1 known extra (embedded submodule gitdir at
+  `special/super/.git/modules/sub`): 222/222 on `/tmp/corpus16`
+- exit 0 with `gaps == 0` and `unresolvable_candidates == 0`.
+
+History: this definition supersedes the earlier "exit 3 with exactly
+4 known unresolvables" rule (template commit `c14c4c6`). The 4
+remote-less/unborn candidates (`bare_one.store`, `bare_two`,
+unborn repo, submodule gitdir) are now inventoried with unknown
+identity per Step 7 instead of parked unresolvable — verified by
+manifest-diff on the shakedown rep (221/221 + 1 known extra,
+exit 0). The `perf_gates` corpus instead adds origins (see
+`benches/perf_gates.rs:616-618`).
 
 Discovery time = wall from process start to the first stderr tick
 with `dirs == coverage.directories_complete` (identical rule for
