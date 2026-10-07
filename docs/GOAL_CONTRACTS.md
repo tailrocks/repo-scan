@@ -381,3 +381,33 @@ against fixture snapshots with no PTY (`tests/tui_impl.rs`).
   disturbs the scan or the catalog. `--after` applies to the TUI
   follow (reset positions drop buffered state); the plain lane
   ignores it (byte-change renders have no cursor).
+
+## D12. Wave4b documentation decisions (Step 17, branch `work/fast-complete-scan`)
+
+Observed delivered behavior pinned by running the debug binary against
+fixture repos (one clone + one bare store under `--root`); README
+examples quote that output (IDs/paths trimmed, never invented).
+
+- Report `1.4.0` carries NO top-level `totals` object and NO `groups[]`:
+  the D1 totals/groups plan is unimplemented in the delivered JSON.
+  Counts are record vec lengths (the human `totals` line prints exactly
+  those) plus the three independent `coverage` properties
+  (`filesystem` / `identity` / `status`) with `gaps` ==
+  `len(errors)` and `unresolvable_candidates` == unresolvable
+  `candidates`. Docs must not promise `totals`/`groups[]` until a wave
+  ships them (additive schema bump when it does).
+- `query TARGET --cached` always prints the short human summary and
+  ignores `--format` (observed: `--format json`/`jsonl` still print the
+  summary, exit 0). `query --all` parses but is unimplemented (exit 1
+  with a redirect hint). Query without `--cached` is exit 2 (live
+  queries unsupported). Short `owner/name` targets under `--cached` may
+  report `canonical: unresolved` (exit 3) where the full URL resolves.
+- No `--format` keeps the legacy terminal report + footers for
+  `scan`/`resume`, but `query --scan` with no `--format` replays the
+  journal as JSONL when redirected (explicit `--format` always wins).
+  `query --scan --format human` prints the plain lane with no footers.
+  Unknown scan IDs are exit 2 for both `query --scan` and `resume`.
+- `--fetch` ships: post-analysis, remote-tracking refs + `FETCH_HEAD` +
+  objects only, never branch tips or checkout files; unsafe refspecs
+  are `unsupported`, never written (observed stderr summary:
+  `fetch: N refreshed, N failed, N unsupported, N resumed-skip`).

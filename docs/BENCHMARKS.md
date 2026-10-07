@@ -14,6 +14,17 @@ cargo bench --bench walk_compare
 # resume (recover + claim) cost, RSS footprint.
 cargo bench --bench scan_cycle
 # results: benches/results/scan_cycle.jsonl (override dir with $BENCH_RESULTS)
+
+# Step 16 measurement corpus: deterministic developer-machine-like tree
+# (>=100k dirs, >=1M files, 200 Git stores + worktrees/submodule/bare).
+CORPUS_DIR=/path/to/corpus cargo bench --bench corpus
+# refuses into an existing ws/ dir; CORPUS_SMALL=1 shrinks all dimensions.
+# manifest: $CORPUS_DIR/manifest.json (every expected store path).
+
+# PERF-02/03 sustained gates (declared corpus, >=30 s measurement,
+# 512 MiB pressure injection). Asserts via tests/accept_perf.rs.
+cargo bench --bench perf_gates
+# results: benches/results/perf_gates.jsonl (override dir with $BENCH_RESULTS)
 ```
 
 Harness: [benches/support.rs](../benches/support.rs) (`Recorder`, traversal driver,
@@ -23,7 +34,10 @@ RSS sampler). Scopes are built in tempdirs per run
 hidden/tmp/cache repos, arbitrarily named bare store, linked worktree, nested repo,
 flat (500 files) and deep (32 levels) trees, non-UTF-8 names on Unix.
 
-Record the hardware, OS, filesystem, dataset, and build versions alongside every run.
+Record the hardware, OS, filesystem, dataset, `--workers` setting, and build
+versions alongside every run. Scans default to platform-parallelism workers
+(`--workers`, max 32); worker-count comparisons measure against that default,
+which is a starting point, not a tuned optimum (`src/config.rs`).
 
 ## Results
 
