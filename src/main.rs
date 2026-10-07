@@ -40,7 +40,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Set by the SIGINT handler; the scan loop polls it between tasks and
@@ -6677,20 +6677,41 @@ enum CollectOutcome {
 // One-shot mid-inspection swap hook for the XSEC-01 regression test:
 // consumed between Git read stages (after remotes, before the poll), so
 // the test swaps the inspected directory mid-collection — the production
-// inspect-time race in miniature. Production builds have no hook.
+// inspect-time race in miniature. Production builds have no hook. The slot
+// is process-global (not thread-local) so the hook fires no matter which
+// worker thread runs the collection, and it fires only for the armed path
+// spelling so concurrent scans in other tests never trip it.
 #[cfg(test)]
-thread_local! {
-    static MID_INSPECTION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>> =
-        std::cell::RefCell::new(None);
+static MID_INSPECTION_HOOK: OnceLock<Mutex<Option<(PathBuf, Box<dyn FnOnce() + Send>)>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn mid_inspection_slot() -> &'static Mutex<Option<(PathBuf, Box<dyn FnOnce() + Send>)>> {
+    MID_INSPECTION_HOOK.get_or_init(|| Mutex::new(None))
 }
 
 /// Arm the one-shot mid-inspection hook, consumed by the next
-/// [`collect_probe_reads`] between read stages.
+/// [`collect_probe_reads`] of `path` between read stages.
 #[cfg(test)]
-pub fn test_set_mid_inspection_hook(hook: impl FnOnce() + Send + 'static) {
-    MID_INSPECTION_HOOK.with(|slot| {
-        *slot.borrow_mut() = Some(Box::new(hook));
-    });
+pub fn test_set_mid_inspection_hook(path: &Path, hook: impl FnOnce() + Send + 'static) {
+    *mid_inspection_slot().lock().unwrap() = Some((path.to_path_buf(), Box::new(hook)));
+}
+
+/// Fire the armed hook when this collection inspects the armed path. The
+/// lock is released before the hook runs, so a panicking hook cannot
+/// poison the slot.
+#[cfg(test)]
+fn fire_mid_inspection_hook(path: &Path) {
+    let hook = {
+        let mut slot = mid_inspection_slot().lock().unwrap();
+        match slot.as_ref() {
+            Some((armed, _)) if armed == path => slot.take().map(|(_, hook)| hook),
+            _ => None,
+        }
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6733,11 +6754,7 @@ async fn collect_probe_reads(
         }
     };
     #[cfg(test)]
-    MID_INSPECTION_HOOK.with(|slot| {
-        if let Some(hook) = slot.borrow_mut().take() {
-            hook();
-        }
-    });
+    fire_mid_inspection_hook(path);
     if !poll.ok_now() {
         return Ok(CollectOutcome::IdentityChanged);
     }

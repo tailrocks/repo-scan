@@ -831,7 +831,7 @@ fn xsec01_mid_inspection_swap_discards() {
         let swap_scheduled = scheduled.clone();
         let swap_donor = donor.clone();
         let swap_stash = tmp.path().join("scheduled-orig");
-        main_under_test::test_set_mid_inspection_hook(move || {
+        main_under_test::test_set_mid_inspection_hook(&scheduled, move || {
             std::fs::rename(&swap_scheduled, &swap_stash).unwrap();
             std::fs::rename(&swap_donor, &swap_scheduled).unwrap();
         });
