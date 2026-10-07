@@ -8625,8 +8625,29 @@ fn execute_remote_fetch(
         .collect();
     debug_assert_eq!(parsed.len(), refspecs.len());
     let known: HashSet<&[u8]> = post.iter().map(|t| t.name.as_slice()).collect();
+    // This remote's default namespace: refs this fetch could never
+    // cover but owns (narrowed refspecs) label `stale` per Step 11
+    // ("keep excluded refs stale"); refs under ANOTHER remote's
+    // namespace are that fetch's business and stay untouched, so a
+    // later-or-earlier fetch cannot downgrade their labels.
+    let own_exact = format!("refs/remotes/{name}");
+    let own_prefix = format!("refs/remotes/{name}/");
     for observed in &post {
         if !git::refspec::covered_by_positive(&parsed, &observed.name) {
+            let in_own = observed.name.as_slice() == own_exact.as_bytes()
+                || observed.name.starts_with(own_prefix.as_bytes());
+            if !in_own {
+                continue;
+            }
+            // Excluded: oid re-observed but never counted (this fetch
+            // did not move it) and labeled `stale`, never `current`.
+            attempt.applies.push(FetchApply {
+                name: observed.name.clone(),
+                oid: observed.oid.clone(),
+                symref: observed.symref.clone(),
+                state: git::fallback::tracking_ref_state(observed, &known),
+                freshness: "stale",
+            });
             continue;
         }
         let freshness = if !attempt.label {
@@ -8703,27 +8724,39 @@ async fn persist_remote_attempt(
     common_path: &[u8],
     object_format: &str,
     remote_name: &[u8],
-    existing_refs: &HashSet<Vec<u8>>,
+    existing_refs: &HashMap<Vec<u8>, String>,
     attempt: &GitAttempt,
     at_ms: i64,
 ) -> repo_scan::Result<()> {
+    // Ref-id rule (analysis persist): ids key on the CANONICAL common
+    // dir, while the instance row stores the raw observed spelling —
+    // so recomputing an id from `common_path` mismatches on any
+    // aliased path (e.g. /tmp -> /private/tmp) and the UPDATE hits
+    // zero rows. Existing rows therefore update by their STORED id;
+    // only fetch-created rows derive an id, from the canonical hex
+    // already embedded in the instance id (`git:<hex>`).
+    let canonical_hex = instance_id
+        .strip_prefix("git:")
+        .map(str::to_owned)
+        .unwrap_or_else(|| config::encode_hex(common_path));
     for apply in &attempt.applies {
-        let ref_id = format!(
-            "ref:{}:{}",
-            config::encode_hex(common_path),
-            config::encode_hex(&apply.name),
-        );
-        if existing_refs.contains(&apply.name) {
+        // Stored id for existing rows; canonical-derived id for rows
+        // this fetch creates. Both arms bind `ref_id` for the label
+        // below.
+        let created_id;
+        let ref_id = if let Some(stored) = existing_refs.get(&apply.name) {
             let due =
-                TursoStore::buffer_update_ref_oid(&mut runner.batch, &ref_id, &apply.oid, at_ms);
+                TursoStore::buffer_update_ref_oid(&mut runner.batch, stored, &apply.oid, at_ms);
             flush_if_due(runner, store, due).await?;
+            stored.as_str()
         } else {
             // Fetch-created tracking branch: insert the row this
             // observation justifies (store algo from the instance;
             // tracking refs never carry an upstream).
+            created_id = format!("ref:{}:{}", canonical_hex, config::encode_hex(&apply.name),);
             let oid_opt = (!apply.oid.is_empty()).then_some(apply.oid.as_slice());
             let new_ref = NewRef {
-                id: &ref_id,
+                id: &created_id,
                 instance_id,
                 checkout_scope_id: None,
                 kind: "remote_tracking",
@@ -8736,11 +8769,12 @@ async fn persist_remote_attempt(
             };
             let due = TursoStore::buffer_upsert_ref(&mut runner.batch, &new_ref, at_ms);
             flush_if_due(runner, store, due).await?;
-        }
+            created_id.as_str()
+        };
         if attempt.label {
             let due = TursoStore::buffer_label_ref_freshness(
                 &mut runner.batch,
-                &ref_id,
+                ref_id,
                 apply.freshness,
                 at_ms,
             );
@@ -8796,7 +8830,7 @@ async fn fetch_one_remote(
     cancel: &git::fallback::WaitCancel,
     inst: &EmittedInstance,
     remote_name: &[u8],
-    existing_refs: &HashSet<Vec<u8>>,
+    existing_refs: &HashMap<Vec<u8>, String>,
     started_ms: i64,
     outcome: &mut FetchOutcome,
 ) -> repo_scan::Result<()> {
@@ -8913,11 +8947,13 @@ async fn fetch_one_store(
     if !remotes.iter().any(|r| r.role == "fetch") {
         return Ok(());
     }
-    // One ref-name read per fetched store: existing rows take the
-    // UPDATE path (attribution preserved), fetch-created tracking
+    // One ref read per fetched store: name -> STORED row id.
+    // Existing rows take the UPDATE path by stored id (never a
+    // recomputed id: the instance row keeps the raw path spelling
+    // while ids key on the canonical dir), fetch-created tracking
     // branches take the INSERT path.
     let refs = store.list_refs(&inst.id).await?;
-    let existing: HashSet<Vec<u8>> = refs.into_iter().map(|r| r.name).collect();
+    let existing: HashMap<Vec<u8>, String> = refs.into_iter().map(|r| (r.name, r.id)).collect();
     for remote in remotes.iter().filter(|r| r.role == "fetch") {
         if interrupted() {
             outcome.interrupted = true;
@@ -10429,9 +10465,14 @@ async fn continue_saved_scan(
         "repo-scan: resuming scan {scan_id} (scope {}, saved options restored)",
         row.scope
     );
+    // v2: restore the `--all` marker (no target filter); without
+    // this every `--all` resume re-resolves the literal `--all`
+    // marker as a target and fails with InvalidArgs. Legacy rows
+    // (NULL) resume single-target via `url_raw` as before.
+    let all = row.all_targets.unwrap_or(false);
     let args = repo_scan::cli::ScanArgs {
-        targets: vec![url],
-        all: false,
+        targets: if all { Vec::new() } else { vec![url] },
+        all,
         scope,
         report,
         force_rescan: false,
