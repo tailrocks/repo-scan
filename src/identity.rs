@@ -25,6 +25,14 @@ pub const MATCHING_POLICY: &str = "github-effective-remotes-v1";
 /// Canonical GitHub host matched by the policy (case-insensitive).
 pub const GITHUB_HOST: &str = "github.com";
 
+/// Documented GitHub SSH-over-HTTPS-port endpoint (Step 10): only the
+/// `ssh://git@ssh.github.com:443/owner/repo` shape normalizes; any other
+/// scheme or port on this host yields `None`.
+pub const SSH_GITHUB_HOST: &str = "ssh.github.com";
+
+/// Port of the documented [`SSH_GITHUB_HOST`] endpoint.
+pub const SSH_GITHUB_PORT: u16 = 443;
+
 /// Placeholder substituted for embedded credentials.
 pub const REDACTED: &str = "<redacted>";
 
@@ -51,12 +59,14 @@ pub enum MatchDisposition {
 /// `unresolvable_identity` with the reason).
 ///
 /// Accepted: `https://`/`http://` (usernames lowercased, credentials and
-/// query/fragment ignored), `ssh://` with default port, and scp-like
-/// `[user@]github.com:owner/repo[.git]`. A single trailing `.git` segment
-/// suffix and one trailing slash are stripped. SSH aliases resolving to
-/// github.com via `~/.ssh/config` are honored read-only (no execution).
-/// `git://`, `file:`, local paths, `ext::`, helper transports, non-default
-/// ports, and non-GitHub hosts yield `None`.
+/// query/fragment ignored), `ssh://` with default port, the documented
+/// `ssh://[user@]ssh.github.com:443/owner/repo[.git]` endpoint, and
+/// scp-like `[user@]github.com:owner/repo[.git]`. A single trailing `.git`
+/// segment suffix and one trailing slash are stripped. SSH aliases
+/// resolving to github.com via `~/.ssh/config` are honored read-only (no
+/// execution) on SSH transports only — never for `http(s)` hosts (Step
+/// 10). `git://`, `file:`, local paths, `ext::`, helper transports,
+/// non-default ports, and non-GitHub hosts yield `None`.
 pub fn normalize_github_url(url: &str) -> Option<String> {
     let url = url.trim();
     if url.is_empty() {
@@ -67,13 +77,20 @@ pub fn normalize_github_url(url: &str) -> Option<String> {
         gix::url::Scheme::Https | gix::url::Scheme::Http | gix::url::Scheme::Ssh => {}
         _ => return None,
     }
+    let ssh_transport = matches!(parsed.scheme, gix::url::Scheme::Ssh);
     let host = parsed.host.as_deref()?;
-    if !is_github_host(host) {
-        return None;
-    }
-    if let Some(port) = parsed.port {
-        if Some(port) != parsed.scheme.default_port() {
+    if host.eq_ignore_ascii_case(SSH_GITHUB_HOST) {
+        if !ssh_transport || parsed.port != Some(SSH_GITHUB_PORT) {
             return None;
+        }
+    } else {
+        if !github_host_matches(host, ssh_transport) {
+            return None;
+        }
+        if let Some(port) = parsed.port {
+            if Some(port) != parsed.scheme.default_port() {
+                return None;
+            }
         }
     }
     let path = std::str::from_utf8(parsed.path.as_bytes()).ok()?;
@@ -2129,15 +2146,26 @@ fn value_span(text: &str, k: usize) -> Option<(usize, usize, Option<char>)> {
     Some((k, j, None))
 }
 
-/// True when `host` is github.com directly or via an SSH alias.
+/// True when `host` literally is github.com (case-insensitive). Pure:
+/// never consults `~/.ssh/config`. Use [`github_host_matches`] when SSH
+/// aliases may apply.
+pub fn is_github_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case(GITHUB_HOST)
+}
+
+/// True when `host` names GitHub for the given transport: literally, or —
+/// on SSH transports only — via a `~/.ssh/config` alias resolving to
+/// github.com. `http(s)` URLs never consult aliases, so a user alias can
+/// never masquerade as the HTTPS host (Step 10).
 ///
 /// Alias resolution is read-only (`~/.ssh/config`, `Host`/`HostName` only;
 /// no `ProxyCommand` or any other directive is honored or executed).
-pub fn is_github_host(host: &str) -> bool {
+pub fn github_host_matches(host: &str, ssh_transport: bool) -> bool {
     if host.eq_ignore_ascii_case(GITHUB_HOST) {
         return true;
     }
-    resolve_ssh_alias(host).is_some_and(|real| real.eq_ignore_ascii_case(GITHUB_HOST))
+    ssh_transport
+        && resolve_ssh_alias(host).is_some_and(|real| real.eq_ignore_ascii_case(GITHUB_HOST))
 }
 
 /// Resolve an SSH alias to its configured `HostName` (lowercased), if any.
@@ -2337,12 +2365,18 @@ fn lenient_noncanonical_verdict(
             )],
         );
     }
-    if !is_github_host(host) {
+    let ssh_transport = matches!(parsed.scheme, gix::url::Scheme::Ssh);
+    if !github_host_matches(host, ssh_transport) {
         if !host.contains('.') && !host.eq_ignore_ascii_case("localhost") {
+            let alias_note = if ssh_transport {
+                " with no matching SSH alias"
+            } else {
+                ""
+            };
             return (
                 MatchDisposition::UnresolvableIdentity,
                 vec![format!(
-                    "Effective {role} remote `{redacted}` uses single-label host `{host}` with no matching SSH alias; identity cannot be determined."
+                    "Effective {role} remote `{redacted}` uses single-label host `{host}`{alias_note}; identity cannot be determined."
                 )],
             );
         }

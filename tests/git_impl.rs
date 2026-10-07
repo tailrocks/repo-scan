@@ -10,8 +10,8 @@ use repo_scan::git::{
     CandidateKind, CheckoutKind, GitInspect, GixInspector, HeadState, WorktreeAvailability,
 };
 use repo_scan::identity::{
-    classify_remote, classify_remotes, normalize_github_url, parse_ssh_config, redact_credentials,
-    MatchDisposition,
+    classify_remote, classify_remotes, github_host_matches, is_github_host, normalize_github_url,
+    parse_ssh_config, redact_credentials, MatchDisposition,
 };
 use repo_scan::model::StatusMode;
 use std::path::{Path, PathBuf};
@@ -510,6 +510,46 @@ fn identity_url_variant_table() {
             MatchDisposition::Confirmed,
             Some(TARGET),
         ),
+        // Documented ssh.github.com:443 endpoint (Step 10).
+        (
+            "ssh://git@ssh.github.com:443/owner/repo.git",
+            "fetch",
+            MatchDisposition::Confirmed,
+            Some(TARGET),
+        ),
+        (
+            "ssh://git@ssh.github.com:443/OWNER/REPO",
+            "push",
+            MatchDisposition::Confirmed,
+            Some(TARGET),
+        ),
+        // ssh.github.com any other way: no port, wrong scheme, wrong port.
+        (
+            "ssh://git@ssh.github.com/owner/repo",
+            "fetch",
+            MatchDisposition::Nonmatch,
+            None,
+        ),
+        (
+            "https://ssh.github.com:443/owner/repo",
+            "fetch",
+            MatchDisposition::Nonmatch,
+            None,
+        ),
+        (
+            "ssh://git@github.com:443/owner/repo",
+            "fetch",
+            MatchDisposition::Nonmatch,
+            None,
+        ),
+        // HTTPS host with an alias-shaped name: aliases never apply to
+        // http(s), so this is unresolvable, not a match (Step 10 case 8).
+        (
+            "https://gh-alias/owner/repo",
+            "fetch",
+            MatchDisposition::UnresolvableIdentity,
+            None,
+        ),
         (
             "https://GITHUB.COM/Owner/Repo",
             "fetch",
@@ -631,6 +671,33 @@ fn identity_url_variant_table() {
         ],
     );
     assert_eq!(all_bad, MatchDisposition::Nonmatch);
+}
+
+#[test]
+fn ssh_alias_scheme_gate() {
+    // Literal matching is transport-independent and never reads config.
+    assert!(is_github_host("github.com"));
+    assert!(is_github_host("GITHUB.COM"));
+    assert!(!is_github_host("gh-alias"));
+    assert!(github_host_matches("github.com", false));
+    assert!(github_host_matches("github.com", true));
+    // Non-SSH transports never consult aliases: hermetic for ANY config.
+    assert!(!github_host_matches("gh-alias", false));
+    assert!(!github_host_matches("gitlab.com", false));
+    // The single-label evidence message must not claim an alias lookup
+    // ran on transports where aliases do not apply (Step 10 case 8).
+    let (_, https_evidence) = classify_remote(
+        "https://github.com/owner/repo",
+        "https://gh-alias/owner/repo",
+        "fetch",
+    );
+    assert!(!https_evidence.iter().any(|l| l.contains("SSH alias")));
+    let (_, ssh_evidence) = classify_remote(
+        "https://github.com/owner/repo",
+        "gh-alias:owner/repo.git",
+        "fetch",
+    );
+    assert!(ssh_evidence.iter().any(|l| l.contains("SSH alias")));
 }
 
 #[test]
