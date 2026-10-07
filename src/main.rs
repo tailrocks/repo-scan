@@ -8254,6 +8254,422 @@ async fn persist_analysis(
 /// stays null — never zero, never clean. The blocking status call runs
 /// under DURING-inspection identity polls plus the task wall budget
 /// (XSEC-01 + SR-STATE-01): change or expiry discards the observation.
+/// Catalog identity + observation window for one status task: resolved
+/// by the writer before dispatch so the read half needs no catalog.
+struct StatusTarget {
+    checkout_id: String,
+    instance_id: String,
+    git_path: std::path::PathBuf,
+    mode: StatusMode,
+    now_ms: i64,
+    observed_rev: u64,
+}
+
+/// Read-half outcome of one status task (Step 8 worker seam): full
+/// observations plus every terminal mid-read condition, all as data.
+/// The writer applies rows/gaps/retries via [`persist_status`].
+enum StatusReadOutcome {
+    Observed {
+        started_ms: i64,
+        finished_ms: i64,
+        submodules: &'static str,
+        observation: Option<git::StatusObservation>,
+    },
+    UnsupportedOpen {
+        error: String,
+    },
+    OpenFailed {
+        detail: String,
+    },
+    StatusFailed {
+        detail: String,
+    },
+    LeaseRetry {
+        detail: String,
+    },
+    Timeout {
+        detail: String,
+    },
+    IdentityChanged,
+    FenceChanged,
+    Refused {
+        state: TaskState,
+        reason: String,
+    },
+    StatFailed(std::io::Error),
+}
+
+/// One status task's collected reads: target meta plus outcome.
+struct StatusCollected {
+    target: StatusTarget,
+    outcome: StatusReadOutcome,
+}
+
+/// Read half of [`exec_status`]: fence verify, open, guarded blocking
+/// status call, fallback counts, submodule coverage, and post-run
+/// re-verification. Applies no catalog writes (lease heartbeats
+/// excepted, which move to the coordinator's scheduled renewal with
+/// the pool slice); the writer applies everything via
+/// [`persist_status`].
+async fn collect_status_reads(
+    runner: &mut Runner,
+    store: &TursoStore,
+    claimed: &ClaimedTask,
+    target: &StatusTarget,
+    deadline: &OpDeadline,
+) -> repo_scan::Result<StatusCollected> {
+    let git_path = &target.git_path;
+    let mode = target.mode;
+    // Status fence (pre-run): same verify-run-reverify envelope as probes.
+    // Refusals park with a preserved gap; nothing is persisted.
+    let schedule = ProbeSchedule::status_legacy();
+    let pinned: Option<PinnedDir> =
+        match verify_probe_path(runner.fence.as_ref(), "status", git_path, &schedule) {
+            ProbeFence::Unfenced => None,
+            ProbeFence::Pinned(pinned) | ProbeFence::Relationship(pinned) => Some(pinned),
+            ProbeFence::Refused { state, reason } => {
+                return Ok(StatusCollected {
+                    target: StatusTarget {
+                        checkout_id: target.checkout_id.clone(),
+                        instance_id: target.instance_id.clone(),
+                        git_path: git_path.clone(),
+                        mode,
+                        now_ms: target.now_ms,
+                        observed_rev: target.observed_rev,
+                    },
+                    outcome: StatusReadOutcome::Refused { state, reason },
+                });
+            }
+            ProbeFence::StatFailed(e) => {
+                return Ok(StatusCollected {
+                    target: StatusTarget {
+                        checkout_id: target.checkout_id.clone(),
+                        instance_id: target.instance_id.clone(),
+                        git_path: git_path.clone(),
+                        mode,
+                        now_ms: target.now_ms,
+                        observed_rev: target.observed_rev,
+                    },
+                    outcome: StatusReadOutcome::StatFailed(e),
+                });
+            }
+        };
+    // The pin binds the execution (XSEC-01): Git runs between the
+    // pre-run pin above and the DURING/post-run re-verification below, so a
+    // path swapped mid-run discards every observation. Inspection keeps
+    // the scheduling spelling, so persisted rows stay spelling-stable.
+    let mut poll = IdentityPoll::new(runner.fence.as_ref(), git_path, pinned.as_ref());
+    let finish = |outcome: StatusReadOutcome| StatusCollected {
+        target: StatusTarget {
+            checkout_id: target.checkout_id.clone(),
+            instance_id: target.instance_id.clone(),
+            git_path: git_path.clone(),
+            mode,
+            now_ms: target.now_ms,
+            observed_rev: target.observed_rev,
+        },
+        outcome,
+    };
+    let instance = match runner.inspector.open_exact(git_path) {
+        Ok(instance) => instance,
+        Err(e) if git::is_unsupported_error(&e) => {
+            return Ok(finish(StatusReadOutcome::UnsupportedOpen {
+                error: e.to_string(),
+            }));
+        }
+        Err(e) => {
+            return Ok(finish(StatusReadOutcome::OpenFailed {
+                detail: e.to_string(),
+            }));
+        }
+    };
+    // XSEC-01: the open is a read stage like any other — poll it.
+    if !poll.ok_now() {
+        return Ok(finish(StatusReadOutcome::IdentityChanged));
+    }
+    // R4 heartbeat: renew before the blocking call below, which has no
+    // in-call yield point. A lost lease stops the op before any Git read.
+    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+        return Ok(finish(StatusReadOutcome::LeaseRetry {
+            detail: format!(
+                "lease lost before status of {}; retrying with a fresh lease",
+                git_path.display()
+            ),
+        }));
+    }
+    let started = store::now_ms();
+    // R4: the blocking status call has no in-call yield point, so it runs
+    // under the tighter of the wall budget and the lease window just
+    // renewed above — the guard trips the interrupt strictly before the
+    // lease can lapse, and a window abandonment retries (fresh lease)
+    // instead of parking valid-but-slow work.
+    let (call_ms, lease_bound) =
+        lease_call_budget(deadline.remaining().as_millis().min(u128::from(u64::MAX)) as u64);
+    let call_deadline = OpDeadline::new(Duration::from_millis(call_ms));
+    // SR-STATE-01 + XSEC-01: the guard thread polls identity DURING the
+    // blocking status call and trips the interrupt flag on change or
+    // deadline. The flag is best-effort preemption; the checks after the
+    // call are the guarantee — even if gix ignores the flag, an expired
+    // or swapped observation never records.
+    let guard = spawn_status_guard(
+        runner.fence.clone(),
+        git_path.clone(),
+        pinned.as_ref().map(snapshot_of),
+        call_deadline,
+    );
+    let status_result =
+        runner
+            .inspector
+            .status_interruptible(&instance, mode, Some(guard.interrupt_flag()));
+    let identity_changed = guard.finish();
+    if identity_changed {
+        return Ok(finish(StatusReadOutcome::IdentityChanged));
+    }
+    if deadline.expired() {
+        return Ok(finish(StatusReadOutcome::Timeout {
+            detail: format!(
+                "timeout-abandoned: status of {} exceeded the {OP_DEADLINE_SECS}s execution budget; observation discarded",
+                git_path.display()
+            ),
+        }));
+    }
+    if lease_bound && call_deadline.expired() {
+        // R4: the lease window (not the wall budget) ended the call — the
+        // observation is discarded and the scope retries with a fresh
+        // lease. The lease itself never lapsed, so no reclaim or duplicate
+        // is possible; parking here would strand valid-but-slow work.
+        return Ok(finish(StatusReadOutcome::LeaseRetry {
+            detail: format!(
+                "status of {} exceeded its lease window; observation discarded",
+                git_path.display()
+            ),
+        }));
+    }
+    if !poll.ok_now() {
+        return Ok(finish(StatusReadOutcome::IdentityChanged));
+    }
+    // R4 heartbeat: the blocking call consumed most of the window renewed
+    // above — renew again so the fallback and submodule reads below run
+    // under a fresh lease instead of racing its expiry.
+    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+        return Ok(finish(StatusReadOutcome::LeaseRetry {
+            detail: format!(
+                "lease lost during status of {}; observation discarded",
+                git_path.display()
+            ),
+        }));
+    }
+    let observation = match status_result {
+        Ok(obs) => Some(obs),
+        Err(e) if git::is_unsupported_error(&e) => {
+            // RSF-FALLBACK-HELPER-SECURITY(5): fallback spawns inherit
+            // the task deadline and SIGINT; cancellation ends even stuck
+            // readers instead of hanging the status task.
+            let task_deadline = *deadline;
+            let cancel = git::fallback::WaitCancel::new(
+                move || INTERRUPTED.load(Ordering::SeqCst) || task_deadline.expired(),
+                None,
+            );
+            git::fallback::with_wait_cancel(&cancel, || {
+                fallback_status_counts(runner, &instance, mode, &e)
+            })
+        }
+        Err(e) => {
+            return Ok(finish(StatusReadOutcome::StatusFailed {
+                detail: e.to_string(),
+            }));
+        }
+    };
+    let finished = store::now_ms();
+    // Submodule coverage (R16): examined through the inspector alongside
+    // the status probe — `checked` when the submodule relationships were
+    // actually read, `unknown` when they could not be.
+    let submodules = match runner.inspector.submodules(&instance) {
+        Ok(_) => "checked",
+        Err(_) => "unknown",
+    };
+    // XSEC-01: one more read stage done — poll before recording.
+    if !poll.ok_now() {
+        return Ok(finish(StatusReadOutcome::IdentityChanged));
+    }
+    // R4 heartbeat: the blocking call and fallback reads above may have
+    // outrun the lease window (the interrupt flag is best-effort) —
+    // verify the lease before any status row is recorded. A lost lease
+    // discards the observation and the scope retries with a fresh lease
+    // instead of racing a completion.
+    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
+        return Ok(finish(StatusReadOutcome::LeaseRetry {
+            detail: format!(
+                "lease lost during status of {}; observation discarded",
+                git_path.display()
+            ),
+        }));
+    }
+    // Status fence (post-run): every Git read above is done; re-verify
+    // identity before any status row is recorded. On mismatch the
+    // observation is discarded and the scope parks. Relationship pins
+    // re-verify through the unscoped descriptor walk.
+    if let Some(pinned) = &pinned {
+        let fence_ok = match runner.fence.as_ref() {
+            None => true,
+            Some(fence) => fence.reverify_pinned(git_path, pinned),
+        };
+        if !fence_ok {
+            return Ok(finish(StatusReadOutcome::FenceChanged));
+        }
+    }
+    Ok(finish(StatusReadOutcome::Observed {
+        started_ms: started,
+        finished_ms: finished,
+        submodules,
+        observation,
+    }))
+}
+
+/// Write half of [`exec_status`]: status rows, gaps, and retries for one
+/// collected outcome. Runs on the single writer.
+async fn persist_status(
+    runner: &mut Runner,
+    store: &TursoStore,
+    claimed: &ClaimedTask,
+    collected: StatusCollected,
+) -> repo_scan::Result<TaskOutcome> {
+    let target = &collected.target;
+    match collected.outcome {
+        StatusReadOutcome::Refused { state, reason } => Ok(TaskOutcome::Parked { state, reason }),
+        StatusReadOutcome::StatFailed(e) => {
+            fail_stat_open(runner, store, claimed, &target.git_path, &e).await
+        }
+        StatusReadOutcome::IdentityChanged => {
+            Ok(park_on_identity_change("status", &target.git_path))
+        }
+        StatusReadOutcome::FenceChanged => Ok(TaskOutcome::Parked {
+            state: TaskState::Unavailable,
+            reason: format!(
+                "status path {} changed during inspection; observations discarded",
+                target.git_path.display()
+            ),
+        }),
+        StatusReadOutcome::Timeout { detail } => Ok(park_on_timeout(&detail)),
+        StatusReadOutcome::LeaseRetry { detail } => {
+            retry_on_lease_lost(runner, store, claimed, &detail).await
+        }
+        StatusReadOutcome::OpenFailed { detail } => {
+            fail_task(
+                runner,
+                store,
+                claimed,
+                ExecFail {
+                    category: String::from("status-open-error"),
+                    detail,
+                },
+            )
+            .await
+        }
+        StatusReadOutcome::StatusFailed { detail } => {
+            fail_task(
+                runner,
+                store,
+                claimed,
+                ExecFail {
+                    category: String::from("status-error"),
+                    detail,
+                },
+            )
+            .await
+        }
+        StatusReadOutcome::UnsupportedOpen { error } => {
+            let reason = format!(
+                "status unsupported on {}: {error}",
+                target.git_path.display()
+            );
+            record_status_row(
+                runner,
+                store,
+                &target.checkout_id,
+                &target.instance_id,
+                target.mode,
+                "unsupported",
+                None,
+                None,
+                None,
+                status_units(target.mode),
+                "unknown",
+                &[error],
+                target.now_ms,
+                target.now_ms,
+                target.observed_rev,
+            )
+            .await?;
+            Ok(TaskOutcome::Parked {
+                state: TaskState::Unsupported,
+                reason,
+            })
+        }
+        StatusReadOutcome::Observed {
+            started_ms,
+            finished_ms,
+            submodules,
+            observation,
+        } => {
+            let is_unsupported = observation.is_none();
+            match observation {
+                None => {
+                    record_status_row(
+                        runner,
+                        store,
+                        &target.checkout_id,
+                        &target.instance_id,
+                        target.mode,
+                        "unsupported",
+                        None,
+                        None,
+                        None,
+                        status_units(target.mode),
+                        submodules,
+                        &["status unsupported in both backends".to_string()],
+                        started_ms,
+                        finished_ms,
+                        target.observed_rev,
+                    )
+                    .await?;
+                }
+                Some(obs) => {
+                    let state = status_state_of(&obs);
+                    record_status_row(
+                        runner,
+                        store,
+                        &target.checkout_id,
+                        &target.instance_id,
+                        target.mode,
+                        state,
+                        obs.staged.map(|c| c.min(i64::MAX as u64) as i64),
+                        obs.unstaged.map(|c| c.min(i64::MAX as u64) as i64),
+                        obs.untracked.map(|c| c.min(i64::MAX as u64) as i64),
+                        status_units(target.mode),
+                        submodules,
+                        &obs.unknown_fields,
+                        started_ms,
+                        finished_ms,
+                        target.observed_rev,
+                    )
+                    .await?;
+                }
+            }
+            if is_unsupported {
+                return Ok(TaskOutcome::Parked {
+                    state: TaskState::Unsupported,
+                    reason: format!(
+                        "status unsupported on {}: status unsupported in both backends",
+                        target.git_path.display()
+                    ),
+                });
+            }
+            Ok(TaskOutcome::Complete)
+        }
+    }
+}
+
 async fn exec_status(
     runner: &mut Runner,
     store: &TursoStore,
@@ -8307,282 +8723,18 @@ async fn exec_status(
         .await?;
         return Ok(TaskOutcome::Complete);
     }
-    let git_path = config::path_from_bytes(checkout.git_path.clone());
-    // Status fence (pre-run): same verify-run-reverify envelope as probes.
-    // Refusals park with a preserved gap; nothing is persisted.
-    let schedule = ProbeSchedule::status_legacy();
-    let pinned: Option<PinnedDir> =
-        match verify_probe_path(runner.fence.as_ref(), "status", &git_path, &schedule) {
-            ProbeFence::Unfenced => None,
-            ProbeFence::Pinned(pinned) | ProbeFence::Relationship(pinned) => Some(pinned),
-            ProbeFence::Refused { state, reason } => {
-                return Ok(TaskOutcome::Parked { state, reason });
-            }
-            ProbeFence::StatFailed(e) => {
-                return fail_stat_open(runner, store, claimed, &git_path, &e).await;
-            }
-        };
-    // The pin binds the execution (XSEC-01): Git runs between the
-    // pre-run pin above and the DURING/post-run re-verification below, so a
-    // path swapped mid-run discards every observation. Inspection keeps
-    // the scheduling spelling, so persisted rows stay spelling-stable.
-    let mut poll = IdentityPoll::new(runner.fence.as_ref(), &git_path, pinned.as_ref());
-    let instance = match runner.inspector.open_exact(&git_path) {
-        Ok(instance) => instance,
-        Err(e) if git::is_unsupported_error(&e) => {
-            record_status_row(
-                runner,
-                store,
-                &checkout_id,
-                &checkout.instance_id,
-                mode,
-                "unsupported",
-                None,
-                None,
-                None,
-                status_units(mode),
-                "unknown",
-                &[e.to_string()],
-                now,
-                now,
-                observed_rev,
-            )
-            .await?;
-            return Ok(TaskOutcome::Parked {
-                state: TaskState::Unsupported,
-                reason: format!("status unsupported on {}: {e}", git_path.display()),
-            });
-        }
-        Err(e) => {
-            return fail_task(
-                runner,
-                store,
-                claimed,
-                ExecFail {
-                    category: String::from("status-open-error"),
-                    detail: e.to_string(),
-                },
-            )
-            .await;
-        }
+    // Step 8 worker seam: the read half runs the guarded Git inspection
+    // without catalog writes; the single writer applies the outcome.
+    let target = StatusTarget {
+        checkout_id: checkout_id.clone(),
+        instance_id: checkout.instance_id.clone(),
+        git_path: config::path_from_bytes(checkout.git_path.clone()),
+        mode,
+        now_ms: now,
+        observed_rev,
     };
-    // XSEC-01: the open is a read stage like any other — poll it.
-    if !poll.ok_now() {
-        return Ok(park_on_identity_change("status", &git_path));
-    }
-    // R4 heartbeat: renew before the blocking call below, which has no
-    // in-call yield point. A lost lease stops the op before any Git read.
-    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
-        return retry_on_lease_lost(
-            runner,
-            store,
-            claimed,
-            &format!(
-                "lease lost before status of {}; retrying with a fresh lease",
-                git_path.display()
-            ),
-        )
-        .await;
-    }
-    let started = store::now_ms();
-    // R4: the blocking status call has no in-call yield point, so it runs
-    // under the tighter of the wall budget and the lease window just
-    // renewed above — the guard trips the interrupt strictly before the
-    // lease can lapse, and a window abandonment retries (fresh lease)
-    // instead of parking valid-but-slow work.
-    let (call_ms, lease_bound) =
-        lease_call_budget(deadline.remaining().as_millis().min(u128::from(u64::MAX)) as u64);
-    let call_deadline = OpDeadline::new(Duration::from_millis(call_ms));
-    // SR-STATE-01 + XSEC-01: the guard thread polls identity DURING the
-    // blocking status call and trips the interrupt flag on change or
-    // deadline. The flag is best-effort preemption; the checks after the
-    // call are the guarantee — even if gix ignores the flag, an expired
-    // or swapped observation never records.
-    let guard = spawn_status_guard(
-        runner.fence.clone(),
-        git_path.clone(),
-        pinned.as_ref().map(snapshot_of),
-        call_deadline,
-    );
-    let status_result =
-        runner
-            .inspector
-            .status_interruptible(&instance, mode, Some(guard.interrupt_flag()));
-    let identity_changed = guard.finish();
-    if identity_changed {
-        return Ok(park_on_identity_change("status", &git_path));
-    }
-    if deadline.expired() {
-        return Ok(park_on_timeout(&format!(
-            "timeout-abandoned: status of {} exceeded the {OP_DEADLINE_SECS}s execution \
-             budget; observation discarded",
-            git_path.display()
-        )));
-    }
-    if lease_bound && call_deadline.expired() {
-        // R4: the lease window (not the wall budget) ended the call — the
-        // observation is discarded and the scope retries with a fresh
-        // lease. The lease itself never lapsed, so no reclaim or duplicate
-        // is possible; parking here would strand valid-but-slow work.
-        return retry_on_lease_lost(
-            runner,
-            store,
-            claimed,
-            &format!(
-                "status of {} exceeded its lease window; observation discarded",
-                git_path.display()
-            ),
-        )
-        .await;
-    }
-    if !poll.ok_now() {
-        return Ok(park_on_identity_change("status", &git_path));
-    }
-    // R4 heartbeat: the blocking call consumed most of the window renewed
-    // above — renew again so the fallback and submodule reads below run
-    // under a fresh lease instead of racing its expiry.
-    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
-        return retry_on_lease_lost(
-            runner,
-            store,
-            claimed,
-            &format!(
-                "lease lost during status of {}; observation discarded",
-                git_path.display()
-            ),
-        )
-        .await;
-    }
-    let observation = match status_result {
-        Ok(obs) => Some(obs),
-        Err(e) if git::is_unsupported_error(&e) => {
-            // RSF-FALLBACK-HELPER-SECURITY(5): fallback spawns inherit
-            // the task deadline and SIGINT; cancellation ends even stuck
-            // readers instead of hanging the status task.
-            let task_deadline = *deadline;
-            let cancel = git::fallback::WaitCancel::new(
-                move || INTERRUPTED.load(Ordering::SeqCst) || task_deadline.expired(),
-                None,
-            );
-            git::fallback::with_wait_cancel(&cancel, || {
-                fallback_status_counts(runner, &instance, mode, &e)
-            })
-        }
-        Err(e) => {
-            return fail_task(
-                runner,
-                store,
-                claimed,
-                ExecFail {
-                    category: String::from("status-error"),
-                    detail: e.to_string(),
-                },
-            )
-            .await;
-        }
-    };
-    let finished = store::now_ms();
-    // Submodule coverage (R16): examined through the inspector alongside
-    // the status probe — `checked` when the submodule relationships were
-    // actually read, `unknown` when they could not be.
-    let submodules = match runner.inspector.submodules(&instance) {
-        Ok(_) => "checked",
-        Err(_) => "unknown",
-    };
-    // XSEC-01: one more read stage done — poll before recording.
-    if !poll.ok_now() {
-        return Ok(park_on_identity_change("status", &git_path));
-    }
-    // R4 heartbeat: the blocking call and fallback reads above may have
-    // outrun the lease window (the interrupt flag is best-effort) —
-    // verify the lease before any status row is recorded. A lost lease
-    // discards the observation and the scope retries with a fresh lease
-    // instead of racing a completion.
-    if !renew_claim_lease(store, &mut runner.counters, claimed).await? {
-        return retry_on_lease_lost(
-            runner,
-            store,
-            claimed,
-            &format!(
-                "lease lost during status of {}; observation discarded",
-                git_path.display()
-            ),
-        )
-        .await;
-    }
-    // Status fence (post-run): every Git read above is done; re-verify
-    // identity before any status row is recorded. On mismatch the
-    // observation is discarded and the scope parks. Relationship pins
-    // re-verify through the unscoped descriptor walk.
-    if let Some(pinned) = &pinned {
-        let fence_ok = match runner.fence.as_ref() {
-            None => true,
-            Some(fence) => fence.reverify_pinned(&git_path, pinned),
-        };
-        if !fence_ok {
-            return Ok(TaskOutcome::Parked {
-                state: TaskState::Unavailable,
-                reason: format!(
-                    "status path {} changed during inspection; observations discarded",
-                    git_path.display()
-                ),
-            });
-        }
-    }
-    let is_unsupported = observation.is_none();
-    match observation {
-        None => {
-            record_status_row(
-                runner,
-                store,
-                &checkout_id,
-                &checkout.instance_id,
-                mode,
-                "unsupported",
-                None,
-                None,
-                None,
-                status_units(mode),
-                submodules,
-                &["status unsupported in both backends".to_string()],
-                started,
-                finished,
-                observed_rev,
-            )
-            .await?;
-        }
-        Some(obs) => {
-            let state = status_state_of(&obs);
-            record_status_row(
-                runner,
-                store,
-                &checkout_id,
-                &checkout.instance_id,
-                mode,
-                state,
-                obs.staged.map(|c| c.min(i64::MAX as u64) as i64),
-                obs.unstaged.map(|c| c.min(i64::MAX as u64) as i64),
-                obs.untracked.map(|c| c.min(i64::MAX as u64) as i64),
-                status_units(mode),
-                submodules,
-                &obs.unknown_fields,
-                started,
-                finished,
-                observed_rev,
-            )
-            .await?;
-        }
-    }
-    if is_unsupported {
-        return Ok(TaskOutcome::Parked {
-            state: TaskState::Unsupported,
-            reason: format!(
-                "status unsupported on {}: status unsupported in both backends",
-                git_path.display()
-            ),
-        });
-    }
-    Ok(TaskOutcome::Complete)
+    let collected = collect_status_reads(runner, store, claimed, &target, deadline).await?;
+    persist_status(runner, store, claimed, collected).await
 }
 
 fn status_units(mode: StatusMode) -> &'static str {
