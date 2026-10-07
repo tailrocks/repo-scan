@@ -159,10 +159,12 @@ fn main() {
     let mut deep = ws.join("deep");
     fs::create_dir_all(&deep).expect("deep root");
     counts.dirs.fetch_add(1, Ordering::Relaxed);
+    // Cycling single-letter names: 300 levels stay under PATH_MAX.
     for d in 0..sh.deep_levels {
-        deep = deep.join(format!("c{d:03}"));
+        let name = char::from(b'a' + (d % 26) as u8).to_string();
+        deep = deep.join(name);
         fs::create_dir_all(&deep).expect("deep level");
-        write_file(&deep.join("level.txt"), b"deep\n");
+        write_file(&deep.join("l.txt"), b"deep\n");
     }
     counts
         .dirs
