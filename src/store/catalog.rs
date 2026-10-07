@@ -1694,6 +1694,57 @@ impl TursoStore {
         Ok(rows == 1)
     }
 
+    /// Extend several live leases in ONE transaction (Step 9 scheduled
+    /// renewal for the worker pool: the coordinator renews every in-flight
+    /// task on a tick instead of each worker renewing inline). Returns the
+    /// ids whose lease is gone — expired into another incarnation, or held
+    /// under a different token/epoch — so the caller stops touching those
+    /// scopes; never touches another owner's lease. Empty input commits
+    /// nothing and returns empty.
+    pub async fn renew_leases_batch(
+        &self,
+        leases: &[(&str, i64, u64)],
+        ttl_ms: i64,
+        now_ms: i64,
+    ) -> crate::Result<Vec<String>> {
+        if leases.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.forbid_write("renew_leases_batch")?;
+        let expires = now_ms.checked_add(ttl_ms).ok_or_else(|| {
+            Error::Store(format!("lease expiry {now_ms} + {ttl_ms} overflows i64"))
+        })?;
+        for (_, _, epoch) in leases {
+            u64_to_i64(*epoch, "lease epoch")?;
+            self.check_owner_epoch(*epoch, "renew_leases_batch")?;
+        }
+        self.with_tx(|conn| async move {
+            let mut lost = Vec::new();
+            for (task_id, token, epoch) in leases {
+                let rows = conn
+                    .execute(
+                        "UPDATE frontier_tasks SET lease_expires_ms = ?1, updated_at_ms = ?2 \
+                        WHERE id = ?3 AND state = 'leased' AND lease_token = ?4 \
+                        AND lease_epoch = ?5",
+                        vec![
+                            v_int(expires),
+                            v_int(now_ms),
+                            v_text(*task_id),
+                            v_int(*token),
+                            v_int(u64_to_i64(*epoch, "lease epoch")?),
+                        ],
+                    )
+                    .await
+                    .map_err(store_err)?;
+                if rows != 1 {
+                    lost.push((*task_id).to_string());
+                }
+            }
+            Ok(lost)
+        })
+        .await
+    }
+
     /// Return expired leases to `pending`; reports how many moved.
     pub async fn expire_leases(&self, now_ms: i64) -> crate::Result<u64> {
         self.with_tx(|conn| async move { Self::expire_leases_on(conn, now_ms).await })
