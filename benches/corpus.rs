@@ -121,7 +121,7 @@ fn main() {
                         let leaf = wide.join(name).join(format!("l{l:04}"));
                         fs::create_dir_all(&leaf).expect("leaf dir");
                         let global = g * sh.leaves_per_group + l;
-                        if global % sh.repo_every == 0 {
+                        if global.is_multiple_of(sh.repo_every) {
                             repo_paths.push((global, leaf));
                         } else {
                             for f in 0..sh.files_per_leaf {
