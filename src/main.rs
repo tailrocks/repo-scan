@@ -10525,10 +10525,14 @@ fn resolve_all_upstreams(
 /// whose source matches the merge ref maps it to the local tracking ref
 /// — with no fallback when that target is missing and no default when
 /// the remote carries no fetch lines (all probed). Garbage (unparseable
-/// or non-UTF-8) and negative/destination-less refspecs SKIP to the next
-/// line — probed: installed git resolves past a garbage-first or
-/// negative-first fetch list to the later valid refspec. The mapped ref
-/// must exist in the same observation; anything else yields no upstream.
+/// or non-UTF-8), negative/destination-less, and source-mismatching
+/// refspecs SKIP to the next line — probed: installed git iterates the
+/// fetch list past a garbage-first, negative-first, or
+/// non-matching-first fetch list to the later valid refspec. The mapped
+/// ref must exist in the same observation; anything else yields no
+/// upstream. A first match whose target is missing stays missing
+/// (probed: installed git reports the missing target as `gone`, never
+/// the later refspec's target), so a match never falls through.
 fn resolve_branch_upstream(
     cfg: &UpstreamConfig,
     branch: &[u8],
@@ -10555,7 +10559,9 @@ fn resolve_branch_upstream(
         if spec.negative || spec.dst.is_none() {
             continue;
         }
-        let mapped = map_fetch_refspec(&spec, merge)?;
+        let Some(mapped) = map_fetch_refspec(&spec, merge) else {
+            continue;
+        };
         return known.contains(mapped.as_slice()).then_some(mapped);
     }
     None
@@ -12768,8 +12774,9 @@ enum FetchPlan {
 /// applies `insteadOf` exactly as a fetch would; `ext::` and
 /// remote-helper transports refuse — they execute repo-chosen local
 /// commands), and executable config origins (repo-scope
-/// `credential.helper`, `core.sshCommand`, or `include.*` chains
-/// refuse — operator system/global definers keep working).
+/// `credential.helper`, `core.sshCommand`, `remote.*.uploadpack` /
+/// `receivepack`, or `include.*` chains refuse — operator
+/// system/global definers keep working).
 fn plan_remote_fetch(
     git: &git::fallback::FallbackGit,
     dir: &Path,
@@ -12864,11 +12871,26 @@ fn plan_fetch_transport(
 }
 
 /// Executable-config gate: refuse repo-scope `credential.helper`,
-/// `core.sshCommand`, and `include.*`/`includeif.*` chains (a
-/// repo-scope include would hide the true definer of the other two,
-/// so any repo-scope include refuses too). Operator system/global
-/// definers are outside the repo and keep working. `Err` on unreadable
-/// config (the attempt fails); unparseable origin rows refuse.
+/// `core.sshCommand`, `remote.*.uploadpack` / `receivepack`, and
+/// `include.*`/`includeif.*` chains (a repo-scope include would hide
+/// the true definer of the others, so any repo-scope include refuses
+/// too). Operator system/global definers are outside the repo and keep
+/// working. `Err` on unreadable config (the attempt fails);
+/// unparseable origin rows refuse.
+///
+/// `uploadpack` matters because the fetch spawn honors it from repo
+/// config and local transports execute it (probed: a wrapper set as
+/// `remote.origin.uploadpack` runs on `git fetch` from a local path);
+/// `receivepack` refuses for symmetry (a fetch never reads it, but a
+/// repo overriding pack commands is hostile either way).
+///
+/// True for lowercase `remote.<name>.uploadpack` / `receivepack` keys
+/// (the origin parser lowercases whole keys, so subsection case never
+/// hides these suffixes).
+fn is_remote_pack_override(key: &str) -> bool {
+    key.starts_with("remote.") && (key.ends_with(".uploadpack") || key.ends_with(".receivepack"))
+}
+
 fn plan_fetch_exec_config(git: &git::fallback::FallbackGit, dir: &Path) -> Result<(), FetchGate> {
     let listed = git
         .git_config_list_origins(dir, FETCH_TIMEOUT)
@@ -12893,7 +12915,8 @@ fn plan_fetch_exec_config(git: &git::fallback::FallbackGit, dir: &Path) -> Resul
         let gated = key == "credential.helper"
             || key == "core.sshcommand"
             || key.starts_with("include.")
-            || key.starts_with("includeif.");
+            || key.starts_with("includeif.")
+            || is_remote_pack_override(key);
         if !gated {
             continue;
         }

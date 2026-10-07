@@ -845,6 +845,120 @@ fn upstream10_garbage_first_refspec_skips_to_valid() {
     );
 }
 
+/// A first fetch refspec that is valid and positive but whose source
+/// does not match the merge ref SKIPS to the later matching refspec —
+/// pinned against installed git, which iterates the fetch list
+/// (probed: `rev-parse --symbolic-full-name` resolves via the second
+/// line, so a multi-refspec remote keeps its upstream). Pre-fix the
+/// resolver returned `None` on the first non-matching line and dropped
+/// the branch's upstream.
+#[test]
+fn upstream10_non_matching_first_refspec_skips_to_valid() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("ws");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    let repo = fixture::normal_clone(&root, "multispec");
+    let head = fixture::git_str(&repo, &["rev-parse", "HEAD"]);
+    fixture::git(&repo, &["update-ref", "refs/remotes/origin/main", &head]);
+    fixture::git(&repo, &["config", "--unset-all", "remote.origin.fetch"]);
+    fixture::git(
+        &repo,
+        &[
+            "config",
+            "--add",
+            "remote.origin.fetch",
+            "+refs/heads/other:refs/remotes/origin/other",
+        ],
+    );
+    fixture::git(
+        &repo,
+        &[
+            "config",
+            "--add",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
+    fixture::git(&repo, &["config", "branch.main.remote", "origin"]);
+    fixture::git(&repo, &["config", "branch.main.merge", "refs/heads/main"]);
+    // Independent oracle: installed git iterates past the non-matching line.
+    let expected = fixture::git_str(
+        &repo,
+        &["rev-parse", "--symbolic-full-name", "main@{upstream}"],
+    );
+    assert_eq!(expected, "refs/remotes/origin/main");
+    let state = dir.path().join("state");
+    let report_path = dir.path().join("rep.json");
+    let out = scan(&root, &state, &report_path, &["--status", "metadata"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let report = read_report(&report_path);
+    let paths = path_map(&report);
+    let repo_row = repo_by_path(&report, &paths, "multispec");
+    assert_eq!(repo_row["match"].as_str(), Some("confirmed"));
+    let main = branch_named(&report, repo_id(repo_row), "refs/heads/main");
+    assert_eq!(
+        main["upstream"]["value"].as_str(),
+        Some("refs/remotes/origin/main")
+    );
+}
+
+/// A first fetch refspec whose source matches but whose target is
+/// missing does NOT fall through to a later refspec: installed git
+/// reports the missing target itself (`%(upstream)` names it,
+/// `branch -vv` shows it `gone`), never the later line's target. The
+/// resolver keeps first-match-wins, and the existence rule then yields
+/// a null upstream rather than a ref git does not use.
+#[test]
+fn upstream10_first_match_missing_never_falls_through() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("ws");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    let repo = fixture::normal_clone(&root, "gonefirst");
+    let head = fixture::git_str(&repo, &["rev-parse", "HEAD"]);
+    fixture::git(&repo, &["update-ref", "refs/remotes/origin/main", &head]);
+    fixture::git(&repo, &["config", "--unset-all", "remote.origin.fetch"]);
+    fixture::git(
+        &repo,
+        &[
+            "config",
+            "--add",
+            "remote.origin.fetch",
+            "+refs/heads/main:refs/remotes/origin/missing",
+        ],
+    );
+    fixture::git(
+        &repo,
+        &[
+            "config",
+            "--add",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
+    fixture::git(&repo, &["config", "branch.main.remote", "origin"]);
+    fixture::git(&repo, &["config", "branch.main.merge", "refs/heads/main"]);
+    // Independent oracle: git names the missing target, never the later line.
+    let expected = fixture::git_str(
+        &repo,
+        &["for-each-ref", "--format=%(upstream)", "refs/heads/main"],
+    );
+    assert_eq!(expected, "refs/remotes/origin/missing");
+    let state = dir.path().join("state");
+    let report_path = dir.path().join("rep.json");
+    let out = scan(&root, &state, &report_path, &["--status", "metadata"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let report = read_report(&report_path);
+    let paths = path_map(&report);
+    let repo_row = repo_by_path(&report, &paths, "gonefirst");
+    assert_eq!(repo_row["match"].as_str(), Some("confirmed"));
+    let main = branch_named(&report, repo_id(repo_row), "refs/heads/main");
+    assert!(
+        main["upstream"].is_null(),
+        "missing first-match target yields no upstream, never the later refspec: {}",
+        main["upstream"]
+    );
+}
+
 /// A local upstream (`remote = .`) resolves to the local merge ref itself
 /// (Step 10).
 #[test]

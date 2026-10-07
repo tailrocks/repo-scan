@@ -1110,3 +1110,124 @@ fn fetch12_repo_ssh_command_refused() {
         "refusal names the repo-scope key: {detail}"
     );
 }
+
+/// FETCH-GATE-05: a repo-scope `remote.origin.uploadpack` refuses the
+/// fetch (`unsupported`) and NOTHING executes: the fetch spawn honors
+/// `uploadpack` from repo config and local transports execute it, so
+/// the sentinel the wrapper would create must not exist after the scan.
+#[test]
+fn fetch13_repo_uploadpack_refused_without_execution() {
+    let tmp = fixture::scratch_root("fetch13");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+
+    let (upstream, _) = seed_upstream(&root, "upstream");
+    let clone = clone_from(&root, &upstream, "clone");
+    let sentinel = tmp.path().join("SENTINEL-uploadpack");
+    let wrapper = tmp.path().join("uploadpack-wrapper.sh");
+    repo_scan::privacy::private_write_0600(
+        &wrapper,
+        format!("#!/bin/sh\ntouch \"{}\"\n", sentinel.display()).as_bytes(),
+    )
+    .expect("write wrapper");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    fixture::git(
+        &clone,
+        &[
+            "config",
+            "remote.origin.uploadpack",
+            wrapper.to_str().expect("utf8"),
+        ],
+    );
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "usable scan result: {}",
+        stderr_text(&out)
+    );
+    assert!(
+        !sentinel.exists(),
+        "uploadpack wrapper must never execute during a gated scan"
+    );
+    let report = load_json(&report_path);
+    let refresh = remote(&report, "origin", "fetch");
+    assert_eq!(refresh["refresh"]["status"].as_str(), Some("unsupported"));
+    let detail = origin_refresh_detail(&state).unwrap_or_default();
+    assert!(
+        detail.contains("remote.origin.uploadpack"),
+        "refusal names the repo-scope key: {detail}"
+    );
+    for b in report["branches"].as_array().expect("branches") {
+        assert_ne!(
+            b["freshness"].as_str(),
+            Some("current"),
+            "refused refresh labels nothing current: {}",
+            b["name"]["value"]
+        );
+    }
+}
+
+/// FETCH-GATE-06: a repo-scope `remote.origin.receivepack` refuses the
+/// fetch (`unsupported`) for symmetry with `uploadpack` — a fetch never
+/// reads it, but a repo overriding pack commands is hostile either way.
+#[test]
+fn fetch14_repo_receivepack_refused() {
+    let tmp = fixture::scratch_root("fetch14");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+
+    let (upstream, _) = seed_upstream(&root, "upstream");
+    let clone = clone_from(&root, &upstream, "clone");
+    fixture::git(
+        &clone,
+        &["config", "remote.origin.receivepack", "canary-pack-fetch14"],
+    );
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "usable scan result: {}",
+        stderr_text(&out)
+    );
+    let report = load_json(&report_path);
+    let refresh = remote(&report, "origin", "fetch");
+    assert_eq!(refresh["refresh"]["status"].as_str(), Some("unsupported"));
+    let detail = origin_refresh_detail(&state).unwrap_or_default();
+    assert!(
+        detail.contains("remote.origin.receivepack"),
+        "refusal names the repo-scope key: {detail}"
+    );
+}
