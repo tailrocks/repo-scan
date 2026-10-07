@@ -25,9 +25,9 @@ use repo_scan::report::builder::{
 use repo_scan::scan_events::{is_terminal_event, Cursor, Envelope, EventType, Op};
 use repo_scan::scheduler::{backoff_for_attempt, Admission, CircuitBreaker, OpClass};
 use repo_scan::store::{
-    self, CheckpointCoordinator, CheckpointPolicy, ClaimedTask, NewCheckout, NewGitInstance,
-    NewRef, NewRemote, NewScan, NewScanEvent, NewStatus, NewTask, NewVolume, OwnerGuard,
-    ScanEventRow, Store, TaskOutcome, TursoStore, WriterBatch,
+    self, CheckpointCoordinator, CheckpointPolicy, ClaimedTask, CompletionGap, NewCheckout,
+    NewGitInstance, NewRef, NewRemote, NewScan, NewScanEvent, NewStatus, NewTask, NewVolume,
+    OwnerGuard, ScanEventRow, Store, TaskOutcome, TursoStore, WriterBatch,
 };
 use repo_scan::telemetry::{live_helper_rss_bytes, FootprintSampler, SamplerInputs};
 use repo_scan::walk::roots::{plan_machine_roots, PlannedRoot, RootPriority};
@@ -924,6 +924,29 @@ impl ScanJournal {
             event_offset: off,
             event_type: EventType::LocationUpdated.name(),
             op: EventType::LocationUpdated.op().name(),
+            reset: false,
+            records,
+        };
+        Ok(Some(TursoStore::buffer_scan_event(batch, &event)?))
+    }
+
+    /// Buffer one `error` into the writer batch: it commits atomically
+    /// with the error row that caused it. No dedupe — errors are
+    /// point-in-time observations (`add`), bounded by the same retry caps
+    /// that bound the rows. Always `Some(should_flush)`.
+    fn buffer_error(
+        &mut self,
+        batch: &mut WriterBatch,
+        records: &[u8],
+    ) -> repo_scan::Result<Option<bool>> {
+        let (seq, off) = self.assign();
+        let event = NewScanEvent {
+            scan_id: &self.scan_id,
+            seq,
+            catalog_rev: self.rev,
+            event_offset: off,
+            event_type: EventType::Error.name(),
+            op: EventType::Error.op().name(),
             reset: false,
             records,
         };
@@ -3671,14 +3694,14 @@ async fn run_until_boundary(
                     );
                     let stall_now = store::now_ms();
                     buffer_record_error(
-                        &mut runner.batch,
+                        runner,
                         &stall_id,
                         &item.task.scope_key,
                         "watchdog-no-progress",
                         &stall_detail,
                         None,
                         stall_now,
-                    );
+                    )?;
                     buffer_resolve_error(&mut runner.batch, &stall_id, stall_now);
                     let stall_due = runner.batch.should_flush();
                     flush_if_due(runner, store, stall_due).await?;
@@ -4175,16 +4198,43 @@ async fn flush_if_due(runner: &mut Runner, store: &TursoStore, due: bool) -> rep
 /// the unconditional `UPDATE` plus `INSERT OR IGNORE`, mirroring
 /// `record_error`'s update-then-insert outcome without a read. Returns
 /// `WriterBatch::should_flush`.
+/// `error` records (D4): the gap row's stable id, scope, category,
+/// and detail. Attempts are omitted: the UPDATE+INSERT pair means the
+/// final count is only knowable after commit (the catalog row has it).
+fn error_records_value(
+    id: &str,
+    scope_key: &str,
+    category: &str,
+    detail: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "scope_key": scope_key,
+        "category": category,
+        "detail": detail,
+    })
+}
+
+fn error_records(
+    id: &str,
+    scope_key: &str,
+    category: &str,
+    detail: &str,
+) -> repo_scan::Result<Vec<u8>> {
+    let records = error_records_value(id, scope_key, category, detail);
+    serde_json::to_vec(&records).map_err(|e| repo_scan::Error::Report(e.to_string()))
+}
+
 fn buffer_record_error(
-    batch: &mut WriterBatch,
+    runner: &mut Runner,
     id: &str,
     scope_key: &str,
     category: &str,
     detail: &str,
     next_retry_ms: Option<i64>,
     now_ms: i64,
-) -> bool {
-    batch.push(
+) -> repo_scan::Result<bool> {
+    runner.batch.push(
         "UPDATE errors SET attempts = attempts + 1, detail = ?1, last_seen_ms = ?2, \
          next_retry_ms = ?3, open = 1 WHERE id = ?4",
         vec![
@@ -4194,7 +4244,7 @@ fn buffer_record_error(
             turso::Value::Text(id.to_string()),
         ],
     );
-    batch.push(
+    runner.batch.push(
         "INSERT OR IGNORE INTO errors (id, scope_key, category, detail, attempts, \
          first_seen_ms, last_seen_ms, next_retry_ms, open) \
          VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5, ?6, 1)",
@@ -4207,7 +4257,14 @@ fn buffer_record_error(
             next_retry_ms.map_or(turso::Value::Null, turso::Value::Integer),
         ],
     );
-    batch.should_flush()
+    // Same batch as the error rows: the event is only readable once its
+    // cause has committed. Unit-test runners (journal: None) persist rows
+    // without journaling.
+    if let Some(journal) = runner.journal.as_mut() {
+        let records = error_records(id, scope_key, category, detail)?;
+        journal.buffer_error(&mut runner.batch, &records)?;
+    }
+    Ok(runner.batch.should_flush())
 }
 
 /// Buffer a gap close (RSF-AC461500-609D-4D55-991E-09C60D382D67), mirroring
@@ -4243,26 +4300,26 @@ impl Runner {
     /// what the report emits (see `alias_inputs`). Capped at
     /// [`MAX_ALIASES`] (A-F5, mirroring [`note_applied_scopes`]): past
     /// the cap new triples drop and one `alias-overflow` gap row
-    /// documents the loss. Returns `WriterBatch::should_flush`.
+    /// documents the loss. Returns `Ok(WriterBatch::should_flush)`.
     fn note_alias(
         &mut self,
         path: Vec<u8>,
         target: Vec<u8>,
         kind: &'static str,
         at_ms: i64,
-    ) -> bool {
+    ) -> repo_scan::Result<bool> {
         if self.alias_overflow {
-            return false;
+            return Ok(false);
         }
         let key = (path, target, kind);
         if self.alias_seen.contains(&key) {
-            return false;
+            return Ok(false);
         }
         if self.alias_seen.len() >= MAX_ALIASES {
             self.alias_overflow = true;
             eprintln!("repo-scan: alias overflow; further aliases dropped (gap recorded)");
             return buffer_record_error(
-                &mut self.batch,
+                self,
                 "alias-overflow",
                 events::mounts_scope_key(),
                 "alias-overflow",
@@ -4278,7 +4335,7 @@ impl Runner {
             kind: key.2,
             verified_at_ms: at_ms,
         });
-        false
+        Ok(false)
     }
 }
 
@@ -4286,15 +4343,15 @@ impl Runner {
 /// (A-F5, mirroring [`note_applied_scopes`]): past the cap the identity
 /// is not recorded (later spellings persist without dedupe) and one
 /// `probe-index-overflow` gap row documents the loss. Returns
-/// `WriterBatch::should_flush`.
+/// `Ok(WriterBatch::should_flush)`.
 fn note_probed_git_id(
     runner: &mut Runner,
     key: (u64, u64),
     git_bytes: Vec<u8>,
     now_ms: i64,
-) -> bool {
+) -> repo_scan::Result<bool> {
     if runner.probed_overflow {
-        return false;
+        return Ok(false);
     }
     if runner.probed_git_ids.len() >= MAX_PROBED_GIT_IDS {
         runner.probed_overflow = true;
@@ -4303,7 +4360,7 @@ fn note_probed_git_id(
              (gap recorded)"
         );
         return buffer_record_error(
-            &mut runner.batch,
+            runner,
             "probe-index-overflow",
             events::mounts_scope_key(),
             "probe-index-overflow",
@@ -4315,7 +4372,7 @@ fn note_probed_git_id(
         );
     }
     runner.probed_git_ids.insert(key, git_bytes);
-    false
+    Ok(false)
 }
 
 /// Per-volume breaker key for a scope key (paths stat their volume;
@@ -4393,14 +4450,14 @@ async fn execute_task(
         other => {
             let detail = format!("unknown task kind: {other}");
             let due = buffer_record_error(
-                &mut runner.batch,
+                runner,
                 &format!("kind:{}", claimed.task.id),
                 &claimed.task.scope_key,
                 "unsupported-task-kind",
                 &detail,
                 None,
                 store::now_ms(),
-            );
+            )?;
             flush_if_due(runner, store, due).await?;
             TaskOutcome::Parked {
                 state: TaskState::Unsupported,
@@ -4432,6 +4489,8 @@ enum CompletionApplied {
 /// Complete one claimed task, translating the store's scheduler signals:
 /// stale completions (already requeued by the store) are routine; lease
 /// mismatches and unknown tasks become typed errors that abort the run.
+/// A gap the completion recorded is journaled as an `error` event after
+/// the completion transaction commits — never inside it.
 async fn complete_claimed(
     store: &TursoStore,
     runner: &mut Runner,
@@ -4441,11 +4500,12 @@ async fn complete_claimed(
 ) -> repo_scan::Result<CompletionApplied> {
     let now = store::now_ms();
     match store
-        .complete_task(&claimed.task.id, claimed.token, epoch, outcome, now)
+        .complete_task_report_gap(&claimed.task.id, claimed.token, epoch, outcome, now)
         .await
     {
-        Ok(()) => {
+        Ok(gap) => {
             runner.counters.db_transactions += 1;
+            journal_completion_gap(runner, store, gap.as_ref()).await?;
             Ok(CompletionApplied::Applied)
         }
         Err(repo_scan::Error::Scheduler(message)) if message.starts_with("stale-completion:") => {
@@ -4460,6 +4520,23 @@ async fn complete_claimed(
         }
         Err(e) => Err(e),
     }
+}
+
+/// Journal one completion-recorded gap as an `error` event in its own
+/// transaction. The gap row is already durable (the completion committed
+/// before this runs); unit-test runners without a journal skip silently.
+async fn journal_completion_gap(
+    runner: &mut Runner,
+    store: &TursoStore,
+    gap: Option<&CompletionGap>,
+) -> repo_scan::Result<()> {
+    let (Some(gap), Some(journal)) = (gap, runner.journal.as_mut()) else {
+        return Ok(());
+    };
+    let records = error_records_value(&gap.id, &gap.scope_key, &gap.category, &gap.detail);
+    journal.emit(store, EventType::Error, &records).await?;
+    runner.counters.db_transactions += 1;
+    Ok(())
 }
 
 /// Translate an [`ExecFail`] into a retry (backoff from the attempt count)
@@ -5065,7 +5142,8 @@ async fn note_enum_alias(
         config::path_as_bytes(&first),
         kind,
         now_ms,
-    );
+    )?;
+
     // Boxed: flush_runner_batch -> note_enum_alias -> flush_if_due ->
     // flush_runner_batch is a future-type cycle (E0733).
     Box::pin(flush_if_due(runner, store, due)).await?;
@@ -5097,7 +5175,7 @@ async fn enqueue_symlink_target(
                         config::path_as_bytes(&target.path),
                         "symlink",
                         now_ms,
-                    );
+                    )?;
                     flush_if_due(runner, store, alias_due).await?;
                     return Ok(());
                 }
@@ -5128,7 +5206,7 @@ async fn enqueue_symlink_target(
                 config::path_as_bytes(&target.path),
                 "symlink",
                 now_ms,
-            );
+            )?;
             // The target itself may be scheduled under another spelling:
             // preserve that pair too (deferred; no-ops on same scope).
             runner.pending_alias_checks.push(PendingAliasCheck {
@@ -5143,7 +5221,7 @@ async fn enqueue_symlink_target(
         }
         Err(ResolveError::Cycle(p) | ResolveError::TooDeep(p)) => {
             let due = buffer_record_error(
-                &mut runner.batch,
+                runner,
                 &format!(
                     "symlink:{}",
                     config::encode_hex(&config::path_as_bytes(link_path))
@@ -5153,13 +5231,13 @@ async fn enqueue_symlink_target(
                 &format!("symlink cycle or excessive chain at {}", p.display()),
                 None,
                 now_ms,
-            );
+            )?;
             flush_if_due(runner, store, due).await?;
             Ok(())
         }
         Err(ResolveError::Io(e)) => {
             let due = buffer_record_error(
-                &mut runner.batch,
+                runner,
                 &format!(
                     "symlink:{}",
                     config::encode_hex(&config::path_as_bytes(link_path))
@@ -5169,7 +5247,7 @@ async fn enqueue_symlink_target(
                 &format!("cannot resolve {}: {e}", link_path.display()),
                 None,
                 now_ms,
-            );
+            )?;
             flush_if_due(runner, store, due).await?;
             Ok(())
         }
@@ -5770,14 +5848,14 @@ async fn exec_probe(
                 "probe-failed"
             };
             let due = buffer_record_error(
-                &mut runner.batch,
+                runner,
                 &gap_id,
                 &claimed.task.scope_key,
                 category,
                 &e.to_string(),
                 None,
                 now,
-            );
+            )?;
             flush_if_due(runner, store, due).await?;
             return Ok(TaskOutcome::Complete);
         }
@@ -6440,8 +6518,12 @@ async fn persist_probe(
                     instance.git_dir == instance.common_dir
                 };
                 if same_dir {
-                    let due =
-                        runner.note_alias(git_bytes.clone(), first.clone(), "same_object", now_ms);
+                    let due = runner.note_alias(
+                        git_bytes.clone(),
+                        first.clone(),
+                        "same_object",
+                        now_ms,
+                    )?;
                     flush_if_due(runner, store, due).await?;
                 }
                 let work_identity = instance
@@ -6570,7 +6652,7 @@ async fn persist_probe(
             }
             Some(_) => {}
             None => {
-                let due = note_probed_git_id(runner, key, common_bytes.clone(), now_ms);
+                let due = note_probed_git_id(runner, key, common_bytes.clone(), now_ms)?;
                 flush_if_due(runner, store, due).await?;
             }
         }
@@ -6864,14 +6946,14 @@ async fn persist_probe(
     }
     for broken in &reads.ref_errors {
         let due = buffer_record_error(
-            &mut runner.batch,
+            runner,
             &format!("ref-err:{instance_id}:{}", fnv1a_hex(broken.as_bytes())),
             &config::scope_key_for_git(path),
             "invalid-ref",
             broken,
             None,
             now_ms,
-        );
+        )?;
         flush_if_due(runner, store, due).await?;
     }
 
@@ -7200,14 +7282,14 @@ async fn exec_status(
     let now = store::now_ms();
     let Some(checkout) = store.get_checkout(&checkout_id).await? else {
         let due = buffer_record_error(
-            &mut runner.batch,
+            runner,
             &format!("status:{checkout_id}"),
             &claimed.task.scope_key,
             "unknown-checkout",
             &format!("status task names unknown checkout {checkout_id}; dropping"),
             None,
             now,
-        );
+        )?;
         flush_if_due(runner, store, due).await?;
         return Ok(TaskOutcome::Complete);
     };
@@ -12498,9 +12580,15 @@ pub async fn test_report_cursors(store: &TursoStore) -> repo_scan::Result<TestRe
 #[cfg(test)]
 pub fn test_alias_dedupe() -> (usize, usize) {
     let mut runner = Runner::new(&config::ResourceLimits::default());
-    runner.note_alias(b"/a".to_vec(), b"/b".to_vec(), "same_object", 1);
-    runner.note_alias(b"/a".to_vec(), b"/b".to_vec(), "same_object", 2);
-    runner.note_alias(b"/a".to_vec(), b"/c".to_vec(), "symlink", 3);
+    runner
+        .note_alias(b"/a".to_vec(), b"/b".to_vec(), "same_object", 1)
+        .expect("note");
+    runner
+        .note_alias(b"/a".to_vec(), b"/b".to_vec(), "same_object", 2)
+        .expect("note");
+    runner
+        .note_alias(b"/a".to_vec(), b"/c".to_vec(), "symlink", 3)
+        .expect("note");
     (runner.aliases.len(), runner.alias_seen.len())
 }
 
@@ -12535,9 +12623,11 @@ pub fn test_alias_cap() -> (usize, bool, bool) {
     for n in 0..(MAX_ALIASES + 10) {
         let path = format!("/a/{n}").into_bytes();
         let target = format!("/b/{n}").into_bytes();
-        let _ = runner.note_alias(path, target, "symlink", 1);
+        let _ = runner.note_alias(path, target, "symlink", 1).expect("note");
     }
-    let _ = runner.note_alias(b"/a/0".to_vec(), b"/b/0".to_vec(), "symlink", 2);
+    let _ = runner
+        .note_alias(b"/a/0".to_vec(), b"/b/0".to_vec(), "symlink", 2)
+        .expect("note");
     (
         runner.aliases.len(),
         runner.alias_overflow,
@@ -12556,7 +12646,8 @@ pub fn test_probed_git_ids_cap() -> (usize, bool, bool) {
             (1, n as u64),
             format!("/g/{n}").into_bytes(),
             1,
-        );
+        )
+        .expect("note");
     }
     (
         runner.probed_git_ids.len(),

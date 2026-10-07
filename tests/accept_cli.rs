@@ -1496,3 +1496,80 @@ fn location_updated_marks_status_completion() {
         store.close().await.expect("close");
     });
 }
+
+/// A completion-recorded coverage gap (chmod-000 directory) is journaled
+/// as an `error` event whose payload joins back to the open `errors` row.
+/// The event carries id/category/detail only; attempts and open state live
+/// on the catalog row, not the event.
+#[test]
+fn error_events_journal_completion_gaps() {
+    use repo_scan::store::{Store, TursoStore};
+    use std::os::unix::fs::PermissionsExt;
+
+    struct Restore<'a> {
+        path: &'a Path,
+    }
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.path, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let env = Env::new();
+    let blocked = env.fixture.join("blocked");
+    repo_scan::privacy::private_dir_0700(&blocked).expect("mkdir");
+    repo_scan::privacy::private_write_0600(&blocked.join("secret.txt"), b"x").expect("write");
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o0)).expect("chmod 000");
+    let _restore = Restore { path: &blocked };
+    if std::fs::read_dir(&blocked).is_ok() {
+        eprintln!("error_events_journal_completion_gaps: chmod 000 ineffective; skipping");
+        return;
+    }
+
+    let out = env.scan(&["--report", "rep.json"], &env.cwd_a);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "permission gap is usable-but-incomplete; stderr: {}",
+        stderr_text(&out)
+    );
+    let scan_id = stdout_line(&out, "scan_id");
+    let report = read_report(&env.cwd_a.join("rep.json"));
+    assert_eq!(report["scan"]["state"].as_str(), Some("incomplete"));
+    assert!(report["coverage"]["gaps"].as_u64().expect("gaps") > 0);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let db = env.state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        let rows = store
+            .read_scan_events(&scan_id, 0, 1_000)
+            .await
+            .expect("read");
+        let errors: Vec<_> = rows.iter().filter(|r| r.event_type == "error").collect();
+        assert!(!errors.is_empty(), "gap journaled at least one error event");
+        for row in &errors {
+            assert_eq!(row.op, "add", "D4 op for error");
+            let v: serde_json::Value = serde_json::from_slice(&row.records).expect("json");
+            let id = v["id"].as_str().expect("event id");
+            assert!(id.starts_with("gap:"), "gap id: {id}");
+            assert!(
+                v["category"].as_str().is_some_and(|c| !c.is_empty()),
+                "category carried"
+            );
+            assert!(
+                v["detail"].as_str().is_some_and(|d| !d.is_empty()),
+                "detail carried"
+            );
+            // Join: the payload names a real open catalog row; attempts and
+            // open state are read there, never from the event.
+            let gap = store.get_error(id).await.expect("get").expect("gap row");
+            assert!(gap.open, "gap row is open");
+            assert!(gap.attempts >= 1, "recorded at least once");
+            assert_eq!(gap.category, v["category"].as_str().expect("category"));
+        }
+        store.close().await.expect("close");
+    });
+}
