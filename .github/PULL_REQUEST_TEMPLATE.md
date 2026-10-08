@@ -39,6 +39,7 @@ Keep only sections that help reviewers understand this change. Use Related pull 
 
 ```sh
 mise --no-config --no-env --no-hooks exec rust@1.98.1 -- rustup component add clippy rustfmt
+mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo fetch --locked --manifest-path Cargo.toml
 mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo fmt --check --manifest-path Cargo.toml
 mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo clippy --locked --offline --manifest-path Cargo.toml --package repo-scan --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo doc --locked --offline --manifest-path Cargo.toml --package repo-scan --no-deps
@@ -50,6 +51,7 @@ env -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS
 <For Rust code changes, run the package tests and doctests used by CI. Drop this section when the change has no testable code.>
 
 ```sh
+mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo fetch --locked --manifest-path Cargo.toml
 mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo test --locked --offline --manifest-path Cargo.toml --package repo-scan --lib --tests
 mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo test --locked --offline --manifest-path Cargo.toml --package repo-scan --doc
 ```
@@ -59,6 +61,7 @@ mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo test --locked --o
 <For changes to CLI, scanning, or binary release behavior, build the package and scan a temporary local checkout with the canonical repository remote. Drop this section when there is no runtime surface.>
 
 ```sh
+mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo fetch --locked --manifest-path Cargo.toml
 mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo build --release --locked --offline --manifest-path Cargo.toml --package repo-scan
 fixture="$(mktemp -d)"
 state="$(mktemp -d)"
