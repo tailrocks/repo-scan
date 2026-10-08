@@ -1,71 +1,69 @@
 <!--
-Rules:
-- Use one paragraph per section, with no hard wrapping.
-- Describe the user or maintainer outcome, not a file-by-file changelog or a list of functions and tests.
-- Keep only sections that add useful information; remove every unused heading and its guidance.
-- Include Verify-locally blocks only for the repository paths named below. Use commands exactly as written and state expected results for smoke checks.
+Write one short paragraph under each prose heading. Describe the shipped outcome and the problem it solves, not the implementation history. Do not add a file-by-file changelog or a full test list; the diff and check output already show those details.
+
+Keep only sections this change needs. Include Related pull requests only for coordinated work across repositories. Include Not included only when a real scope boundary helps reviewers. Include Migration notes only when CLI behavior, configuration, report formats, or persisted state changes. Include Smoke only for changes to command-line or scanning behavior.
 -->
+
+## Related pull requests
+
+<For coordinated work across repositories, list each related PR. Drop this section for a standalone change.>
+
+- <Add a link to a related PR in another repository.>
 
 ## Summary
 
-<In one short paragraph, say what this change does and who benefits.>
+<State what this PR adds or changes and who benefits.>
 
 ## What ships
 
-<Keep the bullets that describe outcomes visible to users or maintainers.>
-
-- <User or maintainer outcome>
-- <Configuration, documentation, or verification outcome>
-
-## Behavior changes
-
-<Keep this section only when changes to `src/`, `.velnor/`, or `.github/` change CLI behavior, scan results, stored state, or CI behavior. Describe the observable change.>
-
-- <Observable behavior change>
+- <Describe a user-visible or contributor-visible outcome.>
+- <Describe another outcome when useful.>
 
 ## What this addresses
 
-<Keep this section when the change resolves a specific problem, regression, or documented roadmap item; name it and state the practical outcome.>
-
-- <Problem or gap addressed>
+- <Name the practical problem, gap, or regression resolved.>
 
 ## Not included
 
-<Keep this section only when the change has a useful boundary, such as work deferred from `src/`, `.velnor/`, or `.github/`.>
-
-- <Deferred or out-of-scope behavior>
+- <Name a deferred follow-up or scope boundary. Drop this section when there is none.>
 
 ## Verify locally
 
 ### Static checks
 
-<Keep for changes to Rust sources or tests, `Cargo.toml`, `.velnor/`, or `.github/`.>
+<For Rust source changes, run the repository format and lint checks used by CI.>
 
 ```sh
-mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo fmt --check --manifest-path Cargo.toml
-mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo clippy --locked --offline --manifest-path Cargo.toml --package repo-scan --all-targets -- -D warnings
+cargo fmt --check --manifest-path Cargo.toml
+cargo clippy --locked --offline --manifest-path Cargo.toml --package repo-scan --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --offline --manifest-path Cargo.toml --package repo-scan --no-deps
 ```
 
 ### Tests
 
-<Keep for changes to Rust sources or tests, `Cargo.toml`, `.velnor/`, or `.github/`.>
+<For Rust source changes, run the repository test suites used by CI.>
 
 ```sh
-mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo test --locked --offline --manifest-path Cargo.toml --package repo-scan --lib --tests
-mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo test --locked --offline --manifest-path Cargo.toml --package repo-scan --doc
+cargo test --locked --offline --manifest-path Cargo.toml --package repo-scan --lib --tests
+cargo test --locked --offline --manifest-path Cargo.toml --package repo-scan --doc
 ```
 
 ### Smoke
 
-<Keep when `src/cli.rs`, `src/main.rs`, or the command examples in `README.md` change.>
+<For CLI or scanning changes, build the binary and scan a temporary local checkout with the canonical repo-scan remote. The report should identify one local checkout. Drop this section for changes without a runtime surface.>
 
 ```sh
-mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo build --release
-target/release/repo-scan --state-dir target/repo-scan-smoke-state scan https://github.com/tailrocks/repo-scan --root . --status metadata --report target/repo-scan-smoke.json
+cargo build --release
+fixture="$(mktemp -d)"
+state="$(mktemp -d)"
+output="$(mktemp -d)"
+git -C "$fixture" init -q
+git -C "$fixture" remote add origin https://github.com/tailrocks/repo-scan.git
+./target/release/repo-scan --state-dir "$state" scan https://github.com/tailrocks/repo-scan --root "$fixture" --report "$output/report.json"
 ```
 
-Expected: writes a JSON report for this checkout and exits with a usable scan result.
+Expected: the report contains one checkout for `tailrocks/repo-scan` and records the explicit fixture root.
 
 ## Migration notes
 
-<Keep when `src/store/schema*.rs` or persistent scan-state compatibility changes. Describe how existing local state is read or upgraded; otherwise remove this section.>
+<For CLI, configuration, report-format, or persisted-state changes, state what an existing user must do. Drop this section when no migration is required.>

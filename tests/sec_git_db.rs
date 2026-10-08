@@ -204,18 +204,21 @@ fn docs_have_no_private_absolute_paths() {
     }
 }
 
-/// RSF-SEC-AUDIT-GATE: the gate is enforced via CI — the record must
-/// exist, name both tools, and point at the enforcing workflow (no
-/// unresolved wiring remains).
+/// RSF-SEC-AUDIT-GATE: documentation names the planned audit tools and
+/// workflow while stating that GitHub Actions does not enforce the gate.
 #[test]
-fn audit_gate_is_documented() {
+fn audit_gate_is_documented_as_unenforced() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let text =
         std::fs::read_to_string(root.join("docs/AUDIT_GATE.md")).expect("docs/AUDIT_GATE.md");
     assert!(text.contains("cargo audit"), "must name cargo-audit");
     assert!(text.contains("cargo deny"), "must name cargo-deny");
     assert!(
-        text.contains("ENFORCED") && text.contains("docs/workflows/audit.yml"),
-        "must record the enforcing workflow"
+        text.contains("Status: NOT ENFORCED BY GITHUB ACTIONS."),
+        "must state that GitHub Actions does not enforce the audit gate"
+    );
+    assert!(
+        text.contains("docs/workflows/audit.yml"),
+        "must identify the documented workflow specification"
     );
 }

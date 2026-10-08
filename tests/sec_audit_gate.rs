@@ -1,8 +1,6 @@
-//! RSF-SEC-AUDIT-GATE: the dependency-audit gate must stay enforced.
-//! Regression tripwire for the workflow + deny.toml shape (triggers, pinned
-//! SHAs, exact tool pins, no persisted credentials, bounded execution,
-//! advisories/licenses/sources). Tamper-evidence, not a security boundary:
-//! enforcement comes from branch protection (see docs/AUDIT_GATE.md).
+//! RSF-SEC-AUDIT-GATE: keep the intended dependency-audit specification
+//! and policy documented accurately. This test validates static inputs;
+//! it does not schedule the workflow or enforce a GitHub status check.
 
 use std::path::PathBuf;
 
@@ -17,7 +15,7 @@ fn read(rel: &str) -> String {
 }
 
 #[test]
-fn audit_gate_files_enforced() {
+fn audit_workflow_specification_matches_policy() {
     let wf_text = read("docs/workflows/audit.yml");
     for needle in [
         "push:",
@@ -180,10 +178,10 @@ fn tool_provenance_and_archive_verification() {
     );
 }
 
-// CI-SC-03: tamper-evidence + branch-protection requirement documented; the
-// workflow points at the doc so edits to either are review-visible.
+// CI-SC-03: keep the unenforced status explicit until a supported workflow
+// schedules the audit and a live run confirms its status check.
 #[test]
-fn tamper_evidence_documented() {
+fn unenforced_status_is_documented() {
     let wf = read("docs/workflows/audit.yml");
     assert!(
         wf.contains("docs/AUDIT_GATE.md"),
@@ -191,8 +189,8 @@ fn tamper_evidence_documented() {
     );
     let doc = read("docs/AUDIT_GATE.md");
     for needle in [
-        "branch protection",
-        "Require the `audit` status check",
+        "Status: NOT ENFORCED BY GITHUB ACTIONS.",
+        "Do not treat an `audit` status check as active",
         "tamper-evident",
         "tests/sec_audit_gate.rs",
     ] {
