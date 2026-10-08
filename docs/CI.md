@@ -37,12 +37,13 @@ The Rust job has no binary packaging or release step.
 
 ## Binary release state
 
-Velnor Actions 0.1.4 does not provide the binary-release feature. There is no
-repo-scan binary-release workflow in `.github/workflows/`: the only workflow
-there is `ci.yml`, which has no tag trigger. This repository therefore does
-not currently build or publish downloadable repo-scan binaries through GitHub
-Actions. Revisit this section when a verified Velnor release adds binary
-release support and the generated workflow is updated.
+The published Velnor Actions 0.1.4 release does not emit a consumer-selectable
+binary-release workflow for repo-scan. There is no repo-scan binary-release
+workflow in `.github/workflows/`: the only workflow there is `ci.yml`, which
+has no tag trigger. This repository therefore does not currently build or
+publish downloadable repo-scan binaries through GitHub Actions. Revisit this
+section when a verified Velnor release can generate the repo-scan binary
+publisher and the generated workflow is enabled here.
 
 ## Other checks
 
