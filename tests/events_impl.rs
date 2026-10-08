@@ -2554,6 +2554,131 @@ fn wave1d_direct_emit_enforces_journal_retention() {
     });
 }
 
+/// `inventory_ready` is authoritative scan state even after its journal row
+/// falls out of the retained tail, so resume never emits the milestone twice.
+#[test]
+fn inventory_ready_survives_journal_retention_and_resume() {
+    use repo_scan::scan_events::EventType;
+    use repo_scan::store::{NewScan, NewScanEvent};
+
+    let hook = Wave1dHookStore::new();
+    hook.rt.block_on(async {
+        hook.store
+            .create_scan_request(
+                &NewScan {
+                    id: "scan-ready-retention-1",
+                    url_raw: b"--all",
+                    url_canonical: None,
+                    scope: "roots",
+                    status_mode: "metadata",
+                    report_dest: None,
+                    targets_json: None,
+                    format: Some("jsonl"),
+                    all_targets: Some(true),
+                    fetch: Some(false),
+                    workers: None,
+                },
+                1,
+            )
+            .await
+            .expect("create request");
+        hook.store
+            .append_scan_event(&NewScanEvent {
+                scan_id: "scan-ready-retention-1",
+                seq: 1,
+                catalog_rev: 1,
+                event_offset: 0,
+                event_type: "scan_started",
+                op: "add",
+                reset: false,
+                records: b"{}",
+            })
+            .await
+            .expect("append start");
+    });
+
+    hook.rt
+        .block_on(main_under_test::test_emit_scan_event_with_retention(
+            &hook.store,
+            "scan-ready-retention-1",
+            EventType::InventoryReady,
+            1,
+        ))
+        .expect("emit ready");
+    hook.rt.block_on(async {
+        hook.store
+            .connection()
+            .execute(
+                "UPDATE scan_requests SET inventory_ready_seq = NULL WHERE id = ?1",
+                vec![turso::Value::Text(String::from("scan-ready-retention-1"))],
+            )
+            .await
+            .expect("simulate retained event before marker backfill");
+    });
+    hook.rt
+        .block_on(main_under_test::test_emit_scan_event_with_retention(
+            &hook.store,
+            "scan-ready-retention-1",
+            EventType::LocationFound,
+            1,
+        ))
+        .expect("emit after ready");
+
+    hook.rt.block_on(async {
+        let scan = hook
+            .store
+            .get_scan("scan-ready-retention-1")
+            .await
+            .expect("get scan")
+            .expect("scan row");
+        assert_eq!(scan.inventory_ready_seq, Some(2));
+        let retained = hook
+            .store
+            .read_scan_events("scan-ready-retention-1", 0, 10)
+            .await
+            .expect("read retained tail");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].seq, 3);
+        assert_eq!(retained[0].event_type, "location_found");
+        assert!(
+            main_under_test::test_scan_journal_has_ready(&hook.store, "scan-ready-retention-1")
+                .await
+                .expect("reopen journal"),
+            "resume reads the durable milestone after its event row was pruned"
+        );
+    });
+
+    // Mirror the production resume guard: a ready journal skips the emit.
+    let has_ready = hook
+        .rt
+        .block_on(main_under_test::test_scan_journal_has_ready(
+            &hook.store,
+            "scan-ready-retention-1",
+        ))
+        .expect("reopen journal");
+    if !has_ready {
+        hook.rt
+            .block_on(main_under_test::test_emit_scan_event_with_retention(
+                &hook.store,
+                "scan-ready-retention-1",
+                EventType::InventoryReady,
+                1,
+            ))
+            .expect("would re-emit ready");
+    }
+    hook.rt.block_on(async {
+        let rows = hook
+            .store
+            .read_scan_events("scan-ready-retention-1", 0, 10)
+            .await
+            .expect("read final tail");
+        assert!(
+            rows.iter().all(|row| row.event_type != "inventory_ready"),
+            "resume must not append a second ready row: {rows:?}"
+        );
+    });
+}
+
 /// Cursor resolution matrix through the production resolver: covered
 /// cursors resume after their `(rev, off)` position; missing, diverged,
 /// and beyond-tip cursors reset; the coalescible gauge never diverges;

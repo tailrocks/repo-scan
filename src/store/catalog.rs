@@ -328,14 +328,28 @@ fn ref_params(reference: &NewRef<'_>, observed_ms: i64) -> Vec<turso::Value> {
 /// Persist-safe scan-target bytes (RETEST-5): the catalog upholds the
 /// no-credential-bytes invariant even when callers bypass CLI sanitization.
 /// Valid UTF-8 targets are normalized with
-/// [`crate::identity::sanitize_target_url`] (scp user → `git`, userinfo and
-/// query/fragment tails stripped); non-UTF-8 targets are refused, never
-/// persisted lossy. The refusal carries no input bytes (they may hold
-/// secrets and may not be UTF-8).
+/// [`crate::identity::sanitize_target_url`] and scrubbed for credential-shaped
+/// free-text values (scp user → `git`, userinfo/query/fragment removed); non-UTF-8
+/// targets are refused, never persisted lossy. The refusal carries no input
+/// bytes (they may hold secrets and may not be UTF-8).
 fn sanitized_target_bytes(url_raw: &[u8], what: &str) -> crate::Result<Vec<u8>> {
     let text = std::str::from_utf8(url_raw)
         .map_err(|_| Error::InvalidArgs(format!("scan {what} URL is not valid UTF-8; refusing")))?;
-    Ok(crate::identity::sanitize_target_url(text).into_bytes())
+    let sanitized = crate::identity::sanitize_target_url(text);
+    let scrubbed = crate::identity::scrub_text(&sanitized);
+    // Free-text scrubbing correctly treats every scp-style username as
+    // untrusted, but `sanitize_target_url` has already normalized that
+    // slot to the safe, fixed `git` login. Preserve that one constant while
+    // keeping credential-shaped values in the host/path scrubbed.
+    let stored = if sanitized.starts_with("git@") {
+        scrubbed
+            .strip_prefix("<redacted>@")
+            .map(|rest| format!("git@{rest}"))
+            .unwrap_or(scrubbed)
+    } else {
+        scrubbed
+    };
+    Ok(stored.into_bytes())
 }
 
 /// Sink-side remote-URL enforcement (FIXREADY4 R): the inspector already
@@ -2450,9 +2464,29 @@ impl TursoStore {
         generation: u64,
         now_ms: i64,
     ) -> crate::Result<u64> {
+        self.invalidate_scope_with_canonicalizer(
+            scope_key,
+            generation,
+            now_ms,
+            crate::config::try_canonical_scope_path,
+        )
+        .await
+    }
+
+    async fn invalidate_scope_with_canonicalizer(
+        &self,
+        scope_key: &str,
+        generation: u64,
+        now_ms: i64,
+        mut canonicalize: impl FnMut(&Path) -> Option<PathBuf>,
+    ) -> crate::Result<u64> {
         // Resolve spelling aliases before `BEGIN IMMEDIATE`: the lookup
-        // canonicalizes filesystem paths and must not hold the writer lock.
-        let fan_keys = Self::scope_fanout_keys(&self.conn, &[scope_key.to_string()]).await?;
+        // uses bounded identity I/O and must not hold the writer lock.
+        // Unknown identity fails closed without bumping a revision or
+        // enqueuing any work.
+        let fan_keys =
+            Self::scope_fanout_keys_with(&self.conn, &[scope_key.to_string()], &mut canonicalize)
+                .await?;
         let fan_keys = fan_keys.into_iter().next().unwrap_or_default();
         self.with_tx(|conn| async move {
             Self::invalidate_scope_on(conn, scope_key, generation, now_ms, &fan_keys).await
@@ -2547,7 +2581,7 @@ impl TursoStore {
 
     /// Snapshot the live path-scope keys that share a physical path with
     /// each requested scope (DB-M1). This runs before the write transaction:
-    /// `canonical_scope_path` performs filesystem I/O. Only `dir:` and
+    /// bounded scope identity resolution performs filesystem I/O. Only `dir:` and
     /// `git:` keys participate; completed work needs no requeue, and future
     /// tasks read the bumped revision when they are created. The resulting
     /// keys are applied atomically with the invalidation by
@@ -2556,18 +2590,31 @@ impl TursoStore {
         conn: &turso::Connection,
         scopes: &[String],
     ) -> crate::Result<Vec<Vec<String>>> {
+        Self::scope_fanout_keys_with(conn, scopes, crate::config::try_canonical_scope_path).await
+    }
+
+    async fn scope_fanout_keys_with(
+        conn: &turso::Connection,
+        scopes: &[String],
+        mut canonicalize: impl FnMut(&Path) -> Option<PathBuf>,
+    ) -> crate::Result<Vec<Vec<String>>> {
         use crate::config::ScopeRef;
-        let targets: Vec<Option<PathBuf>> = scopes
-            .iter()
-            .map(
-                |scope_key| match crate::config::parse_scope_key(scope_key) {
-                    Some(ScopeRef::Dir(path)) | Some(ScopeRef::Git(path)) => {
-                        Some(crate::config::canonical_scope_path(&path))
-                    }
-                    Some(ScopeRef::Status(_)) | None => None,
-                },
-            )
-            .collect();
+        let mut targets: Vec<Option<PathBuf>> = Vec::with_capacity(scopes.len());
+        for scope_key in scopes {
+            let target = match crate::config::parse_scope_key(scope_key) {
+                Some(ScopeRef::Dir(path)) | Some(ScopeRef::Git(path)) => {
+                    Some(canonicalize(&path).ok_or_else(|| {
+                        Error::Store(
+                            "scope path identity did not resolve within the bounded I/O limit; \
+                             event invalidation was not committed and can be retried"
+                                .to_string(),
+                        )
+                    })?)
+                }
+                Some(ScopeRef::Status(_)) | None => None,
+            };
+            targets.push(target);
+        }
         if targets.iter().all(Option::is_none) {
             return Ok(vec![Vec::new(); scopes.len()]);
         }
@@ -2585,7 +2632,13 @@ impl TursoStore {
             let key = req_text(&row, 0)?;
             let path = match crate::config::parse_scope_key(&key) {
                 Some(ScopeRef::Dir(path)) | Some(ScopeRef::Git(path)) => {
-                    crate::config::canonical_scope_path(&path)
+                    canonicalize(&path).ok_or_else(|| {
+                        Error::Store(
+                            "pending task path identity did not resolve within the bounded I/O limit; \
+                             event invalidation was not committed and can be retried"
+                                .to_string(),
+                        )
+                    })?
                 }
                 Some(ScopeRef::Status(_)) | None => continue,
             };
@@ -3360,6 +3413,9 @@ pub struct ScanRow {
     /// v4: explicit `--workers` request; `None` = legacy row or flag
     /// absent, resolved at runtime. Resume restores this.
     pub workers: Option<u64>,
+    /// v7: authoritative `inventory_ready` event sequence, retained even
+    /// after the event row ages out of the bounded journal.
+    pub inventory_ready_seq: Option<u64>,
 }
 
 impl ScanRow {
@@ -3384,6 +3440,9 @@ impl ScanRow {
             // `restore_workers`) instead of failing the whole read —
             // resume stays resilient to a bad stored value.
             workers: opt_i64(row, 15)?.and_then(|v| u64::try_from(v).ok()),
+            inventory_ready_seq: opt_i64(row, 16)?
+                .map(|v| i64_to_u64(v, "inventory_ready sequence"))
+                .transpose()?,
         })
     }
 }
@@ -3865,6 +3924,7 @@ impl TursoStore {
         observed_ms: i64,
     ) -> crate::Result<()> {
         self.forbid_write("record_dir_observation")?;
+        let error = error.map(crate::identity::scrub_text);
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO dir_observations (dir_id, generation, completed, \
@@ -3876,7 +3936,7 @@ impl TursoStore {
                     v_int(i64::from(completed)),
                     v_int(u64_to_i64(entry_generation, "dir entry_generation")?),
                     v_int(u64_to_i64(entries_seen, "dir entries_seen")?),
-                    v_opt_text(error.map(str::to_string)),
+                    v_opt_text(error),
                     v_int(observed_ms),
                 ],
             )
@@ -4426,7 +4486,7 @@ impl TursoStore {
                     v_text(scan.status_mode),
                     v_opt_blob(scan.report_dest.map(<[u8]>::to_vec)),
                     v_int(now_ms),
-                    v_opt_text(scan.targets_json.map(str::to_string)),
+                    v_opt_text(scan.targets_json.map(crate::identity::scrub_text)),
                     v_opt_text(scan.format.map(str::to_string)),
                     v_opt_int(scan.all_targets.map(i64::from)),
                     v_opt_int(scan.fetch.map(i64::from)),
@@ -4465,6 +4525,26 @@ impl TursoStore {
         Ok(())
     }
 
+    /// Persist the authoritative `inventory_ready` sequence independently
+    /// of the retained event rows. Called after the event insert and before
+    /// retention pruning; a crash before this write leaves the event row
+    /// available for replay, while pruning cannot remove both copies.
+    pub async fn mark_scan_inventory_ready(&self, id: &str, seq: u64) -> crate::Result<()> {
+        self.forbid_write("mark_scan_inventory_ready")?;
+        self.conn
+            .execute(
+                "UPDATE scan_requests SET inventory_ready_seq = ?1 \
+                    WHERE id = ?2 AND inventory_ready_seq IS NULL",
+                vec![
+                    v_int(u64_to_i64(seq, "inventory_ready sequence")?),
+                    v_text(id),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
     /// Fetch one scan request by id.
     pub async fn get_scan(&self, id: &str) -> crate::Result<Option<ScanRow>> {
         let mut rows = self
@@ -4472,7 +4552,7 @@ impl TursoStore {
             .query(
                 "SELECT id, url_raw, url_canonical, scope, status_mode, report_dest, \
                     state, outcome, successor_id, created_at_ms, updated_at_ms, \
-                    targets_json, format, all_targets, fetch, workers \
+                    targets_json, format, all_targets, fetch, workers, inventory_ready_seq \
                     FROM scan_requests WHERE id = ?1",
                 vec![v_text(id)],
             )
@@ -4583,12 +4663,13 @@ impl TursoStore {
         next_retry_ms: Option<i64>,
         now_ms: i64,
     ) -> crate::Result<()> {
+        let detail = crate::identity::scrub_text(detail);
         let rows = conn
             .execute(
                 "UPDATE errors SET attempts = attempts + 1, detail = ?1, \
                     last_seen_ms = ?2, next_retry_ms = ?3, open = 1 WHERE id = ?4",
                 vec![
-                    v_text(detail),
+                    v_text(&detail),
                     v_int(now_ms),
                     v_opt_int(next_retry_ms),
                     v_text(id),
@@ -4605,7 +4686,7 @@ impl TursoStore {
                     v_text(id),
                     v_text(scope_key),
                     v_text(category),
-                    v_text(detail),
+                    v_text(&detail),
                     v_int(now_ms),
                     v_opt_int(next_retry_ms),
                 ],
@@ -5491,6 +5572,7 @@ impl TursoStore {
         let generation_i64 = u64_to_i64_buf(generation, "dir observation generation");
         let entry_generation_i64 = u64_to_i64_buf(entry_generation, "dir entry_generation");
         let entries_seen_i64 = u64_to_i64_buf(entries_seen, "dir entries_seen");
+        let error = error.map(crate::identity::scrub_text);
         batch.push(
             "INSERT OR REPLACE INTO dir_observations (dir_id, generation, completed, \
                 entry_generation, entries_seen, error, observed_at_ms) \
@@ -5501,7 +5583,7 @@ impl TursoStore {
                 v_int(i64::from(completed)),
                 v_int(entry_generation_i64),
                 v_int(entries_seen_i64),
-                v_opt_text(error.map(str::to_string)),
+                v_opt_text(error),
                 v_int(observed_ms),
             ],
         )
@@ -5529,6 +5611,7 @@ impl TursoStore {
     ) -> bool {
         let generation_i64 = u64_to_i64_buf(generation, "dir observation generation");
         let entries_seen_i64 = u64_to_i64_buf(entries_seen, "dir entries_seen");
+        let error = error.map(crate::identity::scrub_text);
         batch.push(
             "UPDATE dir_observations SET entry_generation = entry_generation + 1, \
                 completed = ?1, entries_seen = ?2, error = ?3, observed_at_ms = ?4 \
@@ -5536,7 +5619,7 @@ impl TursoStore {
             vec![
                 v_int(i64::from(completed)),
                 v_int(entries_seen_i64),
-                v_opt_text(error.map(str::to_string)),
+                v_opt_text(error.clone()),
                 v_int(observed_ms),
                 v_int(dir_id),
                 v_int(generation_i64),
@@ -5551,7 +5634,7 @@ impl TursoStore {
                 v_int(generation_i64),
                 v_int(i64::from(completed)),
                 v_int(entries_seen_i64),
-                v_opt_text(error.map(str::to_string)),
+                v_opt_text(error),
                 v_int(observed_ms),
             ],
         );
@@ -6028,6 +6111,29 @@ mod tests {
                     .expect("probe gen 2"),
                 "own-generation skew must still be found"
             );
+            store.close().await.expect("close");
+        });
+    }
+
+    #[test]
+    fn unresolved_scope_identity_aborts_before_invalidation() {
+        let rt = runtime();
+        rt.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db = dir.path().join("payload").join("catalog.db");
+            let store = TursoStore::open(&db).await.expect("open");
+            let scope = crate::config::scope_key_for_git(&dir.path().join("repo"));
+
+            let err = store
+                .invalidate_scope_with_canonicalizer(&scope, 1, 123, |_| None)
+                .await
+                .expect_err("unknown identity must fail closed");
+
+            assert!(
+                err.to_string().contains("bounded I/O limit"),
+                "unexpected error: {err}"
+            );
+            assert_eq!(store.scope_rev(&scope).await.expect("scope rev"), 0);
             store.close().await.expect("close");
         });
     }

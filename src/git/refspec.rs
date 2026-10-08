@@ -11,8 +11,8 @@
 //!
 //! Fail closed: `mirror = true`, unparseable values, and degenerate
 //! forms are all `unsupported`, never executed. Refspec text carries
-//! ref patterns only (never URLs or credentials), so verdict reasons
-//! may echo the offending value.
+//! untrusted bytes and verdict reasons use fixed safe text rather than
+//! echoing the offending value.
 
 /// Local branch-tip namespace a fetch must never write.
 const HEADS_PREFIX: &str = "refs/heads/";
@@ -409,17 +409,17 @@ pub fn inspect_remote_fetch(remote_name: &str, refspecs: &[&str], mirror: bool) 
     for value in refspecs {
         let Some(parsed) = parse_fetch_refspec(value) else {
             return FetchVerdict::Unsupported {
-                reason: format!("unparseable fetch refspec: {value}"),
+                reason: "unparseable fetch refspec; refusing fetch".to_string(),
             };
         };
         if parsed.can_write_branch_tips() {
             return FetchVerdict::Unsupported {
-                reason: format!("fetch refspec can write to local branch tips: {value}"),
+                reason: "fetch refspec can write to local branch tips; refusing fetch".to_string(),
             };
         }
         if parsed.can_write_tag_refs() {
             return FetchVerdict::Unsupported {
-                reason: format!("fetch refspec can write to local tag refs: {value}"),
+                reason: "fetch refspec can write to local tag refs; refusing fetch".to_string(),
             };
         }
         if parsed
@@ -428,9 +428,8 @@ pub fn inspect_remote_fetch(remote_name: &str, refspecs: &[&str], mirror: bool) 
             .is_some_and(|dst| !dst.starts_with(&remote_tracking_prefix))
         {
             return FetchVerdict::Unsupported {
-                reason: format!(
-                    "fetch refspec destination is outside this remote's tracking refs: {value}"
-                ),
+                reason: "fetch refspec destination is outside this remote's tracking refs; refusing fetch"
+                    .to_string(),
             };
         }
     }
@@ -446,6 +445,26 @@ mod tests {
         let verdict =
             inspect_remote_fetch("origin", &["+refs/heads/*:refs/remotes/origin/*"], false);
         assert_eq!(verdict, FetchVerdict::Safe);
+    }
+
+    #[test]
+    fn malformed_refspec_refusal_never_echoes_untrusted_value() {
+        let secret = "https://alice:super-secret@example.invalid/repo";
+        let value = format!("refs/heads/*:{secret}");
+        let FetchVerdict::Unsupported { reason } =
+            inspect_remote_fetch("origin", &[value.as_str()], false)
+        else {
+            panic!("malformed refspec must be refused");
+        };
+        assert!(!reason.contains("alice"), "reason leaked user: {reason}");
+        assert!(
+            !reason.contains("super-secret"),
+            "reason leaked password: {reason}"
+        );
+        assert!(
+            !reason.contains("example.invalid"),
+            "reason leaked host: {reason}"
+        );
     }
 
     #[test]

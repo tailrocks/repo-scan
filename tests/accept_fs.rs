@@ -372,6 +372,102 @@ fn fs02_outside_root_registered_worktree_followed() {
     );
 }
 
+#[test]
+fn fs02_roots_only_scan_refreshes_outside_root_worktree_status() {
+    fn status_at_root(report: &serde_json::Value, root: &Path) -> serde_json::Value {
+        let mut root_spellings = vec![expected_bytes(root)];
+        if let Ok(canonical) = root.canonicalize() {
+            let canonical_bytes = expected_bytes(&canonical);
+            if !root_spellings.contains(&canonical_bytes) {
+                root_spellings.push(canonical_bytes);
+            }
+        }
+        let paths = path_table(report);
+        report["checkouts"]
+            .as_array()
+            .expect("checkouts")
+            .iter()
+            .find(|checkout| {
+                checkout["root_path_id"]
+                    .as_str()
+                    .and_then(|id| paths.get(id))
+                    .is_some_and(|path| root_spellings.contains(path))
+            })
+            .unwrap_or_else(|| panic!("checkout at {}", root.display()))
+            .get("status")
+            .expect("status")
+            .clone()
+    }
+
+    let env = Env::new();
+    let (main, sibling) = fixture::linked_worktree(&env.root);
+    let broad_root = env.root.to_str().expect("utf8 broad root").to_string();
+    let broad = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            broad_root.as_str(),
+            "--status",
+            "summary",
+            "--report",
+            "broad.json",
+        ],
+        &env.cwd,
+        &env.state,
+    );
+    assert_eq!(
+        broad.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&broad)
+    );
+    let broad_report = read_report(&env.cwd.join("broad.json"));
+    assert_eq!(broad_report["scan"]["scope"].as_str(), Some("roots"));
+    assert_eq!(
+        broad_report["scan"]["status_mode"].as_str(),
+        Some("summary")
+    );
+    for checkout_root in [&main, &sibling] {
+        let status = status_at_root(&broad_report, checkout_root);
+        assert_eq!(status["state"].as_str(), Some("complete"));
+        assert_eq!(status["untracked"].as_u64(), Some(0));
+    }
+
+    std::fs::write(sibling.join("new-untracked.txt"), b"new worktree file\n")
+        .expect("write sibling untracked file");
+    let main_root = main.to_str().expect("utf8 main root").to_string();
+    let roots_only = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            main_root.as_str(),
+            "--status",
+            "summary",
+            "--report",
+            "roots-only.json",
+        ],
+        &env.cwd,
+        &env.state,
+    );
+    assert_eq!(
+        roots_only.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&roots_only)
+    );
+    let roots_only_report = read_report(&env.cwd.join("roots-only.json"));
+    assert_eq!(roots_only_report["scan"]["scope"].as_str(), Some("roots"));
+    assert_eq!(
+        roots_only_report["scan"]["status_mode"].as_str(),
+        Some("summary")
+    );
+    let sibling_status = status_at_root(&roots_only_report, &sibling);
+    assert_eq!(sibling_status["state"].as_str(), Some("complete"));
+    assert_eq!(sibling_status["untracked"].as_u64(), Some(1));
+}
+
 // ---------------------------------------------------------------------------
 // FS-03: cycles, replacement, no duplicates.
 // ---------------------------------------------------------------------------

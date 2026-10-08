@@ -111,6 +111,15 @@ pub fn plan_machine_roots(mounts: &[MountPoint]) -> Vec<PlannedRoot> {
 /// flags exist yet; traversal-time filesystem-class filtering is
 /// deterministic from the mount set, so it needs no extra key input.
 pub fn generation_scope_key(policy: &str, roots: &[PlannedRoot]) -> String {
+    let identities = scope_root_identities(roots);
+    generation_scope_key_with_identities(policy, roots, &identities)
+}
+
+/// Bounded canonical identities used both for generation keys and report
+/// scope filtering. A timeout falls back to normalized lexical spelling,
+/// matching [`generation_scope_key`] so aliases cannot diverge between
+/// generation selection and catalog/report filtering.
+pub fn scope_root_identities(roots: &[PlannedRoot]) -> Vec<(PathBuf, Option<u64>)> {
     let paths: Vec<PathBuf> = roots.iter().map(|root| root.path.clone()).collect();
     // Root canonicalization and volume identity both run through the
     // topology layer's bounded identity-I/O worker. If admission or the
@@ -118,13 +127,32 @@ pub fn generation_scope_key(policy: &str, roots: &[PlannedRoot]) -> String {
     // unknown-device marker; when the identity becomes available later,
     // the key changes and safely starts a fresh generation.
     let identities = crate::walk::topology::bounded_scope_identities(&paths);
+    roots
+        .iter()
+        .enumerate()
+        .map(|(index, root)| {
+            identities
+                .as_ref()
+                .and_then(|items| items.get(index))
+                .cloned()
+                .unwrap_or_else(|| (crate::config::normalize_scope_path(&root.path), None))
+        })
+        .collect()
+}
+
+/// Generation-key builder for a previously resolved identity snapshot.
+/// The caller can pass the same bounded results to root-scope filters.
+pub fn generation_scope_key_with_identities(
+    policy: &str,
+    roots: &[PlannedRoot],
+    identities: &[(PathBuf, Option<u64>)],
+) -> String {
     let mut entries: Vec<Vec<u8>> = roots
         .iter()
         .enumerate()
         .map(|(index, root)| {
             let (canonical, dev) = identities
-                .as_ref()
-                .and_then(|items| items.get(index))
+                .get(index)
                 .map(|(path, dev)| (path.clone(), *dev))
                 .unwrap_or_else(|| (crate::config::normalize_scope_path(&root.path), None));
             let mut entry = Vec::new();

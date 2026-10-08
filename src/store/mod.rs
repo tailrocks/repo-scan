@@ -27,6 +27,7 @@ pub mod schema_v3;
 pub mod schema_v4;
 pub mod schema_v5;
 pub mod schema_v6;
+pub mod schema_v7;
 pub mod writer;
 
 pub use catalog::{
@@ -44,7 +45,7 @@ pub use writer::{
 };
 
 /// Current catalog schema version. Migrations are append-only.
-pub const CURRENT_SCHEMA_VERSION: u32 = 6;
+pub const CURRENT_SCHEMA_VERSION: u32 = 7;
 
 /// One append-only schema migration, applied inside a single transaction.
 #[derive(Debug, Clone)]

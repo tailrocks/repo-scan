@@ -37,6 +37,7 @@ fn test_inputs(report_id: &str) -> ReportInputs {
         catalog_revision: 7,
         target_url: "https://github.com/OWNER/REPO".to_string(),
         canonical_url: Some("https://github.com/owner/repo".to_string()),
+        event_volume_ids: Vec::new(),
         targets: vec![],
         scope: "roots".to_string(),
         scan_state: "complete".to_string(),

@@ -60,6 +60,9 @@ pub struct RootInput {
     pub id: String,
     pub dir_id: Option<i64>,
     pub path_bytes: Option<Vec<u8>>,
+    /// Optional canonical identity used only for catalog filtering. The
+    /// report still records `path_bytes` as the requested spelling.
+    pub scope_path_bytes: Option<Vec<u8>>,
     pub volume_id: Option<String>,
     pub state: String,
     pub observed_at_ms: Option<i64>,
@@ -136,6 +139,9 @@ pub struct ReportInputs {
     pub catalog_revision: u64,
     pub target_url: String,
     pub canonical_url: Option<String>,
+    /// Event-monitor volume identities for explicit roots. These scope
+    /// `volume:<id>` errors without claiming they are catalog volume rows.
+    pub event_volume_ids: Vec<String>,
     /// Full requested target set in request order (empty for `--all`).
     pub targets: Vec<ScanTarget>,
     pub scope: String,
@@ -627,19 +633,116 @@ async fn row_exists(
 /// paths) are complete.
 struct PrePass {
     included_repos: HashSet<String>,
+    included_groups: HashSet<String>,
+    /// Explicit roots carried by this snapshot; `None` means machine scope.
+    scope_roots: Option<Vec<PathBuf>>,
+    /// Canonical roots used only to identify this request's derivation gap.
+    scope_identity_roots: Option<Vec<PathBuf>>,
     unresolvable_repo: bool,
     checkout_repos: HashMap<String, String>,
     statuses: HashMap<String, Status>,
     /// Latest `--fetch` attempt per (store id, remote name bytes),
     /// scoped to emitted repositories (report 1.2.0).
     refreshes: HashMap<(String, Vec<u8>), RemoteRefresh>,
+    included_volumes: HashSet<String>,
+    scope_volumes: HashSet<String>,
     stub_volumes: Vec<String>,
     interner: PathInterner,
     open_errors: u64,
     tasks_pending: u64,
 }
 
+fn report_path_in_roots(path_bytes: &[u8], roots: &[PathBuf]) -> bool {
+    let path = crate::config::path_from_bytes(path_bytes.to_vec());
+    crate::config::path_is_within_roots(&path, roots)
+}
+
+fn report_error_in_scope(
+    scope_key: &str,
+    roots: Option<&[PathBuf]>,
+    identity_roots: Option<&[PathBuf]>,
+    checkouts: &HashMap<String, String>,
+    volumes: &HashSet<String>,
+) -> bool {
+    let Some(roots) = roots else {
+        return true;
+    };
+    match crate::config::parse_scope_key(scope_key) {
+        Some(crate::config::ScopeRef::Dir(path) | crate::config::ScopeRef::Git(path)) => {
+            crate::config::path_is_within_roots(&path, roots)
+        }
+        Some(crate::config::ScopeRef::Status(checkout_id)) => checkouts.contains_key(&checkout_id),
+        None => {
+            scope_key
+                == crate::config::report_derivation_gap_scope_key(identity_roots.or(Some(roots)))
+                || scope_key
+                    .strip_prefix("volume:")
+                    .is_some_and(|id| volumes.contains(id))
+        }
+    }
+}
+
+/// Return volume IDs represented by directory rows under the supplied roots.
+/// The synthetic `explicit-roots` volume is deliberately not inferred here:
+/// it represents the whole request and cannot safely attribute a volume event
+/// to one root.
+pub async fn volume_ids_within_roots(
+    conn: &turso::Connection,
+    roots: &[PathBuf],
+) -> crate::Result<HashSet<String>> {
+    let mut rows = conn
+        .query("SELECT id, volume_id FROM directories ORDER BY id ASC", ())
+        .await
+        .map_err(store_err)?;
+    let mut cache = FullPathCache::new();
+    let mut volumes = HashSet::new();
+    while let Some(row) = rows.next().await.map_err(store_err)? {
+        let dir_id = req_i64(&row, 0)?;
+        let full = resolve_full_path(conn, dir_id, &mut cache).await?;
+        if report_path_in_roots(&full, roots) {
+            let volume = req_text(&row, 1)?;
+            if volume != "explicit-roots" {
+                volumes.insert(volume);
+            }
+        }
+    }
+    Ok(volumes)
+}
+
 async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Result<PrePass> {
+    let (scope_roots, scope_identity_roots) = if inputs.scope == "roots" {
+        let mut roots = Vec::with_capacity(inputs.roots.len().saturating_mul(2));
+        let mut identities = Vec::with_capacity(inputs.roots.len());
+        let mut cache = FullPathCache::new();
+        for root in &inputs.roots {
+            let bytes = match (&root.dir_id, &root.path_bytes) {
+                (Some(dir_id), None) => resolve_full_path(conn, *dir_id, &mut cache).await?,
+                (None, Some(bytes)) => bytes.clone(),
+                _ => {
+                    return Err(Error::Report(format!(
+                        "root {} must set exactly one of dir_id or path_bytes",
+                        root.id
+                    )))
+                }
+            };
+            let requested = crate::config::path_from_bytes(bytes);
+            let identity = crate::config::path_from_bytes(
+                root.scope_path_bytes
+                    .clone()
+                    .unwrap_or_else(|| crate::config::path_as_bytes(&requested)),
+            );
+            if !roots.contains(&requested) {
+                roots.push(requested);
+            }
+            if !roots.contains(&identity) {
+                roots.push(identity.clone());
+            }
+            identities.push(identity);
+        }
+        (Some(roots), Some(identities))
+    } else {
+        (None, None)
+    };
     let mut known_volumes = HashSet::new();
     {
         let mut rows = conn
@@ -651,7 +754,26 @@ async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Res
         }
     }
     let mut referenced_volumes = HashSet::new();
-    {
+    if let Some(roots) = &scope_roots {
+        let mut rows = conn
+            .query("SELECT id, volume_id FROM directories ORDER BY id ASC", ())
+            .await
+            .map_err(store_err)?;
+        let mut cache = FullPathCache::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            let dir_id = req_i64(&row, 0)?;
+            let full = resolve_full_path(conn, dir_id, &mut cache).await?;
+            if report_path_in_roots(&full, roots) {
+                referenced_volumes.insert(req_text(&row, 1)?);
+            }
+        }
+        referenced_volumes.extend(
+            inputs
+                .roots
+                .iter()
+                .filter_map(|root| root.volume_id.clone()),
+        );
+    } else {
         let mut rows = conn
             .query("SELECT DISTINCT volume_id FROM directories", ())
             .await
@@ -660,11 +782,44 @@ async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Res
             referenced_volumes.insert(req_text(&row, 0)?);
         }
     }
+    let included_volumes: HashSet<String> = known_volumes
+        .intersection(&referenced_volumes)
+        .cloned()
+        .collect();
     let mut stub_volumes: Vec<String> = referenced_volumes
         .difference(&known_volumes)
         .cloned()
         .collect();
     stub_volumes.sort();
+    let mut scope_volumes: HashSet<String> = referenced_volumes
+        .iter()
+        .filter(|id| id.as_str() != "explicit-roots")
+        .cloned()
+        .collect();
+    if scope_roots.is_some() {
+        scope_volumes.extend(inputs.event_volume_ids.iter().cloned());
+    }
+
+    // Checkout paths are needed to recognize worktrees whose Git metadata
+    // lives outside the requested roots. Keep only the owning store IDs,
+    // then reload and intern just those checkout rows after repo filtering.
+    let mut in_scope_checkout_repos = HashSet::new();
+    if let Some(roots) = &scope_roots {
+        let mut rows = conn
+            .query(
+                "SELECT instance_id, root_path, git_path FROM checkouts ORDER BY id ASC",
+                (),
+            )
+            .await
+            .map_err(store_err)?;
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            let instance_id = req_text(&row, 0)?;
+            let path = opt_blob(&row, 1)?.unwrap_or(req_blob(&row, 2)?);
+            if report_path_in_roots(&path, roots) {
+                in_scope_checkout_repos.insert(instance_id);
+            }
+        }
+    }
 
     let mut included_repos = HashSet::new();
     let mut unresolvable_repo = false;
@@ -683,7 +838,10 @@ async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Res
             let common_path = req_blob(&row, 2)?;
             let disposition = req_text(&row, 3)?;
             let included = inputs.include_nonmatching || disposition != "nonmatch";
-            if !included {
+            let in_scope = scope_roots.as_ref().is_none_or(|roots| {
+                report_path_in_roots(&git_path, roots) || in_scope_checkout_repos.contains(&id)
+            });
+            if !included || !in_scope {
                 continue;
             }
             if disposition == "unresolvable_identity" {
@@ -710,11 +868,33 @@ async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Res
             if !included_repos.contains(&instance_id) {
                 continue;
             }
-            if let Some(root_path) = opt_blob(&row, 2)? {
+            let root_path = opt_blob(&row, 2)?;
+            let git_path = req_blob(&row, 3)?;
+            // Once a repository is in scope, include every checkout in its
+            // registered Git worktree topology. A linked checkout may live
+            // outside the requested enumeration path but is still part of
+            // the in-scope repository relationship.
+            if let Some(root_path) = root_path {
                 interner.intern(&root_path)?;
             }
-            interner.intern(&req_blob(&row, 3)?)?;
+            interner.intern(&git_path)?;
             checkout_repos.insert(id, instance_id);
+        }
+    }
+
+    let mut included_groups = HashSet::new();
+    {
+        let mut rows = conn
+            .query(
+                "SELECT group_id, instance_id FROM group_members ORDER BY group_id ASC",
+                (),
+            )
+            .await
+            .map_err(store_err)?;
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            if included_repos.contains(&req_text(&row, 1)?) {
+                included_groups.insert(req_text(&row, 0)?);
+            }
         }
     }
 
@@ -836,13 +1016,22 @@ async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Res
 
     let open_errors = {
         let mut rows = conn
-            .query("SELECT COUNT(*) FROM errors WHERE open = 1", ())
+            .query("SELECT scope_key FROM errors WHERE open = 1", ())
             .await
             .map_err(store_err)?;
-        match rows.next().await.map_err(store_err)? {
-            Some(row) => req_i64(&row, 0)?.max(0) as u64,
-            None => 0,
+        let mut count = 0u64;
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            if report_error_in_scope(
+                &req_text(&row, 0)?,
+                scope_roots.as_deref(),
+                scope_identity_roots.as_deref(),
+                &checkout_repos,
+                &scope_volumes,
+            ) {
+                count += 1;
+            }
         }
+        count
     };
 
     // RSP-008: pending/leased work is counted in this same read
@@ -912,10 +1101,15 @@ async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Res
 
     Ok(PrePass {
         included_repos,
+        included_groups,
+        scope_roots,
+        scope_identity_roots,
         unresolvable_repo,
         checkout_repos,
         statuses,
         refreshes,
+        included_volumes,
+        scope_volumes,
         stub_volumes,
         interner,
         open_errors,
@@ -1143,17 +1337,20 @@ async fn stream_with_pre_pass<W: Write>(
         generation: inputs.generation,
         epoch: inputs.epoch,
         catalog_revision,
-        target_url: redact_remote_url(&inputs.target_url),
+        target_url: scrub_text(&redact_remote_url(&inputs.target_url)),
         canonical_url: inputs
             .canonical_url
             .as_ref()
-            .map(|url| redact_remote_url(url)),
+            .map(|url| scrub_text(&redact_remote_url(url))),
         targets: inputs
             .targets
             .iter()
             .map(|t| ScanTarget {
-                raw: redact_remote_url(&t.raw),
-                canonical: t.canonical.as_ref().map(|url| redact_remote_url(url)),
+                raw: scrub_text(&redact_remote_url(&t.raw)),
+                canonical: t
+                    .canonical
+                    .as_ref()
+                    .map(|url| scrub_text(&redact_remote_url(url))),
                 matched_repositories: t.matched_repositories,
             })
             .collect(),
@@ -1208,8 +1405,12 @@ async fn stream_with_pre_pass<W: Write>(
             .await
             .map_err(store_err)?;
         while let Some(row) = rows.next().await.map_err(store_err)? {
+            let id = req_text(&row, 0)?;
+            if pre.scope_roots.is_some() && !pre.included_volumes.contains(&id) {
+                continue;
+            }
             stream.array_item(&Volume {
-                id: req_text(&row, 0)?,
+                id,
                 native_identity: opt_text(&row, 1)?,
                 namespace: req_text(&row, 2)?,
                 filesystem: opt_text(&row, 3)?,
@@ -1253,6 +1454,13 @@ async fn stream_with_pre_pass<W: Write>(
             let dir_id = req_i64(&row, 0)?;
             let volume_id = req_text(&row, 1)?;
             let full = resolve_full_path(reader, dir_id, &mut cache).await?;
+            if pre
+                .scope_roots
+                .as_ref()
+                .is_some_and(|roots| !report_path_in_roots(&full, roots))
+            {
+                continue;
+            }
             let (encoding, value, display) = encode_bytes(&full);
             stream.array_item(&PathRecord {
                 id: format!("path-{dir_id}"),
@@ -1338,6 +1546,9 @@ async fn stream_with_pre_pass<W: Write>(
             .map_err(store_err)?;
         let mut last_account: Option<(String, String)> = None;
         while let Some(row) = rows.next().await.map_err(store_err)? {
+            if !pre.included_groups.contains(&req_text(&row, 0)?) {
+                continue;
+            }
             let host = req_text(&row, 1)?;
             let account = req_text(&row, 2)?;
             let account_key = (host.clone(), account.clone());
@@ -1422,7 +1633,7 @@ async fn stream_with_pre_pass<W: Write>(
         while let Some(row) = rows.next().await.map_err(store_err)? {
             let id = req_text(&row, 0)?;
             let instance_id = req_text(&row, 1)?;
-            if !pre.included_repos.contains(&instance_id) {
+            if !pre.checkout_repos.contains_key(&id) {
                 stats.skipped_orphans += 1;
                 continue;
             }
@@ -1488,7 +1699,15 @@ async fn stream_with_pre_pass<W: Write>(
                 stats.skipped_orphans += 1;
                 continue;
             }
-            let scope = opt_text(&row, 2)?.filter(|id| pre.checkout_repos.contains_key(id));
+            let checkout_scope = opt_text(&row, 2)?;
+            if pre.scope_roots.is_some()
+                && checkout_scope
+                    .as_ref()
+                    .is_some_and(|id| !pre.checkout_repos.contains_key(id))
+            {
+                continue;
+            }
+            let scope = checkout_scope.filter(|id| pre.checkout_repos.contains_key(id));
             let (comparison, ahead, behind) = if v6 {
                 (
                     opt_text(&row, 13)?.unwrap_or_else(|| String::from("pending")),
@@ -1548,7 +1767,15 @@ async fn stream_with_pre_pass<W: Write>(
                 stats.skipped_orphans += 1;
                 continue;
             }
-            let scope = opt_text(&row, 2)?.filter(|id| pre.checkout_repos.contains_key(id));
+            let checkout_scope = opt_text(&row, 2)?;
+            if pre.scope_roots.is_some()
+                && checkout_scope
+                    .as_ref()
+                    .is_some_and(|id| !pre.checkout_repos.contains_key(id))
+            {
+                continue;
+            }
+            let scope = checkout_scope.filter(|id| pre.checkout_repos.contains_key(id));
             let name_bytes = req_blob(&row, 3)?;
             stream.array_item(&Remote {
                 id: req_text(&row, 0)?,
@@ -1664,6 +1891,15 @@ async fn stream_with_pre_pass<W: Write>(
         while let Some(row) = rows.next().await.map_err(store_err)? {
             let id = req_text(&row, 0)?;
             let scope_key = req_text(&row, 1)?;
+            if !report_error_in_scope(
+                &scope_key,
+                pre.scope_roots.as_deref(),
+                pre.scope_identity_roots.as_deref(),
+                &pre.checkout_repos,
+                &pre.scope_volumes,
+            ) {
+                continue;
+            }
             let category = req_text(&row, 2)?;
             let path_id = error_path_id(reader, &scope_key).await?;
             let retryable = req_i64(&row, 8)? != 0

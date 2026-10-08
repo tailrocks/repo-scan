@@ -55,6 +55,148 @@ fn char_key(c: char) -> Key {
     Key::Char(c)
 }
 
+#[test]
+fn credential_shaped_path_and_branch_text_is_scrubbed_in_tui_inputs() {
+    let raw = "https://alice:super-secret@example.invalid/repo";
+
+    let mut report = tui_sample_report();
+    report.paths[1].display = raw.to_string();
+    report.branches[0].name.display = raw.to_string();
+    report.branches[0].name.value = raw.to_string();
+    let snapshot = TuiSnapshot::from_report(&report, 1_759_454_400_000);
+    let store = snapshot
+        .groups
+        .iter()
+        .flat_map(|group| &group.stores)
+        .find(|store| store.id == "store:repo-w1")
+        .expect("report store");
+    let checkout = store
+        .checkouts
+        .iter()
+        .find(|checkout| checkout.id == "checkout:co-w1")
+        .expect("report checkout");
+    let branch = store
+        .branches
+        .iter()
+        .find(|branch| branch.id == "branch:br-w1-main")
+        .expect("report branch");
+    assert!(
+        !checkout.path.contains("super-secret"),
+        "report path password leaked: {checkout:?}"
+    );
+    assert!(
+        checkout.path.contains("<redacted>"),
+        "report path was not scrubbed: {checkout:?}"
+    );
+    assert!(
+        !branch.name.contains("super-secret"),
+        "report branch leaked: {branch:?}"
+    );
+
+    // Live event folding has its own text ingress path, including upstream.
+    let mut live = TuiSnapshot::empty();
+    live.apply_envelope(&envelope(
+        EventType::LocationFound,
+        serde_json::json!({
+            "checkout_id": "co-live",
+            "store_id": "repo-live",
+            "path": raw,
+            "git_path": raw,
+        }),
+    ));
+    live.apply_envelope(&envelope(
+        EventType::BranchBatch,
+        serde_json::json!({
+            "store_id": "repo-live",
+            "branches": [{
+                "id": "br-live",
+                "name": raw,
+                "upstream": raw,
+            }],
+        }),
+    ));
+    let store = live
+        .groups
+        .iter()
+        .flat_map(|group| &group.stores)
+        .find(|store| store.id == "store:repo-live")
+        .expect("live store");
+    assert!(
+        !store.path.contains("super-secret"),
+        "event store path password leaked: {store:?}"
+    );
+    assert!(
+        store.path.contains("<redacted>"),
+        "event path was not scrubbed: {store:?}"
+    );
+    let checkout = store.checkouts.first().expect("live checkout");
+    assert!(
+        !checkout.path.contains("super-secret"),
+        "event path password leaked: {checkout:?}"
+    );
+    assert!(
+        checkout.path.contains("<redacted>"),
+        "event path was not scrubbed: {checkout:?}"
+    );
+    let branch = store.branches.first().expect("live branch");
+    assert!(
+        !branch.name.contains("super-secret"),
+        "event branch password leaked: {branch:?}"
+    );
+    assert!(
+        !branch
+            .upstream
+            .as_deref()
+            .unwrap_or_default()
+            .contains("super-secret"),
+        "event upstream password leaked: {branch:?}"
+    );
+}
+
+#[test]
+fn tui_scan_target_is_scrubbed_from_report_and_started_event() {
+    let raw = "https://ghp_R5T1TUIUSER:target-secret@example.invalid/repo?token=query-secret";
+    let local = "/workspace/token=target-path-secret";
+
+    let mut report = tui_sample_report();
+    report.scan.target_url = raw.to_string();
+    let snapshot = TuiSnapshot::from_report(&report, 1_759_454_400_000);
+    assert!(!snapshot.header.target.contains("ghp_R5T1TUIUSER"));
+    assert!(!snapshot.header.target.contains("target-secret"));
+    assert!(!snapshot.header.target.contains("query-secret"));
+
+    report.scan.target_url = local.to_string();
+    let snapshot = TuiSnapshot::from_report(&report, 1_759_454_400_000);
+    assert!(!snapshot.header.target.contains("target-path-secret"));
+
+    // Production ScanStarted envelopes carry the target in the targets list;
+    // older and test envelopes may carry the scalar `target` field.
+    let mut live = TuiSnapshot::empty();
+    live.apply_envelope(&envelope(
+        EventType::ScanStarted,
+        serde_json::json!({
+            "targets": [{"raw": raw, "canonical": raw}],
+        }),
+    ));
+    assert!(!live.header.target.contains("ghp_R5T1TUIUSER"));
+    assert!(!live.header.target.contains("target-secret"));
+    assert!(!live.header.target.contains("query-secret"));
+
+    live.apply_envelope(&envelope(
+        EventType::ScanStarted,
+        serde_json::json!({"targets": [{"raw": local}]}),
+    ));
+    assert!(!live.header.target.contains("target-path-secret"));
+
+    live.apply_envelope(&envelope(
+        EventType::ScanStarted,
+        serde_json::json!({"target": raw}),
+    ));
+    assert!(!live.header.target.contains("ghp_R5T1TUIUSER"));
+    assert!(!live.header.target.contains("target-secret"));
+    assert!(!live.header.target.contains("query-secret"));
+}
+
 /// Rendered frame joined for substring assertions.
 fn frame_text(state: &ViewState, width: usize, height: usize, color: bool) -> String {
     tui::render_lines(state, width, height, color).join("\n")

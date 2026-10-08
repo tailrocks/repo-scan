@@ -62,6 +62,7 @@ fn test_inputs(report_id: &str) -> ReportInputs {
         catalog_revision: 7,
         target_url: "https://github.com/OWNER/REPO".to_string(),
         canonical_url: Some("https://github.com/owner/repo".to_string()),
+        event_volume_ids: Vec::new(),
         targets: vec![],
         scope: "roots".to_string(),
         scan_state: "complete".to_string(),
@@ -239,6 +240,11 @@ fn api_store_create_scan_request_holds_no_credential_bytes() {
             "scp-user",
             "FAILAPICANARY04@github.com:o/r.git",
             "FAILAPICANARY04",
+        ),
+        (
+            "scp-standard-user",
+            "git@github.com:o/r.git",
+            "FAILAPICANARY05",
         ),
     ];
     runtime().block_on(async {

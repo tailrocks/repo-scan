@@ -1019,7 +1019,7 @@ fn v6_migration_is_additive_with_legacy_null() {
         // Open migrates v5 -> v6; the legacy ref row reads NULL
         // (pending) and new labels persist and round-trip.
         let store = TursoStore::open(&db).await.expect("open upgrades");
-        assert_eq!(store.schema_version().expect("version"), 6);
+        assert_eq!(store.schema_version().expect("version"), 7);
         assert!(store.supports_ref_comparison().await.expect("gate"));
         let rows = store.list_refs("repo-1").await.expect("list");
         assert_eq!(rows.len(), 1);
@@ -1053,6 +1053,7 @@ fn test_inputs(report_id: &str) -> ReportInputs {
         catalog_revision: 7,
         target_url: "https://github.com/OWNER/REPO".to_string(),
         canonical_url: Some("https://github.com/owner/repo".to_string()),
+        event_volume_ids: Vec::new(),
         targets: vec![],
         scope: "roots".to_string(),
         scan_state: "complete".to_string(),

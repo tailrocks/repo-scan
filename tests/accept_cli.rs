@@ -14,6 +14,7 @@ use clap::Parser;
 use common::fixture;
 use repo_scan::cli::{CacheAction, Cli, Command};
 use repo_scan::model::{Scope, StatusMode};
+use repo_scan::store::Store;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcCommand;
 
@@ -814,6 +815,429 @@ fn step6_all_finds_without_target_filter() {
     assert_eq!(report["scan"]["state"], "complete");
 }
 
+/// Explicit roots are report boundaries even when the catalog already has
+/// matching records from an earlier `--all` run at a different root.
+#[test]
+fn sequential_all_root_scans_exclude_prior_out_of_scope_records() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let cwd = dir.path().join("cwd");
+    let root_a = dir.path().join("root-a");
+    let root_b = dir.path().join("root-b");
+    for path in [&cwd, &root_a, &root_b] {
+        repo_scan::privacy::private_dir_0700(path).expect("mkdir");
+    }
+    fixture::normal_clone(&root_a, "repo");
+    fixture::normal_clone(&root_b, "repo");
+
+    let scan = |root: &Path, report_name: &str| {
+        let out = run(
+            &[
+                "scan",
+                "--all",
+                "--root",
+                root.to_str().expect("utf8 root"),
+                "--report",
+                report_name,
+                "--format",
+                "human",
+            ],
+            &cwd,
+            &state,
+        );
+        assert!(
+            matches!(out.status.code(), Some(0) | Some(3)),
+            "usable report: {}",
+            stderr_text(&out)
+        );
+        read_report(&cwd.join(report_name))
+    };
+
+    let first = scan(&root_a, "root-a.json");
+    assert_eq!(first["repositories"].as_array().unwrap().len(), 1);
+
+    // Model a persisted root-A report-derivation gap. Root B must not
+    // surface it when both scopes share the same catalog.
+    let root_a_set = [root_a.clone()];
+    let old_gap_id = repo_scan::config::report_derivation_gap_id("errors", Some(&root_a_set));
+    let old_gap_scope = repo_scan::config::report_derivation_gap_scope_key(Some(&root_a_set));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = repo_scan::store::TursoStore::open(&db)
+            .await
+            .expect("open catalog");
+        store
+            .record_error(
+                &old_gap_id,
+                &old_gap_scope,
+                "report-derivation-truncated",
+                "root A derivation budget reached",
+                None,
+                repo_scan::store::now_ms(),
+            )
+            .await
+            .expect("seed root A gap");
+        store.close().await.expect("close catalog");
+    });
+
+    let second = scan(&root_b, "root-b.json");
+    assert_eq!(second["repositories"].as_array().unwrap().len(), 1);
+    assert_eq!(second["checkouts"].as_array().unwrap().len(), 1);
+    assert_eq!(second["repositories"][0]["match"], "confirmed");
+    assert!(
+        second["errors"]
+            .as_array()
+            .expect("errors array")
+            .iter()
+            .all(|error| error["id"].as_str() != Some(old_gap_id.as_str())),
+        "root B report must exclude root A's persisted derivation gap: {}",
+        second["errors"]
+    );
+
+    let paths = second["paths"].as_array().expect("paths array");
+    for record in paths {
+        let value = record["value"].as_str().unwrap_or_default();
+        assert!(
+            !value.contains(root_a.to_str().expect("root A UTF-8")),
+            "out-of-scope path was persisted in the second report: {value}"
+        );
+    }
+    let checkout = &second["checkouts"][0];
+    let path_id = checkout["root_path_id"].as_str().expect("root path id");
+    let checkout_path = paths
+        .iter()
+        .find(|path| path["id"] == path_id)
+        .expect("checkout path record")["value"]
+        .as_str()
+        .expect("UTF-8 checkout path");
+    assert!(
+        checkout_path.starts_with(root_b.to_str().expect("root B UTF-8")),
+        "second report checkout belongs to root B: {checkout_path}"
+    );
+}
+
+/// A symlink spelling shares the same canonical generation scope as its
+/// physical root, so existing catalog rows remain visible to that scope.
+#[cfg(unix)]
+#[test]
+fn roots_symlink_alias_reuses_catalog_rows() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let cwd = dir.path().join("cwd");
+    let physical_lexical = dir.path().join("physical");
+    let alias = dir.path().join("alias");
+    for path in [&cwd, &physical_lexical] {
+        repo_scan::privacy::private_dir_0700(path).expect("mkdir");
+    }
+    fixture::normal_clone(&physical_lexical, "repo");
+    let physical = std::fs::canonicalize(&physical_lexical).expect("canonical physical root");
+    symlink(&physical, &alias).expect("symlink root alias");
+
+    let scan = |root: &Path, report_name: &str| {
+        let out = run(
+            &[
+                "scan",
+                "--all",
+                "--root",
+                root.to_str().expect("utf8 root"),
+                "--report",
+                report_name,
+            ],
+            &cwd,
+            &state,
+        );
+        assert!(
+            matches!(out.status.code(), Some(0) | Some(3)),
+            "usable report: {}",
+            stderr_text(&out)
+        );
+        read_report(&cwd.join(report_name))
+    };
+
+    let physical_report = scan(&physical, "physical.json");
+    let alias_report = scan(&alias, "alias.json");
+    assert_eq!(
+        alias_report["scan"]["generation"], physical_report["scan"]["generation"],
+        "root spellings share the canonical generation"
+    );
+    assert_eq!(
+        alias_report["repositories"].as_array().unwrap().len(),
+        1,
+        "alias report must retain physical catalog rows: {alias_report}"
+    );
+    assert_eq!(alias_report["checkouts"].as_array().unwrap().len(), 1);
+    assert!(!alias_report["branches"].as_array().unwrap().is_empty());
+
+    let git_path_id = alias_report["repositories"][0]["git_path_id"]
+        .as_str()
+        .expect("repository git path id");
+    let git_path = alias_report["paths"]
+        .as_array()
+        .expect("paths")
+        .iter()
+        .find(|path| path["id"].as_str() == Some(git_path_id))
+        .expect("repository git path")["value"]
+        .as_str()
+        .expect("UTF-8 git path");
+    assert_eq!(
+        git_path,
+        physical.join("repo/.git").to_str().expect("utf8 path"),
+        "alias scope includes the physical catalog spelling"
+    );
+
+    let root_gap_id = "shared-root-gap";
+    let root_scope_key = repo_scan::config::scope_key_for_dir(&physical);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = repo_scan::store::TursoStore::open(&db)
+            .await
+            .expect("open catalog");
+        store
+            .record_error(
+                root_gap_id,
+                &root_scope_key,
+                "permission-denied",
+                "synthetic shared-root gap",
+                None,
+                repo_scan::store::now_ms(),
+            )
+            .await
+            .expect("seed root gap");
+        store.close().await.expect("close catalog");
+    });
+
+    let both = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            physical.to_str().expect("utf8 physical root"),
+            "--root",
+            alias.to_str().expect("utf8 alias root"),
+            "--report",
+            "both.json",
+        ],
+        &cwd,
+        &state,
+    );
+    assert!(
+        matches!(both.status.code(), Some(0) | Some(3)),
+        "usable paired-root report: {}",
+        stderr_text(&both)
+    );
+    let both_report = read_report(&cwd.join("both.json"));
+    assert_eq!(
+        both_report["scan"]["generation"],
+        physical_report["scan"]["generation"]
+    );
+    assert_eq!(both_report["roots"].as_array().unwrap().len(), 2);
+    assert_eq!(both_report["repositories"].as_array().unwrap().len(), 1);
+    assert!(both_report["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|error| error["id"].as_str() == Some(root_gap_id)));
+    assert!(both_report["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|root| root["error_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id.as_str() == Some(root_gap_id))));
+
+    let reversed = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            alias.to_str().expect("utf8 alias root"),
+            "--root",
+            physical.to_str().expect("utf8 physical root"),
+            "--report",
+            "both-reversed.json",
+        ],
+        &cwd,
+        &state,
+    );
+    assert!(
+        matches!(reversed.status.code(), Some(0) | Some(3)),
+        "usable reversed paired-root report: {}",
+        stderr_text(&reversed)
+    );
+    let reversed_report = read_report(&cwd.join("both-reversed.json"));
+    assert_eq!(reversed_report["roots"].as_array().unwrap().len(), 2);
+    assert_eq!(reversed_report["repositories"].as_array().unwrap().len(), 1);
+    assert!(reversed_report["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|root| root["error_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id.as_str() == Some(root_gap_id))));
+
+    // Start with an alias-only root and a lexically keyed identity gap.
+    // Both its own rows and the safety gap must survive report filtering.
+    let fresh_lexical = dir.path().join("fresh-physical");
+    let fresh_alias = dir.path().join("fresh-alias");
+    repo_scan::privacy::private_dir_0700(&fresh_lexical).expect("mkdir fresh root");
+    fixture::normal_clone(&fresh_lexical, "repo");
+    let fresh_physical = std::fs::canonicalize(&fresh_lexical).expect("canonical fresh root");
+    symlink(&fresh_physical, &fresh_alias).expect("fresh symlink root");
+    let fresh_gap_id = "fresh-alias-identity-gap";
+    let fresh_scope = repo_scan::config::scope_key_for_dir(&fresh_alias);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = repo_scan::store::TursoStore::open(&db)
+            .await
+            .expect("open catalog");
+        store
+            .record_error(
+                fresh_gap_id,
+                &fresh_scope,
+                "fence-identity-unknown",
+                "synthetic unresolved alias identity",
+                None,
+                repo_scan::store::now_ms(),
+            )
+            .await
+            .expect("seed fresh alias gap");
+        store.close().await.expect("close catalog");
+    });
+    let fresh = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            fresh_alias.to_str().expect("utf8 fresh alias"),
+            "--report",
+            "fresh-alias.json",
+        ],
+        &cwd,
+        &state,
+    );
+    assert!(
+        matches!(fresh.status.code(), Some(0) | Some(3)),
+        "usable fresh alias report: {}",
+        stderr_text(&fresh)
+    );
+    let fresh_report = read_report(&cwd.join("fresh-alias.json"));
+    assert!(fresh_report["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|error| error["id"].as_str() == Some(fresh_gap_id)));
+    assert!(fresh_report["roots"][0]["error_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|id| id.as_str() == Some(fresh_gap_id)));
+}
+
+#[test]
+fn local_target_credentials_are_scrubbed_from_persistence_and_report() {
+    use repo_scan::store::{Store, TursoStore};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let cwd = dir.path().join("cwd");
+    repo_scan::privacy::private_dir_0700(&cwd).expect("cwd");
+    // Synthetic credential-shaped path component, used only as a canary.
+    let root = dir
+        .path()
+        .join("password=ghp_TESTTARGETCANARY00000000000000000000");
+    repo_scan::privacy::private_dir_0700(&root).expect("root");
+    let repo = fixture::normal_clone(&root, "repo");
+    let target = repo.to_str().expect("UTF-8 target");
+    let root_arg = root.to_str().expect("UTF-8 root");
+    let output = run(
+        &[
+            "scan",
+            target,
+            "--root",
+            root_arg,
+            "--report",
+            "report.json",
+            "--format",
+            "human",
+        ],
+        &cwd,
+        &state,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&output)
+    );
+    let report = read_report(&cwd.join("report.json"));
+    let scan_id = report["scan"]["id"].as_str().expect("scan id");
+    let scan_json = serde_json::to_string(&report["scan"]).expect("scan JSON");
+    assert!(
+        !scan_json.contains("TESTTARGETCANARY"),
+        "report scan target fields must not retain the synthetic credential"
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open catalog");
+        let saved = store
+            .get_scan(scan_id)
+            .await
+            .expect("get scan")
+            .expect("scan row");
+        assert!(
+            !String::from_utf8_lossy(&saved.url_raw).contains("TESTTARGETCANARY"),
+            "scan url_raw must be scrubbed"
+        );
+        assert!(
+            !saved
+                .url_canonical
+                .as_deref()
+                .is_some_and(|bytes| String::from_utf8_lossy(bytes).contains("TESTTARGETCANARY")),
+            "scan url_canonical must be scrubbed"
+        );
+        assert!(
+            !saved
+                .targets_json
+                .as_deref()
+                .is_some_and(|text| text.contains("TESTTARGETCANARY")),
+            "targets_json must be scrubbed"
+        );
+        let rows = store
+            .read_scan_events(scan_id, 0, 10_000)
+            .await
+            .expect("read scan events");
+        let started = rows
+            .iter()
+            .find(|row| row.event_type == "scan_started")
+            .expect("scan_started event");
+        let records = String::from_utf8_lossy(&started.records);
+        assert!(
+            !records.contains("TESTTARGETCANARY"),
+            "scan_started target and root fields must be scrubbed"
+        );
+        store.close().await.expect("close catalog");
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Step 15 case 5: distinct explicit root sets never share a generation.
 // ---------------------------------------------------------------------------
@@ -1158,6 +1582,37 @@ fn query_scan_replays_journaled_lifecycle_as_jsonl() {
         serde_json::Value::String("scan_completed".to_string())
     );
 
+    // A cursor on the terminal event closes replay. The malformed row we
+    // appended after terminal above must never be treated as a live tail.
+    let terminal = lines.last().expect("terminal");
+    let terminal_cursor = Cursor {
+        seq: terminal["seq"].as_u64().expect("terminal seq"),
+        catalog_rev: terminal["catalog_rev"].as_u64().expect("terminal rev"),
+        event_offset: terminal["event_offset"].as_u64().expect("terminal offset"),
+    }
+    .encode();
+    let terminal_tail = run(
+        &[
+            "query",
+            "--scan",
+            &scan_id,
+            "--follow",
+            "--format",
+            "jsonl",
+            "--after",
+            &terminal_cursor,
+        ],
+        &cwd,
+        &state,
+    );
+    assert_eq!(
+        terminal_tail.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&terminal_tail)
+    );
+    assert!(stdout_text(&terminal_tail).is_empty());
+
     // A validly encoded seq beyond SQLite's signed range cannot exist in
     // this journal. Treat it as an expired cursor and explicitly reset.
     let overflow = Cursor {
@@ -1198,6 +1653,62 @@ fn query_scan_replays_journaled_lifecycle_as_jsonl() {
         "stderr: {}",
         stderr_text(&missing)
     );
+}
+
+#[test]
+fn human_footers_and_destination_errors_scrub_local_paths() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("password=STATEPATHCANARY");
+    let cwd = dir.path().join("cwd");
+    repo_scan::privacy::private_dir_0700(&cwd).expect("cwd");
+    let root = dir.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("root");
+    fixture::normal_clone(&root, "repo");
+    let report_dir = cwd.join("password=REPORTPATHCANARY");
+    repo_scan::privacy::private_dir_0700(&report_dir).expect("report dir");
+    let report = report_dir.join("report.json");
+    let successful = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            root.to_str().expect("root UTF-8"),
+            "--report",
+            report.to_str().expect("report UTF-8"),
+            "--format",
+            "human",
+        ],
+        &cwd,
+        &state,
+    );
+    assert_eq!(
+        successful.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&successful)
+    );
+    assert!(!stdout_text(&successful).contains("STATEPATHCANARY"));
+    assert!(!stdout_text(&successful).contains("REPORTPATHCANARY"));
+
+    let rejected_dest = state.join("password=ERRORPATHCANARY").join("report.json");
+    let rejected = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            root.to_str().expect("root UTF-8"),
+            "--report",
+            rejected_dest.to_str().expect("rejected path UTF-8"),
+            "--format",
+            "human",
+        ],
+        &cwd,
+        &state,
+    );
+    assert_ne!(rejected.status.code(), Some(0));
+    let diagnostic = stderr_text(&rejected);
+    assert!(!diagnostic.contains("STATEPATHCANARY"));
+    assert!(!diagnostic.contains("ERRORPATHCANARY"));
 }
 
 /// JSON output stays a single report document with an explicit report

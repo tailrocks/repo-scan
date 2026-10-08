@@ -255,6 +255,9 @@ pub enum ResumeAction {
     /// Resume strictly after the cursor's `(catalog_rev, event_offset)`
     /// position; the first delivered envelope keeps its stored flags.
     ResumeAfterCursor,
+    /// The cursor points at a terminal event; the stream must stop there.
+    /// A terminal cursor is never a valid point from which to resume rows.
+    StopAtTerminal,
     /// Retained events no longer cover the cursor: replay the retained
     /// window from its start with `reset:true` on the first envelope, so
     /// the consumer drops buffered state instead of silently skipping.
@@ -272,7 +275,8 @@ pub enum ResumeAction {
 ///   still delivered. (Production gauge positions are immutable, so the
 ///   fuzzy arm only fires on hand-mutated journals; routine ticks never
 ///   resync followers either way.)
-/// - Row found, record class, `(rev, off)` matches → `ResumeAfterCursor`.
+/// - Row found, record class, `(rev, off)` matches → `ResumeAfterCursor`,
+///   except an exact terminal row gives [`ResumeAction::StopAtTerminal`].
 /// - Row found, record class, `(rev, off)` differs (foreign scan's cursor
 ///   or corruption) → `ResetSnapshot`.
 #[must_use]
@@ -281,6 +285,13 @@ pub fn classify_cursor(cursor: &Cursor, found: Option<(EventType, u64, u64)>) ->
         None => ResumeAction::ResetSnapshot,
         Some((event_type, _rev, _off)) if is_progress_coalescible(event_type) => {
             ResumeAction::ResumeAfterCursor
+        }
+        Some((event_type, rev, off))
+            if is_terminal_event(event_type)
+                && rev == cursor.catalog_rev
+                && off == cursor.event_offset =>
+        {
+            ResumeAction::StopAtTerminal
         }
         Some((_event_type, rev, off))
             if rev == cursor.catalog_rev && off == cursor.event_offset =>
@@ -562,6 +573,18 @@ mod tests {
         assert_eq!(
             classify_cursor(&cursor, Some((EventType::DiscoveryProgress, 9, 9))),
             ResumeAction::ResumeAfterCursor
+        );
+        assert_eq!(
+            classify_cursor(&cursor, Some((EventType::ScanCompleted, 3, 4))),
+            ResumeAction::StopAtTerminal
+        );
+        assert_eq!(
+            classify_cursor(&cursor, Some((EventType::ScanCompleted, 3, 5))),
+            ResumeAction::ResetSnapshot
+        );
+        assert_eq!(
+            classify_cursor(&cursor, Some((EventType::ScanCompleted, 9, 4))),
+            ResumeAction::ResetSnapshot
         );
     }
 
