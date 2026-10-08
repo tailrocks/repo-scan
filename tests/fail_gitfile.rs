@@ -108,7 +108,10 @@ fn runtime() -> tokio::runtime::Runtime {
 
 /// Compile the shipped Draft 2020-12 schema (local `$ref`s only, no I/O).
 fn schema_validator() -> jsonschema::Validator {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/schemas/report-v1.schema.json");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/schemas/report-v1.5.schema.json"
+    );
     let bytes = std::fs::read(path).expect("read shipped schema");
     let schema: Value = serde_json::from_slice(&bytes).expect("schema parses");
     jsonschema::validator_for(&schema).expect("shipped schema compiles")

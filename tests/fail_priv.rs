@@ -38,9 +38,10 @@ fn runtime() -> tokio::runtime::Runtime {
 
 fn marker_report(report_id: &str) -> String {
     format!(
-        "{{\"schema_version\":\"1.0.0\",\
+        "{{\"schema_version\":\"{}\",\
         \"tool\":{{\"name\":\"repo-scan\",\"version\":\"test\"}},\
-        \"report_id\":\"{report_id}\"}}"
+        \"report_id\":\"{report_id}\"}}",
+        repo_scan::report::model::SCHEMA_VERSION
     )
 }
 

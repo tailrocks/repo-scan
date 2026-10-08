@@ -775,7 +775,7 @@ fn verify_bound_parent(
 }
 
 /// True when the existing file parses as a `repo-scan` report: a JSON
-/// object with `schema_version: "1.0.0"`, `tool.name: "repo-scan"`, a
+/// object with the current `schema_version`, `tool.name: "repo-scan"`, a
 /// nonempty tool version, and a nonempty snapshot-safe `report_id`. A
 /// filename extension alone is never proof. Reads from an `O_NOFOLLOW`
 /// regular-file FD under the staged-report cap so a swapped-in symlink,
@@ -801,22 +801,35 @@ pub fn is_verified_prior_report_bytes(bytes: &[u8]) -> bool {
 /// Extract the claimed `report_id` when `bytes` carry the verified-prior
 /// provenance fields (schema, tool name/version, snapshot-safe report ID).
 fn prior_report_id(bytes: &[u8]) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    let object = value.as_object()?;
-    let schema_ok = object.get("schema_version").and_then(|v| v.as_str())
-        == Some(crate::report::model::SCHEMA_VERSION);
-    let tool = object.get("tool")?.as_object()?;
-    let tool_ok =
-        tool.get("name").and_then(|v| v.as_str()) == Some(crate::report::model::TOOL_NAME);
-    let version_ok = tool
-        .get("version")
-        .and_then(|v| v.as_str())
-        .is_some_and(|v| !v.is_empty());
-    let id = object.get("report_id")?.as_str()?;
-    if !(schema_ok && tool_ok && version_ok) || check_report_id(id).is_err() {
+    #[derive(serde::Deserialize)]
+    struct PriorReport<'a> {
+        #[serde(borrow)]
+        schema_version: &'a str,
+        #[serde(borrow)]
+        report_id: &'a str,
+        tool: PriorTool<'a>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PriorTool<'a> {
+        #[serde(borrow)]
+        name: &'a str,
+        #[serde(borrow)]
+        version: &'a str,
+    }
+
+    // Deserialize only the small provenance envelope. Serde ignores the
+    // record arrays without allocating them, so replacing a previous large
+    // report does not build a second full JSON tree in memory.
+    let prior: PriorReport<'_> = serde_json::from_slice(bytes).ok()?;
+    let schema_ok =
+        crate::report::model::SUPPORTED_PRIOR_SCHEMA_VERSIONS.contains(&prior.schema_version);
+    let tool_ok = prior.tool.name == crate::report::model::TOOL_NAME;
+    let version_ok = !prior.tool.version.is_empty();
+    if !(schema_ok && tool_ok && version_ok) || check_report_id(prior.report_id).is_err() {
         return None;
     }
-    Some(id.to_string())
+    Some(prior.report_id.to_string())
 }
 
 /// State-bound prior-report check (XSEC-04): field verification plus, when

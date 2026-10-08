@@ -36,6 +36,7 @@ fn test_inputs(report_id: &str) -> ReportInputs {
         catalog_revision: 7,
         target_url: "https://github.com/OWNER/REPO".to_string(),
         canonical_url: Some("https://github.com/owner/repo".to_string()),
+        targets: vec![],
         scope: "roots".to_string(),
         scan_state: "complete".to_string(),
         started_at_ms: 1_759_154_398_000,
@@ -633,7 +634,9 @@ fn retest_submodule_url_strictly_redacted() {
     assert!(on_disk.contains(canary_tail), "taint planted");
     let inspector = GixInspector::new();
     let instance = inspector.open_exact(&sup).expect("open super");
-    let observations = inspector.submodules(&instance).expect("submodules");
+    let observations = inspector
+        .submodules(&instance, &repo_scan::identity::load_ssh_aliases())
+        .expect("submodules");
     for observation in &observations {
         if let Some(url) = &observation.url {
             assert!(!url.contains(canary_user), "{url}");

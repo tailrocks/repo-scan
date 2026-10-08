@@ -8,7 +8,7 @@
 //! removal or `realpath` alone (firmlinks would collapse incorrectly).
 
 use super::{ChildKind, EntryMetadata};
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 #[cfg(unix)]
 use std::ffi::{c_char, CString, OsString};
 #[cfg(unix)]
@@ -33,16 +33,6 @@ pub struct PhysicalDirId {
     pub ino: u64,
     /// Mount or snapshot namespace (mount path or volume UUID).
     pub namespace: String,
-}
-
-/// Outcome of observing one physical directory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObserveOutcome {
-    /// First observation: schedule enumeration.
-    New,
-    /// Already observed in this namespace: record the alias, do not
-    /// re-enumerate.
-    Duplicate,
 }
 
 /// Schedule-time identity/provenance token (PG-01 support).
@@ -140,80 +130,6 @@ impl ScheduleProvenance {
             ino,
             path,
         })
-    }
-}
-
-/// Maximum entries retained by the in-memory [`Topology`] guard (R2
-/// bound, spec §5: no in-memory set of every path/identity). Past the cap
-/// the oldest entry is evicted (FIFO), so memory stays flat on a full
-/// machine scan regardless of distinct-directory count.
-pub const TOPOLOGY_SEEN_CAP: usize = 4096;
-
-/// Process-local cycle/dedupe guard for in-flight traversal.
-///
-/// This is the cheap in-memory guard against symlink cycles and firmlink
-/// double-scheduling within one owner process. Durable deduplication state
-/// lives in the store (directories table keyed by physical identity); this
-/// guard never replaces it and is rebuilt from durable state on restart.
-///
-/// The guard retains at most [`TOPOLOGY_SEEN_CAP`] identities (FIFO
-/// eviction). Re-walk cost of eviction: an identity evicted and observed
-/// again reports [`ObserveOutcome::New`] instead of `Duplicate`, so a
-/// caller that schedules on `New` may re-enumerate that directory — a
-/// bounded duplicate, never a missed directory and never unbounded
-/// memory. A catalog-backed visited set was rejected for this layer:
-/// [`Topology::observe`] is synchronous while the store is async, and the
-/// sole production call site (`exec_enumerate`) already upserts through
-/// the durable `directories` identity index, which remains the dedupe
-/// authority.
-#[derive(Debug, Default)]
-pub struct Topology {
-    seen: HashSet<PhysicalDirId>,
-    order: VecDeque<PhysicalDirId>,
-}
-
-impl Topology {
-    /// Empty guard.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Observe one physical directory, reporting whether it is new.
-    ///
-    /// Past [`TOPOLOGY_SEEN_CAP`] retained identities the oldest entry is
-    /// evicted first; an evicted identity observed again reports `New`
-    /// (bounded re-walk, documented on [`Topology`]).
-    pub fn observe(&mut self, id: PhysicalDirId) -> ObserveOutcome {
-        if self.seen.contains(&id) {
-            return ObserveOutcome::Duplicate;
-        }
-        while self.seen.len() >= TOPOLOGY_SEEN_CAP {
-            match self.order.pop_front() {
-                Some(oldest) => {
-                    self.seen.remove(&oldest);
-                }
-                None => break,
-            }
-        }
-        self.order.push_back(id.clone());
-        self.seen.insert(id);
-        ObserveOutcome::New
-    }
-
-    /// True when this physical directory is currently retained.
-    pub fn contains(&self, id: &PhysicalDirId) -> bool {
-        self.seen.contains(id)
-    }
-
-    /// Number of physical directories currently retained (at most
-    /// [`TOPOLOGY_SEEN_CAP`]).
-    pub fn len(&self) -> usize {
-        self.seen.len()
-    }
-
-    /// True when nothing is currently retained.
-    pub fn is_empty(&self) -> bool {
-        self.seen.is_empty()
     }
 }
 
@@ -379,6 +295,16 @@ pub const IDENTITY_IO_TIMEOUT: Duration = Duration::from_secs(1);
 /// no owner [`Admission`](crate::scheduler::admission::Admission) handle).
 static IDENTITY_IO_LIVE: AtomicUsize = AtomicUsize::new(0);
 
+/// Process-lifetime bounded identity-I/O calls (routing telemetry: every
+/// coordinator stat flows through [`bounded_identity_io`], so this
+/// advances once per resolve attempt whatever the outcome).
+static IDENTITY_IO_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Total bounded identity-I/O calls so far (see `IDENTITY_IO_CALLS`).
+pub fn identity_io_calls() -> u64 {
+    IDENTITY_IO_CALLS.load(Ordering::Relaxed) as u64
+}
+
 /// Run blocking identity I/O (`canonicalize`/`metadata`) on a worker
 /// thread with bounded admission plus a timeout. `None` means the slot
 /// wait expired, the worker timed out, or the spawn failed: the caller
@@ -388,6 +314,7 @@ fn bounded_identity_io<T>(op: impl FnOnce() -> T + Send + 'static) -> Option<T>
 where
     T: Send + 'static,
 {
+    IDENTITY_IO_CALLS.fetch_add(1, Ordering::Relaxed);
     let start = Instant::now();
     let admitted = loop {
         let live = IDENTITY_IO_LIVE.load(Ordering::Relaxed);
@@ -436,16 +363,65 @@ where
     rx.recv_timeout(IDENTITY_IO_TIMEOUT).ok()
 }
 
+/// Canonical paths and owning-volume device numbers for a set of scan roots.
+/// The whole batch runs inside one admitted identity-I/O worker, so even a
+/// stalled network mount cannot block the coordinator's generation-key
+/// construction past the standard identity timeout. Failed identities are
+/// returned as `None` entries; callers must retain a safe lexical key.
+pub fn bounded_scope_identities(roots: &[PathBuf]) -> Option<Vec<(PathBuf, Option<u64>)>> {
+    let owned = roots.to_vec();
+    bounded_identity_io(move || {
+        owned
+            .iter()
+            .map(|root| {
+                // A failed canonicalization must not leave lexical aliases
+                // such as `unused/../missing` as distinct generation scopes.
+                // Keep the same deterministic lexical fallback used when the
+                // bounded identity worker itself cannot complete.
+                let canonical = root
+                    .canonicalize()
+                    .unwrap_or_else(|_| crate::config::normalize_scope_path(root));
+                let dev = std::fs::metadata(&canonical)
+                    .ok()
+                    .map(|metadata| super::fs_entry_metadata(&metadata).dev);
+                (canonical, dev)
+            })
+            .collect()
+    })
+}
+
 /// Bounded physical identity for one coordinator path (R7 alias sharing:
-/// follows symlinks). `None` on stat failure: the caller persists
-/// unknown/gap instead of silently substituting a path-derived identity.
-/// Avoids spawning dedicated OS threads for simple path/identity checks (R07).
+/// follows symlinks). Runs through `bounded_identity_io` (cap-2
+/// admission plus a 1 s timeout): `None` on stat failure, slot refusal,
+/// or timeout — the caller persists unknown/gap instead of silently
+/// substituting a path-derived identity. A hung path never stalls the
+/// coordinator past the budget.
 #[cfg(unix)]
 pub fn bounded_dir_identity(path: &Path) -> Option<(u64, u64)> {
-    std::fs::metadata(path).ok().map(|md| {
-        let meta = super::fs_entry_metadata(&md);
-        (meta.dev, meta.ino)
+    let owned = path.to_path_buf();
+    bounded_identity_io(move || {
+        std::fs::metadata(&owned).ok().map(|md| {
+            let meta = super::fs_entry_metadata(&md);
+            (meta.dev, meta.ino)
+        })
     })
+    .flatten()
+}
+
+/// Bounded owning-volume device for one coordinator path (per-claim
+/// breaker keying). Like [`bounded_dir_identity`] but never follows
+/// symlinks (`symlink_metadata`): the link itself keys the breaker, so a
+/// hung link target cannot stall the resolve. `None` (stat failure,
+/// refusal, timeout) keys the shared `unknown` bucket.
+#[cfg(unix)]
+pub fn bounded_volume_dev(path: &Path) -> Option<u64> {
+    let owned = path.to_path_buf();
+    bounded_identity_io(move || {
+        std::fs::symlink_metadata(&owned)
+            .ok()
+            .map(|md| super::fs_entry_metadata(&md).dev)
+    })
+    .flatten()
 }
 
 /// Non-unix targets have no stable `(dev, ino)` identity, so coordinator
@@ -453,6 +429,13 @@ pub fn bounded_dir_identity(path: &Path) -> Option<(u64, u64)> {
 /// path-derived fallback that splits or shares tasks unpredictably).
 #[cfg(not(unix))]
 pub fn bounded_dir_identity(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// Non-unix twin of [`bounded_volume_dev`]: no stable device numbers,
+/// so breaker keying always lands in the shared `unknown` bucket.
+#[cfg(not(unix))]
+pub fn bounded_volume_dev(_path: &Path) -> Option<u64> {
     None
 }
 
@@ -1302,17 +1285,24 @@ mod tests {
     /// exceeding the cap), and the count drains once the workers exit.
     #[test]
     fn identity_io_timeout_abandons_wait_not_cap() {
-        let baseline = IDENTITY_IO_LIVE.load(Ordering::Relaxed);
+        // No baseline arithmetic: sibling lib tests run in parallel and
+        // their in-flight identity-I/O workers would pollute a baseline
+        // read here and drain before the assertions below (CI flake).
+        // Instead assert absolute properties of this test's own workers.
         let mut releases = Vec::new();
+        let mut dones = Vec::new();
         let mut callers = Vec::new();
         for _ in 0..IDENTITY_IO_CAP {
             let (started_tx, started_rx) = mpsc::channel();
             let (release_tx, release_rx) = mpsc::channel::<()>();
+            let (done_tx, done_rx) = mpsc::channel::<()>();
             releases.push(release_tx);
+            dones.push(done_rx);
             callers.push(std::thread::spawn(move || {
                 bounded_identity_io(move || {
                     let _ = started_tx.send(());
                     let _ = release_rx.recv();
+                    let _ = done_tx.send(());
                     7u32
                 })
             }));
@@ -1321,21 +1311,36 @@ mod tests {
                 .expect("identity worker starts");
         }
         // Both workers are blocked inside `op()` while their callers sit
-        // in `recv_timeout`: the cap is fully charged.
-        assert!(IDENTITY_IO_LIVE.load(Ordering::Relaxed) >= baseline + IDENTITY_IO_CAP);
+        // in `recv_timeout`: each holds a permit, so the live count is at
+        // least the cap whatever sibling tests do.
+        assert!(IDENTITY_IO_LIVE.load(Ordering::Relaxed) >= IDENTITY_IO_CAP);
         // Every caller abandons its wait at the timeout ...
         for caller in callers {
             assert_eq!(caller.join().expect("caller joins"), None);
         }
         // ... but the stalled workers still hold the cap (pre-fix code
-        // dropped the caller-owned guard here and fell back to baseline).
-        assert!(IDENTITY_IO_LIVE.load(Ordering::Relaxed) >= baseline + IDENTITY_IO_CAP);
-        // Releasing the workers drains the cap back to baseline: no leak.
+        // dropped the caller-owned guard here and the count fell).
+        assert!(IDENTITY_IO_LIVE.load(Ordering::Relaxed) >= IDENTITY_IO_CAP);
+        // Releasing the workers drains their permits: no leak. Wait for
+        // this test's own workers to exit first (done signals), then for
+        // the live count to drop by the two released permits. Sibling
+        // tests only run brief resolves, so a bounded poll observes the
+        // drop even if a sibling flickers the count mid-poll.
+        let held = IDENTITY_IO_LIVE.load(Ordering::Relaxed);
         drop(releases);
+        for done in dones {
+            done.recv_timeout(Duration::from_secs(10))
+                .expect("identity worker exits");
+        }
         let drain_by = Instant::now() + Duration::from_secs(10);
-        while IDENTITY_IO_LIVE.load(Ordering::Relaxed) != baseline && Instant::now() < drain_by {
+        while IDENTITY_IO_LIVE.load(Ordering::Relaxed) > held - IDENTITY_IO_CAP
+            && Instant::now() < drain_by
+        {
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(IDENTITY_IO_LIVE.load(Ordering::Relaxed), baseline);
+        assert!(
+            IDENTITY_IO_LIVE.load(Ordering::Relaxed) <= held - IDENTITY_IO_CAP,
+            "released permits drain from the live count"
+        );
     }
 }

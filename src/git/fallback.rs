@@ -512,7 +512,9 @@ impl FallbackGit {
     ///
     /// Symbolic targets are preserved from `%(symref)`. Peeled values are
     /// left `None`: peeling here would add object-store reads the caller
-    /// did not request.
+    /// did not request. Raw-byte parse: records split on `\n`, fields on
+    /// `\0` — names and symref targets keep exact bytes; oids must be
+    /// ASCII hex (malformed records skip, like empty fields).
     pub fn refs(
         &self,
         git_dir: &Path,
@@ -534,25 +536,30 @@ impl FallbackGit {
                 "--format=%(refname)%00%(objectname)%00%(symref)",
             ],
         )?;
-        let text = String::from_utf8_lossy(&out);
         let mut refs = Vec::new();
-        for line in text.lines() {
-            let mut parts = line.split('\0');
-            let (Some(name), Some(oid), symref) =
+        for record in out.split(|b| *b == b'\n') {
+            if record.is_empty() {
+                continue;
+            }
+            let mut parts = record.split(|b| *b == 0);
+            let (Some(name), Some(oid_hex), symref) =
                 (parts.next(), parts.next(), parts.next().unwrap_or_default())
             else {
                 continue;
             };
-            if name.is_empty() || oid.is_empty() {
+            if name.is_empty() {
                 continue;
             }
+            let Some(oid) = oid_from_ascii_hex(&expected_algorithm, oid_hex) else {
+                continue;
+            };
             let target = if symref.is_empty() {
-                RefTarget::Object(oid_from_hex(&expected_algorithm, oid))
+                RefTarget::Object(oid)
             } else {
-                RefTarget::Symbolic(symref.as_bytes().to_vec())
+                RefTarget::Symbolic(symref.to_vec())
             };
             refs.push(RefObservation {
-                name: name.as_bytes().to_vec(),
+                name: name.to_vec(),
                 target,
                 peeled: None,
             });
@@ -560,44 +567,107 @@ impl FallbackGit {
         Ok(refs)
     }
 
+    /// Ahead/behind counts via `rev-list --left-right --count A...B`
+    /// (graph fallback for stores gix cannot walk; see
+    /// [`super::graph`]). Read-only commit walk: no worktree content
+    /// is read, so no filter driver can execute. Output parses
+    /// strictly as `"<ahead>\t<behind>"` with nothing else —
+    /// anything unparseable fails loudly, never as partial counts.
+    /// Returns `(ahead, behind)`: commits reachable from `a_hex`
+    /// but not `b_hex`, and the reverse.
+    pub fn rev_list_count(
+        &self,
+        git_dir: &Path,
+        work_tree: Option<&Path>,
+        a_hex: &str,
+        b_hex: &str,
+    ) -> crate::Result<(u64, u64)> {
+        self.rev_list_count_inner(git_dir, work_tree, a_hex, b_hex, None)
+    }
+
+    /// [`Self::rev_list_count`] with an explicit cancellation/deadline token.
+    /// Graph walks use this so cancellation remains effective after a
+    /// primary gix walk fails and the installed-git fallback starts.
+    pub fn rev_list_count_cancel(
+        &self,
+        git_dir: &Path,
+        work_tree: Option<&Path>,
+        a_hex: &str,
+        b_hex: &str,
+        cancel: &WaitCancel,
+    ) -> crate::Result<(u64, u64)> {
+        self.rev_list_count_inner(git_dir, work_tree, a_hex, b_hex, Some(cancel))
+    }
+
+    fn rev_list_count_inner(
+        &self,
+        git_dir: &Path,
+        work_tree: Option<&Path>,
+        a_hex: &str,
+        b_hex: &str,
+        cancel: Option<&WaitCancel>,
+    ) -> crate::Result<(u64, u64)> {
+        if a_hex.is_empty() || b_hex.is_empty() {
+            return Err(crate::Error::Git(String::from(
+                "installed git: rev-list refuses empty tip OID",
+            )));
+        }
+        let spec = format!("{a_hex}...{b_hex}");
+        // One argv element, no shell: hostile OID text cannot escape
+        // into options or paths (and git re-validates the revision).
+        let args = ["rev-list", "--left-right", "--count", &spec];
+        let out = match cancel {
+            Some(cancel) => {
+                self.run_inner_with_cancel(git_dir, work_tree, &args, None, Some(cancel))?
+            }
+            None => self.run(git_dir, work_tree, &args)?,
+        };
+        parse_rev_list_count(&out).ok_or_else(|| {
+            crate::Error::Git(format!(
+                "installed git: unparseable rev-list --count output: {:?}",
+                String::from_utf8_lossy(&out)
+            ))
+        })
+    }
+
     /// Observe HEAD via `symbolic-ref` + `rev-parse` (no checkout touched).
+    /// Ref names keep exact bytes (ASCII-whitespace trimmed, no lossy
+    /// round-trip); oids must be ASCII hex (branch oid `None`, detached
+    /// `Unknown`, when malformed).
     pub fn head(&self, git_dir: &Path, work_tree: Option<&Path>) -> crate::Result<HeadState> {
         let algorithm = self.object_format(git_dir, work_tree);
         match self.run(git_dir, work_tree, &["symbolic-ref", "-q", "HEAD"]) {
             Ok(out) => {
-                let name = String::from_utf8_lossy(&out).trim().to_string();
+                let name = out.trim_ascii();
                 if name.is_empty() {
                     return Ok(HeadState::Unknown);
                 }
                 match self.run(git_dir, work_tree, &["rev-parse", "--verify", "HEAD"]) {
                     Ok(oid_out) => {
-                        let hex = String::from_utf8_lossy(&oid_out).trim().to_string();
+                        let hex = oid_out.trim_ascii();
                         Ok(HeadState::Branch {
-                            ref_name: name.into_bytes(),
-                            oid: (!hex.is_empty()).then(|| oid_from_hex(&algorithm, &hex)),
+                            ref_name: name.to_vec(),
+                            oid: oid_from_ascii_hex(&algorithm, hex),
                         })
                     }
                     Err(_) => Ok(HeadState::Unborn {
-                        ref_name: name.into_bytes(),
+                        ref_name: name.to_vec(),
                     }),
                 }
             }
             Err(_) => match self.run(git_dir, work_tree, &["rev-parse", "HEAD"]) {
                 Ok(oid_out) => {
-                    let hex = String::from_utf8_lossy(&oid_out).trim().to_string();
-                    if hex.is_empty() {
+                    let hex = oid_out.trim_ascii();
+                    let Some(target) = oid_from_ascii_hex(&algorithm, hex) else {
                         return Ok(HeadState::Unknown);
-                    }
+                    };
                     let peeled = self
                         .run(git_dir, work_tree, &["rev-parse", "HEAD^{}"])
                         .ok()
-                        .map(|raw| String::from_utf8_lossy(&raw).trim().to_string())
-                        .filter(|peeled| !peeled.is_empty() && *peeled != hex)
-                        .map(|peeled| oid_from_hex(&algorithm, &peeled));
-                    Ok(HeadState::Detached {
-                        target: oid_from_hex(&algorithm, &hex),
-                        peeled,
-                    })
+                        .map(|raw| raw.trim_ascii().to_vec())
+                        .filter(|peeled| !peeled.is_empty() && peeled.as_slice() != hex)
+                        .and_then(|peeled| oid_from_ascii_hex(&algorithm, &peeled));
+                    Ok(HeadState::Detached { target, peeled })
                 }
                 Err(_) => {
                     if git_dir.join("HEAD").is_file() {
@@ -610,12 +680,14 @@ impl FallbackGit {
         }
     }
 
-    /// Status counts via `status --porcelain=v2`.
+    /// Status counts via `status --porcelain=v2 -z`.
     ///
     /// `collapsed` selects `--untracked-files=normal` (one entry per
     /// untracked directory, spec `summary`) versus `all` (spec `full`).
-    /// Returns `(staged, unstaged, untracked)`. Renames are disabled for
-    /// parity with the gix counting policy.
+    /// Returns `(staged, unstaged, untracked, conflicts)`. Renames are
+    /// disabled for parity with the gix counting policy. `-z` NUL
+    /// records keep hostile paths (newlines, non-UTF-8) from splitting
+    /// records; counts parse from raw bytes (record-type byte + XY).
     ///
     /// FIXREADY4 F: both this spawn and its driver guard run under
     /// `StatusConfigIsolation` (empty global/system config, empty HOME,
@@ -628,7 +700,7 @@ impl FallbackGit {
         git_dir: &Path,
         work_tree: Option<&Path>,
         collapsed: bool,
-    ) -> crate::Result<(u64, u64, u64)> {
+    ) -> crate::Result<(u64, u64, u64, u64)> {
         if !self.capabilities.porcelain_v2 {
             return Err(crate::Error::Git(format!(
                 "{}installed git ({}) lacks status --porcelain=v2",
@@ -659,21 +731,21 @@ impl FallbackGit {
         let out = self.run_inner(
             git_dir,
             work_tree,
-            &["status", "--porcelain=v2", untracked, "--no-renames"],
+            &["status", "--porcelain=v2", "-z", untracked, "--no-renames"],
             Some(&isolation),
         )?;
-        let text = String::from_utf8_lossy(&out);
         let mut staged = 0u64;
         let mut unstaged = 0u64;
         let mut untracked_count = 0u64;
-        for line in text.lines() {
-            match line.as_bytes().first() {
+        let mut conflicts = 0u64;
+        // `-z`: every record (including `#` headers) is NUL-terminated,
+        // so hostile paths never split records. Rename records would
+        // append a second NUL field, but `--no-renames` disables them —
+        // every NUL field is one record.
+        for record in out.split(|b| *b == 0) {
+            match record.first() {
                 Some(b'1') | Some(b'2') => {
-                    let fields: Vec<&str> = line.splitn(9, ' ').collect();
-                    if fields.len() < 2 {
-                        continue;
-                    }
-                    let xy = fields[1].as_bytes();
+                    let xy = record.split(|b| *b == b' ').nth(1).unwrap_or_default();
                     let staged_dirty = xy.first().is_some_and(|c| !matches!(c, b'.' | b'!'));
                     let unstaged_dirty = xy.get(1).is_some_and(|c| !matches!(c, b'.' | b'!'));
                     if staged_dirty {
@@ -683,11 +755,16 @@ impl FallbackGit {
                         unstaged += 1;
                     }
                 }
+                // Porcelain-v2 unmerged records (Step 10): one `u` line
+                // per conflicted path. Counted ONLY as conflicts — never
+                // staged/unstaged — so conflict-only checkouts read
+                // `conflicted`, not `dirty` or `clean`.
+                Some(b'u') => conflicts += 1,
                 Some(b'?') => untracked_count += 1,
                 _ => {}
             }
         }
-        Ok((staged, unstaged, untracked_count))
+        Ok((staged, unstaged, untracked_count, conflicts))
     }
 
     /// Object format via config (defaults to sha1 when unset).
@@ -746,6 +823,10 @@ impl FallbackGit {
     ) -> bool {
         let parent_hit =
             match self.run_inner(git_dir, work_tree, &["config", "--list"], Some(isolation)) {
+                // Lossy is sound here: only ASCII key shapes (`filter.*.
+                // clean|smudge|process) are matched, and the U+FFFD
+                // replacement never equals ASCII — mangled bytes can
+                // neither forge nor hide a driver key.
                 Ok(out) => String::from_utf8_lossy(&out).lines().any(|line| {
                     line.split_once('=')
                         .is_some_and(|(key, _)| Self::is_exec_filter_key(&key.to_ascii_lowercase()))
@@ -812,21 +893,37 @@ impl FallbackGit {
     /// Resolve the common dir for the absorbed-tree scan: `git_dir`
     /// plus its `commondir` pointer when present. Absent pointer =
     /// `git_dir` itself. Present-but-unreadable/unparseable/empty =
-    /// `None` (fail closed: the absorbed set is unprovable).
+    /// `None` (fail closed: the absorbed set is unprovable). The
+    /// pointer is a path: first line, ASCII-trimmed, byte-exact, so
+    /// non-UTF-8 stores resolve exactly, never lossy-mangled.
     fn common_dir_for(git_dir: &Path) -> Option<PathBuf> {
         let pointer = git_dir.join("commondir");
-        let text = match super::read_bounded_string(&pointer, super::MAX_GIT_CONTROL_BYTES) {
-            Some(text) => text,
+        let raw = match super::read_bounded_bytes(&pointer, super::MAX_GIT_CONTROL_BYTES) {
+            Some(raw) => raw,
             None if std::fs::symlink_metadata(&pointer).is_err() => {
                 return Some(git_dir.to_path_buf());
             }
             None => return None,
         };
-        let target = text.lines().next().unwrap_or_default().trim();
+        let target = raw
+            .split(|b| *b == b'\n')
+            .next()
+            .unwrap_or_default()
+            .trim_ascii();
         if target.is_empty() {
             return None;
         }
-        let target_path = Path::new(target);
+        let target_os: &std::ffi::OsStr = {
+            #[cfg(unix)]
+            {
+                std::os::unix::ffi::OsStrExt::from_bytes(target)
+            }
+            #[cfg(not(unix))]
+            {
+                std::ffi::OsStr::new(std::str::from_utf8(target).unwrap_or_default())
+            }
+        };
+        let target_path = Path::new(target_os);
         if target_path.is_absolute() {
             Some(target_path.to_path_buf())
         } else {
@@ -967,7 +1064,7 @@ impl FallbackGit {
     /// neutralized via [`apply_repo_neutralization`], and proxy/helpful
     /// network variables are stripped. Only read-only subcommands are
     /// ever passed by this module (for-each-ref, symbolic-ref, rev-parse,
-    /// status, config). The spawn runs inside the shared envelope
+    /// rev-list --left-right --count, status, config). The spawn runs inside the shared envelope
     /// (timeout+kill, capture cap, sanitized config environment,
     /// scoped wait token); over-cap output and unexpected status fail
     /// rather than returning partial data.
@@ -993,6 +1090,26 @@ impl FallbackGit {
         args: &[&str],
         isolation: Option<&StatusConfigIsolation>,
     ) -> crate::Result<Vec<u8>> {
+        self.run_inner_with_cancel(git_dir, work_tree, args, isolation, None)
+    }
+
+    /// [`run_inner`] with an explicit wait token. All spawn safety and
+    /// output limits remain shared; only the wait token source differs.
+    fn run_inner_with_cancel(
+        &self,
+        git_dir: &Path,
+        work_tree: Option<&Path>,
+        args: &[&str],
+        isolation: Option<&StatusConfigIsolation>,
+        cancel: Option<&WaitCancel>,
+    ) -> crate::Result<Vec<u8>> {
+        if cancel.is_some_and(WaitCancel::cancelled) {
+            return Err(crate::Error::Git(format!(
+                "installed git ({}): `{}` cancelled before spawn",
+                self.path.display(),
+                args.join(" ")
+            )));
+        }
         // Re-bind the executable before every spawn (XSEC-02): the
         // binary must still be the probed (dev, ino, owner, mode, size,
         // mtime) — a swapped, replaced, or re-permissioned binary is
@@ -1027,14 +1144,23 @@ impl FallbackGit {
         }
         apply_repo_neutralization(&mut command);
         command.args(args);
-        let outcome = spawn_enveloped(&mut command, false, GIT_SPAWN_TIMEOUT, MAX_CAPTURE_BYTES)
-            .map_err(|reason| {
-                crate::Error::Git(format!(
-                    "installed git ({}): `{}` spawn failed: {reason}",
-                    self.path.display(),
-                    args.join(" ")
-                ))
-            })?;
+        let spawn_result = match cancel {
+            Some(cancel) => spawn_enveloped_cancel(
+                &mut command,
+                false,
+                GIT_SPAWN_TIMEOUT,
+                MAX_CAPTURE_BYTES,
+                cancel,
+            ),
+            None => spawn_enveloped(&mut command, false, GIT_SPAWN_TIMEOUT, MAX_CAPTURE_BYTES),
+        };
+        let outcome = spawn_result.map_err(|reason| {
+            crate::Error::Git(format!(
+                "installed git ({}): `{}` spawn failed: {reason}",
+                self.path.display(),
+                args.join(" ")
+            ))
+        })?;
         if outcome.truncated {
             return Err(crate::Error::Git(format!(
                 "installed git ({}): `{}` output exceeded {MAX_CAPTURE_BYTES} bytes; \
@@ -1854,6 +1980,48 @@ fn parse_git_version(banner: &str) -> (u32, u32, u32) {
     (major, minor, patch)
 }
 
+/// True when every byte is ASCII hex (non-empty). Oid-shaped gate
+/// for raw-byte CLI parses: names stay byte-exact, oids stay ASCII.
+fn is_ascii_hex(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && bytes.iter().all(|b| b.is_ascii_hexdigit())
+}
+
+/// [`oid_from_hex`] over raw bytes: `None` unless ASCII hex.
+fn oid_from_ascii_hex(algorithm: &str, hex: &[u8]) -> Option<Oid> {
+    // Even-length ASCII hex of exactly the algorithm's digest width:
+    // abbreviated or overlong output is malformed (branch oid `None`,
+    // detached `Unknown`, ref row skipped at the call sites).
+    if !is_ascii_hex(hex) || !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let expected = match algorithm {
+        "sha1" => 40,
+        "sha256" => 64,
+        // Defensive: callers normalize to sha1/sha256; anything else
+        // cannot verify a length, so fail closed.
+        _ => return None,
+    };
+    if hex.len() != expected {
+        return None;
+    }
+    std::str::from_utf8(hex)
+        .ok()
+        .map(|hex| oid_from_hex(algorithm, hex))
+}
+
+/// Parse `rev-list --left-right --count` output: exactly two
+/// whitespace-separated decimal counts and nothing else.
+fn parse_rev_list_count(out: &[u8]) -> Option<(u64, u64)> {
+    let text = std::str::from_utf8(out).ok()?;
+    let mut parts = text.split_whitespace();
+    let ahead = parts.next()?.parse::<u64>().ok()?;
+    let behind = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((ahead, behind))
+}
+
 /// Build an [`Oid`] from hex, tolerating either hash length.
 fn oid_from_hex(algorithm: &str, hex: &str) -> Oid {
     let hex = hex.trim().to_lowercase();
@@ -1865,6 +2033,452 @@ fn oid_from_hex(algorithm: &str, hex: &str) -> Oid {
         algorithm.to_string()
     };
     Oid { algorithm, hex }
+}
+
+// ---------------------------------------------------------------------------
+// Remote refresh operations (goal Step 11, `--fetch` only)
+// ---------------------------------------------------------------------------
+// The read-only probes above never touch the network. The methods below
+// are the fetch phase's installed-git surface: config inspection, the
+// fetch itself, the ls-remote audit, and the post-fetch tracking-ref
+// re-read. Every spawn goes through `spawn_enveloped` (timeout, capture
+// cap, cancel token, helper ledger). Error details are NOT scrubbed here
+// (stderr may echo the remote URL): the fetch phase scrubs before any
+// persistence or display.
+
+/// Disable interactive credential prompting on a network git command.
+/// Stored credentials (`credential.helper`, ssh keys/agents) keep
+/// working; only terminal/askpass/ssh interactive fallbacks die.
+/// Runs AFTER `sanitize_git_env` (which strips both `GIT_SSH*` vars),
+/// so every branch below re-derives from the ambient process env:
+/// * ambient `GIT_SSH_COMMAND`: preserved (ports, keys, proxies) with
+///   `-o BatchMode=yes` appended so ssh can never open /dev/tty
+///   mid-scan. `OsString::push` is byte-exact: non-UTF-8 survives.
+/// * else ambient `GIT_SSH` (bare program, e.g. plink): honored as-is;
+///   no flag injection point exists. The fetch timeout still bounds it.
+/// * else: `ssh -o BatchMode=yes`.
+fn harden_no_prompt(cmd: &mut Command) {
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    cmd.env("GIT_ASKPASS", "true");
+    match (
+        std::env::var_os("GIT_SSH_COMMAND"),
+        std::env::var_os("GIT_SSH"),
+    ) {
+        (Some(ambient), _) => {
+            let mut hardened = ambient;
+            hardened.push(" -o BatchMode=yes");
+            cmd.env("GIT_SSH_COMMAND", hardened);
+        }
+        (None, Some(ssh)) => {
+            cmd.env("GIT_SSH", ssh);
+        }
+        (None, None) => {
+            cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+        }
+    }
+}
+
+impl FallbackGit {
+    /// Build a fetch-phase command: the [`FallbackGit::run`] hardening
+    /// (binary re-bind per spawn, env sanitize, optional locks off, no
+    /// pager, hooks/fsmonitor neutered) MINUS `core.sshCommand=false` —
+    /// fetch needs the user's ssh transport; prompts die via `BatchMode`
+    /// instead. `--git-dir` + ceiling mirror `run_inner` (fetch never
+    /// needs the worktree); the flag is built from exact bytes so
+    /// non-UTF-8 store paths survive.
+    fn fetch_command(&self, git_dir: &Path) -> Result<Command, String> {
+        // Re-bind the executable before every spawn (XSEC-02, mirrors
+        // `run_inner`): a swapped binary is refused, never spawned.
+        let canonical = self.path.canonicalize().map_err(|e| {
+            format!(
+                "installed git ({}): refusing spawn: cannot resolve binary: {e}",
+                self.path.display()
+            )
+        })?;
+        if binary_identity(&canonical) != Some(self.identity) {
+            return Err(format!(
+                "installed git ({}): refusing spawn: binary identity changed since probe",
+                self.path.display()
+            ));
+        }
+        let mut command = Command::new(&canonical);
+        let mut dir_flag = std::ffi::OsString::from("--git-dir=");
+        dir_flag.push(git_dir);
+        command.arg(dir_flag);
+        sanitize_git_env(&mut command);
+        command.env("GIT_OPTIONAL_LOCKS", "0");
+        command.env("GIT_CEILING_DIRECTORIES", git_dir);
+        if self.capabilities.no_optional_locks {
+            command.arg("--no-optional-locks");
+        }
+        command
+            .arg("--no-pager")
+            .arg("-c")
+            .arg("core.hooksPath=/dev/null")
+            .arg("-c")
+            .arg("core.fsmonitor=false")
+            .arg("-c")
+            .arg("credential.interactive=never")
+            // Fetch must not trigger store rewrites behind the scan's
+            // back (Step 11: no automatic maintenance): `gc.auto=0`
+            // disables auto-gc, `maintenance.auto=false` disables auto
+            // maintenance. Older gits ignore the unknown keys; the
+            // read-only fetch-phase probes (config/ls-remote/for-each-ref)
+            // never gc, so sharing the base is harmless.
+            .arg("-c")
+            .arg("gc.auto=0")
+            .arg("-c")
+            .arg("maintenance.auto=false");
+        command.env("GIT_PAGER", "cat");
+        // AFTER sanitizing (XSEC-03): the prompt-killers must win.
+        harden_no_prompt(&mut command);
+        Ok(command)
+    }
+
+    /// Read one multivalued git config key (`--get-all`) in `dir`,
+    /// honoring includes and worktree scope exactly as git resolves
+    /// them. A missing key yields an empty vec (exit 1 + empty
+    /// stdout); values are exact bytes and may be empty strings.
+    /// Callers validate encoding.
+    pub fn git_config_get_all(
+        &self,
+        dir: &Path,
+        key: &std::ffi::OsStr,
+        timeout: Duration,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        let mut cmd = self.fetch_command(dir)?;
+        cmd.arg("config").arg("--get-all").arg(key);
+        let out = spawn_enveloped(&mut cmd, true, timeout, MAX_CAPTURE_BYTES)?;
+        if out.truncated {
+            return Err("git config output exceeded capture cap".to_string());
+        }
+        if out.status.success() {
+            let mut values: Vec<Vec<u8>> = out
+                .stdout
+                .split(|b| *b == b'\n')
+                .map(<[u8]>::to_vec)
+                .collect();
+            // Every value row ends with `\n`; drop that one trailing empty.
+            if values.last().is_some_and(Vec::is_empty) {
+                values.pop();
+            }
+            return Ok(values);
+        }
+        if out.status.code() == Some(1) && out.stdout.is_empty() {
+            return Ok(Vec::new());
+        }
+        Err(format!(
+            "git config --get-all failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+
+    /// Fetch-subcommand argv without the remote operand (single source
+    /// for [`FallbackGit::git_fetch_remote`] and its unit test): no
+    /// prune (deleted upstream branches keep their tracking refs), no
+    /// submodule recursion, no tag downloads (branch freshness needs
+    /// no tags; the CLI flag overrides a configured `tagOpt`).
+    fn fetch_argv() -> [&'static str; 4] {
+        [
+            "fetch",
+            "--no-prune",
+            "--no-recurse-submodules",
+            "--no-tags",
+        ]
+    }
+
+    /// Fetch one remote with its configured refspecs (the caller
+    /// verified them [`Safe`](crate::git::refspec::FetchVerdict::Safe)
+    /// first): prompts disabled, bounded by `timeout`. Writes
+    /// remote-tracking refs, `FETCH_HEAD`, and fetched objects only —
+    /// never checkout files or local branch tips. No prune, no
+    /// maintenance (see the `gc.auto`/`maintenance.auto` base config),
+    /// no submodule recursion, no tag downloads. `Ok` on exit 0; the
+    /// `Err` detail is unscrubbed stderr — scrub before persisting.
+    pub fn git_fetch_remote(
+        &self,
+        dir: &Path,
+        remote: &std::ffi::OsStr,
+        timeout: Duration,
+        cap_bytes: u64,
+    ) -> Result<(), String> {
+        let mut cmd = self.fetch_command(dir)?;
+        for arg in Self::fetch_argv() {
+            cmd.arg(arg);
+        }
+        cmd.arg(remote);
+        let out = spawn_enveloped(&mut cmd, true, timeout, cap_bytes)?;
+        if out.truncated {
+            return Err("git fetch output exceeded capture cap".to_string());
+        }
+        if out.status.success() {
+            return Ok(());
+        }
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+
+    /// List upstream refs via `git ls-remote --heads --tags`
+    /// (exact-byte names; peeled and malformed rows skipped by
+    /// [`crate::git::refspec::parse_ls_remote_refs`]). Prompts disabled
+    /// like [`FallbackGit::git_fetch_remote`]. The `Err` detail is
+    /// unscrubbed stderr — scrub before persisting.
+    pub fn git_ls_remote_refs(
+        &self,
+        dir: &Path,
+        remote: &std::ffi::OsStr,
+        timeout: Duration,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        let mut cmd = self.fetch_command(dir)?;
+        cmd.arg("ls-remote")
+            .arg("--heads")
+            .arg("--tags")
+            .arg(remote);
+        let out = spawn_enveloped(&mut cmd, true, timeout, MAX_CAPTURE_BYTES)?;
+        if out.truncated {
+            return Err("git ls-remote output exceeded capture cap".to_string());
+        }
+        if out.status.success() {
+            return Ok(crate::git::refspec::parse_ls_remote_refs(&out.stdout));
+        }
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+
+    /// Resolve one remote URL (or remote name) to its EFFECTIVE fetch
+    /// URL via `git ls-remote --get-url`: pure local config resolution,
+    /// no transport runs, but `url.<base>.insteadOf` rewrites apply
+    /// exactly as a fetch would see them. The caller gates the result
+    /// (executable transports refuse) BEFORE any network spawn. Returns
+    /// the first output line trimmed; the `Err` detail is unscrubbed
+    /// stderr — scrub before persisting.
+    pub fn git_ls_remote_get_url(
+        &self,
+        dir: &Path,
+        url_or_remote: &std::ffi::OsStr,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let mut cmd = self.fetch_command(dir)?;
+        cmd.arg("ls-remote").arg("--get-url").arg(url_or_remote);
+        let out = spawn_enveloped(&mut cmd, true, timeout, MAX_CAPTURE_BYTES)?;
+        if out.truncated {
+            return Err("git ls-remote --get-url output exceeded capture cap".to_string());
+        }
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+        }
+        let line = out.stdout.split(|b| *b == b'\n').next().unwrap_or_default();
+        Ok(String::from_utf8_lossy(line).trim().to_owned())
+    }
+
+    /// Dump the effective config with per-value origins
+    /// (`--show-origin --list`): one `file:<path>\t<key>=<value>` or
+    /// `command line:\t<key>=<value>` row per value. The fetch gate
+    /// parses this to refuse repo-scope executable config
+    /// (`credential.helper`, `core.sshCommand`) and repo-scope
+    /// `include.*` chains (which would hide the true definer). The
+    /// `Err` detail is unscrubbed stderr — scrub before persisting.
+    pub fn git_config_list_origins(
+        &self,
+        dir: &Path,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, String> {
+        let mut cmd = self.fetch_command(dir)?;
+        cmd.arg("config").arg("--show-origin").arg("--list");
+        let out = spawn_enveloped(&mut cmd, true, timeout, MAX_CAPTURE_BYTES)?;
+        if out.truncated {
+            return Err("git config --list output exceeded capture cap".to_string());
+        }
+        if !out.status.success() {
+            return Err(format!(
+                "git config --list failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(out.stdout)
+    }
+}
+
+/// One `--show-origin` config row: the defining file (empty for
+/// `command line:` rows, which are this process's own `-c` flags) plus
+/// the lowercase key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigOrigin {
+    /// Defining file exactly as git printed it (`None` for `command
+    /// line:` rows). May be relative (resolved against the spawn cwd).
+    pub file: Option<String>,
+    /// Lowercase config key (`credential.helper`, ...).
+    pub key: String,
+}
+
+/// Parse one `git config --show-origin --list` row. `Ok(None)` is a
+/// `command line:` row (our own `-c` flags — trusted, skipped).
+/// `Err` is an unparseable row: the caller fails closed.
+pub fn parse_config_origin_line(line: &[u8]) -> Result<Option<ConfigOrigin>, String> {
+    let err = || "git config origin row is not `<origin>\\t<key>=<value>`".to_string();
+    let tab = line.iter().position(|b| *b == b'\t').ok_or_else(err)?;
+    let (origin, rest) = (&line[..tab], &line[tab + 1..]);
+    let origin = std::str::from_utf8(origin).map_err(|_| err())?;
+    let rest = std::str::from_utf8(rest).map_err(|_| err())?;
+    let (key, _) = rest.split_once('=').ok_or_else(err)?;
+    if origin == "command line:" {
+        return Ok(None);
+    }
+    let file = origin.strip_prefix("file:").ok_or_else(err)?;
+    Ok(Some(ConfigOrigin {
+        file: Some(file.to_string()),
+        key: key.to_lowercase(),
+    }))
+}
+
+/// True when a `--show-origin` file path resolves inside `git_dir`
+/// (the `--git-dir` the config was read through): repo-scope config,
+/// including `config`, `config.worktree`, and anything they include
+/// from inside the store. Relative origins resolve against the
+/// current directory (the spawn inherits it). ANY resolution failure
+/// fails closed (`true`): an origin git read but we cannot place is
+/// treated as repo-scope.
+pub fn config_origin_within_repo(origin_file: &str, git_dir: &Path) -> bool {
+    let origin_path = Path::new(origin_file);
+    let abs = if origin_path.is_absolute() {
+        origin_path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(origin_path),
+            Err(_) => return true,
+        }
+    };
+    match (std::fs::canonicalize(&abs), std::fs::canonicalize(git_dir)) {
+        (Ok(origin), Ok(dir)) => origin.starts_with(&dir),
+        // Unresolvable either side: fail closed.
+        _ => true,
+    }
+}
+
+/// Fetch-transport gate over one EFFECTIVE remote URL (post-`insteadOf`
+/// resolution): `ext::` and remote-helper transports execute local
+/// commands chosen by repo config, so they refuse with a reason;
+/// everything else parses-or-fails downstream. Returns `Some(reason)`
+/// on refusal, `None` when the URL may proceed to the scheme-agnostic
+/// fetch. Unparseable URLs are NOT refused here (git itself fails them
+/// honestly without executing anything — the caller reports `failed`).
+pub fn refused_fetch_scheme(effective_url: &str) -> Option<String> {
+    let parsed = gix::url::parse(effective_url.trim()).ok()?;
+    let transport = match parsed.scheme {
+        gix::url::Scheme::Ext => Some("ext::"),
+        gix::url::Scheme::Helper(_) | gix::url::Scheme::HelperUrl(_) => Some("remote-helper"),
+        _ => None,
+    };
+    transport.map(|t| format!("remote URL uses executable {t} transport; refusing to fetch"))
+}
+
+/// One remote-tracking ref observed via `for-each-ref` (exact bytes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackingRef {
+    /// Full ref name (`refs/remotes/<remote>/...`).
+    pub name: Vec<u8>,
+    /// `%(objectname)` hex bytes (may be empty for a broken ref).
+    pub oid: Vec<u8>,
+    /// `%(symref)` target; nonempty exactly for symbolic refs
+    /// (`refs/remotes/<remote>/HEAD`).
+    pub symref: Vec<u8>,
+}
+
+/// Ref state over one post-fetch tracking observation: directly
+/// observed oids are `valid`, as is any symbolic ref whose target
+/// exists in the same observation (`known`). Only a dangling
+/// symbolic ref is non-valid: `unborn` for a branch target,
+/// `invalid` otherwise. An empty oid with no symref (a broken ref)
+/// is `invalid`. Mirrors the probe path's ref-state rules except
+/// this path has no peel data (for-each-ref reports symref targets
+/// only).
+#[must_use]
+pub fn tracking_ref_state(
+    reference: &TrackingRef,
+    known: &std::collections::HashSet<&[u8]>,
+) -> &'static str {
+    if !reference.symref.is_empty() {
+        if known.contains(reference.symref.as_slice()) {
+            return "valid";
+        }
+        if reference.symref.starts_with(b"refs/heads/") {
+            return "unborn";
+        }
+        return "invalid";
+    }
+    if reference.oid.is_empty() {
+        "invalid"
+    } else {
+        "valid"
+    }
+}
+
+impl FallbackGit {
+    /// Read every ref under `refs/remotes/` via NUL-delimited
+    /// `for-each-ref` (byte-exact). Pure local read, bounded by
+    /// `timeout`. Callers filter by remote in Rust (no
+    /// user-controlled patterns reach git). Malformed (non-triple)
+    /// output errors, never half-parses.
+    pub fn git_remote_tracking_refs(
+        &self,
+        dir: &Path,
+        timeout: Duration,
+    ) -> Result<Vec<TrackingRef>, String> {
+        let mut cmd = self.fetch_command(dir)?;
+        cmd.arg("for-each-ref")
+            .arg("--format=%(refname)%00%(objectname)%00%(symref)%00")
+            .arg("refs/remotes");
+        let out = self.fetch_outcome(&mut cmd, timeout, MAX_CAPTURE_BYTES, "for-each-ref")?;
+        Self::parse_tracking_refs(&out)
+    }
+
+    /// Spawn one fetch-phase read and return its stdout on exit 0
+    /// (`what` names the subcommand in errors).
+    fn fetch_outcome(
+        &self,
+        cmd: &mut Command,
+        timeout: Duration,
+        cap_bytes: u64,
+        what: &str,
+    ) -> Result<Vec<u8>, String> {
+        let _ = self;
+        let out = spawn_enveloped(cmd, true, timeout, cap_bytes)?;
+        if out.truncated {
+            return Err(format!("git {what} output exceeded capture cap"));
+        }
+        if !out.status.success() {
+            return Err(format!(
+                "git {what} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(out.stdout)
+    }
+
+    /// Parse `for-each-ref` tracking records. Real git appends `\n`
+    /// after every formatted record, so each record is
+    /// `name\0oid\0symref\0\n` (verified against installed git; a
+    /// bare-`\0` split mis-parses real output). Ref names, hex oids,
+    /// and symref targets never contain `\n`, so records split safely
+    /// on newlines. Malformed output errors, never half-parses.
+    fn parse_tracking_refs(stdout: &[u8]) -> Result<Vec<TrackingRef>, String> {
+        if stdout.is_empty() {
+            return Ok(Vec::new());
+        }
+        let err = || "git for-each-ref output is not NUL-field records".to_string();
+        let body = stdout.strip_suffix(b"\n").ok_or_else(err)?;
+        let mut refs = Vec::new();
+        for record in body.split(|b| *b == b'\n') {
+            let fields: Vec<&[u8]> = record.split(|b| *b == 0).collect();
+            if fields.len() != 4 || !fields[3].is_empty() {
+                return Err(err());
+            }
+            refs.push(TrackingRef {
+                name: fields[0].to_vec(),
+                oid: fields[1].to_vec(),
+                symref: fields[2].to_vec(),
+            });
+        }
+        Ok(refs)
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -2271,8 +2885,9 @@ mod tests {
         ]);
         // Fake git: `--version` + the feature probe answer canned; the
         // driver guard (`config --list`) answers empty; the status read
-        // answers one staged, one unstaged, one untracked entry. Both
-        // status-path spawns append an argv/env block to the log.
+        // answers one staged, one unstaged, one untracked entry as `-z`
+        // NUL records. Both status-path spawns append an argv/env block
+        // to the log.
         let dir = tempfile::tempdir().expect("tempdir");
         let log = dir.path().join("spawn.log");
         let log_str = log.to_str().expect("utf8").to_string();
@@ -2284,9 +2899,9 @@ mod tests {
              echo \"SYSTEM=${{GIT_CONFIG_SYSTEM-unset}}\" >> \"{log_str}\"\n\
              echo \"HOME=$HOME\" >> \"{log_str}\"\n\
              echo \"XDG=${{XDG_CONFIG_HOME-unset}}\" >> \"{log_str}\"\n\
-             echo '1 M. N... 100644 100644 100644 abcdef01 abcdef01 staged.txt'\n\
-             echo '1 .M N... 100644 100644 100644 abcdef02 abcdef03 unstaged.txt'\n\
-             echo '? untracked.txt'\nexit 0\nfi\n\
+             printf '1 M. N... 100644 100644 100644 abcdef01 abcdef01 staged.txt\\0'\n\
+             printf '1 .M N... 100644 100644 100644 abcdef02 abcdef03 unstaged.txt\\0'\n\
+             printf '? untracked.txt\\0'\nexit 0\nfi\n\
              if [ \"$subcmd\" = \"config\" ]; then\n\
              echo \"SPAWN argv=$*\" >> \"{log_str}\"\n\
              echo \"GLOBAL=${{GIT_CONFIG_GLOBAL-unset}}\" >> \"{log_str}\"\n\
@@ -2301,10 +2916,10 @@ mod tests {
         let repo = tempfile::tempdir().expect("repo");
         let git_dir = repo.path().join("repo.git");
         std::fs::create_dir(&git_dir).expect("git dir");
-        let (staged, unstaged, untracked) = found
+        let (staged, unstaged, untracked, conflicts) = found
             .status_counts(&git_dir, Some(repo.path()), true)
             .expect("global drivers neutralize, never refuse");
-        assert_eq!((staged, unstaged, untracked), (1, 1, 1));
+        assert_eq!((staged, unstaged, untracked, conflicts), (1, 1, 1, 0));
         assert!(!marker.exists(), "marker helper must never execute");
         // argv/env proof: exactly the guard + status spawns logged, both
         // isolated, both carrying the status argv.
@@ -2357,6 +2972,7 @@ mod tests {
             }
             if argv.contains("status")
                 && argv.contains("--porcelain=v2")
+                && argv.contains(" -z ")
                 && argv.contains("--untracked-files=normal")
                 && argv.contains("--no-renames")
             {
@@ -2365,5 +2981,336 @@ mod tests {
         }
         assert!(saw_guard, "driver-guard spawn logged: {text}");
         assert!(saw_status, "isolated status spawn logged: {text}");
+    }
+
+    #[test]
+    fn parse_tracking_refs_triples_and_rejects() {
+        // Byte-exact shape of real git output: git appends `\n` after
+        // every `--format` record, and `%(objectname)` of a symbolic
+        // ref resolves to the target oid.
+        let out = b"refs/remotes/origin/HEAD\0\
+            0123456789abcdef0123456789abcdef01234567\0refs/remotes/origin/main\0\n\
+            refs/remotes/origin/main\0\
+            0123456789abcdef0123456789abcdef01234567\0\0\n";
+        let refs = FallbackGit::parse_tracking_refs(out).expect("records parse");
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].name, b"refs/remotes/origin/HEAD");
+        assert_eq!(refs[0].symref, b"refs/remotes/origin/main");
+        assert_eq!(refs[1].name, b"refs/remotes/origin/main");
+        assert_eq!(refs[1].oid, b"0123456789abcdef0123456789abcdef01234567");
+        assert!(refs[1].symref.is_empty());
+
+        // Empty output (no tracking refs) is valid: zero refs.
+        assert!(FallbackGit::parse_tracking_refs(b"")
+            .expect("empty parses")
+            .is_empty());
+        // Malformed records never half-parse: truncated tail, short
+        // record, long record, missing record terminator.
+        for bad in [
+            b"refs/a\0oid\0\0\ntrail".as_slice(),
+            b"refs/a\0oid\0\n".as_slice(),
+            b"a\0b\0c\0d\0\n".as_slice(),
+            b"a\0b\0\0".as_slice(),
+        ] {
+            assert!(
+                FallbackGit::parse_tracking_refs(bad).is_err(),
+                "{bad:?} must error"
+            );
+        }
+    }
+
+    /// Discover the fixture git for fetch-command tests.
+    fn fixture_git(dir: &Path) -> FallbackGit {
+        let _ = git_fixture(dir, "git", "git version 2.47.1", CAPABLE_BODY);
+        let path_var = dir.to_str().expect("utf8").to_string();
+        FallbackGit::discover_from(&[], &[], Some(path_var)).expect("discover")
+    }
+
+    #[test]
+    fn fetch_command_hardening() {
+        let _serial = spawn_serial();
+        // Hermetic ssh-command assertions: `fetch_command` is the only
+        // reader of ambient `GIT_SSH_COMMAND` in the test binary, so
+        // save/remove/set/restore here cannot disturb another test.
+        let saved_ssh = std::env::var_os("GIT_SSH_COMMAND");
+        let saved_bare = std::env::var_os("GIT_SSH");
+        std::env::remove_var("GIT_SSH_COMMAND");
+        std::env::remove_var("GIT_SSH");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = fixture_git(dir.path());
+        let repo = dir.path().join("repo.git");
+        let cmd = git.fetch_command(&repo).expect("command");
+        let argv: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let env: std::collections::HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        // Exact --git-dir flag (not lossy display formatting).
+        let mut flag = std::ffi::OsString::from("--git-dir=");
+        flag.push(&repo);
+        assert!(cmd.get_args().any(|a| a == flag), "{argv:?}");
+        // Prompt killers win over sanitization.
+        assert_eq!(
+            env.get("GIT_TERMINAL_PROMPT").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(env.get("GIT_ASKPASS").map(String::as_str), Some("true"));
+        assert!(
+            env.get("GIT_SSH_COMMAND")
+                .is_some_and(|v| v.contains("BatchMode=yes")),
+            "{env:?}"
+        );
+        assert!(
+            argv.contains(&"credential.interactive=never".to_string()),
+            "{argv:?}"
+        );
+        // No automatic maintenance behind the scan's back (Step 11).
+        assert!(argv.contains(&"gc.auto=0".to_string()), "{argv:?}");
+        assert!(
+            argv.contains(&"maintenance.auto=false".to_string()),
+            "{argv:?}"
+        );
+        // Probes neuter ssh; fetch needs the transport.
+        assert!(!argv.iter().any(|a| a.contains("sshCommand")), "{argv:?}");
+        assert_eq!(
+            argv.contains(&"--no-optional-locks".to_string()),
+            git.capabilities().no_optional_locks
+        );
+        // Ambient GIT_SSH_COMMAND: preserved, BatchMode appended
+        // (sanitize strips it; harden must re-derive, never drop it to
+        // a prompting ssh).
+        std::env::set_var("GIT_SSH_COMMAND", "ssh -o Custom=yes");
+        let cmd = git.fetch_command(&repo).expect("command");
+        let ssh = cmd
+            .get_envs()
+            .find_map(|(k, v)| {
+                (k.to_string_lossy() == "GIT_SSH_COMMAND")
+                    .then(|| v.map(|s| s.to_owned()))
+                    .flatten()
+            })
+            .expect("ssh passthrough");
+        assert_eq!(ssh, "ssh -o Custom=yes -o BatchMode=yes");
+        // Bare GIT_SSH alone: honored as-is, no GIT_SSH_COMMAND set
+        // (COMMAND would take precedence and hijack the mechanism).
+        std::env::remove_var("GIT_SSH_COMMAND");
+        std::env::set_var("GIT_SSH", "/usr/bin/plink");
+        let cmd = git.fetch_command(&repo).expect("command");
+        let env: std::collections::HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        assert_eq!(
+            env.get("GIT_SSH").map(String::as_str),
+            Some("/usr/bin/plink")
+        );
+        assert!(!env.contains_key("GIT_SSH_COMMAND"), "{env:?}");
+        match saved_ssh {
+            Some(v) => std::env::set_var("GIT_SSH_COMMAND", v),
+            None => std::env::remove_var("GIT_SSH_COMMAND"),
+        }
+        match saved_bare {
+            Some(v) => std::env::set_var("GIT_SSH", v),
+            None => std::env::remove_var("GIT_SSH"),
+        }
+    }
+
+    #[test]
+    fn tracking_ref_state_matrix() {
+        let known: std::collections::HashSet<&[u8]> = [b"refs/remotes/origin/main".as_slice()]
+            .into_iter()
+            .collect();
+        let direct = TrackingRef {
+            name: b"refs/remotes/origin/main".to_vec(),
+            oid: b"0123456789abcdef0123456789abcdef01234567".to_vec(),
+            symref: Vec::new(),
+        };
+        assert_eq!(tracking_ref_state(&direct, &known), "valid");
+        // Symbolic HEAD resolving inside the observation.
+        let head = TrackingRef {
+            name: b"refs/remotes/origin/HEAD".to_vec(),
+            oid: b"0123456789abcdef0123456789abcdef01234567".to_vec(),
+            symref: b"refs/remotes/origin/main".to_vec(),
+        };
+        assert_eq!(tracking_ref_state(&head, &known), "valid");
+        // Dangling symref to a branch target: unborn.
+        let dangling_branch = TrackingRef {
+            name: b"refs/remotes/origin/HEAD".to_vec(),
+            oid: Vec::new(),
+            symref: b"refs/heads/gone".to_vec(),
+        };
+        assert_eq!(tracking_ref_state(&dangling_branch, &known), "unborn");
+        // Dangling symref elsewhere: invalid.
+        let dangling_other = TrackingRef {
+            name: b"refs/remotes/origin/HEAD".to_vec(),
+            oid: Vec::new(),
+            symref: b"refs/tags/v9".to_vec(),
+        };
+        assert_eq!(tracking_ref_state(&dangling_other, &known), "invalid");
+        // Broken ref: no oid, no symref.
+        let broken = TrackingRef {
+            name: b"refs/remotes/origin/broken".to_vec(),
+            oid: Vec::new(),
+            symref: Vec::new(),
+        };
+        assert_eq!(tracking_ref_state(&broken, &known), "invalid");
+    }
+
+    #[test]
+    fn fetch_argv_disables_prune_submodules_tags() {
+        // Step 11: deleted upstream branches keep their tracking refs,
+        // no submodule recursion, no tag downloads. `git_fetch_remote`
+        // builds from this single source; the assertion pins it.
+        assert_eq!(
+            FallbackGit::fetch_argv().as_slice(),
+            &[
+                "fetch",
+                "--no-prune",
+                "--no-recurse-submodules",
+                "--no-tags"
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_command_refuses_swapped_binary() {
+        let _serial = spawn_serial();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = fixture_git(dir.path());
+        // Rewrite the binary after discovery: identity changes.
+        let path = dir.path().join("git");
+        let mut body = std::fs::read(&path).expect("read");
+        body.extend_from_slice(b"# swapped\n");
+        std::fs::write(&path, body).expect("write");
+        let err = git
+            .fetch_command(dir.path())
+            .expect_err("swapped binary refused");
+        assert!(err.contains("identity changed"), "{err}");
+    }
+
+    #[test]
+    fn fetch_scheme_gate_refuses_exec_transports_only() {
+        // Executable transports refuse (fail closed, no execution).
+        assert!(refused_fetch_scheme("ext::sh -c up").is_some());
+        assert!(refused_fetch_scheme("  ext::ssh host  ").is_some());
+        // Remote-helper transports refuse in both spellings, no
+        // vacuous arm: `<name>::<address>` parses as
+        // `Scheme::Helper` (even `ssh::...`, which names
+        // `git-remote-ssh` rather than the built-in transport) and
+        // unknown `<name>://...` as `Scheme::HelperUrl`.
+        assert!(refused_fetch_scheme("myhelper::/path").is_some());
+        assert!(refused_fetch_scheme("my.helper+v2::addr").is_some());
+        assert!(refused_fetch_scheme("ssh::host/path").is_some());
+        assert!(refused_fetch_scheme("myhelper://host/path").is_some());
+        // Ordinary transports pass the gate.
+        for ok in [
+            "/tmp/upstream",
+            "file:///tmp/upstream",
+            "https://github.com/o/r.git",
+            "http://host/r.git",
+            "git://host/r.git",
+            "git@github.com:o/r.git",
+            "ssh://git@github.com/o/r.git",
+        ] {
+            assert_eq!(refused_fetch_scheme(ok), None, "{ok}");
+        }
+        // Unparseable URLs are NOT gate refusals: git fails them
+        // honestly without executing anything.
+        assert_eq!(refused_fetch_scheme(":::"), None);
+    }
+
+    #[test]
+    fn config_origin_line_parses_show_origin_rows() {
+        let row = parse_config_origin_line(b"file:/tmp/r/.git/config\tcredential.helper=store")
+            .expect("parse")
+            .expect("file row");
+        assert_eq!(row.file.as_deref(), Some("/tmp/r/.git/config"));
+        assert_eq!(row.key, "credential.helper");
+        // Keys lowercase (`core.sshCommand` -> `core.sshcommand`).
+        let row = parse_config_origin_line(b"file:/x\tcore.sshCommand=ssh")
+            .expect("parse")
+            .expect("file row");
+        assert_eq!(row.key, "core.sshcommand");
+        // Our own `-c` flags skip.
+        assert_eq!(
+            parse_config_origin_line(b"command line:\tcore.pager=cat"),
+            Ok(None)
+        );
+        // Anything else fails closed.
+        assert!(parse_config_origin_line(b"file:/x\tnokey").is_err());
+        assert!(parse_config_origin_line(b"no-tab-here").is_err());
+        assert!(parse_config_origin_line(b"stdin:\tkey=value").is_err());
+        assert!(parse_config_origin_line(b"").is_err());
+    }
+
+    #[test]
+    fn oid_from_ascii_hex_requires_algo_correct_length() {
+        let sha1 = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
+        let sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        // Exact widths accept.
+        assert!(oid_from_ascii_hex("sha1", sha1.as_bytes()).is_some());
+        assert!(oid_from_ascii_hex("sha256", sha256.as_bytes()).is_some());
+        // Cross-algo widths refuse (a sha256 hex is not a sha1 oid).
+        assert!(oid_from_ascii_hex("sha1", sha256.as_bytes()).is_none());
+        assert!(oid_from_ascii_hex("sha256", sha1.as_bytes()).is_none());
+        // Abbreviated, odd, overlong, empty, and non-hex refuse.
+        assert!(oid_from_ascii_hex("sha1", b"da39a3e").is_none());
+        assert!(oid_from_ascii_hex("sha1", &sha1.as_bytes()[..39]).is_none());
+        assert!(oid_from_ascii_hex("sha1", format!("{sha1}00").as_bytes()).is_none());
+        assert!(oid_from_ascii_hex("sha1", b"").is_none());
+        assert!(oid_from_ascii_hex("sha1", b"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_none());
+        // Unknown algorithms fail closed (callers normalize, defensive).
+        assert!(oid_from_ascii_hex("sha257", sha1.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn config_origin_containment_is_prefix_and_fail_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git_dir = dir.path().join("r.git");
+        std::fs::create_dir_all(&git_dir).expect("mkdir");
+        let config = git_dir.join("config");
+        std::fs::write(&config, b"[core]\n").expect("write");
+        let outside = dir.path().join("other");
+        std::fs::write(&outside, b"x").expect("write");
+        // Inside the store: repo scope.
+        assert!(config_origin_within_repo(
+            config.to_str().expect("utf8"),
+            &git_dir
+        ));
+        // Outside: operator scope.
+        assert!(!config_origin_within_repo(
+            outside.to_str().expect("utf8"),
+            &git_dir
+        ));
+        // Sibling-prefix trap (`r.git2` must not match `r.git`).
+        let sibling = dir.path().join("r.git2");
+        std::fs::create_dir_all(&sibling).expect("mkdir");
+        let sibling_config = sibling.join("config");
+        std::fs::write(&sibling_config, b"x").expect("write");
+        assert!(!config_origin_within_repo(
+            sibling_config.to_str().expect("utf8"),
+            &git_dir
+        ));
+        // Unresolvable either side: fail closed.
+        assert!(config_origin_within_repo(
+            dir.path().join("vanished").to_str().expect("utf8"),
+            &git_dir
+        ));
+        assert!(config_origin_within_repo(
+            config.to_str().expect("utf8"),
+            &dir.path().join("no-git-dir")
+        ));
     }
 }

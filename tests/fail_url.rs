@@ -444,6 +444,11 @@ fn finding3_query_resume_strip_opaque_tails() {
                     scope: "roots",
                     status_mode: "summary",
                     report_dest: None,
+                    targets_json: None,
+                    format: None,
+                    all_targets: None,
+                    fetch: None,
+                    workers: None,
                 },
                 repo_scan::store::now_ms(),
             )

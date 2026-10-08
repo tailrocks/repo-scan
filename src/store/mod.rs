@@ -22,14 +22,20 @@ pub mod catalog;
 pub mod checkpoint;
 pub mod owner;
 pub mod schema;
+pub mod schema_v2;
+pub mod schema_v3;
+pub mod schema_v4;
+pub mod schema_v5;
+pub mod schema_v6;
 pub mod writer;
 
 pub use catalog::{
     dir_identity_id, task_state_as_str, task_state_from_str, CheckoutRow, ClaimedTask,
-    DirObservation, DirRecord, ErrorRow, EventRow, FrontierTask, GenerationRow, GitInstanceRow,
-    IngestedBatch, NewCheckout, NewGitInstance, NewRef, NewRemote, NewScan, NewStatus, NewTask,
-    NewVolume, RecoveryReport, RefRow, RemoteRow, ReportSnapshotRow, ScanRow, StatusRow,
-    StoreStats, TaskOutcome, TursoStore, VolumeRow, WalStatus,
+    CompletionDelta, CompletionGap, DirObservation, DirRecord, ErrorRow, EventRow, FrontierTask,
+    GenerationRow, GitInstanceRow, GithubGroupRow, GroupMemberRow, IngestedBatch, NewCheckout,
+    NewGitInstance, NewRef, NewRemote, NewRemoteRefresh, NewScan, NewScanEvent, NewStatus, NewTask,
+    NewVolume, RecoveryReport, RefRow, RemoteRefreshRow, RemoteRow, ReportSnapshotRow,
+    ScanEventRow, ScanRow, StatusRow, StoreStats, TaskOutcome, TursoStore, VolumeRow, WalStatus,
 };
 pub use checkpoint::{CheckpointCoordinator, CheckpointPolicy, CheckpointStats};
 pub use owner::{catalog_db_path, lock_path, payload_dir, OwnerGuard, StateRootAnchor};
@@ -38,7 +44,7 @@ pub use writer::{
 };
 
 /// Current catalog schema version. Migrations are append-only.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 6;
 
 /// One append-only schema migration, applied inside a single transaction.
 #[derive(Debug, Clone)]

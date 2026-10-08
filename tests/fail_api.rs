@@ -5,7 +5,7 @@
 
 use repo_scan::model::StatusMode;
 use repo_scan::report::builder::{stream_report_from_store, ReportInputs, ReportPipeline};
-use repo_scan::report::model::{EncodedName, Remote, Scan};
+use repo_scan::report::model::{EncodedName, Remote, Scan, ScanTarget};
 use repo_scan::store::{
     NewCheckout, NewGitInstance, NewRef, NewRemote, NewScan, NewStatus, NewVolume, Store,
     TursoStore,
@@ -62,6 +62,7 @@ fn test_inputs(report_id: &str) -> ReportInputs {
         catalog_revision: 7,
         target_url: "https://github.com/OWNER/REPO".to_string(),
         canonical_url: Some("https://github.com/owner/repo".to_string()),
+        targets: vec![],
         scope: "roots".to_string(),
         scan_state: "complete".to_string(),
         started_at_ms: 1_759_154_398_000,
@@ -196,6 +197,8 @@ fn seed_catalog(store: &TursoStore, now: i64) {
                     staged: Some(1),
                     unstaged: Some(2),
                     untracked: Some(3),
+                    conflicts: Some(0),
+                    working_state: "dirty",
                     untracked_units: "collapsed_entries",
                     submodules: "checked",
                     unknown_fields: "[]",
@@ -253,6 +256,11 @@ fn api_store_create_scan_request_holds_no_credential_bytes() {
                         scope: "roots",
                         status_mode: "summary",
                         report_dest: None,
+                        targets_json: None,
+                        format: None,
+                        all_targets: None,
+                        fetch: None,
+                        workers: None,
                     },
                     now,
                 )
@@ -290,6 +298,11 @@ fn api_store_create_scan_request_holds_no_credential_bytes() {
                     scope: "roots",
                     status_mode: "summary",
                     report_dest: None,
+                    targets_json: None,
+                    format: None,
+                    all_targets: None,
+                    fetch: None,
+                    workers: None,
                 },
                 now,
             )
@@ -323,6 +336,11 @@ fn api_report_model_sanitized_drops_canaries() {
         catalog_revision: 1,
         target_url: "https://user:FAILAPIMODELCANARY05@github.com/o/r".to_string(),
         canonical_url: Some("https://github.com/o/r?jwt=FAILAPIMODELCANARY06".to_string()),
+        targets: vec![ScanTarget {
+            raw: "https://user:FAILAPIMODELCANARY08@github.com/o/r".to_string(),
+            canonical: Some("https://github.com/o/r?jwt=FAILAPIMODELCANARY09".to_string()),
+            matched_repositories: 1,
+        }],
         matching_policy: "v1".to_string(),
         scope: "roots".to_string(),
         state: "complete".to_string(),
@@ -336,6 +354,8 @@ fn api_report_model_sanitized_drops_canaries() {
     let bytes = serde_json::to_vec(&scan).expect("scan json");
     assert!(!contains_bytes(&bytes, b"FAILAPIMODELCANARY05"));
     assert!(!contains_bytes(&bytes, b"FAILAPIMODELCANARY06"));
+    assert!(!contains_bytes(&bytes, b"FAILAPIMODELCANARY08"));
+    assert!(!contains_bytes(&bytes, b"FAILAPIMODELCANARY09"));
     assert!(
         scan.target_url.contains("<redacted>"),
         "{}",
@@ -357,6 +377,7 @@ fn api_report_model_sanitized_drops_canaries() {
         url: "https://tok:FAILAPIREMOTECANARY07@github.com/o/r.git".to_string(),
         canonical_url: Some("https://github.com/o/r".to_string()),
         observed_at: "2026-01-01T00:00:00Z".to_string(),
+        refresh: None,
     }
     .sanitized();
     let bytes = serde_json::to_vec(&remote).expect("remote json");

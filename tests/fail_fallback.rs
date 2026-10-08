@@ -11,6 +11,8 @@ use common::fixture;
 #[cfg(unix)]
 use repo_scan::git::{self, fallback::FallbackGit};
 #[cfg(unix)]
+use std::ffi::OsStr;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::Arc;
@@ -128,7 +130,7 @@ fn fallback01_repo_selected_code_never_executes() {
     let counts = fallback
         .status_counts(&git_dir_b, Some(&repo_b), true)
         .expect("unfiltered status serves");
-    assert_eq!(counts, (0, 0, 0));
+    assert_eq!(counts, (0, 0, 0, 0));
     assert!(
         !marker_fs.exists(),
         "fsmonitor hook must be neutralized, including via includes"
@@ -520,4 +522,168 @@ fn fallback07_writable_path_entries_rejected() {
     let explicit = FallbackGit::discover_from(&[writable.join("git")], &[], None)
         .expect("explicit paths stay operator-trusted");
     assert_eq!(explicit.source(), BinarySource::Explicit);
+}
+
+/// Byte-safe fallback parsing (Step 10 + Step 15 case 11): non-UTF-8
+/// refnames survive `refs()` and `head()` byte-exact, cross-checked
+/// against independent `for-each-ref`/`symbolic-ref` parses.
+#[cfg(unix)]
+#[test]
+fn fallback_refs_head_preserve_non_utf8_bytes() {
+    let _serial = spawn_serial();
+    let Some(git_bin) = git_or_skip() else {
+        eprintln!("skip: no installed git");
+        return;
+    };
+    let scratch = fixture::scratch_root("rsf-fb-bytes-");
+    let (repo, hostile) = fixture::non_utf8_branch_repo(scratch.path(), "bytes");
+    assert!(
+        hostile.contains(&0xe9) && hostile.contains(&0xff),
+        "fixture must carry raw hostile bytes: {hostile:?}"
+    );
+    // The hostile name is a legal refname (plumbing verdict), not a
+    // corrupt store git merely tolerates.
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let ref_arg = std::ffi::OsString::from_vec(hostile.clone());
+        let checked = fixture::git_os(
+            &repo,
+            &[
+                OsStr::new("check-ref-format"),
+                OsStr::new("--print"),
+                ref_arg.as_os_str(),
+            ],
+        );
+        assert_eq!(checked.trim_ascii(), hostile.as_slice());
+    }
+    let fallback = FallbackGit::probe(&git_bin).expect("probe explicit git");
+    let git_dir = repo.join(".git");
+
+    // Independent reference: installed git's own `for-each-ref`
+    // bytes, split raw in the test (no fallback code involved).
+    let raw = fixture::git(
+        &repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname)%00%(objectname)%00%(symref)",
+        ],
+    );
+    let mut expected: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
+    for record in raw.split(|b| *b == b'\n') {
+        if record.is_empty() {
+            continue;
+        }
+        let fields: Vec<&[u8]> = record.split(|b| *b == 0).collect();
+        assert_eq!(fields.len(), 3, "for-each-ref emits triples");
+        expected.push((fields[0].to_vec(), fields[1].to_vec(), fields[2].to_vec()));
+    }
+    assert!(
+        expected.iter().any(|(name, _, _)| *name == hostile),
+        "reference must list the hostile branch: {expected:?}"
+    );
+
+    let refs = fallback.refs(&git_dir, Some(&repo)).expect("fallback refs");
+    assert_eq!(refs.len(), expected.len(), "no ref lost or invented");
+    for (name, oid_hex, symref) in &expected {
+        let found = refs
+            .iter()
+            .find(|r| r.name == *name)
+            .unwrap_or_else(|| panic!("fallback refs missing {name:?}"));
+        // A lossy parse would show U+FFFD replacements here instead
+        // of the raw \xE9\xFF bytes; equality proves exactness.
+        assert_eq!(found.name, *name);
+        assert!(
+            oid_hex.iter().all(|b| b.is_ascii_hexdigit()),
+            "reference oid must be ASCII hex: {oid_hex:?}"
+        );
+        match &found.target {
+            git::RefTarget::Object(oid) => {
+                assert!(symref.is_empty(), "object target needs empty symref");
+                assert_eq!(oid.hex.as_bytes(), oid_hex.as_slice());
+            }
+            git::RefTarget::Symbolic(target) => assert_eq!(target, symref),
+        }
+    }
+    assert!(
+        refs.iter().any(|r| r.name == hostile),
+        "hostile branch must survive byte-exact"
+    );
+
+    // HEAD points at the hostile branch: exact refname bytes plus the
+    // resolving oid, cross-checked against plumbing.
+    let sym_raw = fixture::git(&repo, &["symbolic-ref", "HEAD"]);
+    assert_eq!(sym_raw.trim_ascii(), hostile.as_slice());
+    match fallback.head(&git_dir, Some(&repo)).expect("fallback head") {
+        git::HeadState::Branch { ref_name, oid } => {
+            assert_eq!(ref_name, hostile);
+            let hex = fixture::git_str(&repo, &["rev-parse", "HEAD"]);
+            assert_eq!(oid.map(|o| o.hex), Some(hex));
+        }
+        other => panic!("expected branch head, got {other:?}"),
+    }
+}
+
+/// `-z` status parsing (Step 15 case 11): newline, non-UTF-8, and
+/// control-char paths count exactly once — matching an independent
+/// `git status --porcelain=v2 -z` parse, never line-split.
+#[cfg(unix)]
+#[test]
+fn fallback_status_counts_hostile_paths() {
+    let _serial = spawn_serial();
+    let Some(git_bin) = git_or_skip() else {
+        eprintln!("skip: no installed git");
+        return;
+    };
+    let scratch = fixture::scratch_root("rsf-fb-hostile-");
+    let (repo, staged_raw) = fixture::hostile_status_repo(scratch.path(), "hostile");
+    let fallback = FallbackGit::probe(&git_bin).expect("probe explicit git");
+
+    // Independent reference: a fresh installed-git `-z` spawn parsed
+    // in the test (NUL records, never lines). `core.excludesFile` is
+    // neutralized so the ambient HOME cannot hide files the
+    // isolation-HOME fallback still counts.
+    let raw = fixture::git(
+        &repo,
+        &[
+            "-c",
+            "core.excludesFile=/dev/null",
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=normal",
+            "--no-renames",
+        ],
+    );
+    assert!(raw.contains(&0), "reference must be NUL-separated");
+    // `-z` carries the hostile name raw (non-`-z` would C-quote it).
+    assert!(
+        raw.windows(staged_raw.len()).any(|w| w == staged_raw),
+        "reference must carry the staged name raw"
+    );
+    let mut reference = (0u64, 0u64, 0u64, 0u64);
+    for record in raw.split(|b| *b == 0) {
+        match record.first() {
+            Some(b'1') | Some(b'2') => {
+                let xy = record.split(|b| *b == b' ').nth(1).unwrap_or_default();
+                if xy.first().is_some_and(|c| !matches!(c, b'.' | b'!')) {
+                    reference.0 += 1;
+                }
+                if xy.get(1).is_some_and(|c| !matches!(c, b'.' | b'!')) {
+                    reference.1 += 1;
+                }
+            }
+            Some(b'u') => reference.3 += 1,
+            Some(b'?') => reference.2 += 1,
+            _ => {}
+        }
+    }
+    // Pinned shape: staged non-UTF-8 + unstaged README + 2 untracked
+    // (newline, control-char). A line-split parser inflates past this
+    // (the newline name alone adds a phantom record).
+    assert_eq!(reference, (1, 1, 2, 0), "reference shape");
+    let counts = fallback
+        .status_counts(&repo.join(".git"), Some(&repo), true)
+        .expect("fallback status");
+    assert_eq!(counts, reference);
+    assert_eq!(counts, (1, 1, 2, 0));
 }

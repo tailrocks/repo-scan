@@ -12,7 +12,7 @@ use repo_scan::scheduler::{
     DurableScheduler, MemorySchedulerStore, OpClass, Scheduler, Task, TaskKind, TaskOutcome,
 };
 use repo_scan::telemetry::{Counters, FootprintSampler, Telemetry};
-use repo_scan::walk::topology::{self, ObserveOutcome, PhysicalDirId};
+use repo_scan::walk::topology;
 use repo_scan::walk::{ChildKind, ListOptions, OneDirAdapter};
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -297,29 +297,6 @@ fn non_utf8_name_round_trips_losslessly() {
 }
 
 #[test]
-#[cfg(unix)]
-fn physical_dedupe_keys_on_dev_ino_plus_namespace() {
-    use std::os::unix::fs::MetadataExt;
-    let (_tmp, root) = build_tree();
-    let md = std::fs::symlink_metadata(&root).unwrap();
-    let id = PhysicalDirId {
-        dev: md.dev(),
-        ino: md.ino(),
-        namespace: String::from("vol-a"),
-    };
-    let mut topo = topology::Topology::new();
-    assert_eq!(topo.observe(id.clone()), ObserveOutcome::New);
-    assert_eq!(topo.observe(id.clone()), ObserveOutcome::Duplicate);
-    // Same object under another namespace (firmlink alias) is distinct.
-    let aliased = PhysicalDirId {
-        namespace: String::from("vol-b"),
-        ..id
-    };
-    assert_eq!(topo.observe(aliased), ObserveOutcome::New);
-    assert_eq!(topo.len(), 2);
-}
-
-#[test]
 fn enumeration_batches_flush_at_first_limit() {
     use repo_scan::walk::batch::{BatchLimits, EntryBatch};
     use repo_scan::walk::ChildEntry;
@@ -351,22 +328,26 @@ fn enumeration_batches_flush_at_first_limit() {
 }
 
 #[test]
-fn machine_root_plan_seeds_and_fair_schedules() {
-    use repo_scan::walk::roots::{plan_machine_roots, seed_roots, RootPlan, RootPriority};
+fn machine_root_plan_seeds_first_then_mounts() {
+    use repo_scan::walk::roots::{plan_machine_roots, seed_roots, RootPriority};
     let seeds = seed_roots();
     assert!(seeds.iter().any(|r| r.path.as_path() == Path::new("/tmp")));
     assert!(seeds.iter().all(|r| r.priority == RootPriority::Early));
     let planned = plan_machine_roots(&[]);
     assert!(planned.len() >= seeds.len());
-    // Round-robin: a large root cannot starve the others.
-    let mut plan = RootPlan::new(planned);
-    let n = plan.len();
-    assert!(n > 1);
-    let mut seen = BTreeSet::new();
-    for _ in 0..n {
-        seen.insert(plan.next().unwrap().path.clone());
-    }
-    assert_eq!(seen.len(), n, "every root visited once per cycle");
+    // Plan order is the schedule order: every seed precedes every mount
+    // (fairness across roots comes from FIFO claims over this order,
+    // pinned end-to-end by the multi-root no-starvation test).
+    let first_mount = planned
+        .iter()
+        .position(|r| r.priority == RootPriority::Normal)
+        .unwrap_or(planned.len());
+    assert!(
+        planned[..first_mount]
+            .iter()
+            .all(|r| r.priority == RootPriority::Early),
+        "seeds precede mounts"
+    );
 }
 
 fn fixture_task(id: &str, scope: &str) -> Task {

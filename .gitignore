@@ -1,2 +1,5 @@
 /target/
 *.log
+
+# Wave4a raw measurement logs (kept out of tree; see docs/WAVE4A_RECEIPT.md)
+benches/results/w4a/

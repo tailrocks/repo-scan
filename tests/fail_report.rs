@@ -38,6 +38,7 @@ fn test_inputs(report_id: &str) -> ReportInputs {
         catalog_revision: 7,
         target_url: "https://github.com/OWNER/REPO".to_string(),
         canonical_url: Some("https://github.com/owner/repo".to_string()),
+        targets: vec![],
         scope: "roots".to_string(),
         scan_state: "complete".to_string(),
         started_at_ms: 1_759_154_398_000,
@@ -166,6 +167,8 @@ fn seed_complete_status(store: &TursoStore, now: i64) {
                     staged: Some(1),
                     unstaged: Some(2),
                     untracked: Some(3),
+                    conflicts: Some(0),
+                    working_state: "dirty",
                     untracked_units: "collapsed_entries",
                     submodules: "checked",
                     unknown_fields: "[]",
@@ -324,7 +327,7 @@ fn rspriv04_spaced_json_cli_multiline_pairs_redact() {
 
 fn prior_bytes(report_id: &str) -> Vec<u8> {
     serde_json::json!({
-        "schema_version": "1.0.0",
+        "schema_version": repo_scan::report::model::SCHEMA_VERSION,
         "report_id": report_id,
         "tool": {"name": "repo-scan", "version": "0.1.0", "source_commit": null},
     })

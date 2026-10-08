@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.0.0",
+  "schema_version": "1.5.0",
   "report_id": "report-example-1",
   "created_at": "2026-09-30T12:00:00Z",
   "tool": {"name": "repo-scan", "version": "0.1.0", "source_commit": null},
@@ -8,6 +8,7 @@
     "catalog_revision": 12,
     "target_url": "https://github.com/OWNER/REPO",
     "canonical_url": "https://github.com/owner/repo",
+    "targets": [{"raw": "https://github.com/OWNER/REPO", "canonical": "https://github.com/owner/repo", "matched_repositories": 1}],
     "matching_policy": "github-effective-remotes-v1",
     "scope": "roots", "state": "complete",
     "started_at": "2026-09-30T11:59:58Z",
@@ -43,6 +44,10 @@
     "event_history_uuid": null, "ingested_cursor": null,
     "reconciled_cursor": null, "error_ids": []
   }],
+  "groups": [{
+    "id": "github.com/owner/repo", "host": "github.com",
+    "account": "owner", "repo": "repo"
+  }],
   "repositories": [{
     "id": "repo-fixture", "git_path_id": "path-bare", "common_path_id": "path-bare",
     "bare": true, "format": "git-files", "object_format": "sha1",
@@ -55,14 +60,25 @@
     "name": {"display": "refs/heads/main", "encoding": "utf8", "value": "refs/heads/main"},
     "oid": {"algorithm": "sha1", "hex": "1111111111111111111111111111111111111111"},
     "symbolic_target": null, "upstream": null, "state": "valid",
-    "observed_at": "2026-09-30T11:59:59Z", "error_ids": []
+    "observed_at": "2026-09-30T11:59:59Z", "error_ids": [],
+    "freshness": "unknown", "freshness_at": null,
+    "comparison": "no_upstream", "ahead": null, "behind": null
   }],
   "remotes": [{
     "id": "remote-origin", "repository_id": "repo-fixture", "checkout_scope_id": null,
     "name": {"display": "origin", "encoding": "utf8", "value": "origin"},
     "role": "fetch", "url": "https://github.com/owner/repo.git",
-    "canonical_url": "https://github.com/owner/repo", "observed_at": "2026-09-30T11:59:59Z"
+    "canonical_url": "https://github.com/owner/repo", "observed_at": "2026-09-30T11:59:59Z",
+    "refresh": {"status": "success", "observed_at": "2026-09-30T12:00:00Z", "duration_ms": 1200, "refs_updated": 2}
   }],
   "storage_links": [], "aliases": [], "candidates": [], "errors": [],
-  "generated_artifacts": []
+  "generated_artifacts": [],
+  "totals": {
+    "accounts": 1, "groups": 1, "stores": 1, "bare_stores": 1,
+    "present_checkouts": 0, "linked_worktrees": 0,
+    "observed_paths": 1, "aliases": 0,
+    "local_branches": 1, "remote_tracking_refs": 0,
+    "analysis": {"completed": 0, "pending": 0, "failed": 0, "unavailable": 0},
+    "unresolved_candidates": 0, "gaps": 0
+  }
 }

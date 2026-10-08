@@ -116,6 +116,26 @@ fn swapped_probe_path_parks_and_persists_nothing() {
                 git_dir.display()
             );
         }
+        // A leaked instance row would land on the canonical store id
+        // (production keys instance ids on the canonical common dir),
+        // so the canonical spellings are checked too.
+        for git_dir in [victim.join(".git"), foreign.join(".git")] {
+            if let Ok(canonical) = std::fs::canonicalize(&git_dir) {
+                let id = format!(
+                    "git:{}",
+                    config::encode_hex(&config::path_as_bytes(&canonical))
+                );
+                assert!(
+                    store
+                        .get_git_instance(&id)
+                        .await
+                        .expect("read instance")
+                        .is_none(),
+                    "no instance row for canonical {}",
+                    canonical.display()
+                );
+            }
+        }
 
         // Re-verify arm (the gate `exec_status` shares): pin an in-scope
         // directory, confirm the pin verifies, swap it, confirm refusal.
@@ -161,9 +181,11 @@ fn swapped_probe_path_parks_and_persists_nothing() {
             matches!(rel_outcome, TaskOutcome::Complete),
             "relationship probe must complete, got {rel_outcome:?}"
         );
+        let rel_canonical =
+            std::fs::canonicalize(foreign.join(".git")).expect("canonicalize foreign");
         let rel_id = format!(
             "git:{}",
-            config::encode_hex(&config::path_as_bytes(&foreign.join(".git")))
+            config::encode_hex(&config::path_as_bytes(&rel_canonical))
         );
         assert!(
             rel_store

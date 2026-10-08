@@ -17,6 +17,8 @@
 //! [`fallback`] backend; anything else is an operational probe failure.
 
 pub mod fallback;
+pub mod graph;
+pub mod refspec;
 
 use crate::model::StatusMode;
 use gix::bstr::{BString, ByteSlice};
@@ -168,6 +170,9 @@ pub struct StatusObservation {
     pub unstaged: Option<u64>,
     /// Untracked count in the mode's units.
     pub untracked: Option<u64>,
+    /// Distinct unmerged (conflicted) paths; `None` when the backend
+    /// could not determine it (metadata mode, unreadable index).
+    pub conflicts: Option<u64>,
     /// Fields the backend could not determine.
     pub unknown_fields: Vec<String>,
     /// Input fingerprints (head id, index mtime+size) for instability retry.
@@ -187,7 +192,13 @@ pub trait GitInspect: Send + Sync {
     /// Effective fetch/push remotes with roles, rewrites safely applied,
     /// credentials redacted. SSH aliases that need ssh-config resolution
     /// surface as `unresolvable_identity`, never a connection.
-    fn remotes(&self, instance: &GitInstance) -> crate::Result<Vec<RemoteObservation>>;
+    /// `ssh_aliases` is the scan-loaded `~/.ssh/config` map (loaded once
+    /// per scan, threaded through — never re-read per remote).
+    fn remotes(
+        &self,
+        instance: &GitInstance,
+        ssh_aliases: &std::collections::HashMap<String, String>,
+    ) -> crate::Result<Vec<RemoteObservation>>;
 
     /// All refs incl. packed; broken refs surface as per-item errors.
     /// Reftable stores route to the installed-git fallback or `unsupported`.
@@ -343,6 +354,80 @@ pub const SUBMODULE_RECURSION_GAP: &str = "submodule-recursion-unisolated";
 /// substrings, so the report state is unaffected.
 pub const ISOLATED_SCOPE_DECLARATION: &str = "isolated-config-scope: only repository-local git config and attributes were consulted; user/system/global scope (core.excludesFile, global gitattributes, filter drivers) was ignored and no content conversion ran";
 
+/// Sparse-checkout declaration for the status path (spec "declare
+/// what was inspected"): when sparsity is enabled, counts cover the
+/// materialized worktree only — excluded paths never verify against
+/// the worktree (their staged state still counts: the index is not
+/// sparse). Returns the `unknown_fields` line, or `None` when sparsity
+/// is off. Deliberately matches none of the `working_state_of` /
+/// `status_state_of` state-mapping substrings: counts agree with
+/// installed `git status` exactly (pinned by the sparse parity test),
+/// so the state is unaffected — the note declares coverage scope.
+///
+/// `sparse_enabled` is the isolated-effective `core.sparseCheckout`
+/// flag (exactly what status traverses under); the patterns file is
+/// evidence only (`info/sparse-checkout` under the worktree admin dir
+/// first, the common dir second). A lone match-all (`/*`) or an empty
+/// file means the worktree is effectively full and declares so.
+pub fn sparse_checkout_note(sparse_enabled: bool, instance: &GitInstance) -> Option<String> {
+    if !sparse_enabled {
+        return None;
+    }
+    let mut candidates = vec![
+        instance.git_dir.join("info").join("sparse-checkout"),
+        instance.common_dir.join("info").join("sparse-checkout"),
+    ];
+    candidates.sort();
+    candidates.dedup();
+    let mut saw_file = false;
+    let mut effective: Vec<String> = Vec::new();
+    for candidate in &candidates {
+        let Some(bytes) = read_bounded_bytes(candidate, MAX_GIT_CONTROL_BYTES) else {
+            continue;
+        };
+        saw_file = true;
+        effective.extend(
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(str::to_string),
+        );
+    }
+    if !saw_file {
+        return Some(
+            "sparse-checkout: core.sparseCheckout is enabled but no readable \
+             info/sparse-checkout patterns file was found; counts cover the \
+             materialized worktree only"
+                .to_string(),
+        );
+    }
+    if effective.is_empty() || (effective.len() == 1 && effective[0] == "/*") {
+        return Some(
+            "sparse-checkout: core.sparseCheckout is enabled with match-all-only \
+             patterns; the worktree is effectively full"
+                .to_string(),
+        );
+    }
+    Some(format!(
+        "sparse-checkout: core.sparseCheckout is enabled with {} sparse pattern(s); \
+         counts cover the materialized worktree only — excluded paths are not \
+         worktree-verified",
+        effective.len()
+    ))
+}
+
+/// Isolated-effective `core.sparseCheckout` flag for one git dir (the
+/// same config scope the status path traverses under). `false` on any
+/// failure: an unopenable store cannot be proven sparse, and the gix
+/// leg (which owns an open repo) reads the flag from its own snapshot
+/// instead — this serves the installed-git fallback leg only.
+pub fn sparse_config_enabled(git_dir: &std::path::Path) -> bool {
+    open_repo_isolated(git_dir)
+        .map(|repo| repo.config_snapshot().boolean("core.sparseCheckout") == Some(true))
+        .unwrap_or(false)
+}
+
 /// Attach [`ISOLATED_SCOPE_DECLARATION`] to a status observation,
 /// exactly once (idempotent across the instability-retry merge).
 fn with_scope_declaration(mut observation: StatusObservation) -> StatusObservation {
@@ -356,6 +441,64 @@ fn with_scope_declaration(mut observation: StatusObservation) -> StatusObservati
             .push(ISOLATED_SCOPE_DECLARATION.to_string());
     }
     observation
+}
+
+/// Distinct unmerged paths in the open repo's index (Step 10).
+///
+/// Entries at stage 1/2/3 share one path per conflicted file, so paths
+/// deduplicate through a set. Read-only; `Err` carries the
+/// `unknown_fields` note and the caller records `conflicts: None`.
+fn unmerged_paths(repo: &gix::Repository) -> Result<std::collections::BTreeSet<Vec<u8>>, String> {
+    let index = repo
+        .index_or_empty()
+        .map_err(|e| format!("conflicts-unknown: cannot open index for stage scan: {e}"))?;
+    let mut paths = std::collections::BTreeSet::new();
+    for entry in index.entries() {
+        if !matches!(entry.stage(), gix::index::entry::Stage::Unconflicted) {
+            paths.insert(entry.path(&index).to_vec());
+        }
+        if paths.len() as u64 > STATUS_ITEM_CAP {
+            return Err(format!(
+                "conflicts-unknown: unmerged-path cap ({STATUS_ITEM_CAP}) reached; count is partial"
+            ));
+        }
+    }
+    Ok(paths)
+}
+
+/// Byte view of a bstr path for unmerged-set membership.
+fn path_bytes<T: AsRef<[u8]> + ?Sized>(path: &T) -> &[u8] {
+    path.as_ref()
+}
+
+/// Step 10 working-state vocabulary for one status observation.
+///
+/// `conflicted` wins on definite evidence (any unmerged path), then the
+/// observation markers (`unstable`, `not_applicable` for bare stores,
+/// `partial` for truncated counts), then the counts: any positive count
+/// is `dirty`, all-known-zero is `clean`, anything else (metadata mode,
+/// unreadable index) is `unknown` — never `clean`.
+pub fn working_state_of(obs: &StatusObservation) -> &'static str {
+    if obs.conflicts.is_some_and(|n| n > 0) {
+        return "conflicted";
+    }
+    if obs.unknown_fields.iter().any(|f| f.contains("unstable")) {
+        return "unstable";
+    }
+    if obs.unknown_fields.iter().any(|f| f.contains("no-worktree")) {
+        return "not_applicable";
+    }
+    if obs.unknown_fields.iter().any(|f| f.contains("truncat")) {
+        return "partial";
+    }
+    let counts = [obs.staged, obs.unstaged, obs.untracked, obs.conflicts];
+    if counts.iter().any(|c| c.is_some_and(|n| n > 0)) {
+        return "dirty";
+    }
+    if counts.iter().all(|c| *c == Some(0)) {
+        return "clean";
+    }
+    "unknown"
 }
 
 /// Bounded pre-scan for executable filter drivers (EXACT-2 defect 1).
@@ -647,7 +790,7 @@ impl GixInspector {
         evidence.push(format!(".git entry: {dot_git_kind}"));
         if dot_git_kind == "file" {
             match read_gitdir_pointer(&dot_git) {
-                Some(target) => evidence.push(format!("gitdir pointer: {target}")),
+                Some(target) => evidence.push(format!("gitdir pointer: {}", target.display())),
                 None => evidence.push("gitdir pointer: unparseable".to_string()),
             }
         }
@@ -708,8 +851,17 @@ impl GixInspector {
         })
     }
 
-    /// Submodule relationships (path/URL/gitdir) for follow-up discovery.
-    pub fn submodules(&self, instance: &GitInstance) -> crate::Result<Vec<SubmoduleObservation>> {
+    /// Submodule relationships (path/URL/gitdir) for manifest-vs-traversal
+    /// reconciliation. Submodule worktrees are discovered by traversal
+    /// ONLY (descent + `.git`-entry probe) — never from this manifest —
+    /// so the status read reconciles each entry against on-disk evidence
+    /// and gaps manifested-but-never-inspected entries instead of
+    /// silently reporting them `checked` (M8).
+    pub fn submodules(
+        &self,
+        instance: &GitInstance,
+        ssh_aliases: &std::collections::HashMap<String, String>,
+    ) -> crate::Result<Vec<SubmoduleObservation>> {
         let repo = open_repo(&instance.git_dir)?;
         let Some(iter) = repo.submodules().map_err(|e| git_err(e.to_string()))? else {
             return Ok(Vec::new());
@@ -730,7 +882,7 @@ impl GixInspector {
                     let full = url.to_bstring().to_string();
                     (
                         Some(crate::identity::redact_remote_url(&full)),
-                        crate::identity::normalize_github_url(&full),
+                        crate::identity::normalize_github_url_with(&full, ssh_aliases),
                     )
                 }
                 Err(_) => (None, None),
@@ -746,26 +898,61 @@ impl GixInspector {
         Ok(out)
     }
 
+    /// Refs plus per-item errors in ONE open + ONE traversal (the
+    /// `refs` + `reference_errors` pair in a single pass): parseable
+    /// refs return as observations, invalid ones as evidence strings —
+    /// never skipped silently (spec §9). [`GitInspect::refs`] and
+    /// [`GixInspector::reference_errors`] both delegate here, so the
+    /// analysis path collects once.
+    pub fn refs_with_errors(
+        &self,
+        instance: &GitInstance,
+    ) -> crate::Result<(Vec<RefObservation>, Vec<String>)> {
+        let repo = open_repo(&instance.git_dir)?;
+        let platform = repo
+            .references()
+            .map_err(|e| map_ref_store_error(&e.to_string(), "ref store"))?;
+        let iter = platform
+            .all()
+            .map_err(|e| map_ref_store_error(&e.to_string(), "ref iteration"))?;
+        // LooseThenPacked covers packed refs.
+        let mut out = Vec::new();
+        let mut errors = Vec::new();
+        for item in iter {
+            let reference = match item {
+                Ok(reference) => reference,
+                Err(e) => {
+                    errors.push(format!("invalid ref: {e}"));
+                    continue;
+                }
+            };
+            let raw = reference.detach();
+            let name = BString::from(raw.name).as_bytes().to_vec();
+            let target = match raw.target {
+                gix::refs::Target::Object(oid) => RefTarget::Object(oid_from_oid(&oid)),
+                gix::refs::Target::Symbolic(name) => {
+                    RefTarget::Symbolic(BString::from(name).as_bytes().to_vec())
+                }
+            };
+            out.push(RefObservation {
+                name,
+                target,
+                peeled: raw.peeled.as_ref().map(|oid| oid_from_oid(oid)),
+            });
+        }
+        Ok((out, errors))
+    }
+
     /// Per-item reference errors (broken refs) as evidence strings.
     ///
-    /// [`GitInspect::refs`] returns the parseable refs; this companion
-    /// preserves the invalid ones for the report `errors` channel instead
-    /// of silently dropping them (spec §9).
+    /// Convenience over [`GixInspector::refs_with_errors`] discarding
+    /// the observations; a whole-store failure surfaces as one
+    /// evidence string instead of `Err`.
     pub fn reference_errors(&self, instance: &GitInstance) -> Vec<String> {
-        let repo = match open_repo(&instance.git_dir) {
-            Ok(repo) => repo,
-            Err(e) => return vec![format!("open failed: {e}")],
-        };
-        let platform = match repo.references() {
-            Ok(platform) => platform,
-            Err(e) => return vec![format!("ref store unavailable: {e}")],
-        };
-        let iter = match platform.all() {
-            Ok(iter) => iter,
-            Err(e) => return vec![format!("ref iteration unavailable: {e}")],
-        };
-        iter.filter_map(|item| item.err().map(|e| format!("invalid ref: {e}")))
-            .collect()
+        match self.refs_with_errors(instance) {
+            Ok((_, errors)) => errors,
+            Err(e) => vec![format!("ref store unavailable: {e}")],
+        }
     }
 
     /// Configuration files consulted for an instance (spec §8 evidence).
@@ -815,6 +1002,7 @@ impl GixInspector {
                 staged: None,
                 unstaged: None,
                 untracked: None,
+                conflicts: None,
                 unknown_fields: Vec::new(),
                 fingerprints,
             }));
@@ -825,6 +1013,7 @@ impl GixInspector {
                 staged: None,
                 unstaged: None,
                 untracked: None,
+                conflicts: None,
                 unknown_fields: vec![
                     "no-worktree: bare or worktree-less repository; status not applicable"
                         .to_string(),
@@ -872,9 +1061,20 @@ impl GixInspector {
             counts.staged = retry.staged;
             counts.unstaged = retry.unstaged;
             counts.untracked = retry.untracked;
+            counts.conflicts = retry.conflicts;
             counts.unknown_fields.extend(retry.unknown_fields);
         } else {
             counts.fingerprints = after;
+        }
+        // Sparse coverage declaration (pushed once, after the retry
+        // merge): counts cover the materialized worktree only. Reads
+        // the flag from this open repo's own isolated snapshot —
+        // exactly the config scope the traversal above ran under.
+        if let Some(note) = sparse_checkout_note(
+            repo.config_snapshot().boolean("core.sparseCheckout") == Some(true),
+            instance,
+        ) {
+            counts.unknown_fields.push(note);
         }
         Ok(with_scope_declaration(counts))
     }
@@ -908,6 +1108,22 @@ impl GixInspector {
         let mut unstaged = 0u64;
         let mut untracked = 0u64;
         let mut unknown_fields = Vec::new();
+        // gix status items carry no conflict variant: unmerged index
+        // entries surface as ordinary TreeIndex/IndexWorktree changes,
+        // so the unmerged set is read first and its paths are excluded
+        // from staged/unstaged tallies (Step 10 count separation). When
+        // the set itself is unreadable the tallies stay unfiltered and
+        // `conflicts` reads `None` (never a guessed zero).
+        let (unmerged, conflicts) = match unmerged_paths(repo) {
+            Ok(set) => {
+                let count = Some(set.len() as u64);
+                (set, count)
+            }
+            Err(note) => {
+                unknown_fields.push(note);
+                (std::collections::BTreeSet::new(), None)
+            }
+        };
         let mut item_errors = 0u32;
         for (tallied, item) in iter.enumerate() {
             if tallied as u64 >= STATUS_ITEM_CAP {
@@ -917,13 +1133,36 @@ impl GixInspector {
                 break;
             }
             match item {
-                Ok(gix::status::Item::TreeIndex(_)) => staged += 1,
+                Ok(gix::status::Item::TreeIndex(change)) => {
+                    if !unmerged.contains(path_bytes(change.location())) {
+                        staged += 1;
+                    }
+                }
                 Ok(gix::status::Item::IndexWorktree(
-                    gix::status::index_worktree::Item::Modification { .. },
-                ))
-                | Ok(gix::status::Item::IndexWorktree(
-                    gix::status::index_worktree::Item::Rewrite { .. },
-                )) => unstaged += 1,
+                    gix::status::index_worktree::Item::Modification { rela_path, .. },
+                )) => {
+                    if !unmerged.contains(path_bytes(&rela_path)) {
+                        unstaged += 1;
+                    }
+                }
+                Ok(gix::status::Item::IndexWorktree(
+                    gix::status::index_worktree::Item::Rewrite { source, .. },
+                )) => {
+                    let unmerged_source = match &source {
+                        gix::status::index_worktree::RewriteSource::RewriteFromIndex {
+                            source_rela_path,
+                            ..
+                        } => unmerged.contains(path_bytes(source_rela_path)),
+                        // Copy sources originate in the directory walk
+                        // (untracked side); unmerged paths never appear.
+                        gix::status::index_worktree::RewriteSource::CopyFromDirectoryEntry {
+                            ..
+                        } => false,
+                    };
+                    if !unmerged_source {
+                        unstaged += 1;
+                    }
+                }
                 Ok(gix::status::Item::IndexWorktree(
                     gix::status::index_worktree::Item::DirectoryContents { .. },
                 )) => untracked += 1,
@@ -943,6 +1182,7 @@ impl GixInspector {
             staged: Some(staged),
             unstaged: Some(unstaged),
             untracked: Some(untracked),
+            conflicts,
             unknown_fields,
             fingerprints: Vec::new(),
         })
@@ -971,15 +1211,17 @@ impl GixInspector {
         if !exists || depth == 4 {
             return;
         }
-        // Byte-capped: giant, special, or racing files yield no text, so
+        // Byte-capped: giant, special, or racing files yield no bytes, so
         // no include paths are followed from them — never an unbounded
-        // read, never a `/dev/zero`/FIFO hang.
-        let Some(text) = read_bounded_string(path, MAX_GIT_CONTROL_BYTES) else {
+        // read, never a `/dev/zero`/FIFO hang. Byte-exact throughout, so
+        // non-UTF-8 include spellings resolve exactly (unix `OsStrExt`),
+        // never lossy-mangled.
+        let Some(bytes) = read_bounded_bytes(path, MAX_GIT_CONTROL_BYTES) else {
             return;
         };
         let base = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-        for target in scan_include_paths(&text) {
-            let resolved = resolve_include_path(&target, base);
+        for target in scan_include_paths_bytes(&bytes) {
+            let resolved = resolve_include_path_bytes(&target, base);
             self.collect_config_deps(&resolved, true, depth + 1, seen, out);
         }
     }
@@ -997,7 +1239,11 @@ impl GitInspect for GixInspector {
         })
     }
 
-    fn remotes(&self, instance: &GitInstance) -> crate::Result<Vec<RemoteObservation>> {
+    fn remotes(
+        &self,
+        instance: &GitInstance,
+        ssh_aliases: &std::collections::HashMap<String, String>,
+    ) -> crate::Result<Vec<RemoteObservation>> {
         let repo = open_repo(&instance.git_dir)?;
         let mut out = Vec::new();
         for name in repo.remote_names() {
@@ -1040,7 +1286,10 @@ impl GitInspect for GixInspector {
                         name: name.as_bytes().to_vec(),
                         role,
                         url: crate::identity::redact_remote_url(&full),
-                        canonical_url: crate::identity::normalize_github_url(&full),
+                        canonical_url: crate::identity::normalize_github_url_with(
+                            &full,
+                            ssh_aliases,
+                        ),
                     });
                 }
             }
@@ -1049,36 +1298,7 @@ impl GitInspect for GixInspector {
     }
 
     fn refs(&self, instance: &GitInstance) -> crate::Result<Vec<RefObservation>> {
-        let repo = open_repo(&instance.git_dir)?;
-        let platform = repo
-            .references()
-            .map_err(|e| map_ref_store_error(&e.to_string(), "ref store"))?;
-        let iter = platform
-            .all()
-            .map_err(|e| map_ref_store_error(&e.to_string(), "ref iteration"))?;
-        let mut out = Vec::new();
-        for item in iter {
-            // LooseThenPacked covers packed refs; per-item errors are
-            // preserved via `reference_errors`, never skipped silently.
-            let reference = match item {
-                Ok(reference) => reference,
-                Err(_) => continue,
-            };
-            let raw = reference.detach();
-            let name = BString::from(raw.name).as_bytes().to_vec();
-            let target = match raw.target {
-                gix::refs::Target::Object(oid) => RefTarget::Object(oid_from_oid(&oid)),
-                gix::refs::Target::Symbolic(name) => {
-                    RefTarget::Symbolic(BString::from(name).as_bytes().to_vec())
-                }
-            };
-            out.push(RefObservation {
-                name,
-                target,
-                peeled: raw.peeled.as_ref().map(|oid| oid_from_oid(oid)),
-            });
-        }
-        Ok(out)
+        self.refs_with_errors(instance).map(|(refs, _)| refs)
     }
 
     fn head(&self, instance: &GitInstance) -> crate::Result<HeadState> {
@@ -1291,14 +1511,18 @@ fn looks_like_git_dir(path: &std::path::Path) -> bool {
 }
 
 /// Read a `.git` pointer file's `gitdir: <target>` line, if well-formed.
-fn read_gitdir_pointer(path: &std::path::Path) -> Option<String> {
-    let text = read_bounded_string(path, MAX_GITDIR_POINTER_BYTES)?;
-    let line = text.lines().next()?;
-    let target = line.strip_prefix("gitdir:")?.trim();
+/// Byte-exact: the target is a path, so non-UTF-8 spellings resolve
+/// exactly via [`os_str_from_bytes`] (unix `OsStrExt`, same pattern as
+/// `fallback::common_dir_for`), never lossy-mangled. Callers render
+/// ASCII identically through `display()`.
+fn read_gitdir_pointer(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let raw = read_bounded_bytes(path, MAX_GITDIR_POINTER_BYTES)?;
+    let line = raw.split(|b| *b == b'\n').next().unwrap_or_default();
+    let target = line.strip_prefix(b"gitdir:")?.trim_ascii();
     if target.is_empty() {
         return None;
     }
-    Some(target.to_string())
+    Some(std::path::PathBuf::from(os_str_from_bytes(target)))
 }
 
 /// `head:<hex|unborn|unknown>` fingerprint for instability detection.
@@ -1338,40 +1562,171 @@ fn index_fingerprint(repo: &gix::Repository) -> String {
 }
 
 /// Narrow scan for `path = ...` values under `[include]`/`[includeIf]`.
-/// Scans the continuation-joined text PLUS the original physical lines
+/// Scans the continuation-joined bytes PLUS the original physical lines
 /// (deduped): the joined leg sees the values git loads through `\` +
 /// newline, the unjoined leg keeps every physical line git parses
 /// without joining (comments, section headers) visible — a join-only
 /// scan would hide a `path = ...` line glued onto a preceding `\`-ended
 /// comment while git still loads it. Over-following is the safe
 /// direction (extra candidates only add evidence / refusal).
-fn scan_include_paths(config_text: &str) -> Vec<String> {
-    let joined = join_continuations(config_text);
+/// Byte-exact: same matching as the retired `str` scan, over raw bytes,
+/// so non-UTF-8 include spellings survive to path resolution.
+fn scan_include_paths_bytes(config: &[u8]) -> Vec<Vec<u8>> {
+    let joined = join_continuations_bytes(config);
     let mut out = Vec::new();
-    for text in [&joined[..], config_text] {
+    for text in [&joined[..], config] {
         let mut in_include = false;
-        for raw_line in text.lines() {
-            let line = strip_bom(raw_line).trim();
-            if line.is_empty() || line.starts_with(['#', ';']) {
+        for raw_line in text.split(|b| *b == b'\n') {
+            let line = strip_bom_bytes(raw_line).trim_ascii();
+            if line.is_empty() || matches!(line.first(), Some(b'#') | Some(b';')) {
                 continue;
             }
-            if line.starts_with('[') {
-                let section = line.to_lowercase();
-                in_include = section == "[include]" || section.starts_with("[includeif ");
+            if line.first() == Some(&b'[') {
+                in_include = line.eq_ignore_ascii_case(b"[include]")
+                    || (line.len() >= b"[includeif ".len()
+                        && line[..b"[includeif ".len()].eq_ignore_ascii_case(b"[includeif "));
                 continue;
             }
             if !in_include {
                 continue;
             }
-            if let Some((key, value)) = line.split_once('=') {
-                if key.trim().eq_ignore_ascii_case("path") {
-                    for candidate in include_path_candidates(value) {
+            if let Some(eq) = line.iter().position(|b| *b == b'=') {
+                if line[..eq].trim_ascii().eq_ignore_ascii_case(b"path") {
+                    for candidate in include_path_candidates_bytes(line[eq + 1..].trim_ascii()) {
                         if !out.contains(&candidate) {
                             out.push(candidate);
                         }
                     }
                 }
             }
+        }
+    }
+    out
+}
+
+/// Byte twin of [`join_continuations`]: identical `\`-before-newline
+/// joining (parity rule, `\r\n` breaks, `\`-at-EOF drop), over raw
+/// bytes, returning raw bytes.
+fn join_continuations_bytes(config: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(config.len());
+    let mut i = 0;
+    while i < config.len() {
+        if config[i] != b'\\' {
+            out.push(config[i]);
+            i += 1;
+            continue;
+        }
+        let mut run_end = i;
+        while run_end < config.len() && config[run_end] == b'\\' {
+            run_end += 1;
+        }
+        let run = run_end - i;
+        let mut break_end = run_end;
+        if break_end < config.len() && config[break_end] == b'\r' {
+            break_end += 1;
+        }
+        if break_end < config.len() && config[break_end] == b'\n' {
+            out.extend(std::iter::repeat_n(b'\\', run - run % 2));
+            if run % 2 == 0 {
+                out.extend_from_slice(&config[run_end..=break_end]);
+            }
+            i = break_end + 1;
+        } else if run_end == config.len() {
+            out.extend(std::iter::repeat_n(b'\\', run - run % 2));
+            i = run_end;
+        } else {
+            out.extend(std::iter::repeat_n(b'\\', run));
+            i = run_end;
+        }
+    }
+    out
+}
+
+/// Byte twin of [`strip_bom`]: strips a leading UTF-8 BOM per line.
+fn strip_bom_bytes(line: &[u8]) -> &[u8] {
+    line.strip_prefix(b"\xef\xbb\xbf").unwrap_or(line)
+}
+
+/// Byte twin of [`strip_git_comment`]: `;`/`#` outside double quotes
+/// ends the value; a backslash escapes the next byte.
+fn strip_git_comment_bytes(value: &[u8]) -> &[u8] {
+    let mut in_quotes = false;
+    let mut i = 0;
+    while i < value.len() {
+        match value[i] {
+            b'\\' => i += 2,
+            b'"' => {
+                in_quotes = !in_quotes;
+                i += 1;
+            }
+            b';' | b'#' if !in_quotes => return &value[..i],
+            _ => i += 1,
+        }
+    }
+    value
+}
+
+/// Byte twin of [`unescape_git_value`]: drop `"` chars, map `\\` `\"`
+/// `\n` `\t` `\b`; anything else (or a trailing lone `\`) is `None`.
+fn unescape_git_value_bytes(value: &[u8]) -> Option<Vec<u8>> {
+    if !value.contains(&b'"') && !value.contains(&b'\\') {
+        return Some(value.to_vec());
+    }
+    let mut out = Vec::with_capacity(value.len());
+    let mut i = 0;
+    while i < value.len() {
+        match value[i] {
+            b'"' => {
+                i += 1;
+            }
+            b'\\' => {
+                i += 1;
+                match value.get(i) {
+                    Some(b'n') => out.push(b'\n'),
+                    Some(b't') => out.push(b'\t'),
+                    Some(b'b') => out.push(0x08),
+                    Some(b'"') => out.push(b'"'),
+                    Some(b'\\') => out.push(b'\\'),
+                    _ => return None,
+                }
+                i += 1;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Byte twin of [`include_path_candidates`]: the legacy raw parse plus
+/// the git-normalized parse when they differ (same both-legs rationale).
+fn include_path_candidates_bytes(raw_value: &[u8]) -> Vec<Vec<u8>> {
+    // Raw leg: trim, strip `"` chars from both ends, trim again (mirrors
+    // the `str` twin's `trim().trim_matches('"').trim()`).
+    let trimmed = raw_value.trim_ascii();
+    let stripped = trimmed
+        .iter()
+        .position(|b| *b != b'"')
+        .map(|start| {
+            let end = trimmed
+                .iter()
+                .rposition(|b| *b != b'"')
+                .map_or(start, |end| end + 1);
+            &trimmed[start..end]
+        })
+        .unwrap_or(&[][..]);
+    let raw = stripped.trim_ascii().to_vec();
+    let mut out = Vec::with_capacity(2);
+    if !raw.is_empty() {
+        out.push(raw.clone());
+    }
+    let trimmed = raw_value.trim_ascii();
+    let normalized = unescape_git_value_bytes(strip_git_comment_bytes(trimmed).trim_ascii());
+    if let Some(normalized) = normalized {
+        if !normalized.is_empty() && normalized != raw && !out.contains(&normalized) {
+            out.push(normalized);
         }
     }
     out
@@ -1977,12 +2332,20 @@ fn scan_modules_tree_with_includes(modules_dir: &std::path::Path, depth: u8) -> 
 /// Resolve an include path the way git does: `~/` against HOME, relative
 /// against the including file's directory, absolute as-is.
 fn resolve_include_path(target: &str, base: &std::path::Path) -> std::path::PathBuf {
-    if let Some(rest) = target.strip_prefix("~/") {
+    resolve_include_path_bytes(target.as_bytes(), base)
+}
+
+/// Byte-exact include-path resolution: `~/` against HOME, relative
+/// against the including file's directory, absolute as-is — with the
+/// target carried as bytes into the path (unix `OsStrExt` via
+/// [`os_str_from_bytes`]), so non-UTF-8 spellings resolve exactly.
+fn resolve_include_path_bytes(target: &[u8], base: &std::path::Path) -> std::path::PathBuf {
+    if let Some(rest) = target.strip_prefix(b"~/") {
         if let Ok(home) = std::env::var("HOME") {
-            return std::path::Path::new(&home).join(rest);
+            return std::path::Path::new(&home).join(os_str_from_bytes(rest));
         }
     }
-    let path = std::path::Path::new(target);
+    let path = std::path::Path::new(os_str_from_bytes(target));
     if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -1991,7 +2354,7 @@ fn resolve_include_path(target: &str, base: &std::path::Path) -> std::path::Path
 }
 
 /// Lossless bytes-to-`OsStr` on unix; lossy fallback elsewhere.
-fn os_str_from_bytes(bytes: &[u8]) -> &std::ffi::OsStr {
+pub fn os_str_from_bytes(bytes: &[u8]) -> &std::ffi::OsStr {
     #[cfg(unix)]
     {
         std::os::unix::ffi::OsStrExt::from_bytes(bytes)

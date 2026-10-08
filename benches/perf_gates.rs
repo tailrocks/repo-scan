@@ -7,10 +7,15 @@
 //! for at least 30 measured seconds after warmup; the pressure phase injects
 //! memory pressure through the existing admission path.
 //!
-//! Run: `cargo bench --bench perf_gates`. Results append to
+//! Run: `cargo bench --release --bench perf_gates`. Results append to
 //! `benches/results/perf_gates.jsonl` (override with `$BENCH_RESULTS`).
 //! Exit 0 only when every gate verdict holds: excessive resource use or
 //! missing evidence fails the gate, it never passes silently.
+//!
+//! Release-only (B4): the gate scans through a `release` binary and FAILS
+//! when none exists — a debug binary is never measured silently. Every
+//! scan pins `--workers 8` (M3, recorded per run); the sustained gate
+//! needs >= 3 iters over the >= 30 s window (M2) with median/variance.
 
 #[path = "support.rs"]
 mod support;
@@ -44,6 +49,17 @@ const REPOS_WT_MAINS: usize = 10;
 const LINKED_WORKTREES: usize = REPOS_WT_MAINS;
 /// Sustained measured window (spec §18: at least 30 measured seconds).
 const MEASURED_MIN_SECS: f64 = 30.0;
+/// Minimum measured iterations (M2): the gate needs >= 3 samples AND the
+/// >= 30 s window, so the verdict rests on median/variance, never n=1.
+const MIN_ITERS: usize = 3;
+/// Pinned scan workers (M3). Worker sweep on the small corpus: 1w~99s,
+/// 2w~44s, 4w~23s, 8w~17s, 16w~13s — diminishing returns after 4-8, so 8
+/// sits at the knee. Every gate scan pins it and records it per run.
+const GATE_WORKERS: usize = 8;
+/// CPU bound re-scoped for the parallel engine (M3): 8 pinned workers at
+/// ~1 core each plus 10% headroom for the main thread and RSS sampler.
+/// The old 1.1-core bound predates the parallel engine.
+const CPU_BOUND_CORES: f64 = 8.8;
 /// Safety cap on sustained iterations (the window check ends first).
 const MAX_ITERS: usize = 60;
 /// Child RSS sampling cadence during each scan.
@@ -289,7 +305,37 @@ fn main() {
     let harness_budget = budget_secs("HARNESS", HARNESS_BUDGET_SECS);
     let limits = ResourceLimits::default();
     let binary = resolve_binary();
-    eprintln!("perf_gates: binary: {}", binary.display());
+    let binary_profile = detect_profile(&binary);
+    let (binary_sha, binary_bytes) =
+        sha256_file(&binary).unwrap_or_else(|| (String::from("unknown (binary unreadable)"), 0));
+    eprintln!(
+        "perf_gates: binary: {} (profile={binary_profile} sha256={binary_sha})",
+        binary.display()
+    );
+    recorder.record(&serde_json::json!({
+        "record": "binary",
+        "path": binary.display().to_string(),
+        "sha256": binary_sha,
+        "bytes": binary_bytes,
+        "profile": binary_profile,
+        "workers": GATE_WORKERS,
+    }));
+    if binary_profile != "release" {
+        recorder.record(&serde_json::json!({
+            "record": "verdict",
+            "perf02_pass": false,
+            "queue_pass": false,
+            "perf03_pass": false,
+            "pass": false,
+            "timeout": false,
+            "reason": format!("refusing to measure a {binary_profile}-profile binary (release-only gate)"),
+        }));
+        eprintln!(
+            "perf_gates: FAIL (binary profile is {binary_profile:?}, not release; refusing debug fallback)"
+        );
+        println!("TEST_EXIT=1");
+        std::process::exit(1);
+    }
     record_build_evidence(&mut recorder);
 
     // --- Declared corpus (tempdir only). ---
@@ -361,6 +407,7 @@ fn main() {
     let warmup = run_scan(&ctx, &reports.join("warmup.json"));
     recorder.record(&serde_json::json!({
         "record": "warmup",
+        "workers": GATE_WORKERS,
         "wall_ms": warmup.wall_ms,
         "exit_code": warmup.exit_code,
         "report_ok": warmup.report_ok,
@@ -375,7 +422,7 @@ fn main() {
     let sustained_start = Instant::now();
     let mut iters = Vec::new();
     for iter in 0..MAX_ITERS {
-        if window_start.elapsed().as_secs_f64() >= MEASURED_MIN_SECS {
+        if window_start.elapsed().as_secs_f64() >= MEASURED_MIN_SECS && iters.len() >= MIN_ITERS {
             break;
         }
         if phase_over(sustained_start.elapsed(), sustained_budget) {
@@ -402,6 +449,7 @@ fn main() {
         recorder.record(&serde_json::json!({
             "record": "sustain_iter",
             "iter": iter,
+            "workers": GATE_WORKERS,
             "wall_ms": sample.wall_ms,
             "exit_code": sample.exit_code,
             "timed_out": sample.timed_out,
@@ -445,8 +493,11 @@ fn main() {
     let all_pending_zero =
         !iters.is_empty() && iters.iter().all(|s| s.report_ok && s.tasks_pending == 0);
     let rss_ok = child_peak.is_some_and(|peak| peak <= limits.rss_target_bytes);
-    let cpu_ok = mean_cores.is_some_and(|cores| cores <= 1.1);
+    let cpu_ok = mean_cores.is_some_and(|cores| cores <= CPU_BOUND_CORES);
+    let walls: Vec<f64> = iters.iter().map(|s| s.wall_ms).collect();
+    let (wall_median, wall_variance) = median_variance(&walls);
     let perf02 = measured_s >= MEASURED_MIN_SECS
+        && iters.len() >= MIN_ITERS
         && all_exit_zero
         && all_complete
         && all_pending_zero
@@ -455,8 +506,12 @@ fn main() {
     recorder.record(&serde_json::json!({
         "record": "sustained",
         "iters": iters.len(),
+        "min_iters": MIN_ITERS,
+        "workers": GATE_WORKERS,
         "measured_wall_s": measured_s,
         "min_required_s": MEASURED_MIN_SECS,
+        "iter_wall_ms_median": wall_median,
+        "iter_wall_ms_variance": wall_variance,
         "total_entries": total_entries,
         "entries_per_s": total_entries as f64 / measured_s.max(0.001),
         "total_tx": total_tx,
@@ -466,7 +521,7 @@ fn main() {
         "child_cpu_seconds": child_cpu,
         "cpu_method": "libc getrusage(RUSAGE_CHILDREN) diff across the measured window (direct children incl. RSS sampler procs; binary grandchildren not separated)",
         "mean_cores": mean_cores,
-        "cpu_bound_cores": 1.1,
+        "cpu_bound_cores": CPU_BOUND_CORES,
         "child_peak_rss_bytes": child_peak,
         "harness_peak_rss_bytes": support::peak_rss_bytes(),
         "rss_bound_bytes": limits.rss_target_bytes,
@@ -516,6 +571,7 @@ fn main() {
         "perf03_pass": pressure_pass,
         "pass": pass,
         "timeout": false,
+        "workers": GATE_WORKERS,
         "measured_wall_s": measured_s,
         "iters": iters.len(),
         "child_peak_rss_bytes": child_peak,
@@ -537,22 +593,64 @@ fn main() {
     }
 }
 
-/// Locate the built binary: the `CARGO_BIN_EXE_repo-scan` environment wins,
-/// then the crate target dirs, then `PATH`. Missing is a loud harness error.
+/// Median plus population variance of per-iter walls (M2). Empty input
+/// yields zeros (unreachable: the gate requires >= 1 iter to proceed).
+fn median_variance(values: &[f64]) -> (f64, f64) {
+    if values.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let mid = sorted.len() / 2;
+    let median = if sorted.len() % 2 == 1 {
+        sorted[mid]
+    } else {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    };
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
+    (median, variance)
+}
+
+/// Build profile of a binary path from its target-dir component:
+/// `release`, `debug`, or `unknown` (anything else, e.g. `$PATH`).
+fn detect_profile(path: &Path) -> &'static str {
+    for component in path.components() {
+        if let std::path::Component::Normal(part) = component {
+            if part == "release" {
+                return "release";
+            }
+            if part == "debug" {
+                return "debug";
+            }
+        }
+    }
+    "unknown"
+}
+
+/// Locate the built binary (B4, release-only): the
+/// `CARGO_BIN_EXE_repo-scan` environment wins, then `target/release`,
+/// then `PATH`. There is NO debug fallback: a missing release binary, or
+/// a resolved binary whose profile is not `release`, FAILS the gate.
+/// Profile enforcement happens in `main` (which records the verdict).
 fn resolve_binary() -> PathBuf {
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_repo-scan") {
         let candidate = PathBuf::from(path);
         if candidate.is_file() {
             return candidate;
         }
+        eprintln!(
+            "perf_gates: CARGO_BIN_EXE_repo-scan={} is not a file",
+            candidate.display()
+        );
+        println!("TEST_EXIT=1");
+        std::process::exit(1);
     }
     let exe = format!("repo-scan{}", std::env::consts::EXE_SUFFIX);
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for profile in ["release", "debug"] {
-        let candidate = manifest.join("target").join(profile).join(&exe);
-        if candidate.is_file() {
-            return candidate;
-        }
+    let release = manifest.join("target").join("release").join(&exe);
+    if release.is_file() {
+        return release;
     }
     if let Ok(path) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path) {
@@ -562,7 +660,9 @@ fn resolve_binary() -> PathBuf {
             }
         }
     }
-    eprintln!("perf_gates: no repo-scan binary found (set CARGO_BIN_EXE_repo-scan)");
+    eprintln!(
+        "perf_gates: no RELEASE repo-scan binary found (build with `cargo build --release --bin repo-scan` or set CARGO_BIN_EXE_repo-scan); refusing debug fallback"
+    );
     println!("TEST_EXIT=1");
     std::process::exit(1);
 }
@@ -678,9 +778,9 @@ struct ScanSample {
     stderr_tail: String,
 }
 
-/// Run one `scan --root <corpus> --force-rescan` through the built binary,
-/// polling child RSS until exit. A nonzero exit or unreadable report is
-/// recorded, never panicked: the verdict decides.
+/// Run one `scan --root <corpus> --force-rescan --workers 8` through the
+/// built binary, polling child RSS until exit. A nonzero exit or
+/// unreadable report is recorded, never panicked: the verdict decides.
 fn run_scan(ctx: &ScanCtx, report_path: &Path) -> ScanSample {
     let mut cmd = Command::new(ctx.binary);
     cmd.args([
@@ -693,6 +793,8 @@ fn run_scan(ctx: &ScanCtx, report_path: &Path) -> ScanSample {
         "--report",
         report_path.to_str().expect("utf8 report"),
         "--force-rescan",
+        "--workers",
+        &GATE_WORKERS.to_string(),
     ]);
     cmd.current_dir(ctx.workdir)
         .stdout(Stdio::piped())
@@ -924,6 +1026,8 @@ fn pressure_phase(sustained_peak: Option<u64>, threshold: u64) -> (serde_json::V
         staged: None,
         unstaged: None,
         untracked: None,
+        conflicts: None,
+        working_state: "pending".to_string(),
         untracked_units: "collapsed_entries".to_string(),
         submodules: "unknown".to_string(),
         unknown_fields: vec![

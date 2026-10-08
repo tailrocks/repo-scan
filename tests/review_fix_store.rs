@@ -311,6 +311,8 @@ fn r10_buffered_scan_writes_commit_in_one_tx() {
                 staged: Some(0),
                 unstaged: Some(0),
                 untracked: Some(0),
+                conflicts: Some(0),
+                working_state: "clean",
                 untracked_units: "collapsed_entries",
                 submodules: "not_requested",
                 unknown_fields: "[]",
@@ -630,6 +632,201 @@ fn r06_fair_scheduling_interleaves_probes_and_enumeration() {
             "status tasks make progress without starving enumeration"
         );
 
+        store.close().await.expect("close");
+    });
+}
+
+/// DB-m7: `git:`/`status:` scopes are never DIRECTLY invalidated
+/// (idempotent point reads under one short lease). With no live
+/// tasks, invalidating the enclosing `dir:` scope bumps only the
+/// directory revision; the probe revisions stay pinned. (The DB-M1
+/// spelling fan-out may bump a LIVE probe's key — covered by
+/// `dbm1_cross_spelling_invalidate_hits_live_task`.)
+#[test]
+fn dbm7_probe_scopes_survive_dir_invalidation() {
+    use std::path::PathBuf;
+
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TursoStore::open(&db_in(&dir)).await.expect("open");
+        let now = now_ms();
+        let gen = store
+            .create_generation("machine", "running", None, now)
+            .await
+            .expect("generation");
+        let dir_scope = repo_scan::config::scope_key_for_dir(&PathBuf::from("/repo"));
+        let git_scope = repo_scan::config::scope_key_for_git(&PathBuf::from("/repo/.git"));
+        let status_scope = repo_scan::config::scope_key_for_status("checkout:1");
+        assert_eq!(store.scope_rev(&dir_scope).await.expect("rev"), 0);
+        assert_eq!(store.scope_rev(&git_scope).await.expect("rev"), 0);
+        assert_eq!(store.scope_rev(&status_scope).await.expect("rev"), 0);
+        let rev = store
+            .invalidate_scope(&dir_scope, gen, now)
+            .await
+            .expect("invalidate");
+        assert_eq!(rev, 1);
+        assert_eq!(store.scope_rev(&dir_scope).await.expect("rev"), 1);
+        assert_eq!(
+            store.scope_rev(&git_scope).await.expect("rev"),
+            0,
+            "git probe rev is never bumped by dir invalidation"
+        );
+        assert_eq!(
+            store.scope_rev(&status_scope).await.expect("rev"),
+            0,
+            "status probe rev is never bumped by dir invalidation"
+        );
+        store.close().await.expect("close");
+    });
+}
+
+/// DB-M1: a live task scheduled under one spelling is hit by an
+/// invalidate issued under another spelling of the same object.
+/// Fan-out bumps the task's key, so its completion requeues stale
+/// instead of committing over the invalidation (pre-fix: the
+/// literal-only bump missed and the completion applied cleanly).
+#[cfg(unix)]
+#[test]
+fn dbm1_cross_spelling_invalidate_hits_live_task() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).expect("mkdir");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let store = TursoStore::open(&db_in(&dir)).await.expect("open");
+        let epoch = store.epoch();
+        let now = now_ms();
+        let gen = store
+            .create_generation("machine", "running", None, now)
+            .await
+            .expect("generation");
+        // Task scheduled under the link spelling.
+        let link_key = repo_scan::config::scope_key_for_dir(&link);
+        let idem = "idem:task:link".to_string();
+        store
+            .enqueue_task(
+                &NewTask {
+                    id: "task:link",
+                    kind: "enumerate_dir",
+                    generation: gen,
+                    dir_id: None,
+                    scope_key: &link_key,
+                    expected_rev: 0,
+                    idempotency_key: &idem,
+                },
+                now,
+            )
+            .await
+            .expect("enqueue");
+        let claimed = store
+            .claim_tasks_in_generation(gen, epoch, 16, 60_000, now)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1);
+        // Invalidate under the physical spelling: the literal key
+        // moves, and fan-out moves the live task's key too.
+        let real_key = repo_scan::config::scope_key_for_dir(&real);
+        assert_ne!(link_key, real_key, "spellings key distinctly");
+        store
+            .invalidate_scope(&real_key, gen, now)
+            .await
+            .expect("invalidate");
+        assert_eq!(store.scope_rev(&real_key).await.expect("rev"), 1);
+        assert_eq!(
+            store.scope_rev(&link_key).await.expect("rev"),
+            1,
+            "fan-out hits the scheduled spelling"
+        );
+        // The task's completion now requeues stale instead of
+        // committing over the invalidation.
+        let err = store
+            .complete_task_report_gap(
+                "task:link",
+                claimed[0].token,
+                epoch,
+                &TaskOutcome::Complete,
+                now,
+            )
+            .await
+            .expect_err("stale completion");
+        assert!(err.to_string().contains("stale"), "{err}");
+        store.close().await.expect("close");
+    });
+}
+
+/// DB-M1 + RSF-F940: the symlink fan-out is resolved before the write
+/// transaction, while the event cursor and all revision changes remain
+/// atomic. A fan-out revision overflow must roll back the cursor and the
+/// literal scope bump together.
+#[cfg(unix)]
+#[test]
+fn dbm1_event_fanout_failure_rolls_back_cursor_and_revisions() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).expect("mkdir");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let store = TursoStore::open(&db_in(&dir)).await.expect("open");
+        let now = now_ms();
+        let link_key = repo_scan::config::scope_key_for_dir(&link);
+        let real_key = repo_scan::config::scope_key_for_dir(&real);
+        store
+            .enqueue_task(
+                &NewTask {
+                    id: "task:link-overflow",
+                    kind: "enumerate_dir",
+                    generation: 1,
+                    dir_id: None,
+                    scope_key: &link_key,
+                    expected_rev: 0,
+                    idempotency_key: "idem:task:link-overflow",
+                },
+                now,
+            )
+            .await
+            .expect("enqueue live alias");
+        store
+            .connection()
+            .execute(
+                "INSERT OR REPLACE INTO scope_revisions (scope_key, rev, updated_at_ms) \
+                    VALUES (?1, ?2, ?3)",
+                vec![
+                    turso::Value::Text(link_key.clone()),
+                    turso::Value::Integer(i64::MAX),
+                    turso::Value::Integer(now),
+                ],
+            )
+            .await
+            .expect("seed max alias revision");
+
+        let error = store
+            .ingest_event_batch(
+                "vol-fanout",
+                "history-fanout",
+                "cursor-fanout",
+                true,
+                std::slice::from_ref(&real_key),
+                1,
+                now,
+            )
+            .await
+            .expect_err("alias revision overflow");
+        assert!(error.to_string().contains("exceeds i64 range"), "{error}");
+        assert_eq!(store.scope_rev(&real_key).await.expect("real rev"), 0);
+        assert_eq!(
+            store.scope_rev(&link_key).await.expect("link rev"),
+            i64::MAX as u64
+        );
+        assert!(store
+            .list_events("vol-fanout", "history-fanout")
+            .await
+            .expect("events")
+            .is_empty());
         store.close().await.expect("close");
     });
 }

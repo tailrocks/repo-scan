@@ -24,9 +24,9 @@ use crate::report::encode::{
     oid_hex_from_bytes,
 };
 use crate::report::model::{
-    Alias, Branch, Candidate, Checkout, Coverage, ErrorRecord, GeneratedArtifact, Head, ObjectId,
-    PathRecord, Remote, Report, Repository, Resources, Root, Scan, Status, StorageLink, Tool,
-    Volume,
+    Alias, AnalysisTotals, Branch, Candidate, Checkout, Coverage, ErrorRecord, GeneratedArtifact,
+    Group, Head, ObjectId, PathRecord, Remote, RemoteRefresh, Report, Repository, Resources, Root,
+    Scan, ScanTarget, Status, StorageLink, Tool, Totals, Volume,
 };
 use crate::report::publish::{
     check_report_id, check_staged_memory_budget, publish_bound, retain_bound, BoundStaged,
@@ -136,6 +136,8 @@ pub struct ReportInputs {
     pub catalog_revision: u64,
     pub target_url: String,
     pub canonical_url: Option<String>,
+    /// Full requested target set in request order (empty for `--all`).
+    pub targets: Vec<ScanTarget>,
     pub scope: String,
     pub scan_state: String,
     pub started_at_ms: i64,
@@ -184,6 +186,8 @@ pub struct StreamStats {
     pub stub_volumes: u64,
     pub paths: u64,
     pub roots: u64,
+    pub groups: u64,
+    pub accounts: u64,
     pub repositories: u64,
     pub checkouts: u64,
     pub branches: u64,
@@ -254,6 +258,19 @@ fn opt_blob(row: &turso::Row, idx: usize) -> crate::Result<Option<Vec<u8>>> {
         turso::Value::Blob(value) => Ok(Some(value)),
         other => Err(Error::Store(format!(
             "report: column {idx} expected BLOB or NULL, got {other:?}"
+        ))),
+    }
+}
+
+/// Nullable count column (`refs.ahead`/`refs.behind`, report 1.4.0):
+/// NULL reads `None`; a negative stored value is catalog corruption
+/// and fails loudly instead of wrapping.
+fn opt_count(row: &turso::Row, idx: usize, what: &str) -> crate::Result<Option<u64>> {
+    match opt_i64(row, idx)? {
+        None => Ok(None),
+        Some(value) if value >= 0 => Ok(Some(value as u64)),
+        Some(value) => Err(Error::Store(format!(
+            "report: refs {what} {value} is negative: catalog corruption"
         ))),
     }
 }
@@ -613,6 +630,9 @@ struct PrePass {
     unresolvable_repo: bool,
     checkout_repos: HashMap<String, String>,
     statuses: HashMap<String, Status>,
+    /// Latest `--fetch` attempt per (store id, remote name bytes),
+    /// scoped to emitted repositories (report 1.2.0).
+    refreshes: HashMap<(String, Vec<u8>), RemoteRefresh>,
     stub_volumes: Vec<String>,
     interner: PathInterner,
     open_errors: u64,
@@ -704,7 +724,7 @@ async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Res
             .query(
                 "SELECT checkout_id, mode, state, started_ms, finished_ms, staged, \
                     unstaged, untracked, untracked_units, submodules, unknown_fields, \
-                    observed_rev FROM status_observations \
+                    observed_rev, conflicts, working_state FROM status_observations \
                     ORDER BY checkout_id ASC, observed_rev DESC",
                 (),
             )
@@ -728,6 +748,10 @@ async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Res
                     staged: opt_i64(&row, 5)?.map(|v| v.max(0) as u64),
                     unstaged: opt_i64(&row, 6)?.map(|v| v.max(0) as u64),
                     untracked: opt_i64(&row, 7)?.map(|v| v.max(0) as u64),
+                    conflicts: opt_i64(&row, 12)?.map(|v| v.max(0) as u64),
+                    // Report 1.3.0: NULL (legacy pre-v5 rows) reads
+                    // `unknown`, never a guessed state.
+                    working_state: opt_text(&row, 13)?.unwrap_or_else(|| "unknown".to_string()),
                     untracked_units: req_text(&row, 8)?,
                     submodules: req_text(&row, 9)?,
                     unknown_fields: parse_string_array(&req_text(&row, 10)?),
@@ -846,6 +870,36 @@ async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Res
         }
     };
 
+    // Latest `--fetch` attempt per store + remote name (report
+    // 1.2.0), scoped to emitted repositories like `statuses`.
+    let mut refreshes = HashMap::new();
+    {
+        let mut rows = conn
+            .query(
+                "SELECT store_id, remote_name, status, observed_at_ms, duration_ms, \
+                    refs_updated FROM remote_refreshes",
+                (),
+            )
+            .await
+            .map_err(store_err)?;
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            let store_id = req_text(&row, 0)?;
+            if !included_repos.contains(&store_id) {
+                continue;
+            }
+            let remote_name = req_blob(&row, 1)?;
+            refreshes.insert(
+                (store_id, remote_name),
+                RemoteRefresh {
+                    status: req_text(&row, 2)?,
+                    observed_at: ms_to_rfc3339(req_i64(&row, 3)?),
+                    duration_ms: opt_i64(&row, 4)?,
+                    refs_updated: req_i64(&row, 5)?.max(0) as u64,
+                },
+            );
+        }
+    }
+
     // Resource gate: the interned-path peak is real report memory;
     // refuse loudly when it already exceeds the caller's RSS target
     // instead of streaming a report built over budget.
@@ -861,6 +915,7 @@ async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Res
         unresolvable_repo,
         checkout_repos,
         statuses,
+        refreshes,
         stub_volumes,
         interner,
         open_errors,
@@ -890,9 +945,9 @@ async fn verify_error_ids(
 }
 
 fn default_status(mode: StatusMode) -> Status {
-    let (state, submodules) = match mode {
-        StatusMode::Metadata => ("not_requested", "not_requested"),
-        _ => ("pending", "unknown"),
+    let (state, submodules, working_state) = match mode {
+        StatusMode::Metadata => ("not_requested", "not_requested", "unknown"),
+        _ => ("pending", "unknown", "pending"),
     };
     Status {
         state: state.to_string(),
@@ -902,6 +957,8 @@ fn default_status(mode: StatusMode) -> Status {
         staged: None,
         unstaged: None,
         untracked: None,
+        conflicts: None,
+        working_state: working_state.to_string(),
         untracked_units: untracked_units_for(mode).to_string(),
         submodules: submodules.to_string(),
         unknown_fields: Vec::new(),
@@ -1009,6 +1066,10 @@ async fn stream_with_pre_pass<W: Write>(
     writer: W,
 ) -> crate::Result<(W, StreamStats)> {
     let mut stats = StreamStats::default();
+    let mut totals = Totals {
+        bare_stores: Some(0),
+        ..Totals::default()
+    };
     let unresolvable_candidates = inputs
         .candidates
         .iter()
@@ -1087,6 +1148,15 @@ async fn stream_with_pre_pass<W: Write>(
             .canonical_url
             .as_ref()
             .map(|url| redact_remote_url(url)),
+        targets: inputs
+            .targets
+            .iter()
+            .map(|t| ScanTarget {
+                raw: redact_remote_url(&t.raw),
+                canonical: t.canonical.as_ref().map(|url| redact_remote_url(url)),
+                matched_repositories: t.matched_repositories,
+            })
+            .collect(),
         matching_policy: crate::identity::MATCHING_POLICY.to_string(),
         scope: inputs.scope.clone(),
         state: inputs.scan_state.clone(),
@@ -1215,6 +1285,8 @@ async fn stream_with_pre_pass<W: Write>(
     }
     stream.end_array()?;
 
+    totals.observed_paths = stats.paths;
+
     // Caller-owned roots.
     stream.begin_array_field("roots")?;
     for root in &inputs.roots {
@@ -1247,6 +1319,43 @@ async fn stream_with_pre_pass<W: Write>(
     }
     stream.end_array()?;
 
+    // GitHub groups are distinct normalized identities linked through at
+    // least one emitted store. The query stays catalog-backed and streams
+    // rows in ID order; it does not materialize every group in memory.
+    stream.begin_array_field("groups")?;
+    {
+        let mut rows = reader
+            .query(
+                "SELECT DISTINCT g.id, g.host, g.account, g.repo \
+                    FROM github_groups g \
+                    JOIN group_members gm ON gm.group_id = g.id \
+                    JOIN git_instances gi ON gi.id = gm.instance_id \
+                    WHERE (?1 = 1 OR gi.disposition != 'nonmatch') \
+                    ORDER BY g.id ASC",
+                vec![turso::Value::Integer(i64::from(inputs.include_nonmatching))],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut last_account: Option<(String, String)> = None;
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            let host = req_text(&row, 1)?;
+            let account = req_text(&row, 2)?;
+            let account_key = (host.clone(), account.clone());
+            if last_account.as_ref() != Some(&account_key) {
+                stats.accounts += 1;
+                last_account = Some(account_key);
+            }
+            stream.array_item(&Group {
+                id: req_text(&row, 0)?,
+                host,
+                account,
+                repo: req_text(&row, 3)?,
+            })?;
+            stats.groups += 1;
+        }
+    }
+    stream.end_array()?;
+
     // Repositories (matching scope; nonmatching skipped unless requested).
     let interned = |bytes: &[u8]| -> crate::Result<String> {
         pre.interner.by_bytes.get(bytes).cloned().ok_or_else(|| {
@@ -1268,11 +1377,21 @@ async fn stream_with_pre_pass<W: Write>(
             if !pre.included_repos.contains(&id) {
                 continue;
             }
+            let bare = opt_i64(&row, 4)?.map(|flag| flag != 0);
+            match bare {
+                Some(true) => {
+                    if let Some(count) = totals.bare_stores.as_mut() {
+                        *count += 1;
+                    }
+                }
+                Some(false) => {}
+                None => totals.bare_stores = None,
+            }
             stream.array_item(&Repository {
                 id,
                 git_path_id: interned(&req_blob(&row, 1)?)?,
                 common_path_id: interned(&req_blob(&row, 2)?)?,
-                bare: opt_i64(&row, 4)?.map(|flag| flag != 0),
+                bare,
                 format: req_text(&row, 3)?,
                 object_format: req_text(&row, 5)?,
                 match_disposition: req_text(&row, 6)?,
@@ -1285,6 +1404,7 @@ async fn stream_with_pre_pass<W: Write>(
         }
     }
     stream.end_array()?;
+    totals.stores = stats.repositories;
 
     // Checkouts with their latest status observation (or an honest
     // pending/not_requested placeholder when none was recorded).
@@ -1315,6 +1435,13 @@ async fn stream_with_pre_pass<W: Write>(
                 .get(&id)
                 .cloned()
                 .unwrap_or_else(|| default_status(inputs.status_mode));
+            if req_text(&row, 5)? == "present" {
+                totals.present_checkouts += 1;
+                if req_text(&row, 4)? == "linked" {
+                    totals.linked_worktrees += 1;
+                }
+            }
+            record_analysis_total(&mut totals.analysis, &status.state);
             stream.array_item(&Checkout {
                 id,
                 repository_id: instance_id,
@@ -1339,15 +1466,22 @@ async fn stream_with_pre_pass<W: Write>(
     // Branches (refs scoped to emitted repositories and checkouts).
     stream.begin_array_field("branches")?;
     {
-        let mut rows = reader
-            .query(
-                "SELECT id, instance_id, checkout_scope_id, kind, name, oid, algo, \
-                    symbolic_target, upstream, state, observed_at_ms \
-                    FROM refs ORDER BY id ASC",
-                (),
-            )
-            .await
-            .map_err(store_err)?;
+        // Report 1.4.0: the v6 comparison columns ride the SELECT
+        // when physically present; pre-v6 catalogs emit
+        // `pending`/null (same legacy read as pre-1.4 snapshots).
+        let v6 = crate::store::catalog::refs_has_comparison(reader).await?;
+        let sql = if v6 {
+            "SELECT id, instance_id, checkout_scope_id, kind, name, oid, algo, \
+                symbolic_target, upstream, state, observed_at_ms, freshness, \
+                freshness_at_ms, comparison_state, ahead, behind \
+                FROM refs ORDER BY id ASC"
+        } else {
+            "SELECT id, instance_id, checkout_scope_id, kind, name, oid, algo, \
+                symbolic_target, upstream, state, observed_at_ms, freshness, \
+                freshness_at_ms \
+                FROM refs ORDER BY id ASC"
+        };
+        let mut rows = reader.query(sql, ()).await.map_err(store_err)?;
         while let Some(row) = rows.next().await.map_err(store_err)? {
             let instance_id = req_text(&row, 1)?;
             if !pre.included_repos.contains(&instance_id) {
@@ -1355,11 +1489,26 @@ async fn stream_with_pre_pass<W: Write>(
                 continue;
             }
             let scope = opt_text(&row, 2)?.filter(|id| pre.checkout_repos.contains_key(id));
+            let (comparison, ahead, behind) = if v6 {
+                (
+                    opt_text(&row, 13)?.unwrap_or_else(|| String::from("pending")),
+                    opt_count(&row, 14, "ahead")?,
+                    opt_count(&row, 15, "behind")?,
+                )
+            } else {
+                (String::from("pending"), None, None)
+            };
+            let kind = req_text(&row, 3)?;
+            match kind.as_str() {
+                "local" => totals.local_branches += 1,
+                "remote_tracking" => totals.remote_tracking_refs += 1,
+                _ => {}
+            }
             stream.array_item(&Branch {
                 id: req_text(&row, 0)?,
                 repository_id: instance_id,
                 checkout_scope_id: scope,
-                kind: req_text(&row, 3)?,
+                kind,
                 name: encode_name(&req_blob(&row, 4)?),
                 oid: object_id_from_parts(opt_blob(&row, 5)?, opt_text(&row, 6)?),
                 symbolic_target: opt_blob(&row, 7)?.as_deref().map(encode_name),
@@ -1367,6 +1516,12 @@ async fn stream_with_pre_pass<W: Write>(
                 state: req_text(&row, 9)?,
                 observed_at: ms_to_rfc3339(req_i64(&row, 10)?),
                 error_ids: Vec::new(),
+                // Report 1.2.0: NULL (legacy/unlabeled) reads `unknown`.
+                freshness: opt_text(&row, 11)?.unwrap_or_else(|| String::from("unknown")),
+                freshness_at: opt_i64(&row, 12)?.map(ms_to_rfc3339),
+                comparison,
+                ahead,
+                behind,
             })?;
             stats.branches += 1;
         }
@@ -1394,11 +1549,12 @@ async fn stream_with_pre_pass<W: Write>(
                 continue;
             }
             let scope = opt_text(&row, 2)?.filter(|id| pre.checkout_repos.contains_key(id));
+            let name_bytes = req_blob(&row, 3)?;
             stream.array_item(&Remote {
                 id: req_text(&row, 0)?,
-                repository_id: instance_id,
+                repository_id: instance_id.clone(),
                 checkout_scope_id: scope,
-                name: encode_name(&req_blob(&row, 3)?),
+                name: encode_name(&name_bytes),
                 role: req_text(&row, 4)?,
                 url: cap_report_field(&redact_remote_url(&String::from_utf8_lossy(&req_blob(
                     &row, 5,
@@ -1407,6 +1563,10 @@ async fn stream_with_pre_pass<W: Write>(
                     cap_report_field(&redact_remote_url(&String::from_utf8_lossy(&bytes)))
                 }),
                 observed_at: ms_to_rfc3339(req_i64(&row, 7)?),
+                // Report 1.2.0: latest attempt for this store + remote
+                // name (`None` when never attempted). Name-keyed, so
+                // both role rows for one remote share the attempt.
+                refresh: pre.refreshes.get(&(instance_id, name_bytes)).cloned(),
             })?;
             stats.remotes += 1;
         }
@@ -1462,6 +1622,7 @@ async fn stream_with_pre_pass<W: Write>(
         stats.aliases += 1;
     }
     stream.end_array()?;
+    totals.aliases = stats.aliases;
 
     stream.begin_array_field("candidates")?;
     for candidate in &inputs.candidates {
@@ -1485,6 +1646,7 @@ async fn stream_with_pre_pass<W: Write>(
         stats.candidates += 1;
     }
     stream.end_array()?;
+    totals.unresolved_candidates = unresolvable_candidates;
 
     // Open errors; a `dir:{n}` scope resolves to its path when the row
     // exists, otherwise the linkage stays honestly null.
@@ -1523,6 +1685,7 @@ async fn stream_with_pre_pass<W: Write>(
         }
     }
     stream.end_array()?;
+    totals.gaps = stats.errors;
 
     stream.begin_array_field("generated_artifacts")?;
     for artifact in &inputs.generated_artifacts {
@@ -1541,9 +1704,25 @@ async fn stream_with_pre_pass<W: Write>(
     }
     stream.end_array()?;
 
+    totals.observed_paths = stats.paths;
+    totals.groups = stats.groups;
+    totals.accounts = stats.accounts;
+    totals.stores = stats.repositories;
+    totals.aliases = stats.aliases;
+    stream.field("totals", &totals)?;
     stream.end_object()?;
     let writer = stream.finish()?;
     Ok((writer, stats))
+}
+
+fn record_analysis_total(totals: &mut AnalysisTotals, state: &str) {
+    match state {
+        "complete" => totals.completed += 1,
+        "pending" | "not_requested" => totals.pending += 1,
+        "unsupported" => totals.unavailable += 1,
+        "partial" | "unstable" | "error" => totals.failed += 1,
+        _ => totals.pending += 1,
+    }
 }
 
 async fn error_path_id(
@@ -1593,6 +1772,8 @@ struct StagedBudgetProbe {
     #[serde(default)]
     roots: Vec<IgnoredAny>,
     #[serde(default)]
+    groups: Vec<IgnoredAny>,
+    #[serde(default)]
     repositories: Vec<IgnoredAny>,
     #[serde(default)]
     checkouts: Vec<IgnoredAny>,
@@ -1617,6 +1798,7 @@ impl StagedBudgetProbe {
         (self.volumes.len()
             + self.paths.len()
             + self.roots.len()
+            + self.groups.len()
             + self.repositories.len()
             + self.checkouts.len()
             + self.branches.len()
@@ -1663,6 +1845,27 @@ pub fn verify_staged_report_capped(staged: &Path, rss_target_bytes: u64) -> crat
             staged.display()
         ))
     })
+}
+
+/// Validate staged report bytes with bounded record-by-record parsing.
+/// Returns the report ID after schema-domain, relationship, count, and
+/// cross-field validation. The record vectors are never retained.
+pub fn verify_staged_report_streaming(
+    staged: &Path,
+    rss_target_bytes: u64,
+) -> crate::Result<String> {
+    let bound = BoundStaged::open(staged)?;
+    verify_bound_report_streaming(&bound, rss_target_bytes)
+}
+
+/// Streaming twin of [`verify_bound_report_capped`] for publication gates
+/// that need validation but do not consume the full typed report.
+pub fn verify_bound_report_streaming(
+    bound: &BoundStaged,
+    rss_target_bytes: u64,
+) -> crate::Result<String> {
+    let records = probe_staged_records(bound.bytes())?;
+    crate::report::validate::validate_report_streaming(bound.bytes(), records, rss_target_bytes)
 }
 
 /// Owned-bound verification (R3): see [`verify_staged_report_capped`].
@@ -1746,7 +1949,7 @@ impl ReportPipeline {
                 staged.display()
             ))
         })?;
-        verify_bound_report_capped(&bound, inputs.rss_target_bytes).map_err(|e| {
+        verify_bound_report_streaming(&bound, inputs.rss_target_bytes).map_err(|e| {
             quarantine_staging(&staged);
             crate::error::Error::Report(format!(
                 "refusing invalid staged report {}: {e}",
@@ -1844,6 +2047,151 @@ impl ReportPipeline {
         })
     }
 
+    /// Stream the report into controlled staging, verify it, retain the
+    /// snapshot, and write the verified JSON document to `out` (normally
+    /// stdout) — the Wave2b `scan --format json` lane. The bytes are the
+    /// retained snapshot bytes verbatim plus one newline: no prose, no
+    /// ANSI, no cursor codes. Invalid staging is quarantined, never
+    /// retained. Returns `Ok(false)` when the consumer went away
+    /// (broken pipe): the snapshot stays retained, the writer just stops.
+    pub async fn emit_to_json(
+        store: &crate::store::TursoStore,
+        inputs: &ReportInputs,
+        staging_dir: &Path,
+        snapshot_dir: &Path,
+        now_ms: i64,
+        out: &mut dyn std::io::Write,
+    ) -> crate::Result<bool> {
+        let staged = stage_report(store, inputs, staging_dir)
+            .await
+            .map_err(stage_refusal)?;
+        let bound = BoundStaged::open(&staged).map_err(|e| {
+            quarantine_staging(&staged);
+            crate::error::Error::Report(format!(
+                "refusing invalid staged report {}: {e}",
+                staged.display()
+            ))
+        })?;
+        verify_bound_report_streaming(&bound, inputs.rss_target_bytes).map_err(|e| {
+            quarantine_staging(&staged);
+            crate::error::Error::Report(format!(
+                "refusing invalid staged report {}: {e}",
+                staged.display()
+            ))
+        })?;
+        let receipt = retain_bound(
+            store,
+            &bound,
+            snapshot_dir,
+            &inputs.report_id,
+            inputs.catalog_revision,
+            inputs.generation,
+            now_ms,
+        )
+        .await?;
+        let pipe_open = crate::report::output::write_machine_bytes(out, bound.bytes())?;
+        drop(bound);
+        store
+            .set_snapshot_publication(&inputs.report_id, "retained")
+            .await?;
+        let _ = std::fs::remove_file(&staged);
+        let _ = receipt;
+        Ok(pipe_open)
+    }
+
+    /// Stream the report into controlled staging, verify it, and retain
+    /// the snapshot without rendering or publishing — the Wave2b
+    /// `scan --format jsonl` lane (the journal replay on stdout is the
+    /// output; the retained snapshot is the state the human/JSON lanes
+    /// read). Returns the snapshot path.
+    pub async fn stage_and_retain(
+        store: &crate::store::TursoStore,
+        inputs: &ReportInputs,
+        staging_dir: &Path,
+        snapshot_dir: &Path,
+        now_ms: i64,
+    ) -> crate::Result<PathBuf> {
+        let staged = stage_report(store, inputs, staging_dir)
+            .await
+            .map_err(stage_refusal)?;
+        let bound = BoundStaged::open(&staged).map_err(|e| {
+            quarantine_staging(&staged);
+            crate::error::Error::Report(format!(
+                "refusing invalid staged report {}: {e}",
+                staged.display()
+            ))
+        })?;
+        verify_bound_report_streaming(&bound, inputs.rss_target_bytes).map_err(|e| {
+            quarantine_staging(&staged);
+            crate::error::Error::Report(format!(
+                "refusing invalid staged report {}: {e}",
+                staged.display()
+            ))
+        })?;
+        let receipt = retain_bound(
+            store,
+            &bound,
+            snapshot_dir,
+            &inputs.report_id,
+            inputs.catalog_revision,
+            inputs.generation,
+            now_ms,
+        )
+        .await?;
+        store
+            .set_snapshot_publication(&inputs.report_id, "retained")
+            .await?;
+        let _ = std::fs::remove_file(&staged);
+        Ok(receipt.path)
+    }
+
+    /// Publish one live `--report` replacement (Wave2b case 17): stage,
+    /// verify, and atomically replace `dest` — WITHOUT retaining a
+    /// snapshot (snapshots are immutable by report ID, so accumulating
+    /// one per live tick would be unbounded; the live destination is
+    /// the replaceable snapshot). Every concurrently read file is valid
+    /// JSON from exactly one revision: readers see either the old or
+    /// the new destination, never a mix. Callers throttle (see
+    /// [`crate::report::output::LiveThrottle`]) and treat failure as a
+    /// best-effort skip: a live tick must never fail the scan.
+    pub async fn publish_live(
+        store: &crate::store::TursoStore,
+        inputs: &ReportInputs,
+        staging_dir: &Path,
+        dest: &Path,
+        state_dir: &Path,
+    ) -> crate::Result<crate::report::publish::PublishReceipt> {
+        let staged = stage_report(store, inputs, staging_dir)
+            .await
+            .map_err(stage_refusal)?;
+        let bound = BoundStaged::open(&staged).map_err(|e| {
+            quarantine_staging(&staged);
+            crate::error::Error::Report(format!(
+                "refusing invalid staged report {}: {e}",
+                staged.display()
+            ))
+        })?;
+        if let Err(e) = verify_bound_report_streaming(&bound, inputs.rss_target_bytes) {
+            quarantine_staging(&staged);
+            return Err(crate::error::Error::Report(format!(
+                "refusing invalid staged report {}: {e}",
+                staged.display()
+            )));
+        }
+        let receipt =
+            publish_bound(&bound, dest, state_dir).inspect_err(|_| quarantine_staging(&staged))?;
+        if receipt.sha256 != bound.sha256() {
+            quarantine_staging(&staged);
+            return Err(Error::Report(format!(
+                "live destination {} digest does not match staged bytes",
+                dest.display()
+            )));
+        }
+        drop(bound);
+        let _ = std::fs::remove_file(&staged);
+        Ok(receipt)
+    }
+
     /// Retry a failed publication from retained snapshot bytes without
     /// repeating discovery. The snapshot is validated before shipping.
     pub async fn retry_publication(
@@ -1855,16 +2203,16 @@ impl ReportPipeline {
     ) -> crate::Result<crate::report::Publication> {
         let bound = BoundStaged::open(snapshot_path)?;
         {
-            let report =
-                verify_bound_report_capped(&bound, DEFAULT_STAGED_VERIFY_RSS_TARGET_BYTES)?;
-            if report.report_id != report_id {
+            let found_id =
+                verify_bound_report_streaming(&bound, DEFAULT_STAGED_VERIFY_RSS_TARGET_BYTES)?;
+            if found_id != report_id {
                 return Err(Error::Report(format!(
                     "snapshot {} holds report {}, not {report_id}",
                     snapshot_path.display(),
-                    report.report_id
+                    found_id
                 )));
             }
-        } // R3: typed report dropped before publication; publish ships bytes only.
+        }
         match publish_bound(&bound, dest, state_dir) {
             Ok(file) => {
                 store

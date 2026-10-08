@@ -397,6 +397,25 @@ fn fs03_symlink_cycle_terminates_without_duplicates() {
     assert_eq!(found[0].disposition, "confirmed");
 }
 
+/// BOUNDARY-M4: durable enumeration dedupe (identity-keyed task ids +
+/// the `directories` identity index — no in-memory seen-set). One
+/// repository reachable via two spellings (a directory symlink)
+/// inventories exactly once: the alias shares the instance.
+#[cfg(unix)]
+#[test]
+fn fs03_same_object_two_spellings_inventories_once() {
+    let env = Env::new();
+    let repo = fixture::normal_clone(&env.root, "repo");
+    std::os::unix::fs::symlink(&repo, env.root.join("repo-alias")).expect("symlink repo");
+    let out = env.scan(&env.root, "rep.json");
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let report = read_report(&env.cwd.join("rep.json"));
+    let found = repositories(&report);
+    assert_eq!(found.len(), 1, "one instance across both spellings");
+    assert_eq!(found[0].git, expected_bytes(&repo.join(".git")));
+    assert_eq!(found[0].disposition, "confirmed");
+}
+
 #[test]
 fn fs03_path_replacement_reconciles_without_duplicates() {
     let env = Env::new();
@@ -659,5 +678,57 @@ fn fs05_deep_path_bounded_and_backends_equivalent() {
             .as_u64()
             .expect("directories_complete")
             >= fixture::DEEP_PATH_CI as u64
+    );
+}
+
+/// BOUNDARY-M3: multi-root fairness without a round-robin cursor — plan
+/// order plus FIFO claims is the whole mechanism. A broad root (many
+/// sibling dirs) listed FIRST must not starve a small second root: one
+/// scan over both roots reports both roots' repositories.
+#[test]
+fn multi_root_broad_first_does_not_starve_small_second() {
+    let env = Env::new();
+    let broad = env.root.join("broad");
+    repo_scan::privacy::private_dir_0700(&broad).expect("mkdir");
+    for i in 0..64 {
+        let dir = broad.join(format!("filler-{i:02}"));
+        repo_scan::privacy::private_dir_0700(&dir).expect("mkdir");
+        repo_scan::privacy::private_write_0600(&dir.join("filler.txt"), b"filler").expect("write");
+    }
+    fixture::normal_clone(&broad, "repo-broad");
+    let small = env.root.join("small");
+    repo_scan::privacy::private_dir_0700(&small).expect("mkdir");
+    fixture::normal_clone(&small, "repo-small");
+
+    let broad_str = broad.to_str().expect("utf8").to_string();
+    let small_str = small.to_str().expect("utf8").to_string();
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            broad_str.as_str(),
+            "--root",
+            small_str.as_str(),
+            "--report",
+            "rep.json",
+        ],
+        &env.cwd,
+        &env.state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let report = read_report(&env.cwd.join("rep.json"));
+    let found = repositories(&report);
+    let git_paths: Vec<String> = found
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.git).into_owned())
+        .collect();
+    assert!(
+        git_paths.iter().any(|p| p.contains("repo-broad")),
+        "broad root's repo reported: {git_paths:?}"
+    );
+    assert!(
+        git_paths.iter().any(|p| p.contains("repo-small")),
+        "small root's repo reported despite broad-first order: {git_paths:?}"
     );
 }

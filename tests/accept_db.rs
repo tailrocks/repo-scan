@@ -206,10 +206,15 @@ fn db02_reader_checkpoint_migration_durability() {
             store.schema_version().expect("version"),
             CURRENT_SCHEMA_VERSION
         );
-        assert_eq!(CURRENT_SCHEMA_VERSION, 1);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 6);
         let chain = repo_scan::store::migrations();
-        assert_eq!(chain.len(), 1);
+        assert_eq!(chain.len(), 6);
         assert_eq!(chain[0].version, 1);
+        assert_eq!(chain[1].version, 2);
+        assert_eq!(chain[2].version, 3);
+        assert_eq!(chain[3].version, 4);
+        assert_eq!(chain[4].version, 5);
+        assert_eq!(chain[5].version, 6);
 
         let proof = store.durability_proof().await.expect("proof");
         assert_eq!(proof.synchronous, 2);
@@ -243,7 +248,7 @@ fn db02_reader_checkpoint_migration_durability() {
         store.close().await.expect("close");
 
         let store = TursoStore::open(&db).await.expect("reopen");
-        assert_eq!(store.schema_version().expect("version"), 1);
+        assert_eq!(store.schema_version().expect("version"), 6);
         assert!(store.get_volume("vol-r1").await.expect("get").is_some());
         assert!(store.get_volume("vol-r2").await.expect("get").is_some());
         store.close().await.expect("close");
@@ -1188,4 +1193,66 @@ fn cache02_foreign_files_preserved() {
     );
     assert!(payload_foreign.join("notes.txt").exists());
     assert_eq!(std::fs::read_to_string(&outside).expect("read"), "precious");
+}
+
+/// BOUNDARY-M6: trailing retries are resume-driven — the drain never
+/// sleeps for backoff eligibility. A `retry_wait` task with a future
+/// `retry_after_ms` is unclaimable now (the drain ends here), still
+/// counts as pending (exit 3 with `resume_cmd`), and claims once its
+/// backoff has elapsed (the resume run picks it up).
+#[test]
+fn trailing_retry_pending_now_claimable_after_backoff() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = fresh_db(&dir);
+        let store = TursoStore::open(&db).await.expect("open");
+        let epoch = store.epoch();
+        let now = now_ms();
+        let task = NewTask {
+            id: "t-retry",
+            kind: "enumerate_dir",
+            generation: 1,
+            dir_id: None,
+            scope_key: "dir:retry",
+            expected_rev: 0,
+            idempotency_key: "idem-retry",
+        };
+        store.enqueue_task(&task, now).await.expect("enqueue");
+        let kinds = ["enumerate_dir"];
+        let claimed = store
+            .claim_tasks_in_generation_kinds(1, epoch, 16, 60_000, now, &kinds)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1);
+        store
+            .complete_task(
+                "t-retry",
+                claimed[0].token,
+                epoch,
+                &TaskOutcome::Retry {
+                    category: String::from("transient"),
+                    detail: String::from("trailing backoff"),
+                    retry_after_ms: now + 60_000,
+                },
+                now,
+            )
+            .await
+            .expect("complete retry");
+        // Trailing: unclaimable now, but pending (exit 3, resume_cmd).
+        let idle = store
+            .claim_tasks_in_generation_kinds(1, epoch, 16, 60_000, now, &kinds)
+            .await
+            .expect("claim");
+        assert!(idle.is_empty(), "future backoff claims nothing");
+        assert_eq!(store.pending_count(1).await.expect("pending"), 1);
+        // After the backoff elapses the resume drain claims it.
+        let later = store
+            .claim_tasks_in_generation_kinds(1, epoch, 16, 60_000, now + 61_000, &kinds)
+            .await
+            .expect("claim");
+        assert_eq!(later.len(), 1);
+        assert_eq!(later[0].task.id, "t-retry");
+        store.close().await.expect("close");
+    });
 }

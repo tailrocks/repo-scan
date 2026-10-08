@@ -1,5 +1,5 @@
 //! Report acceptance (REPORT-01, REPORT-02): every CLI-emitted report
-//! structurally matches `schemas/report-v1.schema.json`, and publication is
+//! structurally matches `schemas/report-v1.5.schema.json`, and publication is
 //! atomic with honest retry semantics.
 //!
 //! REPORT-01: scan real tempdir fixtures through the built binary with
@@ -65,7 +65,10 @@ fn load_json(path: &Path) -> serde_json::Value {
 }
 
 fn schema_doc() -> serde_json::Value {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/schemas/report-v1.schema.json");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/schemas/report-v1.5.schema.json"
+    );
     load_json(Path::new(path))
 }
 
@@ -74,7 +77,7 @@ fn schema_doc() -> serde_json::Value {
 // ---------------------------------------------------------------------------
 
 /// Minimal JSON-Schema evaluator over the constructs the shipped
-/// `report-v1.schema.json` uses: `$ref`, `type` (incl. unions), `const`,
+/// `report-v1.5.schema.json` uses: `$ref`, `type` (incl. unions), `const`,
 /// `enum`, `required`, `properties`, `additionalProperties: false`,
 /// `items`, `anyOf`, `allOf`, `if`/`then`, `minLength`/`maxLength`,
 /// `minimum`/`exclusiveMinimum`. `pattern`/`format` need a regex engine
@@ -564,13 +567,35 @@ fn report_01_shipped_example_validates() {
 /// Minimal verified prior report: schema marker + tool name + report ID.
 /// A filename extension alone is never proof (checked by the negative cases).
 fn prior_report_bytes(report_id: &str) -> Vec<u8> {
+    prior_report_bytes_version(report_id, repo_scan::report::model::SCHEMA_VERSION)
+}
+
+fn prior_report_bytes_version(report_id: &str, schema_version: &str) -> Vec<u8> {
     serde_json::json!({
-        "schema_version": "1.0.0",
+        "schema_version": schema_version,
         "report_id": report_id,
         "tool": {"name": "repo-scan", "version": "0.1.0", "source_commit": null},
     })
     .to_string()
     .into_bytes()
+}
+
+#[test]
+fn prior_1_0_report_remains_state_bound_overwriteable() {
+    use repo_scan::report::publish::is_verified_prior_report_in_state;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    repo_scan::privacy::private_dir_0700(&state).expect("state dir");
+    let dest = dir.path().join("legacy-report.json");
+    let prior = prior_report_bytes_version("legacy-1-0", "1.0.0");
+    repo_scan::privacy::private_write_0600(&dest, &prior).expect("legacy report");
+
+    assert!(is_verified_prior_report_in_state(&dest, &state).expect("prior check"));
+    assert_eq!(
+        check_destination(&dest, &state).expect("legacy overwrite accepted"),
+        DestinationKind::VerifiedPriorReport
+    );
 }
 
 fn sibling_leftovers(parent: &Path) -> Vec<PathBuf> {
@@ -677,6 +702,8 @@ fn report_02_stalled_publish_does_not_pin_reader() {
             root_str.as_str(),
             "--report",
             "report.json",
+            "--format",
+            "human",
         ],
         dir.path(),
         &state,
@@ -727,6 +754,8 @@ fn report_02_failed_publish_retries_from_snapshot() {
             root_str.as_str(),
             "--report",
             "blocked.json",
+            "--format",
+            "human",
         ],
         dir.path(),
         &state,
@@ -741,7 +770,13 @@ fn report_02_failed_publish_retries_from_snapshot() {
     // Remove the blocker; resume retries from the saved snapshot without
     // repeating discovery.
     std::fs::remove_file(&dest).expect("unblock");
-    let out = run(&["resume", scan_id.as_str()], dir.path(), &state);
+    // Wave6: explicit human keeps the footer lines (the redirected
+    // default is now the JSONL journal replay).
+    let out = run(
+        &["resume", scan_id.as_str(), "--format", "human"],
+        dir.path(),
+        &state,
+    );
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert_eq!(
         out.status.code(),
@@ -826,6 +861,8 @@ fn report_02_unrelated_files_never_overwritten() {
             root_str.as_str(),
             "--report",
             "user.json",
+            "--format",
+            "human",
         ],
         dir.path(),
         &state,
@@ -895,6 +932,8 @@ fn report_02_symlink_destination_is_refused() {
             root_str.as_str(),
             "--report",
             "link.json",
+            "--format",
+            "human",
         ],
         dir.path(),
         &state,
@@ -941,5 +980,87 @@ fn report_01_live_report_validates_against_real_json_schema() {
         errors.is_empty(),
         "live report schema violations:\n{}",
         errors.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Step 4: reports record the effective worker limits of the invocation
+// ---------------------------------------------------------------------------
+
+/// `scan --workers 4` reports `resources.cpu_target_cores == 4.0`, and a
+/// default invocation reports `effective_workers(None)` — never the
+/// hardcoded 1.0 legacy value. The RSS target stays the §5 table budget.
+#[test]
+fn report_resources_record_effective_worker_limits() {
+    if !git_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    fixture::normal_clone(&root, "repo");
+    let root_str = root.to_str().expect("utf8").to_string();
+
+    // Explicit `--workers 4`.
+    let state = dir.path().join("state-4");
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            root_str.as_str(),
+            "--report",
+            "report-4.json",
+            "--workers",
+            "4",
+        ],
+        dir.path(),
+        &state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let report = load_json(&dir.path().join("report-4.json"));
+    assert_report_conforms(&report, 0);
+    assert_eq!(
+        report["resources"]["cpu_target_cores"].as_f64(),
+        Some(4.0),
+        "--workers 4 must surface in resources: {report}"
+    );
+    assert_eq!(
+        report["resources"]["profile"].as_str(),
+        Some("conservative")
+    );
+    assert_eq!(
+        report["resources"]["rss_target_bytes"].as_u64(),
+        Some(256 * 1024 * 1024),
+        "rss target stays the §5 table budget: {report}"
+    );
+
+    // Default invocation: platform parallelism, clamped to MAX_WORKERS.
+    let state = dir.path().join("state-default");
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            root_str.as_str(),
+            "--report",
+            "report-default.json",
+        ],
+        dir.path(),
+        &state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let report = load_json(&dir.path().join("report-default.json"));
+    assert_report_conforms(&report, 0);
+    let expected = repo_scan::config::effective_workers(None) as f64;
+    assert_eq!(
+        report["resources"]["cpu_target_cores"].as_f64(),
+        Some(expected),
+        "default workers must surface in resources: {report}"
+    );
+    assert_eq!(
+        report["resources"]["rss_target_bytes"].as_u64(),
+        Some(256 * 1024 * 1024),
+        "rss target stays the §5 table budget: {report}"
     );
 }

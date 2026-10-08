@@ -130,11 +130,15 @@ original finding texts.
   and the sustained gate exercises repeated real scans with queue bounds held
   (`tests/accept_perf.rs:362`); still missing: slow-consumer and event-burst
   admission-cap tests.
-- [x] PERF-02 — sustained RSS/CPU gate. Evidence: corpus declared
-  (`fixtures/corpus.json`), harness `benches/perf_gates.rs` (≥30 s sustained window,
-  RSS ≤ 256 MiB, mean ≤ 1.1 cores, tx/sync rates, queue bounds), gate test
-  `tests/accept_perf.rs:362` (passes per `/tmp/repo-scan-gate-freeze.log`).
-  Gap: no isolated first-result-latency record (per-iteration full-scan records only).
+- [ ] PERF-02 — gate implementation and acceptance assertions are present, but
+  performance qualification is pending a current qualifying run. The release-only
+  harness (`benches/perf_gates.rs`) pins 8 workers, requires ≥30 s and ≥3 measured
+  iterations, and checks RSS ≤ 256 MiB, mean CPU ≤ 8.8 cores, and queue bounds;
+  it records transaction/sync rates, and `tests/accept_perf.rs` verifies the
+  emitted evidence.
+  `benches/results/perf_gates.jsonl` contains only a superseded-result marker, so
+  it does not qualify this revision. Gap: no isolated first-result-latency record
+  (per-iteration full-scan records only).
 - [x] PERF-03 — pressure containment. Evidence: `tests/accept_misc.rs:768`
   (pressure stops admission, work resumes), `:809` (no false clean, CPU accounting
   survives respawn), binary 512 MiB wiring (`src/main.rs:2468-2469,2509`,

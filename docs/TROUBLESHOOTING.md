@@ -39,6 +39,16 @@ destination and options are restored ([src/main.rs](../src/main.rs:6018)).
 Note: in-flight breaker-held leases take up to 60 s to expire; a prompt resume may
 briefly report them pending (see [docs/REVIEW_WF4.md](../docs/REVIEW_WF4.md) R4).
 
+## Incomplete scan with pending retries (exit 3)
+
+A scan whose only remaining work is retry backoffs still in the future
+exits `3` with a `pending` count instead of sleeping: retries are
+resume-driven by design (backoffs run to 300 s; the drain never waits
+for eligibility). Re-run `resume SCAN_ID` after the backoff elapses —
+the resume re-drains and the retries claim normally. Short backoffs
+usually elapse while other work still drains, so only trailing retries
+surface this way.
+
 ## Report not published (exit 1, snapshot retained)
 
 Publication failures (no-clobber refusal, `.git`/payload destination, IO error) keep the

@@ -1,11 +1,18 @@
 # Machine-Scale Performance & Telemetry Receipt (R09 / PERF-01..03)
 
+> SUPERSEDED (2026-10-07, Step 17 review B4/M5): §§2–3 below predate the
+> release-only gate (no debug fallback), pinned `--workers 8`, and the
+> ≥3-iter median/variance rule. Provenance is wrong (§2: wrong path, unmatched
+> SHA, wrong toolchain, decimal MB labeled MiB, invented release flags) and the
+> §3 numbers rest on a single debug-binary iter. Do not cite. Current
+> per-run provenance template and re-run protocol: `docs/WAVE4A_RECEIPT.md`.
+
 ## 1. Executive Summary & Verification Context
 
 - **Tool**: `repo-scan` v0.1.0
 - **Remediation Item**: R09 — Replace misleading benchmarks with production evidence
 - **Audit Target**: `benches/perf_gates.rs`, `machine_scale_performance_receipt.md`
-- **Release Profile Priority**: Fixed in `benches/perf_gates.rs:551` to search `["release", "debug"]` instead of defaulting to unoptimized debug artifacts.
+- **Release Profile Priority**: `benches/perf_gates.rs` `resolve_binary` is release-only — a missing release binary, or any non-release binary, FAILS the gate (no `["release", "debug"]` fallback; the old fallback silently measured debug builds).
 - **Hardware / Platform**: Apple Silicon (aarch64-apple-darwin) / Linux (x86_64 / aarch64)
 - **Engine**: Embedded Turso (`=0.8.1`, zero-cloud, local file mode)
 
@@ -13,23 +20,33 @@
 
 ## 2. Binary Provenance & Build Profile
 
-| Property | Value |
+SUPERSEDED — the table below is retained for audit trail only; every value
+in it is wrong (M5). Do not cite. Per-run provenance now comes from the
+harness `binary` + `build_evidence` records; see `docs/WAVE4A_RECEIPT.md`.
+
+Honest release-flag statement (B4): `Cargo.toml` has no `[profile.release]`,
+so release builds use cargo defaults — `opt-level = 3`, `lto = false`,
+`codegen-units = 16`, `panic = "unwind"`, `debug = false`. The old table
+claimed `lto = true`, `codegen-units = 1`, `panic = "abort"`; none of those
+were ever set.
+
+| Property (ALL STALE) | Value (DO NOT CITE) |
 |---|---|
 | Binary Name | `repo-scan` |
-| Binary Path | `/Users/donbeave/Projects/repo-scan/target/release/repo-scan` |
-| SHA-256 Digest | `5e15b7f6b2ff1354b2334b3cc07b1cd091549e0fcf0debe101b07cd83692e15d` |
-| Binary Size | 26 MB (fully optimized, LTO enabled) |
-| Toolchain | `rustc 1.85.0+` / `cargo 1.98.1` |
-| Profile | `release` |
-| Optimization Level | `opt-level = 3` |
-| Link-Time Optimization | `lto = true` |
-| Codegen Units | `codegen-units = 1` |
-| Panic Strategy | `abort` |
-| Discovery Order | `["release", "debug"]` ([benches/perf_gates.rs](file:///Users/donbeave/Projects/repo-scan/benches/perf_gates.rs#L551)) |
+| Binary Path | ~~`/Users/donbeave/Projects/repo-scan/target/release/repo-scan`~~ (wrong path) |
+| SHA-256 Digest | ~~`5e15b7f6…`~~ (matches nothing) |
+| Binary Size | ~~26 MB (fully optimized, LTO enabled)~~ (LTO was never enabled) |
+| Toolchain | ~~`rustc 1.85.0+` / `cargo 1.98.1`~~ (rustc pinned at 1.98.1) |
+| Profile | `release` (claimed, not enforced — the harness silently fell back to debug) |
 
 ---
 
 ## 3. Resource Contract & Measured Telemetry
+
+SUPERSEDED (do not cite): the telemetry below rests on a single (n=1)
+debug-binary iter under the pre-parallel 1.1-core bound, and the RSS cell
+reports decimal MB labeled as MiB. Awaiting re-measurement under the fixed
+harness (release-only, `--workers 8`, ≥3 iters); see `docs/WAVE4A_RECEIPT.md`.
 
 The product resource contract establishes hard admission and buffer limits alongside measured CPU/RSS targets. The telemetry below reflects the verified production release execution over the normative test corpus (2,000 flat files, 40 deep levels, 200 Git repositories across normal, bare, detached, and linked worktree archetypes):
 
@@ -83,5 +100,9 @@ The product resource contract establishes hard admission and buffer limits along
 ---
 
 ## 5. Verification Sign-Off
+
+SUPERSEDED (do not cite): the sign-off below was issued against the n=1
+debug-binary run and the unenforced profile claim. It stands withdrawn
+pending the fixed-harness re-run (`docs/WAVE4A_RECEIPT.md`).
 
 All PERF-01, PERF-02, and PERF-03 gates pass under the release profile. Production evidence supersedes prior misleading microbenchmarks, confirming that `repo-scan` operates deterministically within its resource ceiling.

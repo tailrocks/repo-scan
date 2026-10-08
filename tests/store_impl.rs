@@ -29,7 +29,7 @@ fn round_trip_persists_across_reopen() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = db_in(&dir);
         let store = TursoStore::open(&db).await.expect("open");
-        assert_eq!(store.schema_version().expect("version"), 1);
+        assert_eq!(store.schema_version().expect("version"), 6);
         assert!(store.epoch() >= 1);
 
         let proof = store.durability_proof().await.expect("proof");
@@ -199,6 +199,8 @@ fn round_trip_persists_across_reopen() {
             staged: Some(1),
             unstaged: Some(2),
             untracked: Some(3),
+            conflicts: Some(0),
+            working_state: "dirty",
             untracked_units: "collapsed_entries",
             submodules: "not_requested",
             unknown_fields: "[]",
@@ -218,6 +220,11 @@ fn round_trip_persists_across_reopen() {
             scope: "machine",
             status_mode: "summary",
             report_dest: None,
+            targets_json: None,
+            format: None,
+            all_targets: None,
+            fetch: None,
+            workers: None,
         };
         assert!(store.create_scan_request(&scan, now).await.expect("scan"));
         assert!(!store
@@ -230,6 +237,7 @@ fn round_trip_persists_across_reopen() {
             .expect("scan state");
         let scan_row = store.get_scan("scan-1").await.expect("get").expect("row");
         assert_eq!(scan_row.state, "complete");
+        assert_eq!(scan_row.workers, None);
 
         assert!(store
             .save_report_snapshot("rep-1", "1.0.0", 3, generation, "staged", None, now)
@@ -734,6 +742,206 @@ fn owner_lock_is_exclusive_and_epochs_fence() {
         // Next owner incarnation claims the next epoch.
         let (guard, store) = TursoStore::open_owned(dir.path()).await.expect("owned");
         assert_eq!(guard.epoch(), first + 1);
+        store.close().await.expect("close");
+    });
+}
+
+/// `complete_task_report_gap` reports the gap delta each outcome caused:
+/// `Retry`/`Parked` open, `Complete` closes only a genuinely open row,
+/// and a clean task reports nothing.
+#[test]
+fn completion_delta_reports_open_then_close() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = db_in(&dir);
+        let store = TursoStore::open(&db).await.expect("open");
+        let epoch = store.epoch();
+        let base = now_ms();
+
+        for (id, idem) in [("t-delta", "idem-delta"), ("t-park", "idem-park")] {
+            assert!(store
+                .enqueue_task(
+                    &NewTask {
+                        id,
+                        kind: "probe_git",
+                        generation: 1,
+                        dir_id: None,
+                        scope_key: "s",
+                        expected_rev: 0,
+                        idempotency_key: idem,
+                    },
+                    base,
+                )
+                .await
+                .expect("enqueue"));
+        }
+        let claimed = store
+            .claim_tasks(epoch, 10, 60_000, base)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 2);
+        let token_for = |id: &str| {
+            claimed
+                .iter()
+                .find(|entry| entry.task.id == id)
+                .unwrap_or_else(|| panic!("claimed {id}"))
+                .token
+        };
+
+        // Retry opens `gap:t-delta`; nothing closes.
+        let delta = store
+            .complete_task_report_gap(
+                "t-delta",
+                token_for("t-delta"),
+                epoch,
+                &TaskOutcome::Retry {
+                    category: "stalled".to_string(),
+                    detail: "helper stuck".to_string(),
+                    retry_after_ms: base + 1_000,
+                },
+                base,
+            )
+            .await
+            .expect("retry");
+        let opened = delta.opened.expect("retry opens");
+        assert_eq!(opened.id, "gap:t-delta");
+        assert_eq!(opened.category, "stalled");
+        assert!(delta.closed.is_none());
+        let row = store
+            .get_error("gap:t-delta")
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(row.open);
+
+        // Parked opens `gap:t-park` the same way.
+        let delta = store
+            .complete_task_report_gap(
+                "t-park",
+                token_for("t-park"),
+                epoch,
+                &TaskOutcome::Parked {
+                    state: TaskState::Unavailable,
+                    reason: "volume offline".to_string(),
+                },
+                base,
+            )
+            .await
+            .expect("park");
+        assert_eq!(delta.opened.expect("park opens").id, "gap:t-park");
+        assert!(delta.closed.is_none());
+
+        // Reclaim after backoff; success closes the open row.
+        let claimed = store
+            .claim_tasks(epoch, 10, 60_000, base + 1_001)
+            .await
+            .expect("reclaim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].task.id, "t-delta");
+        let delta = store
+            .complete_task_report_gap(
+                "t-delta",
+                claimed[0].token,
+                epoch,
+                &TaskOutcome::Complete,
+                base + 1_001,
+            )
+            .await
+            .expect("complete");
+        assert!(delta.opened.is_none());
+        assert_eq!(delta.closed.as_deref(), Some("gap:t-delta"));
+        let row = store
+            .get_error("gap:t-delta")
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(!row.open);
+
+        // A task that never failed reports no delta at all.
+        assert!(store
+            .enqueue_task(
+                &NewTask {
+                    id: "t-clean",
+                    kind: "probe_git",
+                    generation: 1,
+                    dir_id: None,
+                    scope_key: "s",
+                    expected_rev: 0,
+                    idempotency_key: "idem-clean",
+                },
+                base + 1_001,
+            )
+            .await
+            .expect("enqueue"));
+        let claimed = store
+            .claim_tasks(epoch, 10, 60_000, base + 1_001)
+            .await
+            .expect("claim clean");
+        assert_eq!(claimed.len(), 1);
+        let delta = store
+            .complete_task_report_gap(
+                "t-clean",
+                claimed[0].token,
+                epoch,
+                &TaskOutcome::Complete,
+                base + 1_001,
+            )
+            .await
+            .expect("complete clean");
+        assert!(delta.opened.is_none());
+        assert!(delta.closed.is_none());
+
+        // Only the parked gap stays open.
+        assert_eq!(
+            store.list_open_error_ids().await.expect("list"),
+            vec!["gap:t-park".to_string()]
+        );
+        store.close().await.expect("close");
+    });
+}
+
+/// v4 resilience: a corrupt negative `workers` value resolves to `None`
+/// (runtime default) instead of failing the scan-request read — resume
+/// never breaks on a bad stored value.
+#[test]
+fn negative_workers_reads_as_none() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = db_in(&dir);
+        let store = TursoStore::open(&db).await.expect("open");
+        let now = now_ms();
+        store
+            .create_scan_request(
+                &NewScan {
+                    id: "scan-neg",
+                    url_raw: b"https://github.com/OWNER/REPO",
+                    url_canonical: None,
+                    scope: "machine",
+                    status_mode: "summary",
+                    report_dest: None,
+                    targets_json: None,
+                    format: None,
+                    all_targets: None,
+                    fetch: None,
+                    workers: Some(4),
+                },
+                now,
+            )
+            .await
+            .expect("scan");
+        store
+            .connection()
+            .execute(
+                "UPDATE scan_requests SET workers = -1 WHERE id = 'scan-neg'",
+                (),
+            )
+            .await
+            .expect("corrupt workers");
+        let row = store.get_scan("scan-neg").await.expect("get").expect("row");
+        assert_eq!(row.workers, None);
+        assert_eq!(repo_scan::config::restore_workers(row.workers), None);
         store.close().await.expect("close");
     });
 }

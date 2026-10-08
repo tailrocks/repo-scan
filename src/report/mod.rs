@@ -1,6 +1,6 @@
 //! Report publication (spec §§3, 15–16).
 //!
-//! Every emitted report validates against `schemas/report-v1.schema.json`
+//! Every emitted report validates against `schemas/report-v1.5.schema.json`
 //! (JSON Schema Draft 2020-12). JSON to a file is streamed from one
 //! consistent catalog revision with bounded memory into controlled local
 //! staging; readers are released; then an admitted helper publishes via a
@@ -9,10 +9,13 @@
 
 pub mod builder;
 pub mod encode;
+pub mod live_text;
 pub mod model;
+pub mod output;
 pub mod publish;
 pub mod render;
 pub mod stream;
+pub mod tui;
 pub mod validate;
 
 pub use builder::{ReportInputs, ReportPipeline, StreamStats};
