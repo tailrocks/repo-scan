@@ -184,6 +184,16 @@ the 4 identity-less candidates as `unresolvable_identity`
 unknown identity (exit 0). Disposition pinned by
 `tests/fail_redact.rs`, `tests/accept_git.rs`.
 
+Series incident 2026-10-08 (series4, after t10): an ambient
+cleaner wiped the mbx cache dir that the shelter's
+`target/` symlink pointed at, so t100 + format runs failed
+safe with "missing binary". Binary restored from the
+immutable backup (`repo-scan-immutable/962b2824-new-fix`,
+digest-verified identical); shelter `target/` is now a real
+dir, not a symlink. t1/t10 unaffected (finished before the
+wipe); remainder rerun as series4b with the identical
+binary.
+
 ## Series incident 2026-10-08 (attempt-2, after r4-base)
 
 - During r4-base, an unknown ambient process deleted the whole
