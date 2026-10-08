@@ -32,23 +32,67 @@ interleaves probes with enumeration).
 
 ## Binaries and toolchain
 
-TODO (measured): for EACH binary — source commit, `sha256` digest,
-`cargo build --release` invocation, rustc version
-(`rustc --version --verbose`), effective release profile (cargo
-defaults: lto off, codegen-units 16, panic unwind — no
-`[profile.release]` in `Cargo.toml`).
+- base (`base@94bb89c6`, all base reps): presumed source
+  `13e534b5d2ad688a4d05901d36d5afc95bc454ce` (pre-optimization);
+  `sha256:94bb89c68fe9e389…` (full digest in each `.meta.json`);
+  27,519,616 bytes — byte-identical size to the Step-4
+  `13e534b` build (`f69a315b`, `docs/BASELINE_RECEIPT.md`);
+  digest differs (rebuild under rustc `48a229cea`; the
+  original `f69a315b` env used a rustc build no longer
+  installed — see series-incident note below). Built
+  2026-10-08 ~04:17 +0700 via `cargo build --release` in a
+  shelter checkout (`.git` since removed, `target/` kept);
+  embedded `rustc/48a229cea…` string verified. PROVENANCE
+  RECHECK (pending, post-series): pristine rebuild of
+  `13e534b` must reproduce `94bb89c6…`; result recorded here.
+- new attempt-2 (`new@98ea5fde` r1–r3, `new@d2ef7208` r4–r5
+  rebuild): source `44315ee764b808b01c40baede35fdd72ac287e18`
+  (Wave8d; shelter reflog-pinned for the rebuild; pre-deletion
+  checkout presumed same — built ~04:17, minutes after
+  `44315ee` landed 04:16).
+- new attempt-3 (`new@962b2824` r6–r10): source
+  `06b1e54dd62a68c9c9e682b896b391d3c5e6d002` (claim-cap +
+  read-only lease verify; shelter reflog-pinned, built
+  2026-10-08 15:02 +0700).
+- Toolchain (all builds): `rustc 1.98.1 (48a229cea
+  2026-09-01)`, `cargo 1.98.1 (797e8a9bc 2026-08-05)`,
+  host `aarch64-apple-darwin`, LLVM 22.1.8.
+- Release profile: cargo defaults (no `[profile.release]` in
+  `Cargo.toml`: opt-level 3, lto off, codegen-units 16,
+  panic unwind, debug off).
 
 ## Machine
 
-TODO (measured): OS, CPU model, RAM, filesystem, storage device,
-core count, ambient load before/during (uptime samples per rep).
+- macOS 27.0.1 (build 26A434), Apple M5 Max, 18 logical
+  CPUs, 128 GB RAM.
+- Filesystem: APFS; `/tmp` → `private/tmp` on the Data
+  volume (`/dev/disk3s1s1`), internal SSD (`Solid State:
+  Yes`).
+- Ambient load: sampled per rep (`load_before/after`
+  ledger column); agents share the machine, so per-rep
+  variance is expected — alternation absorbs drift.
 
 ## Dataset
 
-TODO (measured): corpus path, manifest counts (dirs/files/stores),
-deep/wide/many-branch/many-file shapes, expected-locations file.
-LIMITATION (M6): single APFS volume, no latency/fault injection
-(deferred in `docs/BASELINE_RECEIPT.md`, still open).
+- Corpus `/tmp/corpus16/ws`, 4.0 GiB; manifest
+  `/tmp/corpus16/manifest.json` (v1): 221 expected stores
+  (`expected_stores_paths`, 221 entries), 100772 tracked
+  dirs, 1050503 tracked files (`.git` internals NOT in
+  tracked counts — `find(1)` totals exceed them).
+- Shapes: `wide/` 400×250 leaves (10 files each, every
+  500th leaf a git store); `deep/` 300-level chain;
+  `wide_single/` 30000 files in one dir; `special/`
+  (nested pair, 2 bare, worktree family main+3, submodule
+  pair, node_modules/hidden/cache/tmp, 5 branchy, dirty,
+  unborn); `extra/` deepnest (60-level chain, store at
+  bottom), manybranch; recall note: scans find one more
+  store than listed (embedded submodule clone at
+  `super/sub`).
+- Expected-locations file: `expected_stores_paths` in the
+  manifest; recall script `/tmp/reps/recall.py`.
+- LIMITATION (M6): single APFS volume, no latency/fault
+  injection (deferred in `docs/BASELINE_RECEIPT.md`, still
+  open).
 
 ## Method
 
