@@ -40,8 +40,9 @@ freshness stay separate properties.
 
 ## D2. Schema versions (Step 5)
 
-- Report `1.0.0` → `1.1.0` (additive: `groups[]`, `totals`, branch
-  comparison fields, freshness basis; no field removed/renamed).
+- Report `1.0.0` → `1.1.0` (planned additive `groups[]` and `totals`; the
+  Wave4b output deferred these fields, which were absent through `1.4.0`
+  and are delivered in `1.5.0`).
 - Report `1.1.0` → `1.2.0` (additive, Step 11: branch `freshness` /
   `freshness_at`, remote `refresh` summary; no field removed/renamed;
   pre-1.2 snapshots deserialize with `unknown` / `None`).
@@ -86,13 +87,16 @@ before the generation's `inventory_ready` row commits.
 
 One envelope: `{schema_version, scan_id, seq, catalog_rev, type, op, records[]}`.
 `op` is `add` | `replace` | `remove`. Per-record `rev` where stale updates
-are possible. Queues bounded; progress events coalesce to newest per scan;
-record/error events never silently dropped (durable replay or backpressure).
+are possible. Queues bounded; the progress gauge coalesces to its newest
+payload per scan and cursor-advancing progress notifications carry later live
+updates; record/error events never silently dropped (durable replay or
+backpressure).
 
 | `type` | `op` | Payload |
 |---|---|---|
 | `scan_started` | add | scan id, scope, targets, options, resume cmd (local target/state paths redacted) |
 | `discovery_progress` | replace | phase, elapsed, discovered, pending, gaps (no % of unknown total) |
+| `discovery_progress_updated` | add | current progress gauge payload; cursor-advancing live notification |
 | `location_found` | add | opaque checkout/store IDs, identity or `unknown`, analysis=`pending`; no raw or reversible local paths |
 | `repository_found` | add | store id + GitHub group assoc; local `file:` remote URLs redacted |
 | `inventory_ready` | add | complete\|incomplete, generation, counts, gaps |
@@ -121,7 +125,18 @@ storage where the producer persists them.
 
 Cursor: opaque; `scan seq` + `(catalog_rev, event offset)`. Snapshot cursor
 = exact end of included changes. Events sent only after their Catalog
-transaction commits. Cursor outside retention → fresh snapshot + `reset:true`.
+transaction commits. The retained report contains owner-local path data and
+the current path-free event schema has no full-inventory snapshot event. Each
+replay page checks the retained prefix and reads its rows in one short
+read-only Catalog transaction, rolled back before output or polling. If a
+cursorless or expired replay starts before a prefix that was already pruned,
+the JSONL command fails before writing rows (exit 1); it never presents the
+retained tail as a full inventory. If concurrent retention prunes unseen rows
+between pages, earlier pages may already have been delivered; the next page
+fails closed rather than skipping the missing rows. Use `--format json` when
+a retained report snapshot is available. `reset:true` remains the signal for
+a complete replay that starts from the journal's beginning after a
+covered-cursor divergence.
 Duplicates: same `(seq)` re-delivery is idempotent; consumers dedupe by seq.
 Replay-once: exactly one terminal (`scan_completed`/`scan_incomplete`/
 `scan_interrupted`/`scan_failed`) and exactly one `inventory_ready` are
@@ -133,17 +148,40 @@ Wave1d deltas (Step 12, branch `work/fast-complete-scan`):
 
 - Gauge coalescing is write-side seq-reuse: the first `discovery_progress`
   tick takes a fresh seq; later ticks UPDATE its payload in place at the
-  immutable `(catalog_rev, event_offset)`. Exactly one progress row per scan
-  holds the NEWEST payload; record events are never dropped by coalescing.
+  immutable `(catalog_rev, event_offset)` and append a
+  `discovery_progress_updated` row with a fresh cursor and the current
+  payload. Exactly one `discovery_progress` gauge row per scan holds the
+  NEWEST payload; notification rows let strict-after live readers observe
+  later ticks. Record events are never dropped by coalescing.
 - Retention bound: newest 50,000 rows per scan journal
   (`MAX_RETAINED_SCAN_EVENTS`); prefix prune in one transaction; the tip row
-  always survives. Cursors at/below the prune cutoff resync as a snapshot
-  with `reset:true` on the first envelope (never a silent resume).
+  always survives. Every JSONL and TUI replay page pairs its prefix check and
+  row read in one short read-only transaction. The transaction ends before
+  JSONL output, TUI rendering, or a poll wait. A replay whose prefix was
+  already pruned fails before its first page; if concurrent retention removes
+  unseen history between pages, the next page fails closed after any earlier
+  pages have been delivered. The event stream does not carry a path-safe
+  full-state snapshot record, so a truncated tail cannot serve as a
+  replacement snapshot. The TUI may use the verified final report snapshot
+  after a terminal scan; a running scan fails closed. Use `--format json`
+  when a retained report snapshot is available.
+- Resume dedupe keys for found stores/checkouts, branch stores, errors, and
+  unresolvable candidates persist in `scan_event_dedupe` outside the pruned
+  rows while a scan remains resumable. New keys commit atomically with their
+  event. The markers are deleted atomically with a terminal event or a
+  `superseded` state transition, because neither scan can resume. On upgrade,
+  retained events backfill the side table; an older resumable scan whose
+  prefix was already pruned before those keys existed fails resume rather
+  than risk duplicate `add` events.
 - Cursor classification: a covered record cursor with a drifted
-  `(catalog_rev, event_offset)` diverges (snapshot + `reset:true`); the
+  `(catalog_rev, event_offset)` diverges (complete replay + `reset:true` if
+  its prefix is intact); the
   coalescible `discovery_progress` gauge NEVER diverges on position drift —
   the reader resumes after its own position. Corrupt `--after` stays a usage
-  error (exit 2); pruned/beyond-tip cursors stay snapshots (exit 0).
+  error (exit 2); beyond-tip cursors replay the complete journal with
+  `reset:true` when its prefix is intact. Cursors into a pruned prefix fail
+  closed (exit 1, with no rows from a retained tail; rows from earlier pages
+  may already have been delivered if pruning races a multi-page replay).
 
 Wave2b deltas (Steps 6 + 12 output matrix, branch `work/fast-complete-scan`):
 
@@ -212,7 +250,9 @@ Wave2b deltas (output matrix, branch `work/fast-complete-scan`):
 - One state model: `scan`, `query --scan`, and `resume` serve all
   lanes from the same retained snapshot bytes (human renders them,
   json prints them, jsonl replays the journal committed with them).
-  Totals and record IDs agree across lanes for one scan revision.
+  Record values and totals agree across lanes for one scan revision.
+  Human and JSON use owner-local catalog IDs; JSONL uses the documented
+  opaque event-ID projection for path-derived IDs.
 - Explicit `--format` wins; no explicit format keeps the legacy
   output (readable terminal report or `scan_id:`/`report_id:`/
   `snapshot:`/`report:` footers). Explicit `scan --format human`
@@ -223,9 +263,11 @@ Wave2b deltas (output matrix, branch `work/fast-complete-scan`):
 - `scan --format json` prints one JSON document (the retained
   snapshot bytes verbatim); with `--report` the file is also
   published. `scan --format jsonl` retains the snapshot and replays
-  the scan journal. `query --scan --format json` prints the scan's
-  verified retained snapshot verbatim; `--format human` renders it as
-  plain text. `resume --format json|jsonl|human` follows the same
+  the scan journal when its prefix is intact; a cursorless replay with
+  history pruned before its first page fails before writing JSONL, while
+  history pruned between pages causes the next page to fail closed. `query --scan --format json`
+  prints the scan's verified retained snapshot verbatim; `--format human`
+  renders it as plain text. `resume --format json|jsonl|human` follows the same
   lanes (explicit wins, else the scan's saved format is restored).
 - `query --scan --follow --format human` was unimplemented in
   Wave2b (exit 1); Wave3 implements it (D11): the live TUI on a TTY,
@@ -238,8 +280,11 @@ Wave2b deltas (output matrix, branch `work/fast-complete-scan`):
   concurrent read is valid JSON from exactly one revision. Live ticks
   are best-effort (a failed tick logs to stderr, never fails the
   scan) and are never retained: the destination is the replaceable
-  snapshot. Completed snapshots are retained bounded (newest 32;
-  snapshots named by a scan outcome are never pruned).
+  snapshot. Completed snapshots are retained bounded (newest 32), along
+  with the current report, the latest prior running recovery report, and
+  snapshots for failed unpublished outcomes so `resume` can retry the saved
+  bytes. Published completed outcomes do not pin snapshots indefinitely. If
+  outcome references cannot be read, pruning skips files and catalog rows.
 
 Consumer-migration notes (README rewrite is a later wave):
 
@@ -305,6 +350,14 @@ Wave2b deltas (fetch recompute, branch `work/fast-complete-scan`):
   observed refs become `current`; excluded and deleted refs stay
   `stale` — never a false `current`, never a recompute without a
   fresh observation. Skipped on pre-v6 catalogs.
+- Every fetch uses Git's atomic ref update mode. After a failed or timed
+  out fetch, the scanner re-reads actual tracking refs and persists their
+  observed OIDs and states without assigning freshness labels.
+- Before transport starts, repo-scope executable config is refused:
+  `credential.helper` and `credential.<url>.helper`,
+  `core.sshCommand`, `core.gitProxy`, remote pack-command overrides,
+  and include chains. This protects HTTP credential challenges and
+  `git://` proxy execution. System/global definitions remain available.
 Default probes offline + read-only (no helper exec, fetch, hooks, fsmonitor,
 index writes); porcelain-v2 unmerged records parsed byte-safe (NUL-delimited).
 
@@ -419,9 +472,10 @@ against fixture snapshots with no PTY (`tests/tui_impl.rs`).
   view browses the exact retained bytes, then the legacy footers
   print. Follow TUI: folds the journal live, swaps to the retained
   snapshot at the terminal event, quits to exit 0. Quitting never
-  disturbs the scan or the catalog. `--after` applies to the TUI
-  follow (reset positions drop buffered state); the plain lane
-  ignores it (byte-change renders have no cursor).
+  disturbs the scan or the catalog. D13 supersedes the historical
+  cursor pin: `--after` applies to both follow lanes. The plain lane waits
+  for journal activity strictly after the cursor before rendering; reset
+  positions require an intact prefix before a full render.
 
 ## D12. Wave4b documentation decisions (Step 17, branch `work/fast-complete-scan`)
 
@@ -474,13 +528,17 @@ Pinned by `wave6_*` tests in `tests/cli_impl.rs`.
   resolved scan's retained snapshot (latest scan covering the target —
   primary canonical, multi-target set, or an `--all` scan, whose
   snapshot covers every repository); `jsonl` replays its journal
-  (byte-identical to `query --scan --format jsonl`; `--follow`
+  (byte-identical to `query --scan --format jsonl`; a cursorless replay
+  with pruned history fails closed; `--follow`
   supported and stops at the tip for finished scans); `human` and the
   default keep the short human summary, except human `--follow`,
   which rides the replay core like `--all` (Step 13 live lane on a
   TTY, plain live lane redirected; `--after` honored). Machine lanes stay
   machine-clean on misses (stderr note, exit 3, empty stdout);
   unresolvable shapes and fresh state dirs keep today's human notes.
+  Reset cursors require an intact journal prefix before either human
+  follow lane renders a full snapshot; a pruned or absent prefix fails
+  closed even when the scan is finished.
 - Redirected `scan`/`resume` with no `--format` replay the scan
   journal as JSONL (every line parses; the scan's own exit code is
   kept); the TTY default keeps the legacy terminal report + footers.

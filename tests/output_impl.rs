@@ -6,15 +6,16 @@
 //! binaries plus read-only catalog reads — never self-comparison:
 //!
 //! - `w2b_formats_agree_on_ids_and_totals`: the same fixture scanned
-//!   with `--format human|json|jsonl` yields identical record IDs and
-//!   totals (each format parsed independently).
+//!   with `--format human|json|jsonl` yields the same records and
+//!   totals (each format parsed independently); JSONL uses documented
+//!   opaque projections for path-derived IDs.
 //! - `w2b_jsonl_replay_reconstructs_json_inventory` (case 15): folding
 //!   the JSONL replay yields the final JSON inventory record by
 //!   record, with the same totals.
-//! - `w2b_mid_transaction_resume_and_expired_reset` (case 16):
+//! - `w2b_mid_transaction_resume_and_expired_prefix_fails_closed` (case 16):
 //!   reconnecting between two events of one transaction loses nothing;
-//!   an expired cursor yields an explicit-reset snapshot — both end to
-//!   end through `query --follow --after`.
+//!   an expired cursor with pruned history fails before partial JSONL is
+//!   written, after the full replay has been compared with the JSON snapshot.
 //! - `w2b_concurrent_readers_see_single_revisions` (case 17): every
 //!   concurrent read of a live `--report` file is valid JSON from
 //!   exactly one revision; revisions stay bounded (no per-discovery
@@ -226,6 +227,28 @@ fn w2b_fold_json(doc: &serde_json::Value) -> JsonInventory {
     }
 }
 
+/// JSONL deliberately hashes owner-local catalog IDs before journaling them.
+/// Project the retained JSON IDs through the same versioned domain so the
+/// replay tests compare identities without exposing path-derived values.
+fn w2b_event_opaque_id(value: &str) -> String {
+    let mut material = b"repo-scan-event-id-v1\0".to_vec();
+    material.extend_from_slice(value.as_bytes());
+    format!("evt:{}", repo_scan::report::publish::sha256_hex(&material))
+}
+
+fn w2b_event_opaque_ids(ids: &HashSet<String>) -> HashSet<String> {
+    ids.iter().map(|id| w2b_event_opaque_id(id)).collect()
+}
+
+fn w2b_event_opaque_branches(
+    branches: &HashMap<String, (String, Option<u64>, Option<u64>)>,
+) -> HashMap<String, (String, Option<u64>, Option<u64>)> {
+    branches
+        .iter()
+        .map(|(id, comparison)| (w2b_event_opaque_id(id), comparison.clone()))
+        .collect()
+}
+
 /// IDs + totals parsed from explicit-human stdout: the `totals` line
 /// plus the `R`/`C`/`B` detail rows (parsed independently of the JSON
 /// lane — plain-text splitting only, no JSON).
@@ -267,7 +290,7 @@ fn w2b_parse_human(stdout: &str) -> HumanInventory {
     }
 }
 
-/// IDs folded from a JSONL event replay: `repository_found` store
+/// Opaque IDs folded from a JSONL event replay: `repository_found` store
 /// IDs, `location_found` checkout IDs, `branch_batch` branch IDs with
 /// their comparison triples, `error` record IDs.
 struct ReplayInventory {
@@ -454,12 +477,23 @@ fn w2b_formats_agree_on_ids_and_totals() {
     let events = w2b_parse_jsonl(&jsonl_out.stdout);
     assert!(events.len() > 5, "nontrivial stream");
     let replay = w2b_fold_replay(&events);
-    assert_eq!(replay.repos, json.repos, "replay repo IDs agree");
-    assert_eq!(replay.checkouts, json.checkouts, "checkout IDs agree");
     assert_eq!(
-        replay.branches.keys().collect::<HashSet<_>>(),
-        json.branches.keys().collect::<HashSet<_>>(),
-        "replay branch IDs agree"
+        replay.repos,
+        w2b_event_opaque_ids(&json.repos),
+        "replay repository IDs are the opaque projections of JSON IDs"
+    );
+    assert_eq!(
+        replay.checkouts,
+        w2b_event_opaque_ids(&json.checkouts),
+        "replay checkout IDs are the opaque projections of JSON IDs"
+    );
+    assert_eq!(
+        replay.branches.keys().cloned().collect::<HashSet<_>>(),
+        json.branches
+            .keys()
+            .map(|id| w2b_event_opaque_id(id))
+            .collect::<HashSet<_>>(),
+        "replay branch IDs are the opaque projections of JSON IDs"
     );
     assert_eq!(replay.terminal_type, "scan_completed");
     assert!(
@@ -477,9 +511,9 @@ fn w2b_formats_agree_on_ids_and_totals() {
 
 /// Case 15: JSONL replay reconstructs the final JSON inventory. One
 /// scan serves both sides: the `--format json` document is the
-/// inventory, and `query --scan --format jsonl` is the replay. Same
-/// records (IDs + comparison triples), same totals, same terminal
-/// counts + resume command.
+/// inventory, and `query --scan --format jsonl` is the replay. Event
+/// IDs are compared through their documented opaque projection; record
+/// values, totals, terminal counts, and resume command also agree.
 #[test]
 fn w2b_jsonl_replay_reconstructs_json_inventory() {
     if !w2b_git_available() {
@@ -514,15 +548,25 @@ fn w2b_jsonl_replay_reconstructs_json_inventory() {
     let events = w2b_parse_jsonl(&replay.stdout);
     let folded = w2b_fold_replay(&events);
 
-    assert_eq!(folded.repos, json.repos, "same repository records");
-    assert_eq!(folded.checkouts, json.checkouts, "same checkout records");
     assert_eq!(
-        folded.branches, json.branches,
-        "same branch records with comparison triples"
+        folded.repos,
+        w2b_event_opaque_ids(&json.repos),
+        "same repository records under opaque event IDs"
     );
     assert_eq!(
-        folded.errors, json.error_ids,
-        "same error records (possibly none)"
+        folded.checkouts,
+        w2b_event_opaque_ids(&json.checkouts),
+        "same checkout records under opaque event IDs"
+    );
+    assert_eq!(
+        folded.branches,
+        w2b_event_opaque_branches(&json.branches),
+        "same branch records with comparison triples and opaque event IDs"
+    );
+    assert_eq!(
+        folded.errors,
+        w2b_event_opaque_ids(&json.error_ids),
+        "same error records under opaque event IDs (possibly none)"
     );
     assert_eq!(folded.terminal_type, "scan_completed");
     // Terminal counts name the same per-target matches the JSON
@@ -547,11 +591,10 @@ fn w2b_jsonl_replay_reconstructs_json_inventory() {
 }
 
 /// Case 16: reconnecting between two events of one transaction loses
-/// nothing, end to end through `query --follow --after`; an expired
-/// cursor yields an explicit-reset snapshot (never a silent resume,
-/// never an error).
+/// nothing. A replay whose cursorless or expired position is before a
+/// retention-pruned prefix fails closed instead of returning partial state.
 #[test]
-fn w2b_mid_transaction_resume_and_expired_reset() {
+fn w2b_mid_transaction_resume_and_expired_prefix_fails_closed() {
     use repo_scan::scan_events::Cursor;
 
     if !w2b_git_available() {
@@ -617,30 +660,128 @@ fn w2b_mid_transaction_resume_and_expired_reset() {
     assert!(tail.iter().all(|e| e["reset"] != true), "no reset");
     assert_eq!(tail.last().expect("last")["type"], "scan_completed");
 
-    // Expire the prefix through seq 2, then reconnect with a cursor
-    // into the pruned prefix: an explicit-reset snapshot replays the
-    // retained window from its start.
-    let expired = rows[1].clone();
+    // Grow this same journal past the production retention bound while
+    // preserving its full inventory events. Fold the complete JSONL replay
+    // and compare it with the retained JSON report before pruning.
+    let snapshot_out = env.run_query(&["query", "--scan", &scan_id, "--format", "json"]);
+    assert_eq!(
+        snapshot_out.status.code(),
+        Some(0),
+        "snapshot: {}",
+        String::from_utf8_lossy(&snapshot_out.stderr)
+    );
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&snapshot_out.stdout).expect("JSON snapshot");
+    let inventory = w2b_fold_json(&snapshot);
+    let old_terminal = rows.last().expect("terminal row").clone();
+    let original_tip = old_terminal.seq;
+    let filler_count = repo_scan::scan_events::MAX_RETAINED_SCAN_EVENTS + 1;
+    rt.block_on(async {
+        use repo_scan::store::{NewScanEvent, Store, TursoStore, WriterBatch};
+        let store = TursoStore::open(&db).await.expect("open writer");
+        store
+            .connection()
+            .execute(
+                "DELETE FROM scan_events WHERE scan_id = ?1 AND seq = ?2",
+                vec![
+                    turso::Value::Text(scan_id.clone()),
+                    turso::Value::Integer(i64::try_from(original_tip).expect("tip i64")),
+                ],
+            )
+            .await
+            .expect("remove old terminal");
+        let mut batch = WriterBatch::new();
+        for index in 0..filler_count {
+            let seq = original_tip + index + 1;
+            let event = NewScanEvent {
+                scan_id: &scan_id,
+                seq,
+                catalog_rev: old_terminal.catalog_rev,
+                event_offset: old_terminal.event_offset + index,
+                event_type: "location_updated",
+                op: "replace",
+                reset: false,
+                records: b"{}",
+            };
+            if TursoStore::buffer_scan_event(&mut batch, &event).expect("buffer filler") {
+                store.flush(&mut batch).await.expect("flush fillers");
+            }
+        }
+        store
+            .flush(&mut batch)
+            .await
+            .expect("flush final filler batch");
+        let terminal_seq = original_tip + filler_count + 1;
+        store
+            .append_scan_event(&NewScanEvent {
+                scan_id: &scan_id,
+                seq: terminal_seq,
+                catalog_rev: old_terminal.catalog_rev,
+                event_offset: old_terminal.event_offset + filler_count,
+                event_type: &old_terminal.event_type,
+                op: &old_terminal.op,
+                reset: old_terminal.reset,
+                records: &old_terminal.records,
+            })
+            .await
+            .expect("append final terminal");
+        store.close().await.expect("close writer");
+    });
+
+    let full_replay = env.run_query(&["query", "--scan", &scan_id, "--format", "jsonl"]);
+    assert_eq!(
+        full_replay.status.code(),
+        Some(0),
+        "full replay: {}",
+        String::from_utf8_lossy(&full_replay.stderr)
+    );
+    let all_events = w2b_parse_jsonl(&full_replay.stdout);
+    let complete_fold = w2b_fold_replay(&all_events);
+    assert_eq!(
+        complete_fold.repos,
+        w2b_event_opaque_ids(&inventory.repos),
+        "full replay repositories match the snapshot's opaque ID projections"
+    );
+    assert_eq!(
+        complete_fold.checkouts,
+        w2b_event_opaque_ids(&inventory.checkouts),
+        "full replay checkouts match the snapshot's opaque ID projections"
+    );
+    assert_eq!(
+        complete_fold.branches,
+        w2b_event_opaque_branches(&inventory.branches),
+        "full replay branches match snapshot under opaque event IDs"
+    );
+    assert_eq!(
+        complete_fold.errors,
+        w2b_event_opaque_ids(&inventory.error_ids),
+        "full replay errors match the snapshot's opaque ID projections"
+    );
+
+    // Prune to the production bound. Cursorless replay and a cursor from
+    // the removed prefix must both fail before writing a retained tail.
     rt.block_on(async {
         use repo_scan::store::Store;
         let store = repo_scan::store::TursoStore::open(&db).await.expect("open");
+        let tip = original_tip + filler_count + 1;
+        let cutoff = tip - repo_scan::scan_events::MAX_RETAINED_SCAN_EVENTS;
         store
             .connection()
             .execute(
                 "DELETE FROM scan_events WHERE scan_id = ?1 AND seq <= ?2",
                 vec![
                     turso::Value::Text(scan_id.clone()),
-                    turso::Value::Integer(2),
+                    turso::Value::Integer(i64::try_from(cutoff).expect("cutoff i64")),
                 ],
             )
             .await
-            .expect("delete prefix");
+            .expect("delete retained prefix");
         store.close().await.expect("close");
     });
     let after = Cursor {
-        seq: expired.seq,
-        catalog_rev: expired.catalog_rev,
-        event_offset: expired.event_offset,
+        seq: rows[0].seq,
+        catalog_rev: rows[0].catalog_rev,
+        event_offset: rows[0].event_offset,
     }
     .encode();
     let resync = env.run_query(&[
@@ -648,15 +789,24 @@ fn w2b_mid_transaction_resume_and_expired_reset() {
     ]);
     assert_eq!(
         resync.status.code(),
-        Some(0),
-        "expired cursor is a snapshot: {}",
+        Some(1),
+        "expired cursor fails closed: {}",
         String::from_utf8_lossy(&resync.stderr)
     );
-    let tail = w2b_parse_jsonl(&resync.stdout);
-    assert_eq!(tail[0]["seq"], 3, "retained window replays");
-    assert_eq!(tail[0]["reset"], true, "explicit reset");
-    assert_eq!(tail.len(), rows.len() - 2, "whole retained window");
-    assert_eq!(tail.last().expect("last")["type"], "scan_completed");
+    assert!(
+        resync.stdout.is_empty(),
+        "no partial rows escape an expired replay"
+    );
+    let cursorless = env.run_query(&["query", "--scan", &scan_id, "--format", "jsonl"]);
+    assert_eq!(
+        cursorless.status.code(),
+        Some(1),
+        "cursorless replay fails closed"
+    );
+    assert!(
+        cursorless.stdout.is_empty(),
+        "no retained tail claims full inventory"
+    );
 }
 
 /// Case 17: every concurrent read of a live `--report` file is valid
@@ -1339,8 +1489,9 @@ fn w2b_follow_json_stays_rejected() {
 }
 
 /// `branch_batch` carries `comparison`/`ahead`/`behind` on every
-/// record, matching the final JSON branch-for-branch — including a
-/// counted `diverged` shape (never a zero default for unknown).
+/// record, matching the final JSON branch-for-branch under opaque event
+/// IDs — including a counted `diverged` shape (never a zero default for
+/// unknown).
 #[test]
 fn w2b_branch_batch_matches_final_json() {
     if !w2b_git_available() {
@@ -1376,8 +1527,9 @@ fn w2b_branch_batch_matches_final_json() {
     let events = w2b_parse_jsonl(&replay.stdout);
     let folded = w2b_fold_replay(&events);
     assert_eq!(
-        folded.branches, json.branches,
-        "branch_batch triples match the final JSON"
+        folded.branches,
+        w2b_event_opaque_branches(&json.branches),
+        "branch_batch triples match final JSON under opaque event IDs"
     );
     // Unknown counts are null, never zero.
     for e in &events {

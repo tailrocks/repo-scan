@@ -295,9 +295,12 @@ fn retest3_display_fails_closed_on_malformed() {
         redact_target_for_display("https://u:p@github.com/o/r?jwt=x#y"),
         "https://u:<redacted>@github.com/o/r"
     );
+    let scp = redact_target_for_display("EXACT2URLSCPCANARY04@github.com:o/r.git");
+    assert_eq!(scp, "<redacted>@github.com:o/r.git");
     assert_eq!(
-        redact_target_for_display("EXACT2URLSCPCANARY04@github.com:o/r.git"),
-        "<<redacted>@github.com:o/r.git"
+        redact_target_for_display(&scp),
+        scp,
+        "the redacted placeholder stays stable when sanitized again"
     );
 }
 

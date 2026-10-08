@@ -138,34 +138,46 @@ pub struct SnapshotEntry {
 /// unsafe stems are never candidates (never followed, never deleted).
 #[must_use]
 pub fn list_snapshot_entries(dir: &Path) -> Vec<SnapshotEntry> {
-    let mut out = Vec::new();
-    let Ok(read) = std::fs::read_dir(dir) else {
-        return out;
-    };
-    for entry in read.flatten() {
-        let path = entry.path();
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let Some(dir_handle) = open_snapshot_directory(dir) else {
+            return Vec::new();
         };
-        if !meta.is_file() || meta.file_type().is_symlink() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
+        let Some(entries) = enumerate_snapshot_entries(dir, &dir_handle) else {
+            return Vec::new();
         };
-        let Some(stem) = name.strip_suffix(".json") else {
-            continue;
-        };
-        if !is_safe_snapshot_stem(stem) {
-            continue;
-        }
-        out.push(SnapshotEntry {
-            id: stem.to_string(),
-            path,
-            modified: meta.modified().ok(),
-        });
+        entries.into_iter().map(|entry| entry.snapshot).collect()
     }
-    out
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let mut out = Vec::new();
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return out;
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !meta.is_file() || meta.file_type().is_symlink() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(stem) = name.strip_suffix(".json") else {
+                continue;
+            };
+            if is_safe_snapshot_stem(stem) {
+                out.push(SnapshotEntry {
+                    id: stem.to_string(),
+                    path,
+                    modified: meta.modified().ok(),
+                });
+            }
+        }
+        out
+    }
 }
 
 /// Mirror of the snapshot-ID filename gate (lib `check_report_id` plus
@@ -208,14 +220,227 @@ pub fn select_snapshot_victims(
 /// IDs so the caller can delete the matching catalog rows. Best-effort
 /// per file: an undeletable file is skipped, never fatal.
 pub fn prune_snapshot_files(dir: &Path, referenced: &HashSet<String>, keep: usize) -> Vec<String> {
-    let victims = select_snapshot_victims(list_snapshot_entries(dir), referenced, keep);
+    let Some(dir_handle) = open_snapshot_directory(dir) else {
+        return Vec::new();
+    };
+    let Some(entries) = enumerate_snapshot_entries(dir, &dir_handle) else {
+        return Vec::new();
+    };
+    let victims = select_snapshot_victims(
+        entries.iter().map(|entry| entry.snapshot.clone()).collect(),
+        referenced,
+        keep,
+    );
     let mut pruned = Vec::new();
     for victim in victims {
-        if std::fs::remove_file(&victim.path).is_ok() {
+        let Some(entry) = entries.iter().find(|entry| entry.snapshot.id == victim.id) else {
+            continue;
+        };
+        if remove_snapshot_entry(&dir_handle, entry) {
             pruned.push(victim.id);
         }
     }
     pruned
+}
+
+// Keep pruning bound to the directory opened here, even if another process
+// renames it and places a symlink at its old path. Linux and macOS support
+// handle-relative, no-follow operations; other platforms fail closed.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct PinnedSnapshotEntry {
+    snapshot: SnapshotEntry,
+    name: std::ffi::CString,
+    device: libc::dev_t,
+    inode: libc::ino_t,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_snapshot_directory(dir: &Path) -> Option<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: open returned a fresh owned descriptor.
+    Some(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn enumerate_snapshot_entries(
+    dir: &Path,
+    dir_handle: &std::fs::File,
+) -> Option<Vec<PinnedSnapshotEntry>> {
+    use std::ffi::CStr;
+    use std::os::fd::AsRawFd;
+
+    let stream_fd = unsafe { libc::dup(dir_handle.as_raw_fd()) };
+    if stream_fd < 0 {
+        return None;
+    }
+    // fdopendir owns stream_fd when it succeeds.
+    let stream = unsafe { libc::fdopendir(stream_fd) };
+    if stream.is_null() {
+        unsafe { libc::close(stream_fd) };
+        return None;
+    }
+    struct DirStream(*mut libc::DIR);
+    impl Drop for DirStream {
+        fn drop(&mut self) {
+            unsafe { libc::closedir(self.0) };
+        }
+    }
+    let stream = DirStream(stream);
+    let dir_fd = dir_handle.as_raw_fd();
+    let mut out = Vec::new();
+    loop {
+        set_errno(0);
+        let raw_entry = unsafe { libc::readdir(stream.0) };
+        if raw_entry.is_null() {
+            if get_errno() != 0 {
+                return None;
+            }
+            break;
+        }
+        // SAFETY: readdir returns an entry owned by the live DIR stream.
+        let name_bytes = unsafe { CStr::from_ptr((*raw_entry).d_name.as_ptr()) }.to_bytes();
+        let Ok(name) = std::str::from_utf8(name_bytes) else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(".json") else {
+            continue;
+        };
+        if !is_safe_snapshot_stem(stem) {
+            continue;
+        }
+        let name_c = std::ffi::CString::new(name_bytes).ok()?;
+        let mut metadata = unsafe { std::mem::zeroed::<libc::stat>() };
+        if unsafe {
+            libc::fstatat(
+                dir_fd,
+                name_c.as_ptr(),
+                &mut metadata,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+            || metadata.st_mode & libc::S_IFMT != libc::S_IFREG
+        {
+            continue;
+        }
+        out.push(PinnedSnapshotEntry {
+            snapshot: SnapshotEntry {
+                id: stem.to_string(),
+                path: dir.join(name),
+                modified: snapshot_mtime(&metadata),
+            },
+            name: name_c,
+            device: metadata.st_dev,
+            inode: metadata.st_ino,
+        });
+    }
+    Some(out)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn remove_snapshot_entry(dir_handle: &std::fs::File, entry: &PinnedSnapshotEntry) -> bool {
+    use std::os::fd::AsRawFd;
+
+    let mut current = unsafe { std::mem::zeroed::<libc::stat>() };
+    let dir_fd = dir_handle.as_raw_fd();
+    // Recheck the name without following it. A replaced file, symlink, or
+    // directory is left alone. unlinkat cannot be redirected by replacing
+    // the directory's old pathname.
+    if unsafe {
+        libc::fstatat(
+            dir_fd,
+            entry.name.as_ptr(),
+            &mut current,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+        || current.st_mode & libc::S_IFMT != libc::S_IFREG
+        || current.st_dev != entry.device
+        || current.st_ino != entry.inode
+    {
+        return false;
+    }
+    unsafe { libc::unlinkat(dir_fd, entry.name.as_ptr(), 0) == 0 }
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_mtime(metadata: &libc::stat) -> Option<std::time::SystemTime> {
+    system_time_from_parts(
+        metadata.st_mtim.tv_sec as i64,
+        metadata.st_mtim.tv_nsec as i64,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn snapshot_mtime(metadata: &libc::stat) -> Option<std::time::SystemTime> {
+    system_time_from_parts(metadata.st_mtime as i64, metadata.st_mtime_nsec as i64)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn system_time_from_parts(seconds: i64, nanoseconds: i64) -> Option<std::time::SystemTime> {
+    let total = i128::from(seconds) * 1_000_000_000 + i128::from(nanoseconds);
+    let magnitude = total.unsigned_abs();
+    let duration = Duration::new(
+        (magnitude / 1_000_000_000) as u64,
+        (magnitude % 1_000_000_000) as u32,
+    );
+    if total < 0 {
+        std::time::SystemTime::UNIX_EPOCH.checked_sub(duration)
+    } else {
+        std::time::SystemTime::UNIX_EPOCH.checked_add(duration)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_errno(value: i32) {
+    unsafe { *libc::__errno_location() = value };
+}
+
+#[cfg(target_os = "linux")]
+fn get_errno() -> i32 {
+    unsafe { *libc::__errno_location() }
+}
+
+#[cfg(target_os = "macos")]
+fn set_errno(value: i32) {
+    unsafe { *libc::__error() = value };
+}
+
+#[cfg(target_os = "macos")]
+fn get_errno() -> i32 {
+    unsafe { *libc::__error() }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+struct PinnedSnapshotEntry;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn open_snapshot_directory(_dir: &Path) -> Option<std::fs::File> {
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn enumerate_snapshot_entries(
+    _dir: &Path,
+    _dir_handle: &std::fs::File,
+) -> Option<Vec<PinnedSnapshotEntry>> {
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn remove_snapshot_entry(_dir_handle: &std::fs::File, _entry: &PinnedSnapshotEntry) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -299,5 +524,36 @@ mod tests {
             })
             .collect();
         assert!(select_snapshot_victims(entries, &HashSet::new(), 32).is_empty());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn pruning_does_not_follow_directory_or_entry_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let external = root.path().join("external");
+        std::fs::create_dir(&external).unwrap();
+        let external_file = external.join("outside.json");
+        std::fs::write(&external_file, b"outside").unwrap();
+        let linked_dir = root.path().join("snapshots-link");
+        symlink(&external, &linked_dir).unwrap();
+
+        assert!(prune_snapshot_files(&linked_dir, &HashSet::new(), 0).is_empty());
+        assert!(external_file.exists());
+
+        let snapshots = root.path().join("snapshots");
+        std::fs::create_dir(&snapshots).unwrap();
+        let candidate = snapshots.join("candidate.json");
+        std::fs::write(&candidate, b"snapshot").unwrap();
+        let linked_entry = snapshots.join("linked.json");
+        symlink(&candidate, &linked_entry).unwrap();
+
+        assert_eq!(
+            prune_snapshot_files(&snapshots, &HashSet::new(), 0),
+            vec!["candidate".to_string()]
+        );
+        assert!(std::fs::symlink_metadata(&linked_entry).is_ok());
+        assert!(!candidate.exists());
     }
 }

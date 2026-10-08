@@ -28,7 +28,7 @@ async fn build_v1_catalog(db: &std::path::Path) {
         .connect()
         .expect("turso connect");
     let chain = repo_scan::store::migrations();
-    assert!(chain.len() >= 7, "v7 chain wired");
+    assert!(chain.len() >= 8, "v8 chain wired");
     assert_eq!(chain[0].version, 1);
     conn.execute_batch(chain[0].sql).await.expect("v1 sql");
     conn.execute(
@@ -68,14 +68,14 @@ async fn build_v1_catalog(db: &std::path::Path) {
 }
 
 #[test]
-fn fresh_open_is_v7_with_working_tables() {
+fn fresh_open_is_v8_with_working_tables() {
     let rt = runtime();
     rt.block_on(async {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("catalog.db");
         let store = TursoStore::open(&db).await.expect("open");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 7);
-        assert_eq!(store.schema_version().expect("version"), 7);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 8);
+        assert_eq!(store.schema_version().expect("version"), 8);
 
         // v2 request columns persist through the extended insert.
         let now = now_ms();
@@ -124,6 +124,19 @@ fn fresh_open_is_v7_with_working_tables() {
             .await
             .expect("append");
         assert!(appended);
+        store
+            .connection()
+            .execute(
+                "INSERT INTO scan_event_dedupe (scan_id, dedupe_kind, event_id) \
+                    VALUES (?1, ?2, ?3)",
+                vec![
+                    turso::Value::Text("scan-v2".to_string()),
+                    turso::Value::Text("repository_found".to_string()),
+                    turso::Value::Text("evt:marker".to_string()),
+                ],
+            )
+            .await
+            .expect("v8 dedupe marker table");
         store.close().await.expect("close");
     });
 }
@@ -137,7 +150,7 @@ fn v1_catalog_upgrades_preserving_v1_rows() {
         build_v1_catalog(&db).await;
 
         let store = TursoStore::open(&db).await.expect("open upgrades");
-        assert_eq!(store.schema_version().expect("version"), 7);
+        assert_eq!(store.schema_version().expect("version"), 8);
 
         // v1 rows survive byte-identical; v2..v7 columns read NULL (legacy).
         let scan = store.get_scan("scan-v1").await.expect("get").expect("row");
@@ -179,9 +192,9 @@ fn v1_catalog_upgrades_preserving_v1_rows() {
             .expect("append"));
         store.close().await.expect("close");
 
-        // Reopen is idempotent: still v7, rows intact.
+        // Reopen is idempotent: still v8, rows intact.
         let store = TursoStore::open(&db).await.expect("reopen");
-        assert_eq!(store.schema_version().expect("version"), 7);
+        assert_eq!(store.schema_version().expect("version"), 8);
         assert!(store.get_scan("scan-v1").await.expect("get").is_some());
         assert_eq!(store.last_event_seq("scan-v1").await.expect("seq"), Some(1));
         store.close().await.expect("close");

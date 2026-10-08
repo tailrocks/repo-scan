@@ -1996,6 +1996,158 @@ fn prior_running_scan_recovery_snapshot_survives_retention() {
     });
 }
 
+/// A failed publication remains retryable after more than 32 newer reports
+/// are staged. Resume must publish the exact saved snapshot bytes.
+#[test]
+fn failed_unpublished_snapshot_survives_retention_and_resume_retries_bytes() {
+    use repo_scan::store::{now_ms, NewScan, TursoStore};
+
+    let env = Env::new();
+    let seed_dest = env.cwd_a.join("seed.json");
+    let seed_dest_s = seed_dest.to_str().expect("seed path");
+    let seed = env.scan(&["--report", seed_dest_s], &env.cwd_a);
+    assert_eq!(
+        seed.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&seed)
+    );
+    let mut failed_report = read_report(&seed_dest);
+
+    let scan_id = "failed-retention-retry";
+    let report_id = repo_scan::config::report_id_for_scan(scan_id);
+    failed_report["report_id"] = report_id.clone().into();
+    failed_report["scan"]["id"] = scan_id.into();
+    let saved_bytes = serde_json::to_vec(&failed_report).expect("saved report JSON");
+    let snapshot =
+        repo_scan::config::snapshot_path(&env.state, &report_id).expect("failed snapshot path");
+    std::fs::write(&snapshot, &saved_bytes).expect("write failed snapshot");
+
+    let destination = env.cwd_a.join("retry.json");
+    let destination_bytes = repo_scan::config::path_as_bytes(&destination);
+    let canonical = repo_scan::identity::normalize_github_url(URL).expect("canonical URL");
+    let catalog_rev = failed_report["scan"]["catalog_revision"]
+        .as_u64()
+        .expect("catalog revision");
+    let generation = failed_report["scan"]["generation"]
+        .as_u64()
+        .expect("generation");
+    let schema_version = failed_report["schema_version"]
+        .as_str()
+        .expect("schema version")
+        .to_string();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let store = TursoStore::open(&env.state.join("payload").join("catalog.db"))
+            .await
+            .expect("open catalog");
+        assert!(store
+            .create_scan_request(
+                &NewScan {
+                    id: scan_id,
+                    url_raw: URL.as_bytes(),
+                    url_canonical: Some(canonical.as_bytes()),
+                    scope: "roots",
+                    status_mode: "summary",
+                    report_dest: Some(&destination_bytes),
+                    targets_json: None,
+                    format: Some("json"),
+                    all_targets: Some(false),
+                    fetch: Some(false),
+                    workers: None,
+                },
+                now_ms(),
+            )
+            .await
+            .expect("create failed scan"));
+        store
+            .update_scan_state(
+                scan_id,
+                "failed",
+                Some(&repo_scan::config::encode_outcome(
+                    1,
+                    Some(0),
+                    &report_id,
+                    false,
+                    Some(generation),
+                )),
+                None,
+                now_ms(),
+            )
+            .await
+            .expect("record failed publication");
+        assert!(store
+            .save_report_snapshot(
+                &report_id,
+                &schema_version,
+                catalog_rev,
+                generation,
+                "failed",
+                None,
+                now_ms(),
+            )
+            .await
+            .expect("catalog failed snapshot"));
+        store.close().await.expect("close catalog");
+    });
+
+    // Make the unpublished snapshot older than the ordinary 32-file window.
+    for n in 0..=repo_scan::report::output::MAX_RETAINED_SNAPSHOTS {
+        let id = format!("retry-filler-{n:03}");
+        let path = repo_scan::config::snapshot_path(&env.state, &id).expect("filler path");
+        std::fs::write(path, &saved_bytes).expect("write filler snapshot");
+    }
+
+    let active = env.scan(&["--force-rescan"], &env.cwd_a);
+    assert_eq!(
+        active.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&active)
+    );
+    assert!(
+        snapshot.is_file(),
+        "failed unpublished snapshot survives pruning"
+    );
+
+    let retry = run(
+        &["resume", scan_id, "--format", "json"],
+        &env.cwd_b,
+        &env.state,
+    );
+    assert_eq!(
+        retry.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&retry)
+    );
+    let output: serde_json::Value = serde_json::from_slice(&retry.stdout).expect("JSON output");
+    assert_eq!(output["report_id"], report_id);
+    assert_eq!(
+        std::fs::read(&destination).expect("published bytes"),
+        saved_bytes
+    );
+    rt.block_on(async {
+        let store = TursoStore::open(&env.state.join("payload").join("catalog.db"))
+            .await
+            .expect("reopen catalog");
+        let row = store
+            .get_scan(scan_id)
+            .await
+            .expect("get scan")
+            .expect("row");
+        assert_eq!(row.state, "complete");
+        assert!(row
+            .outcome
+            .as_deref()
+            .and_then(repo_scan::config::parse_outcome)
+            .is_some_and(|outcome| outcome.published));
+        store.close().await.expect("close catalog");
+    });
+}
+
 /// Goal Step 12 (D4): a discovery scan journals one `repository_found`
 /// per local store and one `location_found` per checkout — each exactly
 /// once, each before `inventory_ready`, each store before its checkouts,

@@ -267,7 +267,7 @@ fn report_remote_urls_cap_huge_fields() {
             canonical_url: Some("https://example.com/owner/repo".to_string()),
             event_volume_ids: Vec::new(),
             targets: vec![],
-            scope: "roots".to_string(),
+            scope: "machine".to_string(),
             scan_state: "complete".to_string(),
             started_at_ms: now,
             finished_at_ms: Some(now),

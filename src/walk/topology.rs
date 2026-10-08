@@ -320,8 +320,16 @@ pub(crate) fn bounded_canonicalize(path: &Path) -> Option<Result<PathBuf, std::i
 fn bounded_canonicalize_with(
     resolve: impl FnOnce() -> Option<PathBuf> + Send + 'static,
 ) -> Option<PathBuf> {
-    bounded_identity_io(resolve).flatten()
+    // Keep this regression isolated from other unit tests that use the
+    // process-wide production budget in parallel. It still exercises the
+    // same admission and worker-lifetime logic with the production cap and
+    // timeouts.
+    IDENTITY_IO_CALLS.fetch_add(1, Ordering::Relaxed);
+    bounded_identity_io_on(&TEST_IDENTITY_IO_LIVE, resolve).flatten()
 }
+
+#[cfg(test)]
+static TEST_IDENTITY_IO_LIVE: AtomicUsize = AtomicUsize::new(0);
 
 /// Run blocking identity I/O (`canonicalize`/`metadata`) on a worker
 /// thread with bounded admission plus a timeout. `None` means the slot
@@ -333,11 +341,24 @@ where
     T: Send + 'static,
 {
     IDENTITY_IO_CALLS.fetch_add(1, Ordering::Relaxed);
+    bounded_identity_io_on(&IDENTITY_IO_LIVE, op)
+}
+
+/// Shared admission and timeout implementation. The test seam uses a
+/// private counter so parallel tests cannot consume part of the production
+/// process-wide cap while its assertions are running.
+fn bounded_identity_io_on<T>(
+    live_count: &'static AtomicUsize,
+    op: impl FnOnce() -> T + Send + 'static,
+) -> Option<T>
+where
+    T: Send + 'static,
+{
     let start = Instant::now();
     let admitted = loop {
-        let live = IDENTITY_IO_LIVE.load(Ordering::Relaxed);
+        let live = live_count.load(Ordering::Relaxed);
         if live < IDENTITY_IO_CAP
-            && IDENTITY_IO_LIVE
+            && live_count
                 .compare_exchange_weak(live, live + 1, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
         {
@@ -351,10 +372,10 @@ where
     if !admitted {
         return None;
     }
-    struct SlotGuard;
-    impl Drop for SlotGuard {
+    struct CountGuard(&'static AtomicUsize);
+    impl Drop for CountGuard {
         fn drop(&mut self) {
-            IDENTITY_IO_LIVE.fetch_sub(1, Ordering::Relaxed);
+            self.0.fetch_sub(1, Ordering::Relaxed);
         }
     }
     // R1: the permit is owned by the detached worker, not the caller.
@@ -368,7 +389,7 @@ where
     if std::thread::Builder::new()
         .name(String::from("identity-io"))
         .spawn({
-            let guard = SlotGuard;
+            let guard = CountGuard(live_count);
             move || {
                 let _held = guard;
                 let _ = tx.send(op());
@@ -1303,7 +1324,7 @@ mod tests {
     /// exceeding the cap), and the count drains once the workers exit.
     #[test]
     fn identity_io_timeout_abandons_wait_not_cap() {
-        let baseline = IDENTITY_IO_LIVE.load(Ordering::Relaxed);
+        let baseline = TEST_IDENTITY_IO_LIVE.load(Ordering::Relaxed);
         let mut releases = Vec::new();
         let mut callers = Vec::new();
         for _ in 0..IDENTITY_IO_CAP {
@@ -1323,20 +1344,21 @@ mod tests {
         }
         // Both workers are blocked inside `op()` while their callers sit
         // in `recv_timeout`: the cap is fully charged.
-        assert!(IDENTITY_IO_LIVE.load(Ordering::Relaxed) >= baseline + IDENTITY_IO_CAP);
+        assert!(TEST_IDENTITY_IO_LIVE.load(Ordering::Relaxed) >= baseline + IDENTITY_IO_CAP);
         // Every caller abandons its wait at the timeout ...
         for caller in callers {
             assert_eq!(caller.join().expect("caller joins"), None);
         }
         // ... but the stalled workers still hold the cap (pre-fix code
         // dropped the caller-owned guard here and fell back to baseline).
-        assert!(IDENTITY_IO_LIVE.load(Ordering::Relaxed) >= baseline + IDENTITY_IO_CAP);
+        assert!(TEST_IDENTITY_IO_LIVE.load(Ordering::Relaxed) >= baseline + IDENTITY_IO_CAP);
         // Releasing the workers drains the cap back to baseline: no leak.
         drop(releases);
         let drain_by = Instant::now() + Duration::from_secs(10);
-        while IDENTITY_IO_LIVE.load(Ordering::Relaxed) != baseline && Instant::now() < drain_by {
+        while TEST_IDENTITY_IO_LIVE.load(Ordering::Relaxed) != baseline && Instant::now() < drain_by
+        {
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(IDENTITY_IO_LIVE.load(Ordering::Relaxed), baseline);
+        assert_eq!(TEST_IDENTITY_IO_LIVE.load(Ordering::Relaxed), baseline);
     }
 }

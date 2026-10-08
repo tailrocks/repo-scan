@@ -43,6 +43,7 @@ impl Op {
 pub enum EventType {
     ScanStarted,
     DiscoveryProgress,
+    DiscoveryProgressUpdated,
     LocationFound,
     RepositoryFound,
     InventoryReady,
@@ -72,6 +73,7 @@ impl EventType {
             | EventType::CoverageUpdated
             | EventType::RemoteUpdated => Op::Replace,
             EventType::ScanStarted
+            | EventType::DiscoveryProgressUpdated
             | EventType::LocationFound
             | EventType::RepositoryFound
             | EventType::InventoryReady
@@ -90,6 +92,7 @@ impl EventType {
         match self {
             EventType::ScanStarted => "scan_started",
             EventType::DiscoveryProgress => "discovery_progress",
+            EventType::DiscoveryProgressUpdated => "discovery_progress_updated",
             EventType::LocationFound => "location_found",
             EventType::RepositoryFound => "repository_found",
             EventType::InventoryReady => "inventory_ready",
@@ -106,9 +109,9 @@ impl EventType {
     }
 }
 
-/// True only for [`EventType::DiscoveryProgress`] (contract D4: progress
-/// events coalesce to newest per scan; record/error events are never
-/// silently dropped).
+/// True only for the coalesced [`EventType::DiscoveryProgress`] gauge.
+/// [`EventType::DiscoveryProgressUpdated`] notifications are append-only
+/// cursor advances and are not coalesced.
 #[must_use]
 pub fn is_progress_coalescible(t: EventType) -> bool {
     matches!(t, EventType::DiscoveryProgress)
@@ -145,8 +148,8 @@ pub fn is_terminal_name(name: &str) -> bool {
 ///
 /// Wire shape is `{schema_version, scan_id, seq, catalog_rev, type, op,
 /// records}` plus `event_offset` (journal offset inside `catalog_rev`) and
-/// `reset` (true when the consumer must drop buffered state, e.g. cursor
-/// outside retention → fresh snapshot). `event_type` serializes as `type`
+/// `reset` (true when the consumer must drop buffered state before applying
+/// a complete replay). `event_type` serializes as `type`
 /// per D4. Events are sent only after their Catalog transaction commits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
@@ -194,9 +197,9 @@ impl Envelope {
 /// event offset)`.
 ///
 /// Replay rules (D4): a snapshot cursor is the exact end of the included
-/// changes; a cursor outside retention yields a fresh snapshot with
-/// `reset:true`; duplicate delivery of the same `seq` is idempotent and
-/// consumers dedupe by `seq`.
+/// changes; a cursor outside retention requests a reset, which the CLI can
+/// serve only when the full event prefix remains available; duplicate
+/// delivery of the same `seq` is idempotent and consumers dedupe by `seq`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cursor {
     pub seq: u64,
@@ -213,7 +216,7 @@ impl Cursor {
     }
 
     /// Decode a cursor produced by [`Cursor::encode`]; corrupt input yields
-    /// `None` (callers then fall back to fresh snapshot + `reset:true`).
+    /// `None` so callers can report a usage error.
     #[must_use]
     pub fn decode(s: &str) -> Option<Self> {
         let bytes = b64url_decode(s)?;
@@ -236,8 +239,9 @@ impl Cursor {
 /// The writer keeps the newest [`MAX_RETAINED_SCAN_EVENTS`] rows per scan
 /// (position-based prefix prune; the tip row always survives, so a
 /// finished scan's terminal event is never pruned). A cursor the retained
-/// window no longer covers yields an explicit-reset snapshot, never a
-/// silent resume ([`classify_cursor`]).
+/// window no longer covers requests a reset. Replay fails closed when prefix
+/// retention removed events needed to rebuild the full state
+/// ([`classify_cursor`]).
 pub const MAX_RETAINED_SCAN_EVENTS: u64 = 50_000;
 
 /// Prune cutoff for [`MAX_RETAINED_SCAN_EVENTS`]: delete retained rows
@@ -259,9 +263,9 @@ pub enum ResumeAction {
     /// The cursor points at a terminal event; the stream must stop there.
     /// A terminal cursor is never a valid point from which to resume rows.
     StopAtTerminal,
-    /// Retained events no longer cover the cursor: replay the retained
-    /// window from its start with `reset:true` on the first envelope, so
-    /// the consumer drops buffered state instead of silently skipping.
+    /// Retained events no longer cover the cursor: the caller must reset
+    /// from a complete state source. The CLI fails closed when prefix
+    /// retention means the remaining event rows cannot rebuild that state.
     ResetSnapshot,
 }
 
@@ -269,7 +273,7 @@ pub enum ResumeAction {
 /// `seq` (`None` when no row carries that seq).
 ///
 /// - No row (pruned prefix, beyond-tip cursor, or empty journal) →
-///   [`ResumeAction::ResetSnapshot`]: resync, never silent.
+///   [`ResumeAction::ResetSnapshot`]: request a resync, never silently skip.
 /// - Row found and [`is_progress_coalescible`] → `ResumeAfterCursor`: a
 ///   coalescible row is a gauge, never divergence — the caller resumes
 ///   after the *cursor's* position, so records journaled around it are
@@ -365,12 +369,17 @@ fn b64url_decode(s: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    const ALL_TYPES: [(EventType, Op, &str); 14] = [
+    const ALL_TYPES: [(EventType, Op, &str); 15] = [
         (EventType::ScanStarted, Op::Add, "scan_started"),
         (
             EventType::DiscoveryProgress,
             Op::Replace,
             "discovery_progress",
+        ),
+        (
+            EventType::DiscoveryProgressUpdated,
+            Op::Add,
+            "discovery_progress_updated",
         ),
         (EventType::LocationFound, Op::Add, "location_found"),
         (EventType::RepositoryFound, Op::Add, "repository_found"),

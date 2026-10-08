@@ -5113,6 +5113,64 @@ impl TursoStore {
         Ok(rows == 1)
     }
 
+    /// Append a terminal scan event and delete that scan's dedupe markers
+    /// in one transaction. A committed terminal is replay-once and blocks
+    /// later event emission, so its per-record dedupe keys are no longer
+    /// needed. If either statement fails, both changes roll back.
+    pub async fn append_terminal_scan_event(
+        &self,
+        event: &NewScanEvent<'_>,
+    ) -> crate::Result<bool> {
+        self.forbid_write("append_terminal_scan_event")?;
+        if !crate::scan_events::is_terminal_name(event.event_type) {
+            return Err(Error::InvalidArgs(format!(
+                "{} is not a terminal scan event",
+                event.event_type
+            )));
+        }
+        let scan_id = event.scan_id.to_string();
+        let insert_scan_id = scan_id.clone();
+        let seq = v_int(u64_to_i64(event.seq, "event seq")?);
+        let catalog_rev = v_int(u64_to_i64(event.catalog_rev, "event catalog_rev")?);
+        let event_offset = v_int(u64_to_i64(event.event_offset, "event offset")?);
+        let event_type = event.event_type.to_string();
+        let op = event.op.to_string();
+        let reset = v_int(i64::from(event.reset));
+        let records = v_blob(event.records.to_vec());
+
+        self.with_tx(move |conn| async move {
+            let inserted = conn
+                .execute(
+                    "INSERT OR IGNORE INTO scan_events (scan_id, seq, catalog_rev, event_offset, \
+                        event_type, op, reset, records) \
+                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    vec![
+                        v_text(insert_scan_id),
+                        seq,
+                        catalog_rev,
+                        event_offset,
+                        v_text(event_type),
+                        v_text(op),
+                        reset,
+                        records,
+                    ],
+                )
+                .await
+                .map_err(store_err)?
+                == 1;
+            if inserted {
+                conn.execute(
+                    "DELETE FROM scan_event_dedupe WHERE scan_id = ?1",
+                    vec![v_text(scan_id)],
+                )
+                .await
+                .map_err(store_err)?;
+            }
+            Ok(inserted)
+        })
+        .await
+    }
+
     /// v2: buffer one scan-event journal row into a writer batch (D4),
     /// committing atomically with the instance/checkout rows that caused
     /// it. Same `INSERT OR IGNORE` by `(scan_id, seq)` as

@@ -83,8 +83,9 @@ Gate record: `docs/GATE_DECISION.md` (do not edit).
    past the threshold (`src/main.rs`); the PERF-02/03 gate harness lives
    in `benches/perf_gates.rs`, asserted by `tests/accept_perf.rs`.
 7. **Reports.** Draft 2020-12 schema at `schemas/report-v1.5.schema.json`
-   (`schema_version` `1.4.0`: branch comparison/ahead/behind over 1.3.0
-   status vocabulary over 1.2.0 freshness over 1.1.0); illustrative
+   (`schema_version` `1.5.0`: normalized groups and derived totals over
+   1.4.0 branch comparison/ahead/behind over 1.3.0 status vocabulary over
+   1.2.0 freshness); illustrative
    example at `tests/data/example-report.json`. The binary stages
    through the lib pipeline: stream from the store, verify, retain an
    immutable snapshot, then atomic publish (`src/main.rs`,
@@ -106,10 +107,13 @@ Gate record: `docs/GATE_DECISION.md` (do not edit).
    per `docs/GOAL_CONTRACTS.md` D4. Events journal to the catalog
    (migration v2 `scan_events`, newest 50,000 rows per scan) only after
    their transaction commits; `discovery_progress` coalesces write-side
-   to one newest-payload row. Catalog is at migration v6
-   (`src/store/schema_v2.rs` … `schema_v6.rs`): `github_groups` journal
+   to one newest-payload row. Catalog is at migration v8
+   (`src/store/schema_v2.rs` … `schema_v8.rs`): `github_groups` journal
    + scope key (v2), `--fetch` (v3), `--workers` (v4), status
-   conflicts/working-state (v5), branch comparison/ahead/behind (v6).
+   conflicts/working-state (v5), branch comparison/ahead/behind (v6), and
+   durable `scan_requests.inventory_ready_seq` metadata retained separately
+   from the prunable scan-event journal prefix (v7), and scan-event dedupe
+   keys retained outside that prefix (v8).
 
 ## Shipped hardening (not in the Phase-1 sketch)
 

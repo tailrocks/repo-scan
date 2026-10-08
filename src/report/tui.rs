@@ -1337,7 +1337,7 @@ impl TuiSnapshot {
                     self.header.target = safe_tui_target(&target);
                 }
             }
-            EventType::DiscoveryProgress => {
+            EventType::DiscoveryProgress | EventType::DiscoveryProgressUpdated => {
                 if let Some(phase) = json_str(&env.records, "phase") {
                     self.header.phase = phase;
                 }

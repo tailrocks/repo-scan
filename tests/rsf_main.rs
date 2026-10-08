@@ -1346,12 +1346,10 @@ fn buffered_error_detail_is_scrubbed_in_catalog_and_journal() {
             serde_json::from_slice(&event.records).expect("parse event records");
         let journal_detail = records["detail"].as_str().expect("detail");
 
-        for saved in [error.detail.as_str(), journal_detail] {
-            assert!(!saved.contains("ghp_R5T1JOURNALUSER"));
-            assert!(!saved.contains("journal-secret"));
-            assert!(!saved.contains("query-secret"));
-            assert!(saved.contains("fetch failed"));
-        }
-        assert_eq!(error.detail, journal_detail);
+        assert!(!error.detail.contains("ghp_R5T1JOURNALUSER"));
+        assert!(!error.detail.contains("journal-secret"));
+        assert!(!error.detail.contains("query-secret"));
+        assert!(error.detail.contains("fetch failed"));
+        assert_eq!(journal_detail, "diagnostic details omitted for privacy");
     });
 }

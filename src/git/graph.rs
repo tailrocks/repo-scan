@@ -37,8 +37,9 @@
 //!
 //! [`ComparisonCache`] reuses saved graph results for equal OID pairs
 //! within a compatible object database: the key is
-//! `(store-id, oid-a, oid-b, algo)` — same store (same common dir),
-//! ordered tips (ahead/behind are directional), explicit algorithm.
+//! `(store-id, replace-context, oid-a, oid-b, algo)` — same store
+//! (same common dir), effective replace-ref settings, ordered tips
+//! (ahead/behind are directional), explicit algorithm.
 //! Only successful count pairs are cached; `error`/`incomplete_history`
 //! are recomputed (object stores change under fetch/GC). Bounded
 //! ([`MAX_GRAPH_CACHE_ENTRIES`], FIFO eviction).
@@ -169,7 +170,8 @@ impl Comparison {
     }
 }
 
-/// Cache key: `(store-id, oid-a, oid-b, algo)`.
+/// Cache key: store id, effective replacement settings, replacement-ref
+/// presence, ordered OIDs, and object algorithm.
 ///
 /// Store-id pins the object database (same common dir ⇒ same objects);
 /// tips are ordered (ahead/behind are directional: swapping tips
@@ -178,6 +180,9 @@ impl Comparison {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CacheKey {
     store_id: String,
+    use_replace_refs: Option<bool>,
+    replace_ref_base: Option<String>,
+    replacement_refs_present: bool,
     oid_a_hex: String,
     oid_b_hex: String,
     algo: String,
@@ -329,6 +334,45 @@ fn control_file_bytes(path: &Path) -> ControlFile {
     }
 }
 
+/// True when a replacement ref exists or its absence cannot be proven.
+/// This check is intentionally conservative: packed refs are bounded and
+/// any loose entry under the configured namespace triggers the safe Git
+/// fallback (including nested/empty directories).
+fn replacement_refs_may_exist(common_dir: &Path, base: &str) -> bool {
+    let base_path = Path::new(base);
+    if !base.starts_with("refs/")
+        || !base.ends_with('/')
+        || base_path.is_absolute()
+        || base_path
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return true;
+    }
+    let ref_dir = common_dir.join(base.trim_end_matches('/'));
+    match std::fs::symlink_metadata(&ref_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return true,
+        Ok(metadata) if !metadata.file_type().is_dir() => return true,
+        Ok(_) => match std::fs::read_dir(&ref_dir) {
+            Ok(mut entries) => match entries.next() {
+                Some(Ok(_)) => return true,
+                None => {}
+                Some(Err(_)) => return true,
+            },
+            Err(_) => return true,
+        },
+    }
+    match control_file_bytes(&common_dir.join("packed-refs")) {
+        ControlFile::Missing => false,
+        ControlFile::Unknown => true,
+        ControlFile::Read(bytes) => bytes.split(|byte| *byte == b'\n').any(|line| {
+            line.windows(base.len())
+                .any(|window| window == base.as_bytes())
+        }),
+    }
+}
+
 fn trim_ascii_bytes(mut bytes: &[u8]) -> &[u8] {
     while bytes.first().is_some_and(u8::is_ascii_whitespace) {
         bytes = &bytes[1..];
@@ -363,6 +407,13 @@ pub struct CompareContext<'a> {
     /// Store id (common-dir identity); pins the cache key to this
     /// object database.
     pub store_id: &'a str,
+    /// Effective replacement behavior of the owning checkout. These
+    /// values are also applied to gix's isolated config so worktree-local
+    /// `core.useReplaceRefs` is honored for linked checkouts.
+    pub use_replace_refs: Option<bool>,
+    /// Effective `gitoxide.objects.replaceRefBase`; `None` uses gix's
+    /// default when no repository-local override was resolved.
+    pub replace_ref_base: Option<&'a str>,
     /// Working-tree root for fallback spawns, when any.
     pub work_tree: Option<&'a Path>,
     /// Shared result cache, if reuse is wanted.
@@ -460,8 +511,15 @@ pub fn compare_oids(
     if local_hex.eq_ignore_ascii_case(upstream_hex) {
         return Comparison::from_counts(0, 0);
     }
+    let replacement_refs_present = replacement_refs_may_exist(
+        ctx.common_dir,
+        ctx.replace_ref_base.unwrap_or("refs/replace/"),
+    );
     let key = CacheKey {
         store_id: ctx.store_id.to_string(),
+        use_replace_refs: ctx.use_replace_refs,
+        replace_ref_base: ctx.replace_ref_base.map(str::to_owned),
+        replacement_refs_present,
         oid_a_hex: local_hex.to_ascii_lowercase(),
         oid_b_hex: upstream_hex.to_ascii_lowercase(),
         algo: algo.to_string(),
@@ -471,13 +529,44 @@ pub fn compare_oids(
             return Comparison::from_counts(ahead, behind);
         }
     }
+    // The primary gix revision walker does not consistently apply
+    // replacement parents during graph traversal and does not consistently
+    // apply per-worktree replacement settings. When replacement refs are
+    // present (or their absence cannot be ruled out), use installed Git's
+    // rev-list in the owning checkout. If no safe fallback exists, keep the
+    // comparison pending instead of publishing ancestry under a guessed
+    // replacement policy.
+    if replacement_refs_present {
+        let use_replace_refs = match ctx.use_replace_refs {
+            Some(enabled) => enabled,
+            None => return Comparison::pending(),
+        };
+        let replace_ref_base = ctx.replace_ref_base.unwrap_or("refs/replace/");
+        // Git's rev-list only implements the standard replacement-ref
+        // namespace. A gix-specific custom namespace cannot be reproduced
+        // by the fallback, so avoid claiming counts for it.
+        if use_replace_refs && replace_ref_base != "refs/replace/" {
+            return Comparison::pending();
+        }
+        return if ctx.fallback.is_some() {
+            fallback_counts(
+                ctx,
+                local_hex,
+                upstream_hex,
+                shallow_present(ctx.git_dir, ctx.common_dir),
+                key.as_ref(),
+            )
+        } else {
+            Comparison::pending()
+        };
+    }
     // Grafts are unreadable to gix 0.88: refuse before the primary
     // can produce graft-ignorant counts.
     if grafts_present(ctx.git_dir, ctx.common_dir) {
         return Comparison::incomplete_history();
     }
     let shallow_file = shallow_present(ctx.git_dir, ctx.common_dir);
-    match open_isolated(ctx.git_dir) {
+    match open_isolated(ctx.git_dir, ctx.use_replace_refs, ctx.replace_ref_base) {
         Ok(repo) => match walk_counts(&repo, local_hex, upstream_hex, ctx.cancel) {
             Ok(WalkOutcome::Counts(ahead, behind)) => {
                 if let Some(cache) = ctx.cache {
@@ -537,14 +626,28 @@ enum WalkError {
 /// Isolated exact-path open mirroring the inspector's opener
 /// (includes disabled, no operator scope): normal attempt, then
 /// `open_path_as_is` for arbitrarily named bare stores.
-fn open_isolated(path: &Path) -> crate::Result<gix::Repository> {
+fn open_isolated(
+    path: &Path,
+    use_replace_refs: Option<bool>,
+    replace_ref_base: Option<&str>,
+) -> crate::Result<gix::Repository> {
     let permissions = gix::open::Permissions::isolated();
-    let options = gix::open::Options::default().permissions(permissions);
+    let mut config_overrides = Vec::new();
+    if let Some(enabled) = use_replace_refs {
+        config_overrides.push(format!("core.useReplaceRefs={enabled}"));
+    }
+    if let Some(base) = replace_ref_base {
+        config_overrides.push(format!("gitoxide.objects.replaceRefBase={base}"));
+    }
+    let options = gix::open::Options::default()
+        .permissions(permissions)
+        .config_overrides(config_overrides.clone());
     match gix::ThreadSafeRepository::open_opts(path.to_path_buf(), options) {
         Ok(repo) => Ok(repo.to_thread_local()),
         Err(first) => {
             let options = gix::open::Options::default()
                 .permissions(permissions)
+                .config_overrides(config_overrides)
                 .open_path_as_is(true);
             gix::ThreadSafeRepository::open_opts(path.to_path_buf(), options)
                 .map(|repo| repo.to_thread_local())
@@ -663,24 +766,50 @@ fn fallback_counts(
     shallow_file: bool,
     key: CacheKeyRef<'_>,
 ) -> Comparison {
-    let Some(fallback) = ctx.fallback else {
-        return Comparison::error();
-    };
     if ctx.cancel.is_some_and(|cancel| cancel.cancelled()) {
         return Comparison::error();
     }
     if shallow_file {
         return Comparison::incomplete_history();
     }
-    let result = match ctx.cancel {
-        Some(cancel) => fallback.rev_list_count_cancel(
+    // Git's rev-list cannot select gix's custom replacement-ref namespace.
+    // Even when that namespace is empty, standard refs/replace entries may
+    // exist and would change the fallback's ancestry. Keep the result
+    // pending unless replacements are explicitly disabled or gix uses the
+    // standard namespace Git supports.
+    let replace_ref_base = ctx.replace_ref_base.unwrap_or("refs/replace/");
+    if ctx.use_replace_refs != Some(false) && replace_ref_base != "refs/replace/" {
+        return Comparison::pending();
+    }
+    let Some(fallback) = ctx.fallback else {
+        return Comparison::error();
+    };
+    let result = match (ctx.cancel, ctx.use_replace_refs) {
+        (Some(cancel), Some(enabled)) => fallback.rev_list_count_with_replace_refs_cancel(
+            ctx.git_dir,
+            ctx.work_tree,
+            local_hex,
+            upstream_hex,
+            enabled,
+            cancel,
+        ),
+        (None, Some(enabled)) => fallback.rev_list_count_with_replace_refs(
+            ctx.git_dir,
+            ctx.work_tree,
+            local_hex,
+            upstream_hex,
+            enabled,
+        ),
+        (Some(cancel), None) => fallback.rev_list_count_cancel(
             ctx.git_dir,
             ctx.work_tree,
             local_hex,
             upstream_hex,
             cancel,
         ),
-        None => fallback.rev_list_count(ctx.git_dir, ctx.work_tree, local_hex, upstream_hex),
+        (None, None) => {
+            fallback.rev_list_count(ctx.git_dir, ctx.work_tree, local_hex, upstream_hex)
+        }
     };
     match result {
         Ok((ahead, behind)) => {

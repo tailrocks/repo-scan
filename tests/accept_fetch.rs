@@ -36,6 +36,60 @@ fn run(args: &[&str], cwd: &Path, state: &Path) -> std::process::Output {
         .expect("spawn repo-scan")
 }
 
+#[cfg(unix)]
+fn sentinel_wrapper(parent: &Path, name: &str, sentinel: &Path) -> PathBuf {
+    let wrapper = parent.join(name);
+    repo_scan::privacy::private_write_0600(
+        &wrapper,
+        format!("#!/bin/sh\ntouch '{}'\nexit 0\n", sentinel.display()).as_bytes(),
+    )
+    .expect("write sentinel wrapper");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod wrapper");
+    wrapper
+}
+
+#[cfg(unix)]
+fn unauthorized_http_remote() -> (
+    String,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind local HTTP fixture");
+    listener
+        .set_nonblocking(true)
+        .expect("set HTTP fixture nonblocking");
+    let address = listener.local_addr().expect("HTTP fixture address");
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let thread_stop = std::sync::Arc::clone(&stop);
+    let thread = std::thread::spawn(move || {
+        let mut requests = 0;
+        while !thread_stop.load(Ordering::Acquire) && requests < 4 {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    requests += 1;
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                    let mut request = [0u8; 2048];
+                    let _ = stream.read(&mut request);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"repo-scan-test\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (format!("http://{address}/repo.git"), stop, thread)
+}
+
 fn stderr_text(out: &std::process::Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
@@ -961,6 +1015,32 @@ fn fetch06_failed_remote_records_failure_keeps_unknown() {
 
     let (upstream, c1) = seed_upstream(&root, "upstream");
     let clone = clone_from(&root, &upstream, "clone");
+    let before_path = tmp.path().join("before.json");
+    let before = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            before_path.to_str().expect("utf8"),
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert_eq!(
+        before.status.code(),
+        Some(0),
+        "baseline scan: {}",
+        stderr_text(&before)
+    );
+    let before_report = load_json(&before_path);
+    let before_freshness = branch(
+        &before_report,
+        "remote_tracking",
+        "refs/remotes/origin/main",
+    )["freshness"]
+        .clone();
     let missing = root.join("no-such-upstream");
     fixture::git(
         &clone,
@@ -1008,6 +1088,16 @@ fn fetch06_failed_remote_records_failure_keeps_unknown() {
             b["name"]["value"]
         );
     }
+    let main = branch(&report, "remote_tracking", "refs/remotes/origin/main");
+    assert_eq!(
+        main["freshness"], before_freshness,
+        "failed fetch preserves the prior freshness label"
+    );
+    assert_eq!(
+        main["oid"]["hex"].as_str(),
+        Some(c1.as_str()),
+        "catalog records the actual post-failure tracking ref"
+    );
 
     // Oracle: the failed fetch changed nothing on disk.
     assert_eq!(
@@ -1511,6 +1601,240 @@ fn fetch11_repo_credential_helper_refused() {
     );
 }
 
+/// FETCH-GATE-20: a URL-qualified repo credential helper is refused
+/// before Git can reach a challenge and execute the helper.
+#[cfg(unix)]
+#[test]
+fn fetch20_repo_url_credential_helper_refused_without_execution() {
+    use std::sync::atomic::Ordering;
+
+    let tmp = fixture::scratch_root("fetch20");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+
+    let (upstream, _) = seed_upstream(&root, "upstream");
+    let clone = clone_from(&root, &upstream, "clone");
+    let (http_url, stop_server, server) = unauthorized_http_remote();
+    fixture::git(&clone, &["remote", "set-url", "origin", http_url.as_str()]);
+    let url_prefix = http_url.strip_suffix("/repo.git").expect("remote URL path");
+    let credential_key = format!("credential.{url_prefix}.helper");
+    let sentinel = tmp.path().join("SENTINEL-url-credential-helper");
+    let wrapper = sentinel_wrapper(tmp.path(), "url-credential-helper.sh", &sentinel);
+    let helper = format!("!sh \"{}\"", wrapper.display());
+    fixture::git(&clone, &["config", "--local", &credential_key, &helper]);
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    stop_server.store(true, Ordering::Release);
+    server.join().expect("join HTTP fixture");
+
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "usable scan result: {}",
+        stderr_text(&out)
+    );
+    assert!(
+        !sentinel.exists(),
+        "URL-qualified credential helper must not execute"
+    );
+    let report = load_json(&report_path);
+    let refresh = remote(&report, "origin", "fetch");
+    assert_eq!(refresh["refresh"]["status"].as_str(), Some("unsupported"));
+    let detail = origin_refresh_detail(&state).unwrap_or_default();
+    assert!(
+        detail.contains("credential.helper"),
+        "refusal identifies the helper class: {detail}"
+    );
+}
+
+/// FETCH-GATE-21: repo-scope core.gitProxy is refused for git:// remotes
+/// before its command can execute.
+#[cfg(unix)]
+#[test]
+fn fetch21_repo_git_proxy_refused_without_execution() {
+    let tmp = fixture::scratch_root("fetch21");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+
+    let (upstream, _) = seed_upstream(&root, "upstream");
+    let clone = clone_from(&root, &upstream, "clone");
+    fixture::git(
+        &clone,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "git://repo-scan.invalid/repo.git",
+        ],
+    );
+    let sentinel = tmp.path().join("SENTINEL-git-proxy");
+    let wrapper = sentinel_wrapper(tmp.path(), "git-proxy.sh", &sentinel);
+    let proxy = format!("sh \"{}\"", wrapper.display());
+    fixture::git(&clone, &["config", "--local", "core.gitProxy", &proxy]);
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "usable scan result: {}",
+        stderr_text(&out)
+    );
+    assert!(!sentinel.exists(), "repo gitProxy must not execute");
+    let report = load_json(&report_path);
+    let refresh = remote(&report, "origin", "fetch");
+    assert_eq!(refresh["refresh"]["status"].as_str(), Some("unsupported"));
+    let detail = origin_refresh_detail(&state).unwrap_or_default();
+    assert!(
+        detail.contains("core.gitproxy"),
+        "refusal identifies the repo-scope key: {detail}"
+    );
+}
+
+/// FETCH-GATE-22: an alternate-ref command is repo-selected executable
+/// configuration. Refuse before fetch negotiation can invoke it.
+#[cfg(unix)]
+#[test]
+fn fetch22_repo_alternate_refs_command_refused_without_execution() {
+    let tmp = fixture::scratch_root("fetch22");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+
+    let (upstream, _) = seed_upstream(&root, "upstream");
+    let clone = clone_from(&root, &upstream, "clone");
+    let alternates = clone.join(".git/objects/info/alternates");
+    repo_scan::privacy::private_write_0600(
+        &alternates,
+        format!("{}\n", upstream.join(".git/objects").display()).as_bytes(),
+    )
+    .expect("write object alternate");
+    let sentinel = tmp.path().join("SENTINEL-alternate-refs");
+    let wrapper = sentinel_wrapper(tmp.path(), "alternate-refs.sh", &sentinel);
+    let command = format!("sh \"{}\"", wrapper.display());
+    fixture::git(
+        &clone,
+        &["config", "--local", "core.alternateRefsCommand", &command],
+    );
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "usable scan result: {}",
+        stderr_text(&out)
+    );
+    assert!(
+        !sentinel.exists(),
+        "alternate refs command must not execute"
+    );
+    let report = load_json(&report_path);
+    let refresh = remote(&report, "origin", "fetch");
+    assert_eq!(refresh["refresh"]["status"].as_str(), Some("unsupported"));
+    let detail = origin_refresh_detail(&state).unwrap_or_default();
+    assert!(
+        detail.contains("core.alternaterefscommand"),
+        "refusal identifies the repo-scope key: {detail}"
+    );
+}
+
+/// FETCH-GATE-23: configured hooks run independently of the traditional
+/// hooks directory and must be refused before a fetch updates refs.
+#[cfg(unix)]
+#[test]
+fn fetch23_repo_configured_hook_refused_without_execution() {
+    let tmp = fixture::scratch_root("fetch23");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+
+    let (upstream, _) = seed_upstream(&root, "upstream");
+    let clone = clone_from(&root, &upstream, "clone");
+    let sentinel = tmp.path().join("SENTINEL-configured-hook");
+    let wrapper = sentinel_wrapper(tmp.path(), "configured-hook.sh", &sentinel);
+    let command = format!("sh \"{}\"", wrapper.display());
+    fixture::git(
+        &clone,
+        &["config", "--local", "hook.repo-scan.command", &command],
+    );
+    fixture::git(
+        &clone,
+        &[
+            "config",
+            "--local",
+            "--add",
+            "hook.repo-scan.event",
+            "reference-transaction",
+        ],
+    );
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "usable scan result: {}",
+        stderr_text(&out)
+    );
+    assert!(!sentinel.exists(), "configured hook must not execute");
+    let report = load_json(&report_path);
+    let refresh = remote(&report, "origin", "fetch");
+    assert_eq!(refresh["refresh"]["status"].as_str(), Some("unsupported"));
+    let detail = origin_refresh_detail(&state).unwrap_or_default();
+    assert!(
+        detail.contains("configured hook command"),
+        "refusal identifies the repo-scope key: {detail}"
+    );
+}
+
 /// FETCH-GATE-04: a repo-scope `core.sshCommand` refuses the fetch
 /// (`unsupported`): the ssh override would execute repo-chosen code.
 #[test]
@@ -1626,6 +1950,141 @@ fn fetch13_repo_uploadpack_refused_without_execution() {
             b["name"]["value"]
         );
     }
+}
+
+/// FETCH-GATE-17: a repo config symlink remains repo-scope even when
+/// `--show-origin` resolves its path outside the git directory. The
+/// configured uploadpack must be refused before it can execute.
+#[cfg(unix)]
+#[test]
+fn fetch17_symlinked_repo_config_uploadpack_refused_without_execution() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = fixture::scratch_root("fetch17");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+
+    let (upstream, _) = seed_upstream(&root, "upstream");
+    let clone = clone_from(&root, &upstream, "clone");
+    let sentinel = tmp.path().join("SENTINEL-symlink-uploadpack");
+    let wrapper = tmp.path().join("symlink-uploadpack-wrapper.sh");
+    repo_scan::privacy::private_write_0600(
+        &wrapper,
+        format!("#!/bin/sh\ntouch \"{}\"\n", sentinel.display()).as_bytes(),
+    )
+    .expect("write wrapper");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    fixture::git(
+        &clone,
+        &[
+            "config",
+            "remote.origin.uploadpack",
+            wrapper.to_str().expect("utf8"),
+        ],
+    );
+
+    let config = clone.join(".git/config");
+    let external_config = tmp.path().join("external-git-config");
+    std::fs::rename(&config, &external_config).expect("move config outside git dir");
+    symlink(&external_config, &config).expect("symlink repo config");
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "usable scan result: {}",
+        stderr_text(&out)
+    );
+    assert!(
+        !sentinel.exists(),
+        "uploadpack from symlinked repo config must never execute"
+    );
+    let report = load_json(&report_path);
+    let refresh = remote(&report, "origin", "fetch");
+    assert_eq!(refresh["refresh"]["status"].as_str(), Some("unsupported"));
+    let detail = origin_refresh_detail(&state).unwrap_or_default();
+    assert!(
+        detail.contains("remote executable setting"),
+        "refusal identifies the repo-scope setting: {detail}"
+    );
+}
+
+/// FETCH-GATE-18: a custom source namespace is refused because the
+/// post-fetch freshness audit lists only heads and tags. It must not
+/// create a tracking ref that would then look deleted upstream.
+#[test]
+fn fetch18_custom_source_namespace_is_unsupported() {
+    let tmp = fixture::scratch_root("fetch18");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+
+    let (upstream, oid) = seed_upstream(&root, "upstream");
+    fixture::git(
+        &upstream,
+        &["update-ref", "refs/custom/snapshot", oid.as_str()],
+    );
+    let clone = clone_from(&root, &upstream, "clone");
+    fixture::git(
+        &clone,
+        &[
+            "config",
+            "--replace-all",
+            "remote.origin.fetch",
+            "+refs/custom/*:refs/remotes/origin/custom/*",
+        ],
+    );
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "usable scan result: {}",
+        stderr_text(&out)
+    );
+    let report = load_json(&report_path);
+    let refresh = remote(&report, "origin", "fetch");
+    assert_eq!(refresh["refresh"]["status"].as_str(), Some("unsupported"));
+    assert!(
+        !fixture::git_succeeds(
+            &clone,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/remotes/origin/custom/snapshot",
+            ],
+        ),
+        "unsupported source namespace must not create a tracking ref"
+    );
 }
 
 /// Run the binary with `path_dir` prepended to `PATH` (thread-safe:

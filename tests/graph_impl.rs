@@ -57,6 +57,8 @@ fn compare_in(
         git_dir: &git_dir,
         common_dir: &git_dir,
         store_id,
+        use_replace_refs: None,
+        replace_ref_base: None,
         work_tree: Some(repo),
         cache,
         fallback,
@@ -109,6 +111,8 @@ fn compare_branch_in(
         git_dir: &git_dir,
         common_dir: &git_dir,
         store_id,
+        use_replace_refs: None,
+        replace_ref_base: None,
         work_tree: Some(repo),
         cache,
         fallback,
@@ -203,6 +207,8 @@ fn malformed_oid_is_error_without_walk() {
         git_dir: &git_dir,
         common_dir: &git_dir,
         store_id: "test-store",
+        use_replace_refs: None,
+        replace_ref_base: None,
         work_tree: None,
         cache: Some(&cache),
         fallback: None,
@@ -244,6 +250,8 @@ fn equal_oid_fast_path_touches_nothing() {
         git_dir: &git_dir,
         common_dir: &git_dir,
         store_id: "test-store",
+        use_replace_refs: None,
+        replace_ref_base: None,
         work_tree: None,
         cache: Some(&cache),
         fallback: None,
@@ -267,6 +275,8 @@ fn branch_state_assignment_without_reads() {
         git_dir: &git_dir,
         common_dir: &git_dir,
         store_id: "test-store",
+        use_replace_refs: None,
+        replace_ref_base: None,
         work_tree: None,
         cache: None,
         fallback: None,
@@ -746,6 +756,8 @@ fn unborn_branch_stays_explicit_error() {
         git_dir: &git_dir,
         common_dir: &git_dir,
         store_id: "store-unborn",
+        use_replace_refs: None,
+        replace_ref_base: None,
         work_tree: Some(&repo),
         cache: None,
         fallback: Some(&fallback),
@@ -807,6 +819,218 @@ fn rev_list_fallback_observes_expired_deadline() {
 }
 
 #[test]
+fn linked_worktree_replace_ref_contexts_do_not_share_cached_counts() {
+    let Some(fallback) = git_or_skip() else {
+        return;
+    };
+    let root = fixture::scratch_root("graph-worktree-replace");
+    let main = fixture::normal_clone(root.path(), "main");
+    let ancestor = fixture::git_str(&main, &["rev-parse", "HEAD"]);
+    let parent = fixture::commit_file(&main, "README.md", "parent\n", "parent");
+    let local = fixture::commit_file(&main, "README.md", "local\n", "local");
+    let tree = fixture::git_str(&main, &["rev-parse", &format!("{parent}^{{tree}}")]);
+    let replacement = fixture::git_str(&main, &["commit-tree", &tree, "-m", "replacement root"]);
+
+    fixture::git(&main, &["config", "extensions.worktreeConfig", "true"]);
+    fixture::git(&main, &["branch", "-f", "upstream", &ancestor]);
+    fixture::git(&main, &["replace", &parent, &replacement]);
+    let linked = root.path().join("linked");
+    let linked_arg = linked.to_string_lossy().into_owned();
+    fixture::git(
+        &main,
+        &["worktree", "add", "-q", "-b", "linked", &linked_arg, &local],
+    );
+    fixture::git(
+        &main,
+        &["config", "--worktree", "core.useReplaceRefs", "true"],
+    );
+    fixture::git(
+        &linked,
+        &["config", "--worktree", "core.useReplaceRefs", "false"],
+    );
+
+    // The upstream is the original root: replacing `parent` makes the
+    // enabled worktree's local history diverge from it.
+    let expected_enabled = fixture::git_str(
+        &main,
+        &[
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("{local}...{ancestor}"),
+        ],
+    );
+    let expected_disabled = fixture::git_str(
+        &linked,
+        &[
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("{local}...{ancestor}"),
+        ],
+    );
+    assert_eq!(expected_enabled, "2\t1");
+    assert_eq!(expected_disabled, "2\t0");
+
+    let main_git_dir = PathBuf::from(fixture::git_str(
+        &main,
+        &["rev-parse", "--absolute-git-dir"],
+    ));
+    let linked_git_dir = PathBuf::from(fixture::git_str(
+        &linked,
+        &["rev-parse", "--absolute-git-dir"],
+    ));
+    let common_dir = main.join(fixture::git_str(&main, &["rev-parse", "--git-common-dir"]));
+    let store_id = common_dir.to_string_lossy().into_owned();
+    let cache = ComparisonCache::new();
+    assert_eq!(
+        fallback
+            .rev_list_count_with_replace_refs(
+                &linked_git_dir,
+                Some(&linked),
+                &local,
+                &ancestor,
+                true,
+            )
+            .expect("explicit replacement policy"),
+        (2, 1),
+        "explicit policy overrides the linked checkout's local false setting"
+    );
+    let main_context = CompareContext {
+        git_dir: &main_git_dir,
+        common_dir: &common_dir,
+        store_id: &store_id,
+        use_replace_refs: Some(true),
+        replace_ref_base: Some("refs/replace/"),
+        work_tree: Some(&main),
+        cache: Some(&cache),
+        fallback: Some(&fallback),
+        cancel: None,
+    };
+    let linked_context = CompareContext {
+        git_dir: &linked_git_dir,
+        common_dir: &common_dir,
+        store_id: &store_id,
+        use_replace_refs: Some(false),
+        replace_ref_base: Some("refs/replace/"),
+        work_tree: Some(&linked),
+        cache: Some(&cache),
+        fallback: Some(&fallback),
+        cancel: None,
+    };
+
+    assert_eq!(
+        compare_oids(&main_context, &local, &ancestor, "sha1"),
+        Comparison::from_counts(2, 1),
+        "enabled worktree follows the replacement commit ancestry"
+    );
+    assert_eq!(
+        compare_oids(&linked_context, &local, &ancestor, "sha1"),
+        Comparison::from_counts(2, 0),
+        "disabled linked worktree follows the original commit ancestry"
+    );
+    assert_eq!(
+        cache.walks(),
+        2,
+        "different effective contexts must walk separately"
+    );
+    assert_eq!(
+        cache.hits(),
+        0,
+        "one worktree must not reuse the other's counts"
+    );
+
+    let custom_ref = format!("refs/custom/{parent}");
+    fixture::git(&main, &["update-ref", &custom_ref, &replacement]);
+    let custom_context = CompareContext {
+        git_dir: &main_git_dir,
+        common_dir: &common_dir,
+        store_id: &store_id,
+        use_replace_refs: Some(true),
+        replace_ref_base: Some("refs/custom/"),
+        work_tree: Some(&main),
+        cache: None,
+        fallback: Some(&fallback),
+        cancel: None,
+    };
+    assert_eq!(
+        compare_oids(&custom_context, &local, &ancestor, "sha1"),
+        Comparison::pending(),
+        "Git rev-list cannot safely represent a custom gix replacement namespace"
+    );
+}
+
+#[test]
+fn empty_custom_replace_base_does_not_fallback_through_standard_replace_refs() {
+    let Some(fallback) = git_or_skip() else {
+        return;
+    };
+    let root = fixture::scratch_root("graph-custom-empty-replace-base");
+    let repo = fixture::normal_clone(root.path(), "repo");
+    let ancestor = fixture::git_str(&repo, &["rev-parse", "HEAD"]);
+    let parent = fixture::commit_file(&repo, "README.md", "parent\n", "parent");
+    let local = fixture::commit_file(&repo, "README.md", "local\n", "local");
+    let tree = fixture::git_str(&repo, &["rev-parse", &format!("{parent}^{{tree}}")]);
+    let replacement = fixture::git_str(&repo, &["commit-tree", &tree, "-m", "replacement root"]);
+    fixture::git(
+        &repo,
+        &[
+            "update-ref",
+            &format!("refs/replace/{parent}"),
+            &replacement,
+        ],
+    );
+
+    let git_dir = PathBuf::from(fixture::git_str(
+        &repo,
+        &["rev-parse", "--absolute-git-dir"],
+    ));
+    let common_dir = git_dir.clone();
+    let objects_dir = PathBuf::from(fixture::git_str(
+        &repo,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        ],
+    ));
+    let parent_object = objects_dir.join(&parent[..2]).join(&parent[2..]);
+    assert!(parent_object.is_file(), "fixture parent is a loose object");
+    std::fs::remove_file(&parent_object).expect("remove parent to force the gix fallback path");
+
+    // Keep the configured custom namespace present but empty, while a
+    // standard replacement ref remains available to Git's fallback.
+    let custom_refs = common_dir.join("refs/custom");
+    std::fs::create_dir_all(&custom_refs).expect("create empty custom namespace");
+    assert_eq!(std::fs::read_dir(&custom_refs).unwrap().count(), 0);
+    assert_eq!(
+        fallback
+            .rev_list_count_with_replace_refs(&git_dir, Some(&repo), &local, &ancestor, true)
+            .expect("standard Git replacement ref is usable"),
+        (2, 1),
+        "the standard namespace would produce counts that differ from the empty custom namespace"
+    );
+
+    let context = CompareContext {
+        git_dir: &git_dir,
+        common_dir: &common_dir,
+        store_id: "custom-empty-replace-base",
+        use_replace_refs: Some(true),
+        replace_ref_base: Some("refs/custom/"),
+        work_tree: Some(&repo),
+        cache: None,
+        fallback: Some(&fallback),
+        cancel: None,
+    };
+    assert_eq!(
+        compare_oids(&context, &local, &ancestor, "sha1"),
+        Comparison::pending(),
+        "Git's standard replacement refs must not stand in for an empty custom namespace"
+    );
+}
+
+#[test]
 fn canceled_graph_walk_stops_before_visiting_the_history() {
     if git_or_skip().is_none() {
         return;
@@ -834,6 +1058,8 @@ fn canceled_graph_walk_stops_before_visiting_the_history() {
         git_dir: &git_dir,
         common_dir: &git_dir,
         store_id: "cancelled-walk",
+        use_replace_refs: None,
+        replace_ref_base: None,
         work_tree: Some(&repo),
         cache: None,
         fallback: None,
@@ -1019,7 +1245,7 @@ fn v6_migration_is_additive_with_legacy_null() {
         // Open migrates v5 -> v6; the legacy ref row reads NULL
         // (pending) and new labels persist and round-trip.
         let store = TursoStore::open(&db).await.expect("open upgrades");
-        assert_eq!(store.schema_version().expect("version"), 7);
+        assert_eq!(store.schema_version().expect("version"), 8);
         assert!(store.supports_ref_comparison().await.expect("gate"));
         let rows = store.list_refs("repo-1").await.expect("list");
         assert_eq!(rows.len(), 1);
@@ -1055,7 +1281,9 @@ fn test_inputs(report_id: &str) -> ReportInputs {
         canonical_url: Some("https://github.com/owner/repo".to_string()),
         event_volume_ids: Vec::new(),
         targets: vec![],
-        scope: "roots".to_string(),
+        // This report fixture has no requested roots, so it must exercise
+        // the all-repositories scope rather than an empty roots scope.
+        scope: "machine".to_string(),
         scan_state: "complete".to_string(),
         started_at_ms: 1_759_154_398_000,
         finished_at_ms: Some(1_759_154_400_000),

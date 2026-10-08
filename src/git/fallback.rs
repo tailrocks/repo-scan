@@ -582,7 +582,7 @@ impl FallbackGit {
         a_hex: &str,
         b_hex: &str,
     ) -> crate::Result<(u64, u64)> {
-        self.rev_list_count_inner(git_dir, work_tree, a_hex, b_hex, None)
+        self.rev_list_count_inner(git_dir, work_tree, a_hex, b_hex, None, None)
     }
 
     /// [`Self::rev_list_count`] with an explicit cancellation/deadline token.
@@ -596,7 +596,41 @@ impl FallbackGit {
         b_hex: &str,
         cancel: &WaitCancel,
     ) -> crate::Result<(u64, u64)> {
-        self.rev_list_count_inner(git_dir, work_tree, a_hex, b_hex, Some(cancel))
+        self.rev_list_count_inner(git_dir, work_tree, a_hex, b_hex, Some(cancel), None)
+    }
+
+    /// [`Self::rev_list_count`] with the repository-local replacement
+    /// policy resolved by the isolated graph caller. The explicit `-c`
+    /// value prevents system config from changing that interpretation.
+    pub fn rev_list_count_with_replace_refs(
+        &self,
+        git_dir: &Path,
+        work_tree: Option<&Path>,
+        a_hex: &str,
+        b_hex: &str,
+        enabled: bool,
+    ) -> crate::Result<(u64, u64)> {
+        self.rev_list_count_inner(git_dir, work_tree, a_hex, b_hex, None, Some(enabled))
+    }
+
+    /// [`Self::rev_list_count_with_replace_refs`] with cancellation.
+    pub fn rev_list_count_with_replace_refs_cancel(
+        &self,
+        git_dir: &Path,
+        work_tree: Option<&Path>,
+        a_hex: &str,
+        b_hex: &str,
+        enabled: bool,
+        cancel: &WaitCancel,
+    ) -> crate::Result<(u64, u64)> {
+        self.rev_list_count_inner(
+            git_dir,
+            work_tree,
+            a_hex,
+            b_hex,
+            Some(cancel),
+            Some(enabled),
+        )
     }
 
     fn rev_list_count_inner(
@@ -606,6 +640,7 @@ impl FallbackGit {
         a_hex: &str,
         b_hex: &str,
         cancel: Option<&WaitCancel>,
+        use_replace_refs: Option<bool>,
     ) -> crate::Result<(u64, u64)> {
         if a_hex.is_empty() || b_hex.is_empty() {
             return Err(crate::Error::Git(String::from(
@@ -615,7 +650,13 @@ impl FallbackGit {
         let spec = format!("{a_hex}...{b_hex}");
         // One argv element, no shell: hostile OID text cannot escape
         // into options or paths (and git re-validates the revision).
-        let args = ["rev-list", "--left-right", "--count", &spec];
+        let replace_override =
+            use_replace_refs.map(|enabled| format!("core.useReplaceRefs={enabled}"));
+        let mut args = Vec::with_capacity(7);
+        if let Some(value) = replace_override.as_deref() {
+            args.extend(["-c", value]);
+        }
+        args.extend(["rev-list", "--left-right", "--count", &spec]);
         let out = match cancel {
             Some(cancel) => {
                 self.run_inner_with_cancel(git_dir, work_tree, &args, None, Some(cancel))?
@@ -2174,13 +2215,15 @@ impl FallbackGit {
     }
 
     /// Fetch-subcommand argv without the remote operand (single source
-    /// for [`FallbackGit::git_fetch_remote`] and its unit test): no
-    /// prune (deleted upstream branches keep their tracking refs), no
-    /// submodule recursion, no tag downloads (branch freshness needs
-    /// no tags; the CLI flag overrides a configured `tagOpt`).
-    fn fetch_argv() -> [&'static str; 4] {
+    /// for [`FallbackGit::git_fetch_remote`] and its unit test): atomic
+    /// ref updates, no prune (deleted upstream branches keep their
+    /// tracking refs), no submodule recursion, and no tag downloads
+    /// (branch freshness needs no tags; the CLI flag overrides a
+    /// configured `tagOpt`).
+    fn fetch_argv() -> [&'static str; 5] {
         [
             "fetch",
+            "--atomic",
             "--no-prune",
             "--no-recurse-submodules",
             "--no-tags",
@@ -2333,24 +2376,52 @@ pub fn parse_config_origin_line(line: &[u8]) -> Result<Option<ConfigOrigin>, Str
     }))
 }
 
-/// True when a `--show-origin` file path resolves inside `git_dir`
-/// (the `--git-dir` the config was read through): repo-scope config,
+/// True when a `--show-origin` file path belongs to `git_dir` (the
+/// `--git-dir` the config was read through): repo-scope config,
 /// including `config`, `config.worktree`, and anything they include
-/// from inside the store. Relative origins resolve against the
-/// current directory (the spawn inherits it). ANY resolution failure
-/// fails closed (`true`): an origin git read but we cannot place is
-/// treated as repo-scope.
+/// from inside the store. Relative origins resolve against the spawn's
+/// working directory, `git_dir`. Check lexical containment before
+/// canonicalization so a repository config symlink to an outside file
+/// remains repo-scope. ANY resolution failure fails closed (`true`):
+/// an origin git read but we cannot place is treated as repo-scope.
 pub fn config_origin_within_repo(origin_file: &str, git_dir: &Path) -> bool {
     let origin_path = Path::new(origin_file);
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(_) => return true,
+    };
+    let dir = if git_dir.is_absolute() {
+        git_dir.to_path_buf()
+    } else {
+        cwd.join(git_dir)
+    };
     let abs = if origin_path.is_absolute() {
         origin_path.to_path_buf()
     } else {
-        match std::env::current_dir() {
-            Ok(cwd) => cwd.join(origin_path),
-            Err(_) => return true,
-        }
+        dir.join(origin_path)
     };
-    match (std::fs::canonicalize(&abs), std::fs::canonicalize(git_dir)) {
+
+    // `git config --show-origin` can name either the symlink path or its
+    // resolved target. Preserve the repository scope in both cases.
+    if abs.starts_with(&dir) {
+        return true;
+    }
+    let config = dir.join("config");
+    match std::fs::symlink_metadata(&config) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            if let (Ok(origin), Ok(target)) =
+                (std::fs::canonicalize(&abs), std::fs::canonicalize(&config))
+            {
+                if origin == target {
+                    return true;
+                }
+            }
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return true,
+        _ => {}
+    }
+
+    match (std::fs::canonicalize(&abs), std::fs::canonicalize(&dir)) {
         (Ok(origin), Ok(dir)) => origin.starts_with(&dir),
         // Unresolvable either side: fail closed.
         _ => true,
@@ -3173,14 +3244,15 @@ mod tests {
     }
 
     #[test]
-    fn fetch_argv_disables_prune_submodules_tags() {
-        // Step 11: deleted upstream branches keep their tracking refs,
-        // no submodule recursion, no tag downloads. `git_fetch_remote`
-        // builds from this single source; the assertion pins it.
+    fn fetch_argv_is_atomic_and_disables_prune_submodules_tags() {
+        // Step 11: refs update atomically, deleted upstream branches
+        // keep their tracking refs, with no submodule recursion or tag
+        // downloads. `git_fetch_remote` builds from this single source.
         assert_eq!(
             FallbackGit::fetch_argv().as_slice(),
             &[
                 "fetch",
+                "--atomic",
                 "--no-prune",
                 "--no-recurse-submodules",
                 "--no-tags"
@@ -3315,6 +3387,35 @@ mod tests {
         assert!(config_origin_within_repo(
             config.to_str().expect("utf8"),
             &dir.path().join("no-git-dir")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_repo_config_origin_remains_repo_scope() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git_dir = dir.path().join("r.git");
+        std::fs::create_dir_all(&git_dir).expect("mkdir");
+        let target = dir.path().join("external-config");
+        std::fs::write(
+            &target,
+            b"[remote \"origin\"]\n\tuploadpack = /tmp/canary\n",
+        )
+        .expect("write target");
+        let config = git_dir.join("config");
+        symlink(&target, &config).expect("symlink config");
+
+        // Git may report the lexical path (`.git/config`) or the
+        // canonical target. Both identify repository-selected settings.
+        assert!(config_origin_within_repo(
+            config.to_str().expect("utf8"),
+            &git_dir
+        ));
+        assert!(config_origin_within_repo(
+            target.to_str().expect("utf8"),
+            &git_dir
         ));
     }
 }

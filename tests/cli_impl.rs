@@ -8,6 +8,7 @@ use clap::Parser;
 use repo_scan::cli::{CacheAction, Cli, Command, OutputFormat, QuerySelection, TargetSet};
 use repo_scan::config;
 use repo_scan::model::{ExitCode, Scope, StatusMode};
+use repo_scan::scan_events::Cursor;
 use repo_scan::store::{Store, TursoStore};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcCommand;
@@ -1010,6 +1011,131 @@ fn wave6_cached_target_human_follow_rides_replay_core() {
         stderr_text(&direct)
     );
     assert_eq!(direct.stdout, out.stdout, "same follow stream");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let db = repo_scan::store::owner::catalog_db_path(&env.state);
+    let rows = rt.block_on(async {
+        let store = TursoStore::open_read_only(&db).await.expect("open catalog");
+        let rows = store
+            .read_scan_events(&scan_id, 0, 10_000)
+            .await
+            .expect("read event rows");
+        store.close().await.expect("close catalog");
+        rows
+    });
+    assert!(rows.len() > 2, "fixture has a middle cursor");
+    let middle = &rows[rows.len() / 2];
+    let middle_cursor = Cursor {
+        seq: middle.seq,
+        catalog_rev: middle.catalog_rev,
+        event_offset: middle.event_offset,
+    }
+    .encode();
+    let middle_follow = run(
+        &[
+            "query",
+            URL,
+            "--cached",
+            "--follow",
+            "--format",
+            "human",
+            "--after",
+            &middle_cursor,
+        ],
+        &env.cwd,
+        &env.state,
+    );
+    assert_eq!(
+        middle_follow.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&middle_follow)
+    );
+    assert!(
+        !middle_follow.stdout.is_empty(),
+        "a middle cursor has later activity and renders its current snapshot"
+    );
+
+    let tip = rows.last().expect("terminal event");
+    let terminal_cursor = Cursor {
+        seq: tip.seq,
+        catalog_rev: tip.catalog_rev,
+        event_offset: tip.event_offset,
+    }
+    .encode();
+    let terminal_follow = run(
+        &[
+            "query",
+            URL,
+            "--cached",
+            "--follow",
+            "--format",
+            "human",
+            "--after",
+            &terminal_cursor,
+        ],
+        &env.cwd,
+        &env.state,
+    );
+    assert_eq!(
+        terminal_follow.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&terminal_follow)
+    );
+    assert!(
+        terminal_follow.stdout.is_empty(),
+        "a terminal cursor has no strictly later state to render"
+    );
+
+    let first = rows.first().expect("initial event");
+    let expired_cursor = Cursor {
+        seq: first.seq,
+        catalog_rev: first.catalog_rev,
+        event_offset: first.event_offset,
+    }
+    .encode();
+    rt.block_on(async {
+        let store = TursoStore::open(&db).await.expect("open catalog writer");
+        store
+            .connection()
+            .execute(
+                "DELETE FROM scan_events WHERE scan_id = ?1 AND seq < ?2",
+                vec![
+                    turso::Value::Text(scan_id.clone()),
+                    turso::Value::Integer(i64::try_from(tip.seq).expect("tip fits i64")),
+                ],
+            )
+            .await
+            .expect("prune event prefix");
+        store.close().await.expect("close catalog writer");
+    });
+    let expired_follow = run(
+        &[
+            "query",
+            URL,
+            "--cached",
+            "--follow",
+            "--format",
+            "human",
+            "--after",
+            &expired_cursor,
+        ],
+        &env.cwd,
+        &env.state,
+    );
+    assert_eq!(
+        expired_follow.status.code(),
+        Some(1),
+        "expired reset cursor fails closed: {}",
+        stderr_text(&expired_follow)
+    );
+    assert!(
+        expired_follow.stdout.is_empty(),
+        "pruned prefix is rejected before rendering a full human snapshot"
+    );
 }
 
 #[test]
