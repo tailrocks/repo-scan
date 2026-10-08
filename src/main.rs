@@ -5146,11 +5146,17 @@ async fn run_until_boundary(
         // run never drains another generation's work and claimed tasks
         // stay visible to that generation's `pending_count` boundary.
         // Phase gating (goal Step 8): only this phase's kinds claim.
+        // The batch never exceeds free admission: claiming more than
+        // admittable releases the surplus back one sync commit each,
+        // every round (Step-16 wall profile: 40% of coordinator time).
+        // At least one keeps the degenerate fully-held case live (it
+        // releases once and the round below breaks on no progress).
+        let batch = CLAIM_BATCH.min(runner.admission.free_shared().max(1));
         let claimed = store
             .claim_tasks_in_generation_kinds(
                 generation,
                 epoch,
-                CLAIM_BATCH,
+                batch,
                 LEASE_TTL_MS,
                 now,
                 phase.kinds(),
@@ -8419,19 +8425,48 @@ const LEASE_WINDOW_MARGIN_MS: i64 = 15_000;
 /// transaction counted through `renewals` when the lease is held (the
 /// coordinator passes its counter; read halves pass a local that the
 /// coordinator replays, so the count survives early returns and errors).
+/// Remaining lease life below which a renewal UPDATE is worthwhile.
+/// A task claimed moments ago holds ~`LEASE_TTL_MS` of lease; rewriting
+/// the same expiry costs a sync commit per task with no new information
+/// (Step-16 wall profile: 30% of coordinator time). Aged leases — slow
+/// volumes, long joins — still renew exactly as before, and the
+/// in-flight renewal tick still covers joined workers on cadence.
+const LEASE_RENEW_MARGIN_MS: i64 = LEASE_TTL_MS / 2;
+
+/// True when the in-memory lease expiry is aged enough to need a
+/// renewal UPDATE (which also extends it). Fresh leases take the
+/// read-only [`TursoStore::verify_lease`] path instead: same
+/// state/token/epoch match as the UPDATE's WHERE clause, so a rival
+/// reclaim still trips the gate — it just costs a SELECT, not a sync
+/// commit. A tick-renewed lease only ever makes the in-memory expiry
+/// older than the store's, which errs toward a harmless extra UPDATE,
+/// never a missed verification.
+fn lease_renewal_due(expires_ms: i64, now_ms: i64) -> bool {
+    expires_ms.saturating_sub(now_ms) < LEASE_RENEW_MARGIN_MS
+}
+
 async fn renew_claim_lease(
     store: &TursoStore,
     renewals: &mut u64,
     claimed: &ClaimedTask,
 ) -> repo_scan::Result<bool> {
+    let now = store::now_ms();
     let lease_epoch = claimed.task.lease_epoch.unwrap_or(u64::MAX);
+    if !lease_renewal_due(claimed.expires_ms, now) {
+        // Fresh lease: verify the row still carries it (a rival reclaim
+        // changes token/epoch) without rewriting the far-out expiry.
+        // Read-only — commits nothing, counts no transaction.
+        return store
+            .verify_lease(&claimed.task.id, claimed.token, lease_epoch)
+            .await;
+    }
     let renewed = store
         .renew_lease(
             &claimed.task.id,
             claimed.token,
             lease_epoch,
             LEASE_TTL_MS,
-            store::now_ms(),
+            now,
         )
         .await?;
     if renewed {
@@ -18371,6 +18406,13 @@ pub fn test_watchdog_exceeded(grace_secs: u64, elapsed: Duration) -> bool {
     let watchdog = Watchdog::new(Duration::from_secs(grace_secs));
     let now = Instant::now();
     watchdog.exceeded(now - elapsed, now)
+}
+
+/// Lease-renewal verdict over an in-memory expiry (coordinator txn
+/// budget test): exposes [`lease_renewal_due`] for the regression test.
+#[cfg(test)]
+pub fn test_lease_renewal_due(expires_ms: i64, now_ms: i64) -> bool {
+    lease_renewal_due(expires_ms, now_ms)
 }
 
 /// Status-lane pending count (m10): exposes [`count_status_pending`] for

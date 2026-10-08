@@ -1980,6 +1980,28 @@ impl TursoStore {
         Ok(rows == 1)
     }
 
+    /// Read-only twin of the [`TursoStore::renew_lease`] match: true when
+    /// the row still carries this exact lease (state, token, epoch). A
+    /// SELECT commits nothing, so fresh-lease gates verify here instead
+    /// of paying a sync commit to rewrite an expiry that is already far
+    /// out; aged leases still renew (and extend) as before.
+    pub async fn verify_lease(&self, task_id: &str, token: i64, epoch: u64) -> crate::Result<bool> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM frontier_tasks WHERE id = ?1 AND state = 'leased' \
+                    AND lease_token = ?2 AND lease_epoch = ?3",
+                vec![
+                    v_text(task_id),
+                    v_int(token),
+                    v_int(u64_to_i64(epoch, "lease epoch")?),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(rows.next().await.map_err(store_err)?.is_some())
+    }
+
     /// Extend several live leases in ONE transaction (Step 9 scheduled
     /// renewal for the worker pool: the coordinator renews every in-flight
     /// task on a tick instead of each worker renewing inline). Returns the

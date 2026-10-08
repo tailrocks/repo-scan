@@ -1072,3 +1072,56 @@ fn status_pending_unions_with_pending_count_on_terminal_states() {
         store.close().await.expect("close");
     });
 }
+
+/// Coordinator fsync budget (Step-16 wall profile): the claim batch
+/// must not exceed free admission (else every round over-claims and
+/// releases tasks back, one sync commit per release) and fresh leases
+/// must not renew (else one sync commit per task). 48 plain dirs run
+/// ~120+ transactions before the fix (2.3/dir measured) and ~30
+/// after; the bound below separates the two with 2x headroom above
+/// the fixed behavior for journal-tick jitter.
+#[test]
+fn coordinator_txn_budget_per_dir() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).unwrap();
+    const DIRS: usize = 48;
+    for i in 0..DIRS {
+        std::fs::create_dir(root.join(format!("d{i:02}"))).expect("mkdir");
+    }
+    let state = tmp.path().join("state");
+    let rep = tmp.path().join("rep.json");
+    let out = scan(
+        &state,
+        URL_A,
+        &[&root],
+        &rep,
+        &["--status", "metadata", "--workers", "8"],
+    );
+    assert_eq!(out.status.code(), Some(0), "scan: {out:?}");
+    let report = read_json(&rep);
+    let tx = report["resources"]["db_transactions"]
+        .as_u64()
+        .expect("db_transactions");
+    assert!(
+        tx < DIRS as u64 + 20,
+        "txn budget blown (over-claim releases or per-task renewals?): {tx} for {DIRS} dirs"
+    );
+}
+
+/// Fresh leases skip the renewal UPDATE; aged, expiring, and expired
+/// leases still re-verify against the store.
+#[test]
+fn lease_renewal_due_only_when_aged() {
+    let now = 1_700_000_000_000_i64;
+    // Full TTL remaining: skip.
+    assert!(!main_under_test::test_lease_renewal_due(now + 60_000, now));
+    // Just above the half-TTL margin: skip.
+    assert!(!main_under_test::test_lease_renewal_due(now + 30_001, now));
+    // At the margin: still fresh, skip. Below it: renew.
+    assert!(!main_under_test::test_lease_renewal_due(now + 30_000, now));
+    assert!(main_under_test::test_lease_renewal_due(now + 29_999, now));
+    assert!(main_under_test::test_lease_renewal_due(now + 1_000, now));
+    assert!(main_under_test::test_lease_renewal_due(now, now));
+    assert!(main_under_test::test_lease_renewal_due(now - 1, now));
+}
