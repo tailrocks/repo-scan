@@ -405,10 +405,18 @@ fn w2b_formats_agree_on_ids_and_totals() {
     let json_text = String::from_utf8_lossy(&json_out.stdout);
     let doc: serde_json::Value =
         serde_json::from_str(&json_text).expect("stdout is one JSON document");
-    assert_eq!(doc["schema_version"], "1.4.0");
+    assert_eq!(doc["schema_version"], "1.5.0");
     let json = w2b_fold_json(&doc);
     assert_eq!(json.repos.len(), 3, "three confirmed repos");
     assert!(!json.branches.is_empty(), "branches observed");
+    assert_eq!(
+        doc["totals"]["stores"].as_u64(),
+        Some(json.repos.len() as u64)
+    );
+    assert_eq!(
+        doc["totals"]["groups"].as_u64(),
+        Some(doc["groups"].as_array().expect("groups[]").len() as u64)
+    );
 
     // Human: plain-text rows parsed without JSON.
     let human_out = scan_once("st-human", "human");
@@ -706,7 +714,7 @@ fn w2b_concurrent_readers_see_single_revisions() {
                                 .send(format!("revision missing keys in {} bytes", bytes.len()));
                             return;
                         };
-                        assert_eq!(ver, "1.4.0");
+                        assert_eq!(ver, "1.5.0");
                         let _ = tx.send((id.to_string(), state.to_string()));
                     }
                     Err(e) => {

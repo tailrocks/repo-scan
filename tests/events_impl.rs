@@ -2483,6 +2483,77 @@ fn wave1d_retention_prunes_prefix_keeping_tip() {
     );
 }
 
+/// Direct lifecycle emits (not only the batched flush path) enforce the
+/// journal bound and retain their terminal row as the newest tip.
+#[test]
+fn wave1d_direct_emit_enforces_journal_retention() {
+    use repo_scan::scan_events::EventType;
+    use repo_scan::store::NewScanEvent;
+
+    let hook = Wave1dHookStore::new();
+    hook.rt.block_on(async {
+        for seq in 1..=4u64 {
+            hook.store
+                .append_scan_event(&NewScanEvent {
+                    scan_id: "scan-direct-prune-1",
+                    seq,
+                    catalog_rev: 1,
+                    event_offset: seq - 1,
+                    event_type: "location_found",
+                    op: "add",
+                    reset: false,
+                    records: b"{}",
+                })
+                .await
+                .expect("append seed event");
+        }
+    });
+
+    let transactions = hook
+        .rt
+        .block_on(main_under_test::test_emit_scan_event_with_retention(
+            &hook.store,
+            "scan-direct-prune-1",
+            EventType::ScanCompleted,
+            3,
+        ))
+        .expect("direct emit and prune");
+    assert_eq!(transactions, 2, "append plus one retention transaction");
+    let after_terminal = hook
+        .rt
+        .block_on(main_under_test::test_emit_scan_event_with_retention(
+            &hook.store,
+            "scan-direct-prune-1",
+            EventType::LocationUpdated,
+            3,
+        ))
+        .expect("emit after terminal");
+    assert_eq!(after_terminal, 0, "terminal journal rejects later emits");
+    let buffered_after_terminal = hook
+        .rt
+        .block_on(main_under_test::test_buffer_location_update_after_terminal(
+            &hook.store,
+            "scan-direct-prune-1",
+        ))
+        .expect("buffer after terminal");
+    assert!(
+        !buffered_after_terminal,
+        "terminal journal rejects batched rows"
+    );
+    hook.rt.block_on(async {
+        let rows = hook
+            .store
+            .read_scan_events("scan-direct-prune-1", 0, 100)
+            .await
+            .expect("read");
+        assert_eq!(
+            rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+        assert_eq!(rows.last().expect("tip").event_type, "scan_completed");
+    });
+}
+
 /// Cursor resolution matrix through the production resolver: covered
 /// cursors resume after their `(rev, off)` position; missing, diverged,
 /// and beyond-tip cursors reset; the coalescible gauge never diverges;

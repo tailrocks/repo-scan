@@ -233,7 +233,7 @@ fn cli01_command_table_end_to_end() {
     let report_path = env.cwd_a.join("rep.json");
     assert!(report_path.exists(), "report published");
     let report = read_report(&report_path);
-    assert_eq!(report["schema_version"].as_str(), Some("1.4.0"));
+    assert_eq!(report["schema_version"].as_str(), Some("1.5.0"));
     assert_eq!(report["tool"]["name"].as_str(), Some("repo-scan"));
     assert_eq!(report["scan"]["id"].as_str(), Some(scan_id.as_str()));
     assert_eq!(report["scan"]["scope"].as_str(), Some("roots"));
@@ -732,7 +732,7 @@ fn step6_multi_target_union_single_pass() {
     );
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
     let report = read_report(&env.cwd_a.join("rep.json"));
-    assert_eq!(report["schema_version"], "1.4.0");
+    assert_eq!(report["schema_version"], "1.5.0");
     // Full target set in request order with per-target match counts.
     let targets = report["scan"]["targets"].as_array().expect("targets array");
     assert_eq!(targets.len(), 2);
@@ -1013,6 +1013,7 @@ fn journal_lifecycle_events_span_started_ready_terminal() {
 #[test]
 fn query_scan_replays_journaled_lifecycle_as_jsonl() {
     use repo_scan::scan_events::Cursor;
+    use repo_scan::store::{NewScanEvent, Store, TursoStore};
 
     let dir = tempfile::tempdir().expect("tempdir");
     let state = dir.path().join("state");
@@ -1081,6 +1082,50 @@ fn query_scan_replays_journaled_lifecycle_as_jsonl() {
         serde_json::Value::String("scan_completed".to_string())
     );
 
+    // A post-terminal row is outside the completed event stream. Readers
+    // stop at the first terminal even if a malformed/legacy journal has a
+    // later row.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        let terminal_seq = lines.last().expect("terminal")["seq"]
+            .as_u64()
+            .expect("terminal seq");
+        let rev = store.next_revision().await.expect("revision");
+        assert!(store
+            .append_scan_event(&NewScanEvent {
+                scan_id: &scan_id,
+                seq: terminal_seq + 1,
+                catalog_rev: rev,
+                event_offset: 0,
+                event_type: "location_updated",
+                op: "replace",
+                reset: false,
+                records: b"{}",
+            })
+            .await
+            .expect("append post-terminal row"));
+        store.close().await.expect("close");
+    });
+    let after_terminal = run(
+        &["query", "--scan", &scan_id, "--format", "jsonl"],
+        &cwd,
+        &state,
+    );
+    assert_eq!(after_terminal.status.code(), Some(0));
+    let after_terminal_lines: Vec<serde_json::Value> = stdout_text(&after_terminal)
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each line is valid JSON"))
+        .collect();
+    assert_eq!(after_terminal_lines.len(), lines.len());
+    assert_eq!(
+        after_terminal_lines.last().expect("terminal")["type"],
+        "scan_completed"
+    );
+
     // `--after` resumes strictly after the cursor: from the first envelope,
     // replay restarts at seq 2 and still ends at the terminal event.
     let cursor = Cursor {
@@ -1113,6 +1158,34 @@ fn query_scan_replays_journaled_lifecycle_as_jsonl() {
         serde_json::Value::String("scan_completed".to_string())
     );
 
+    // A validly encoded seq beyond SQLite's signed range cannot exist in
+    // this journal. Treat it as an expired cursor and explicitly reset.
+    let overflow = Cursor {
+        seq: u64::MAX,
+        catalog_rev: u64::MAX,
+        event_offset: u64::MAX,
+    }
+    .encode();
+    let reset = run(
+        &[
+            "query", "--scan", &scan_id, "--follow", "--format", "jsonl", "--after", &overflow,
+        ],
+        &cwd,
+        &state,
+    );
+    assert_eq!(
+        reset.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&reset)
+    );
+    let reset_lines: Vec<serde_json::Value> = stdout_text(&reset)
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("reset line is valid JSON"))
+        .collect();
+    assert_eq!(reset_lines[0]["reset"], true);
+    assert_eq!(reset_lines[0]["type"], "scan_started");
+
     // Unknown scan IDs follow the resume convention: exit 2, clear error.
     let missing = run(
         &["query", "--scan", "scan-no-such", "--format", "jsonl"],
@@ -1125,6 +1198,262 @@ fn query_scan_replays_journaled_lifecycle_as_jsonl() {
         "stderr: {}",
         stderr_text(&missing)
     );
+}
+
+/// JSON output stays a single report document with an explicit report
+/// destination, and the scan row stores the clamped effective worker
+/// count so resume restores the value that ran.
+#[test]
+fn scan_json_report_and_effective_workers_are_persisted() {
+    use repo_scan::store::{Store, TursoStore};
+
+    let env = Env::new();
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            env.fixture_str.as_str(),
+            "--workers",
+            "999",
+            "--report",
+            "report.json",
+            "--format",
+            "json",
+        ],
+        &env.cwd_a,
+        &env.state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let stdout_doc: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout is one JSON report");
+    let report_path = env.cwd_a.join("report.json");
+    let file_doc = read_report(&report_path);
+    assert_eq!(stdout_doc["report_id"], file_doc["report_id"]);
+    assert_eq!(stdout_doc["scan"], file_doc["scan"]);
+    let expected_source = option_env!("REPO_SCAN_SOURCE_COMMIT").filter(|source| {
+        matches!(source.len(), 40 | 64) && source.bytes().all(|byte| byte.is_ascii_hexdigit())
+    });
+    assert_eq!(
+        stdout_doc["tool"]["source_commit"],
+        expected_source
+            .map(|source| serde_json::Value::String(source.to_string()))
+            .unwrap_or(serde_json::Value::Null)
+    );
+    let scan_id = stdout_doc["scan"]["id"]
+        .as_str()
+        .expect("scan id")
+        .to_string();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let db = env.state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        let row = store
+            .get_scan(&scan_id)
+            .await
+            .expect("get scan")
+            .expect("scan row");
+        assert_eq!(row.workers, Some(repo_scan::config::MAX_WORKERS as u64));
+        store.close().await.expect("close");
+    });
+}
+
+/// Actual retained report snapshots stay within the configured bound even
+/// after completed scan outcomes accumulate in `scan_requests`.
+#[test]
+fn completed_scan_outcomes_do_not_pin_snapshots_past_retention() {
+    let env = Env::new();
+    let mut latest_report_id = None;
+    for _ in 0..=repo_scan::report::output::MAX_RETAINED_SNAPSHOTS {
+        let out = run(
+            &[
+                "scan",
+                "--all",
+                "--root",
+                env.fixture_str.as_str(),
+                "--force-rescan",
+                "--format",
+                "jsonl",
+            ],
+            &env.cwd_a,
+            &env.state,
+        );
+        assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+        let events: Vec<serde_json::Value> = stdout_text(&out)
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("event is JSON"))
+            .collect();
+        latest_report_id = events
+            .last()
+            .and_then(|event| event["records"]["report_id"].as_str())
+            .map(str::to_string);
+    }
+    let latest_report_id = latest_report_id.expect("latest report id");
+    let snapshots = env
+        .state
+        .join("payload")
+        .join(repo_scan::config::SNAPSHOTS_DIR_NAME);
+    let retained: Vec<PathBuf> = std::fs::read_dir(&snapshots)
+        .expect("snapshots directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    assert_eq!(
+        retained.len(),
+        repo_scan::report::output::MAX_RETAINED_SNAPSHOTS,
+        "only the configured newest snapshots remain"
+    );
+    assert!(
+        snapshots.join(format!("{latest_report_id}.json")).is_file(),
+        "the current report survives pruning"
+    );
+}
+
+/// The active scan's recovery report is pinned separately from the newest
+/// window. Pruning must also keep the newest earlier running scan's
+/// snapshot when that snapshot falls outside the window.
+#[test]
+fn prior_running_scan_recovery_snapshot_survives_retention() {
+    use repo_scan::store::{NewScan, Store, TursoStore};
+    use std::collections::HashSet;
+
+    let env = Env::new();
+    let seed = env.scan(&["--report", "seed.json"], &env.cwd_a);
+    assert_eq!(
+        seed.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&seed)
+    );
+    let seed_scan_id = stdout_line(&seed, "scan_id");
+    let seed_report_id = repo_scan::config::report_id_for_scan(&seed_scan_id);
+    let seed_snapshot =
+        repo_scan::config::snapshot_path(&env.state, &seed_report_id).expect("seed snapshot path");
+    let mut recovery_report = read_report(&seed_snapshot);
+
+    let crashed_scan_id = "crashed-retention-prior";
+    let recovery_report_id = repo_scan::config::report_id_for_scan(crashed_scan_id);
+    let crashed_url = "https://github.com/OWNER/CRASHED";
+    let crashed_canonical =
+        repo_scan::identity::normalize_github_url(crashed_url).expect("crashed target");
+    recovery_report["report_id"] = recovery_report_id.clone().into();
+    recovery_report["scan"]["id"] = crashed_scan_id.into();
+    recovery_report["scan"]["target_url"] = crashed_url.into();
+    recovery_report["scan"]["canonical_url"] = crashed_canonical.clone().into();
+    let recovery_bytes = serde_json::to_vec(&recovery_report).expect("recovery report JSON");
+    let recovery_snapshot = repo_scan::config::snapshot_path(&env.state, &recovery_report_id)
+        .expect("recovery snapshot path");
+    std::fs::write(&recovery_snapshot, &recovery_bytes).expect("write recovery snapshot");
+
+    let recovery_outcome =
+        repo_scan::config::encode_outcome(-1, None, &recovery_report_id, false, Some(1));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let store = TursoStore::open(&env.state.join("payload").join("catalog.db"))
+            .await
+            .expect("open catalog");
+        let inserted = store
+            .create_scan_request(
+                &NewScan {
+                    id: crashed_scan_id,
+                    url_raw: crashed_url.as_bytes(),
+                    url_canonical: Some(crashed_canonical.as_bytes()),
+                    scope: "roots",
+                    status_mode: "summary",
+                    report_dest: None,
+                    targets_json: None,
+                    format: None,
+                    all_targets: None,
+                    fetch: None,
+                    workers: None,
+                },
+                1,
+            )
+            .await
+            .expect("insert crashed scan");
+        assert!(inserted);
+        store
+            .update_scan_state(
+                crashed_scan_id,
+                "running:roots",
+                Some(&recovery_outcome),
+                None,
+                1,
+            )
+            .await
+            .expect("mark crashed scan running");
+        assert!(store
+            .save_report_snapshot(&recovery_report_id, "1.5.0", 1, 1, "staged", None, 1,)
+            .await
+            .expect("save recovery snapshot row"));
+        store.close().await.expect("close catalog");
+    });
+
+    // Place 33 newer, unreferenced snapshots behind the recovery snapshot.
+    // The recovery ID sorts before these if the filesystem has coarse mtime
+    // resolution, and its earlier creation time sorts it first otherwise.
+    for n in 0..=repo_scan::report::output::MAX_RETAINED_SNAPSHOTS {
+        let id = format!("retained-{n:03}");
+        let path = repo_scan::config::snapshot_path(&env.state, &id).expect("filler path");
+        std::fs::write(path, &recovery_bytes).expect("write filler snapshot");
+    }
+    let snapshots_dir = recovery_snapshot.parent().expect("snapshot directory");
+    let ordinary_victims = repo_scan::report::output::select_snapshot_victims(
+        repo_scan::report::output::list_snapshot_entries(snapshots_dir),
+        &HashSet::new(),
+        repo_scan::report::output::MAX_RETAINED_SNAPSHOTS,
+    );
+    assert!(
+        ordinary_victims
+            .iter()
+            .any(|entry| entry.id == recovery_report_id),
+        "setup puts the prior recovery snapshot outside normal retention"
+    );
+
+    let active = env.scan(&["--report", "active.json"], &env.cwd_a);
+    assert_eq!(
+        active.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&active)
+    );
+    let active_scan_id = stdout_line(&active, "scan_id");
+    let active_report_id = repo_scan::config::report_id_for_scan(&active_scan_id);
+    let active_snapshot = repo_scan::config::snapshot_path(&env.state, &active_report_id)
+        .expect("active snapshot path");
+    assert!(active_snapshot.is_file(), "current scan report is retained");
+    assert!(
+        recovery_snapshot.is_file(),
+        "the latest prior running scan recovery report survives pruning"
+    );
+
+    let retained_files = repo_scan::report::output::list_snapshot_entries(snapshots_dir);
+    assert!(
+        (repo_scan::report::output::MAX_RETAINED_SNAPSHOTS + 1
+            ..=repo_scan::report::output::MAX_RETAINED_SNAPSHOTS + 2)
+            .contains(&retained_files.len()),
+        "only the current report and prior recovery report may extend the normal window"
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let store = TursoStore::open(&env.state.join("payload").join("catalog.db"))
+            .await
+            .expect("open catalog");
+        assert!(store
+            .get_report_snapshot(&recovery_report_id)
+            .await
+            .expect("recovery snapshot row")
+            .is_some());
+        store.close().await.expect("close catalog");
+    });
 }
 
 /// Goal Step 12 (D4): a discovery scan journals one `repository_found`

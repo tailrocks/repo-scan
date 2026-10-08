@@ -236,6 +236,71 @@ fn goal_exact_counts_main_plus_worktrees_plus_clone() {
         assert!(names.insert(n.clone()), "duplicate branch row for {n}");
     }
 
-    // TODO(report 1.1.0, D1): assert groups[] has one entry for goal-owner/goal-repo — not implemented yet.
-    // TODO(report 1.1.0, D1): assert totals { stores: 2, present checkouts: 5, linked worktrees: 3 } — not implemented yet.
+    // D1: the normalized GitHub group is emitted once across both stores,
+    // and its derived totals agree with independently counted report rows.
+    let groups = report["groups"].as_array().expect("groups[]");
+    assert_eq!(groups.len(), 1, "both stores share one normalized group");
+    assert_eq!(groups[0]["id"], "github.com/goal-owner/goal-repo");
+    assert_eq!(groups[0]["host"], "github.com");
+    assert_eq!(groups[0]["account"], "goal-owner");
+    assert_eq!(groups[0]["repo"], "goal-repo");
+
+    let totals = &report["totals"];
+    assert_eq!(totals["accounts"].as_u64(), Some(1));
+    assert_eq!(totals["groups"].as_u64(), Some(groups.len() as u64));
+    assert_eq!(totals["stores"].as_u64(), Some(repos.len() as u64));
+    assert_eq!(totals["bare_stores"].as_u64(), Some(0));
+    assert_eq!(totals["present_checkouts"].as_u64(), Some(5));
+    assert_eq!(totals["linked_worktrees"].as_u64(), Some(3));
+    assert_eq!(
+        totals["observed_paths"].as_u64(),
+        Some(report["paths"].as_array().expect("paths[]").len() as u64)
+    );
+    assert_eq!(
+        totals["aliases"].as_u64(),
+        Some(report["aliases"].as_array().expect("aliases[]").len() as u64)
+    );
+    assert_eq!(
+        totals["local_branches"].as_u64(),
+        Some(branches.iter().filter(|b| b["kind"] == "local").count() as u64)
+    );
+    assert_eq!(
+        totals["remote_tracking_refs"].as_u64(),
+        Some(
+            branches
+                .iter()
+                .filter(|b| b["kind"] == "remote_tracking")
+                .count() as u64
+        )
+    );
+    assert_eq!(
+        totals["unresolved_candidates"].as_u64(),
+        Some(
+            report["candidates"]
+                .as_array()
+                .expect("candidates[]")
+                .iter()
+                .filter(|candidate| candidate["disposition"] == "unresolvable_identity")
+                .count() as u64
+        )
+    );
+    assert_eq!(
+        totals["gaps"].as_u64(),
+        Some(report["errors"].as_array().expect("errors[]").len() as u64)
+    );
+    let checkouts = report["checkouts"].as_array().expect("checkouts[]");
+    let analysis = &totals["analysis"];
+    let analysis_states: [(&str, &[&str]); 4] = [
+        ("completed", &["complete"]),
+        ("pending", &["pending", "not_requested"]),
+        ("failed", &["partial", "unstable", "error"]),
+        ("unavailable", &["unsupported"]),
+    ];
+    for (key, states) in analysis_states {
+        let expected = checkouts
+            .iter()
+            .filter(|checkout| states.contains(&checkout["status"]["state"].as_str().unwrap_or("")))
+            .count() as u64;
+        assert_eq!(analysis[key].as_u64(), Some(expected), "analysis.{key}");
+    }
 }

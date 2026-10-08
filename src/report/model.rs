@@ -8,21 +8,28 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Report schema version. Must equal `schemas/report-v1.4.schema.json`.
-pub const SCHEMA_VERSION: &str = "1.4.0";
+/// Report schema version. Must equal `schemas/report-v1.5.schema.json`.
+pub const SCHEMA_VERSION: &str = "1.5.0";
 
 /// Previous report schema version, still accepted by
-/// [`crate::report::validate`] (additive 1.3.0 → 1.4.0: comparison
-/// fields default to `pending`/null).
-pub const PREVIOUS_SCHEMA_VERSION: &str = "1.3.0";
+/// [`crate::report::validate`] (additive 1.4.0 → 1.5.0: groups and totals).
+pub const PREVIOUS_SCHEMA_VERSION: &str = "1.4.0";
+
+/// Report schemas emitted by supported repo-scan releases. This provenance
+/// allowlist is used only to recognize a prior report for safe replacement;
+/// it does not imply that every old version can be parsed as the current
+/// [`Report`] type.
+pub const SUPPORTED_PRIOR_SCHEMA_VERSIONS: &[&str] =
+    &["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", SCHEMA_VERSION];
 
 /// Tool name recorded in every envelope.
 pub const TOOL_NAME: &str = "repo-scan";
 
 /// Full normative report envelope (spec §16 table, first row).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Report {
-    /// Must be [`SCHEMA_VERSION`].
+    /// Must be [`SCHEMA_VERSION`] for newly built reports.
     pub schema_version: String,
     /// Immutable snapshot/report ID.
     pub report_id: String,
@@ -35,6 +42,9 @@ pub struct Report {
     pub volumes: Vec<Volume>,
     pub paths: Vec<PathRecord>,
     pub roots: Vec<Root>,
+    /// Normalized GitHub identities observed through emitted stores.
+    #[serde(default)]
+    pub groups: Vec<Group>,
     pub repositories: Vec<Repository>,
     pub checkouts: Vec<Checkout>,
     pub branches: Vec<Branch>,
@@ -44,10 +54,56 @@ pub struct Report {
     pub candidates: Vec<Candidate>,
     pub errors: Vec<ErrorRecord>,
     pub generated_artifacts: Vec<GeneratedArtifact>,
+    /// Compact counts derived from the records above.
+    #[serde(default)]
+    pub totals: Totals,
+}
+
+/// One normalized GitHub account/repository identity (D1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Group {
+    /// `lower(host)/lower(account)/lower(repo)`.
+    pub id: String,
+    pub host: String,
+    pub account: String,
+    pub repo: String,
+}
+
+/// Compact report counts. All values describe the records in this report;
+/// `bare_stores` is null if at least one emitted store has unknown bare state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Totals {
+    pub accounts: u64,
+    pub groups: u64,
+    pub stores: u64,
+    pub bare_stores: Option<u64>,
+    pub present_checkouts: u64,
+    pub linked_worktrees: u64,
+    pub observed_paths: u64,
+    pub aliases: u64,
+    pub local_branches: u64,
+    pub remote_tracking_refs: u64,
+    pub analysis: AnalysisTotals,
+    pub unresolved_candidates: u64,
+    pub gaps: u64,
+}
+
+/// Checkout analysis counts. `not_requested` is included in `pending`;
+/// `unsupported` is unavailable; partial, unstable, and error states failed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnalysisTotals {
+    pub completed: u64,
+    pub pending: u64,
+    pub failed: u64,
+    pub unavailable: u64,
 }
 
 /// Tool record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Tool {
     /// Must be `repo-scan`.
     pub name: String,
@@ -59,6 +115,7 @@ pub struct Tool {
 
 /// Scan record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Scan {
     /// Scan-request ID (external catalog history; exempt from ID resolution).
     pub id: String,
@@ -91,6 +148,7 @@ pub struct Scan {
 
 /// One requested scan target (report 1.1.0).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScanTarget {
     /// Target exactly as supplied (credentials redacted, never secret bytes).
     pub raw: String,
@@ -102,6 +160,7 @@ pub struct ScanTarget {
 
 /// Coverage record. Filesystem, identity, and status are independent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Coverage {
     /// `complete`, `incomplete`, or `unknown`.
     pub filesystem: String,
@@ -123,6 +182,7 @@ pub struct Coverage {
 
 /// Resources record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Resources {
     pub profile: String,
     /// Must be greater than 0.
@@ -137,6 +197,7 @@ pub struct Resources {
 
 /// Volume record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Volume {
     pub id: String,
     pub native_identity: Option<String>,
@@ -154,6 +215,7 @@ pub struct Volume {
 /// raw bytes are valid UTF-8, otherwise the standard Base64 encoding of the
 /// original bytes. `display` is escaped presentation text only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PathRecord {
     pub id: String,
     pub display: String,
@@ -168,6 +230,7 @@ pub struct PathRecord {
 /// Lossless short-name record, used uniformly for branch names, HEAD
 /// references, symbolic targets, upstream references, and remote names.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EncodedName {
     pub display: String,
     /// `utf8` or `base64`.
@@ -177,6 +240,7 @@ pub struct EncodedName {
 
 /// Scan-root record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Root {
     pub id: String,
     pub path_id: String,
@@ -192,6 +256,7 @@ pub struct Root {
 
 /// Repository (common-storage instance) record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Repository {
     pub id: String,
     pub git_path_id: String,
@@ -210,6 +275,7 @@ pub struct Repository {
 
 /// Checkout (working tree) record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Checkout {
     pub id: String,
     pub repository_id: String,
@@ -227,6 +293,7 @@ pub struct Checkout {
 
 /// HEAD observation. Kind and HEAD state are independent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Head {
     /// `branch`, `detached`, `unborn`, `invalid`, or `unknown`.
     pub state: String,
@@ -236,6 +303,7 @@ pub struct Head {
 
 /// Object ID with explicit algorithm (never assume 40 hex chars).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObjectId {
     pub algorithm: String,
     /// Nonempty even-length lowercase hex; known algorithms enforce length.
@@ -244,6 +312,7 @@ pub struct ObjectId {
 
 /// Branch / reference observation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Branch {
     pub id: String,
     pub repository_id: String,
@@ -310,6 +379,7 @@ fn default_working_state() -> String {
 /// when their requested units are known. Never report zero or clean for an
 /// unknown, pending, unsupported, or failed field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Status {
     /// `complete`, `partial`, `pending`, `not_requested`, `unsupported`,
     /// `unstable`, or `error`.
@@ -341,6 +411,7 @@ pub struct Status {
 
 /// Effective remote observation with role preserved. Credentials redacted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Remote {
     pub id: String,
     pub repository_id: String,
@@ -364,6 +435,7 @@ pub struct Remote {
 /// Names observed current / deleted upstream travel on the
 /// `remote_updated` event and branch freshness labels, not here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RemoteRefresh {
     /// `success`, `failed`, or `unsupported`.
     pub status: String,
@@ -376,6 +448,7 @@ pub struct RemoteRefresh {
 
 /// Shared-storage relationship edge. A dependency edge, not a merged clone.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageLink {
     pub id: String,
     pub from_repository_id: String,
@@ -388,6 +461,7 @@ pub struct StorageLink {
 
 /// Pathname alias (symlink, firmlink, mount alias, verified same object).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Alias {
     pub path_id: String,
     pub target_path_id: String,
@@ -398,6 +472,7 @@ pub struct Alias {
 
 /// Unresolved Git candidate that prevents strict exhaustiveness.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Candidate {
     pub id: String,
     pub path_id: String,
@@ -411,6 +486,7 @@ pub struct Candidate {
 
 /// Error / coverage-gap record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ErrorRecord {
     pub id: String,
     pub path_id: Option<String>,
@@ -428,6 +504,7 @@ pub struct ErrorRecord {
 /// listed here with `created_after_status: true`; requested working state
 /// is observed before publication.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GeneratedArtifact {
     pub path_id: String,
     /// `report` or `tool_state`.

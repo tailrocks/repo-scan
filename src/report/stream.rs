@@ -187,6 +187,7 @@ pub fn write_report_value<W: std::io::Write>(
     write_array(&mut stream, "volumes", &report.volumes)?;
     write_array(&mut stream, "paths", &report.paths)?;
     write_array(&mut stream, "roots", &report.roots)?;
+    write_array(&mut stream, "groups", &report.groups)?;
     write_array(&mut stream, "repositories", &report.repositories)?;
     write_array(&mut stream, "checkouts", &report.checkouts)?;
     write_array(&mut stream, "branches", &report.branches)?;
@@ -200,6 +201,7 @@ pub fn write_report_value<W: std::io::Write>(
         "generated_artifacts",
         &report.generated_artifacts,
     )?;
+    stream.field("totals", &report.totals)?;
     stream.end_object()?;
     stream.finish()
 }

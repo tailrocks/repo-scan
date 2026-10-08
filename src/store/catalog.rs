@@ -2119,6 +2119,8 @@ impl TursoStore {
         now_ms: i64,
     ) -> crate::Result<bool> {
         self.forbid_write("release_claim")?;
+        let epoch_i64 = u64_to_i64(epoch, "lease epoch")?;
+        self.check_owner_epoch(epoch, "release_claim")?;
         let rows = self
             .connection()
             .execute(
@@ -2131,7 +2133,7 @@ impl TursoStore {
                     v_int(now_ms),
                     v_text(task_id),
                     v_int(token),
-                    v_int(u64_to_i64(epoch, "lease epoch")?),
+                    v_int(epoch_i64),
                 ],
             )
             .await
@@ -2448,8 +2450,12 @@ impl TursoStore {
         generation: u64,
         now_ms: i64,
     ) -> crate::Result<u64> {
+        // Resolve spelling aliases before `BEGIN IMMEDIATE`: the lookup
+        // canonicalizes filesystem paths and must not hold the writer lock.
+        let fan_keys = Self::scope_fanout_keys(&self.conn, &[scope_key.to_string()]).await?;
+        let fan_keys = fan_keys.into_iter().next().unwrap_or_default();
         self.with_tx(|conn| async move {
-            Self::invalidate_scope_on(conn, scope_key, generation, now_ms).await
+            Self::invalidate_scope_on(conn, scope_key, generation, now_ms, &fan_keys).await
         })
         .await
     }
@@ -2473,6 +2479,7 @@ impl TursoStore {
         scope_key: &str,
         generation: u64,
         now_ms: i64,
+        fan_keys: &[String],
     ) -> crate::Result<u64> {
         let next = Self::scope_rev_on(conn, scope_key)
             .await?
@@ -2497,8 +2504,8 @@ impl TursoStore {
         // spelling of this object requeue like directly-invalidated
         // ones. Each key bumps from its own revision with its own
         // mirror; failures are loud (caller's transaction rolls back).
-        for fan_key in Self::same_object_live_keys(conn, scope_key).await? {
-            let fan_next = Self::scope_rev_on(conn, &fan_key)
+        for fan_key in fan_keys {
+            let fan_next = Self::scope_rev_on(conn, fan_key)
                 .await?
                 .checked_add(1)
                 .ok_or_else(|| Error::Store("scope revision overflow".to_string()))?;
@@ -2512,7 +2519,7 @@ impl TursoStore {
             )
             .await
             .map_err(store_err)?;
-            Self::mirror_dir_invalidation(conn, &fan_key, fan_next).await?;
+            Self::mirror_dir_invalidation(conn, fan_key, fan_next).await?;
         }
         let task_id = format!("reconcile:{scope_key}:{next}");
         let idempotency = format!("idem:{task_id}");
@@ -2538,27 +2545,33 @@ impl TursoStore {
         Ok(next)
     }
 
-    /// Live-task scope keys denoting the same object as `scope_key`
-    /// under a different spelling (DB-M1 fan-out set). Only `dir:` and
-    /// `git:` keys participate (other families carry no paths); only
-    /// keys with live (`pending`/`leased`/`retry_wait`) tasks are
-    /// returned — completed work needs no requeue, and future tasks
-    /// read the bumped revision at creation. Identity compares
-    /// through [`crate::config::canonical_scope_path`]; unparseable
-    /// keys and unresolvable paths never match. The input key itself
-    /// is excluded (the caller already bumped it). Runs inside the
-    /// caller's transaction.
-    async fn same_object_live_keys(
+    /// Snapshot the live path-scope keys that share a physical path with
+    /// each requested scope (DB-M1). This runs before the write transaction:
+    /// `canonical_scope_path` performs filesystem I/O. Only `dir:` and
+    /// `git:` keys participate; completed work needs no requeue, and future
+    /// tasks read the bumped revision when they are created. The resulting
+    /// keys are applied atomically with the invalidation by
+    /// `invalidate_scope_on`.
+    async fn scope_fanout_keys(
         conn: &turso::Connection,
-        scope_key: &str,
-    ) -> crate::Result<Vec<String>> {
+        scopes: &[String],
+    ) -> crate::Result<Vec<Vec<String>>> {
         use crate::config::ScopeRef;
-        let target = match crate::config::parse_scope_key(scope_key) {
-            Some(ScopeRef::Dir(path)) | Some(ScopeRef::Git(path)) => {
-                crate::config::canonical_scope_path(&path)
-            }
-            Some(ScopeRef::Status(_)) | None => return Ok(Vec::new()),
-        };
+        let targets: Vec<Option<PathBuf>> = scopes
+            .iter()
+            .map(
+                |scope_key| match crate::config::parse_scope_key(scope_key) {
+                    Some(ScopeRef::Dir(path)) | Some(ScopeRef::Git(path)) => {
+                        Some(crate::config::canonical_scope_path(&path))
+                    }
+                    Some(ScopeRef::Status(_)) | None => None,
+                },
+            )
+            .collect();
+        if targets.iter().all(Option::is_none) {
+            return Ok(vec![Vec::new(); scopes.len()]);
+        }
+        let mut fanouts = vec![Vec::new(); scopes.len()];
         let mut rows = conn
             .query(
                 "SELECT DISTINCT scope_key FROM frontier_tasks \
@@ -2568,23 +2581,21 @@ impl TursoStore {
             )
             .await
             .map_err(store_err)?;
-        let mut out = Vec::new();
         while let Some(row) = rows.next().await.map_err(store_err)? {
             let key = req_text(&row, 0)?;
-            if key == scope_key {
-                continue;
-            }
-            let same = match crate::config::parse_scope_key(&key) {
+            let path = match crate::config::parse_scope_key(&key) {
                 Some(ScopeRef::Dir(path)) | Some(ScopeRef::Git(path)) => {
-                    crate::config::canonical_scope_path(&path) == target
+                    crate::config::canonical_scope_path(&path)
                 }
-                Some(ScopeRef::Status(_)) | None => false,
+                Some(ScopeRef::Status(_)) | None => continue,
             };
-            if same {
-                out.push(key);
+            for (index, (scope_key, target)) in scopes.iter().zip(&targets).enumerate() {
+                if key != *scope_key && target.as_ref().is_some_and(|target| target == &path) {
+                    fanouts[index].push(key.clone());
+                }
             }
         }
-        Ok(out)
+        Ok(fanouts)
     }
 
     /// Mirror a `dir:` scope invalidation into every matching
@@ -4814,6 +4825,10 @@ impl TursoStore {
         let uuid = history_uuid.to_string();
         let cursor = cursor.to_string();
         let scopes = scopes.to_vec();
+        // Canonicalize all candidate spellings before opening the write
+        // transaction. Cursor insertion and every resulting revision/task
+        // update still commit or roll back together below.
+        let fanouts = Self::scope_fanout_keys(&self.conn, &scopes).await?;
         self.with_tx(move |conn| async move {
             let inserted = conn
                 .execute(
@@ -4838,8 +4853,10 @@ impl TursoStore {
                 });
             }
             let mut revs = Vec::with_capacity(scopes.len());
-            for scope in &scopes {
-                revs.push(Self::invalidate_scope_on(conn, scope, generation, now_ms).await?);
+            for (scope, fan_keys) in scopes.iter().zip(&fanouts) {
+                revs.push(
+                    Self::invalidate_scope_on(conn, scope, generation, now_ms, fan_keys).await?,
+                );
             }
             Ok::<IngestedBatch, Error>(IngestedBatch {
                 inserted: true,

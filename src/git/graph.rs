@@ -265,17 +265,19 @@ impl ComparisonCache {
 
 /// True when `git_dir` or `common_dir` carries a non-empty `shallow`
 /// file (the store is a shallow clone, or was made shallow by hand).
-/// Read-only control-file probe; unreadable files read as absent —
-/// the gix open below re-checks via `shallow_commits` before any
-/// walk, so a missed file degrades to the walk-time check, never to
-/// a false complete claim.
+/// Read-only bounded, no-follow probe; an existing but unreadable or
+/// oversized file is treated as shallow because its state is unknown.
 #[must_use]
 pub fn shallow_present(git_dir: &Path, common_dir: &Path) -> bool {
     for dir in [git_dir, common_dir] {
         let path = dir.join("shallow");
-        if let Ok(bytes) = std::fs::read(&path) {
-            if bytes.iter().any(|b| !b.is_ascii_whitespace()) {
-                return true;
+        match control_file_bytes(&path) {
+            ControlFile::Missing => {}
+            ControlFile::Unknown => return true,
+            ControlFile::Read(bytes) => {
+                if bytes.iter().any(|b| !b.is_ascii_whitespace()) {
+                    return true;
+                }
             }
         }
     }
@@ -285,21 +287,56 @@ pub fn shallow_present(git_dir: &Path, common_dir: &Path) -> bool {
 /// True when `git_dir` or `common_dir` carries a live `info/grafts`
 /// entry (a non-blank, non-comment line). gix 0.88 honors no grafts,
 /// so any grafted store compares as [`STATE_INCOMPLETE_HISTORY`].
+/// Existing but unreadable, oversized, symlinked, or special files are
+/// treated as grafted because their contents cannot be proven empty.
 #[must_use]
 pub fn grafts_present(git_dir: &Path, common_dir: &Path) -> bool {
     for dir in [git_dir, common_dir] {
         let path = dir.join("info").join("grafts");
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        for line in text.lines() {
-            let line = line.trim();
-            if !line.is_empty() && !line.starts_with('#') {
-                return true;
+        match control_file_bytes(&path) {
+            ControlFile::Missing => {}
+            ControlFile::Unknown => return true,
+            ControlFile::Read(bytes) => {
+                for line in bytes.split(|b| *b == b'\n') {
+                    let line = trim_ascii_bytes(line);
+                    if !line.is_empty() && !line.starts_with(b"#") {
+                        return true;
+                    }
+                }
             }
         }
     }
     false
+}
+
+enum ControlFile {
+    Missing,
+    Unknown,
+    Read(Vec<u8>),
+}
+
+/// Read a git control file without following links or accepting special
+/// files. Existing-but-unreadable files are unknown evidence and must be
+/// treated conservatively by callers.
+fn control_file_bytes(path: &Path) -> ControlFile {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ControlFile::Missing,
+        Err(_) => ControlFile::Unknown,
+        Ok(_) => match super::read_bounded_bytes(path, super::MAX_GIT_CONTROL_BYTES) {
+            Some(bytes) => ControlFile::Read(bytes),
+            None => ControlFile::Unknown,
+        },
+    }
+}
+
+fn trim_ascii_bytes(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
 }
 
 /// Validate a tip OID: even-length lowercase hex of the algorithm's
@@ -332,6 +369,8 @@ pub struct CompareContext<'a> {
     pub cache: Option<&'a ComparisonCache>,
     /// Installed-git fallback for stores gix cannot walk.
     pub fallback: Option<&'a super::fallback::FallbackGit>,
+    /// Cancellation/deadline for the graph walk and any fallback spawn.
+    pub cancel: Option<&'a super::fallback::WaitCancel>,
 }
 
 /// One local branch with its resolved upstream, as observed: OID hex
@@ -369,6 +408,9 @@ pub struct BranchTips<'a> {
 /// no defined merge-base). Otherwise delegates to [`compare_oids`].
 #[must_use]
 pub fn compare_branch(ctx: &CompareContext<'_>, tips: &BranchTips<'_>) -> Comparison {
+    if ctx.cancel.is_some_and(|cancel| cancel.cancelled()) {
+        return Comparison::error();
+    }
     if tips.upstream.is_none() {
         return Comparison::no_upstream();
     }
@@ -405,6 +447,11 @@ pub fn compare_oids(
     upstream_hex: &str,
     algo: &str,
 ) -> Comparison {
+    // Cancellation is reported through the caller-owned token; this
+    // placeholder must not be persisted as a comparison result.
+    if ctx.cancel.is_some_and(|cancel| cancel.cancelled()) {
+        return Comparison::error();
+    }
     if !valid_oid_hex(local_hex, algo) || !valid_oid_hex(upstream_hex, algo) {
         return Comparison::error();
     }
@@ -431,7 +478,7 @@ pub fn compare_oids(
     }
     let shallow_file = shallow_present(ctx.git_dir, ctx.common_dir);
     match open_isolated(ctx.git_dir) {
-        Ok(repo) => match walk_counts(&repo, local_hex, upstream_hex) {
+        Ok(repo) => match walk_counts(&repo, local_hex, upstream_hex, ctx.cancel) {
             Ok(WalkOutcome::Counts(ahead, behind)) => {
                 if let Some(cache) = ctx.cache {
                     cache.insert(key, (ahead, behind));
@@ -446,7 +493,10 @@ pub fn compare_oids(
             Ok(WalkOutcome::MissingObject) => {
                 fallback_counts(ctx, local_hex, upstream_hex, shallow_file, key.as_ref())
             }
-            Err(_) => fallback_counts(ctx, local_hex, upstream_hex, shallow_file, key.as_ref()),
+            Err(WalkError::Cancelled) => Comparison::error(),
+            Err(WalkError::Failed) => {
+                fallback_counts(ctx, local_hex, upstream_hex, shallow_file, key.as_ref())
+            }
         },
         // gix cannot open the store (unsupported object format, …):
         // the fallback's `rev-list` reads what gix cannot.
@@ -476,6 +526,12 @@ enum WalkOutcome {
     CutCrossed,
     /// A needed object is absent from the store.
     MissingObject,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkError {
+    Failed,
+    Cancelled,
 }
 
 /// Isolated exact-path open mirroring the inspector's opener
@@ -530,16 +586,23 @@ fn count_exclusive(
     tip: gix::hash::ObjectId,
     hidden: gix::hash::ObjectId,
     boundary: &Option<HashSet<gix::hash::ObjectId>>,
-) -> Result<(u64, bool), ()> {
+    cancel: Option<&super::fallback::WaitCancel>,
+) -> Result<(u64, bool), WalkError> {
+    if cancel.is_some_and(|cancel| cancel.cancelled()) {
+        return Err(WalkError::Cancelled);
+    }
     let walk = repo
         .rev_walk([tip])
         .with_hidden([hidden])
         .all()
-        .map_err(|_| ())?;
+        .map_err(|_| WalkError::Failed)?;
     let mut count = 0u64;
     let mut touched = false;
     for info in walk {
-        let info = info.map_err(|_| ())?;
+        if cancel.is_some_and(|cancel| cancel.cancelled()) {
+            return Err(WalkError::Cancelled);
+        }
+        let info = info.map_err(|_| WalkError::Failed)?;
         count = count.saturating_add(1);
         if let Some(set) = boundary {
             if set.contains(&info.id) {
@@ -558,9 +621,15 @@ fn walk_counts(
     repo: &gix::Repository,
     local_hex: &str,
     upstream_hex: &str,
-) -> Result<WalkOutcome, ()> {
-    let local = gix::hash::ObjectId::from_hex(local_hex.as_bytes()).map_err(|_| ())?;
-    let upstream = gix::hash::ObjectId::from_hex(upstream_hex.as_bytes()).map_err(|_| ())?;
+    cancel: Option<&super::fallback::WaitCancel>,
+) -> Result<WalkOutcome, WalkError> {
+    if cancel.is_some_and(|cancel| cancel.cancelled()) {
+        return Err(WalkError::Cancelled);
+    }
+    let local =
+        gix::hash::ObjectId::from_hex(local_hex.as_bytes()).map_err(|_| WalkError::Failed)?;
+    let upstream =
+        gix::hash::ObjectId::from_hex(upstream_hex.as_bytes()).map_err(|_| WalkError::Failed)?;
     // Existence first: a missing tip is MissingObject even when the
     // other tip's walk would fail differently.
     if repo.find_object(local).is_err() || repo.find_object(upstream).is_err() {
@@ -573,8 +642,8 @@ fn walk_counts(
     if repo_is_shallow(repo) && boundary.is_none() {
         return Ok(WalkOutcome::CutCrossed);
     }
-    let (ahead, touched_a) = count_exclusive(repo, local, upstream, &boundary)?;
-    let (behind, touched_b) = count_exclusive(repo, upstream, local, &boundary)?;
+    let (ahead, touched_a) = count_exclusive(repo, local, upstream, &boundary, cancel)?;
+    let (behind, touched_b) = count_exclusive(repo, upstream, local, &boundary, cancel)?;
     if touched_a || touched_b {
         return Ok(WalkOutcome::CutCrossed);
     }
@@ -597,10 +666,23 @@ fn fallback_counts(
     let Some(fallback) = ctx.fallback else {
         return Comparison::error();
     };
+    if ctx.cancel.is_some_and(|cancel| cancel.cancelled()) {
+        return Comparison::error();
+    }
     if shallow_file {
         return Comparison::incomplete_history();
     }
-    match fallback.rev_list_count(ctx.git_dir, ctx.work_tree, local_hex, upstream_hex) {
+    let result = match ctx.cancel {
+        Some(cancel) => fallback.rev_list_count_cancel(
+            ctx.git_dir,
+            ctx.work_tree,
+            local_hex,
+            upstream_hex,
+            cancel,
+        ),
+        None => fallback.rev_list_count(ctx.git_dir, ctx.work_tree, local_hex, upstream_hex),
+    };
+    match result {
         Ok((ahead, behind)) => {
             if let Some(cache) = ctx.cache {
                 cache.insert(key.key.clone(), (ahead, behind));

@@ -24,9 +24,9 @@ use crate::report::encode::{
     oid_hex_from_bytes,
 };
 use crate::report::model::{
-    Alias, Branch, Candidate, Checkout, Coverage, ErrorRecord, GeneratedArtifact, Head, ObjectId,
-    PathRecord, Remote, RemoteRefresh, Report, Repository, Resources, Root, Scan, ScanTarget,
-    Status, StorageLink, Tool, Volume,
+    Alias, AnalysisTotals, Branch, Candidate, Checkout, Coverage, ErrorRecord, GeneratedArtifact,
+    Group, Head, ObjectId, PathRecord, Remote, RemoteRefresh, Report, Repository, Resources, Root,
+    Scan, ScanTarget, Status, StorageLink, Tool, Totals, Volume,
 };
 use crate::report::publish::{
     check_report_id, check_staged_memory_budget, publish_bound, retain_bound, BoundStaged,
@@ -186,6 +186,8 @@ pub struct StreamStats {
     pub stub_volumes: u64,
     pub paths: u64,
     pub roots: u64,
+    pub groups: u64,
+    pub accounts: u64,
     pub repositories: u64,
     pub checkouts: u64,
     pub branches: u64,
@@ -1064,6 +1066,10 @@ async fn stream_with_pre_pass<W: Write>(
     writer: W,
 ) -> crate::Result<(W, StreamStats)> {
     let mut stats = StreamStats::default();
+    let mut totals = Totals {
+        bare_stores: Some(0),
+        ..Totals::default()
+    };
     let unresolvable_candidates = inputs
         .candidates
         .iter()
@@ -1279,6 +1285,8 @@ async fn stream_with_pre_pass<W: Write>(
     }
     stream.end_array()?;
 
+    totals.observed_paths = stats.paths;
+
     // Caller-owned roots.
     stream.begin_array_field("roots")?;
     for root in &inputs.roots {
@@ -1311,6 +1319,43 @@ async fn stream_with_pre_pass<W: Write>(
     }
     stream.end_array()?;
 
+    // GitHub groups are distinct normalized identities linked through at
+    // least one emitted store. The query stays catalog-backed and streams
+    // rows in ID order; it does not materialize every group in memory.
+    stream.begin_array_field("groups")?;
+    {
+        let mut rows = reader
+            .query(
+                "SELECT DISTINCT g.id, g.host, g.account, g.repo \
+                    FROM github_groups g \
+                    JOIN group_members gm ON gm.group_id = g.id \
+                    JOIN git_instances gi ON gi.id = gm.instance_id \
+                    WHERE (?1 = 1 OR gi.disposition != 'nonmatch') \
+                    ORDER BY g.id ASC",
+                vec![turso::Value::Integer(i64::from(inputs.include_nonmatching))],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut last_account: Option<(String, String)> = None;
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            let host = req_text(&row, 1)?;
+            let account = req_text(&row, 2)?;
+            let account_key = (host.clone(), account.clone());
+            if last_account.as_ref() != Some(&account_key) {
+                stats.accounts += 1;
+                last_account = Some(account_key);
+            }
+            stream.array_item(&Group {
+                id: req_text(&row, 0)?,
+                host,
+                account,
+                repo: req_text(&row, 3)?,
+            })?;
+            stats.groups += 1;
+        }
+    }
+    stream.end_array()?;
+
     // Repositories (matching scope; nonmatching skipped unless requested).
     let interned = |bytes: &[u8]| -> crate::Result<String> {
         pre.interner.by_bytes.get(bytes).cloned().ok_or_else(|| {
@@ -1332,11 +1377,21 @@ async fn stream_with_pre_pass<W: Write>(
             if !pre.included_repos.contains(&id) {
                 continue;
             }
+            let bare = opt_i64(&row, 4)?.map(|flag| flag != 0);
+            match bare {
+                Some(true) => {
+                    if let Some(count) = totals.bare_stores.as_mut() {
+                        *count += 1;
+                    }
+                }
+                Some(false) => {}
+                None => totals.bare_stores = None,
+            }
             stream.array_item(&Repository {
                 id,
                 git_path_id: interned(&req_blob(&row, 1)?)?,
                 common_path_id: interned(&req_blob(&row, 2)?)?,
-                bare: opt_i64(&row, 4)?.map(|flag| flag != 0),
+                bare,
                 format: req_text(&row, 3)?,
                 object_format: req_text(&row, 5)?,
                 match_disposition: req_text(&row, 6)?,
@@ -1349,6 +1404,7 @@ async fn stream_with_pre_pass<W: Write>(
         }
     }
     stream.end_array()?;
+    totals.stores = stats.repositories;
 
     // Checkouts with their latest status observation (or an honest
     // pending/not_requested placeholder when none was recorded).
@@ -1379,6 +1435,13 @@ async fn stream_with_pre_pass<W: Write>(
                 .get(&id)
                 .cloned()
                 .unwrap_or_else(|| default_status(inputs.status_mode));
+            if req_text(&row, 5)? == "present" {
+                totals.present_checkouts += 1;
+                if req_text(&row, 4)? == "linked" {
+                    totals.linked_worktrees += 1;
+                }
+            }
+            record_analysis_total(&mut totals.analysis, &status.state);
             stream.array_item(&Checkout {
                 id,
                 repository_id: instance_id,
@@ -1435,11 +1498,17 @@ async fn stream_with_pre_pass<W: Write>(
             } else {
                 (String::from("pending"), None, None)
             };
+            let kind = req_text(&row, 3)?;
+            match kind.as_str() {
+                "local" => totals.local_branches += 1,
+                "remote_tracking" => totals.remote_tracking_refs += 1,
+                _ => {}
+            }
             stream.array_item(&Branch {
                 id: req_text(&row, 0)?,
                 repository_id: instance_id,
                 checkout_scope_id: scope,
-                kind: req_text(&row, 3)?,
+                kind,
                 name: encode_name(&req_blob(&row, 4)?),
                 oid: object_id_from_parts(opt_blob(&row, 5)?, opt_text(&row, 6)?),
                 symbolic_target: opt_blob(&row, 7)?.as_deref().map(encode_name),
@@ -1553,6 +1622,7 @@ async fn stream_with_pre_pass<W: Write>(
         stats.aliases += 1;
     }
     stream.end_array()?;
+    totals.aliases = stats.aliases;
 
     stream.begin_array_field("candidates")?;
     for candidate in &inputs.candidates {
@@ -1576,6 +1646,7 @@ async fn stream_with_pre_pass<W: Write>(
         stats.candidates += 1;
     }
     stream.end_array()?;
+    totals.unresolved_candidates = unresolvable_candidates;
 
     // Open errors; a `dir:{n}` scope resolves to its path when the row
     // exists, otherwise the linkage stays honestly null.
@@ -1614,6 +1685,7 @@ async fn stream_with_pre_pass<W: Write>(
         }
     }
     stream.end_array()?;
+    totals.gaps = stats.errors;
 
     stream.begin_array_field("generated_artifacts")?;
     for artifact in &inputs.generated_artifacts {
@@ -1632,9 +1704,25 @@ async fn stream_with_pre_pass<W: Write>(
     }
     stream.end_array()?;
 
+    totals.observed_paths = stats.paths;
+    totals.groups = stats.groups;
+    totals.accounts = stats.accounts;
+    totals.stores = stats.repositories;
+    totals.aliases = stats.aliases;
+    stream.field("totals", &totals)?;
     stream.end_object()?;
     let writer = stream.finish()?;
     Ok((writer, stats))
+}
+
+fn record_analysis_total(totals: &mut AnalysisTotals, state: &str) {
+    match state {
+        "complete" => totals.completed += 1,
+        "pending" | "not_requested" => totals.pending += 1,
+        "unsupported" => totals.unavailable += 1,
+        "partial" | "unstable" | "error" => totals.failed += 1,
+        _ => totals.pending += 1,
+    }
 }
 
 async fn error_path_id(
@@ -1684,6 +1772,8 @@ struct StagedBudgetProbe {
     #[serde(default)]
     roots: Vec<IgnoredAny>,
     #[serde(default)]
+    groups: Vec<IgnoredAny>,
+    #[serde(default)]
     repositories: Vec<IgnoredAny>,
     #[serde(default)]
     checkouts: Vec<IgnoredAny>,
@@ -1708,6 +1798,7 @@ impl StagedBudgetProbe {
         (self.volumes.len()
             + self.paths.len()
             + self.roots.len()
+            + self.groups.len()
             + self.repositories.len()
             + self.checkouts.len()
             + self.branches.len()
@@ -1754,6 +1845,27 @@ pub fn verify_staged_report_capped(staged: &Path, rss_target_bytes: u64) -> crat
             staged.display()
         ))
     })
+}
+
+/// Validate staged report bytes with bounded record-by-record parsing.
+/// Returns the report ID after schema-domain, relationship, count, and
+/// cross-field validation. The record vectors are never retained.
+pub fn verify_staged_report_streaming(
+    staged: &Path,
+    rss_target_bytes: u64,
+) -> crate::Result<String> {
+    let bound = BoundStaged::open(staged)?;
+    verify_bound_report_streaming(&bound, rss_target_bytes)
+}
+
+/// Streaming twin of [`verify_bound_report_capped`] for publication gates
+/// that need validation but do not consume the full typed report.
+pub fn verify_bound_report_streaming(
+    bound: &BoundStaged,
+    rss_target_bytes: u64,
+) -> crate::Result<String> {
+    let records = probe_staged_records(bound.bytes())?;
+    crate::report::validate::validate_report_streaming(bound.bytes(), records, rss_target_bytes)
 }
 
 /// Owned-bound verification (R3): see [`verify_staged_report_capped`].
@@ -1837,7 +1949,7 @@ impl ReportPipeline {
                 staged.display()
             ))
         })?;
-        verify_bound_report_capped(&bound, inputs.rss_target_bytes).map_err(|e| {
+        verify_bound_report_streaming(&bound, inputs.rss_target_bytes).map_err(|e| {
             quarantine_staging(&staged);
             crate::error::Error::Report(format!(
                 "refusing invalid staged report {}: {e}",
@@ -1960,7 +2072,7 @@ impl ReportPipeline {
                 staged.display()
             ))
         })?;
-        verify_bound_report_capped(&bound, inputs.rss_target_bytes).map_err(|e| {
+        verify_bound_report_streaming(&bound, inputs.rss_target_bytes).map_err(|e| {
             quarantine_staging(&staged);
             crate::error::Error::Report(format!(
                 "refusing invalid staged report {}: {e}",
@@ -2009,7 +2121,7 @@ impl ReportPipeline {
                 staged.display()
             ))
         })?;
-        verify_bound_report_capped(&bound, inputs.rss_target_bytes).map_err(|e| {
+        verify_bound_report_streaming(&bound, inputs.rss_target_bytes).map_err(|e| {
             quarantine_staging(&staged);
             crate::error::Error::Report(format!(
                 "refusing invalid staged report {}: {e}",
@@ -2059,7 +2171,7 @@ impl ReportPipeline {
                 staged.display()
             ))
         })?;
-        if let Err(e) = verify_bound_report_capped(&bound, inputs.rss_target_bytes) {
+        if let Err(e) = verify_bound_report_streaming(&bound, inputs.rss_target_bytes) {
             quarantine_staging(&staged);
             return Err(crate::error::Error::Report(format!(
                 "refusing invalid staged report {}: {e}",
@@ -2091,16 +2203,16 @@ impl ReportPipeline {
     ) -> crate::Result<crate::report::Publication> {
         let bound = BoundStaged::open(snapshot_path)?;
         {
-            let report =
-                verify_bound_report_capped(&bound, DEFAULT_STAGED_VERIFY_RSS_TARGET_BYTES)?;
-            if report.report_id != report_id {
+            let found_id =
+                verify_bound_report_streaming(&bound, DEFAULT_STAGED_VERIFY_RSS_TARGET_BYTES)?;
+            if found_id != report_id {
                 return Err(Error::Report(format!(
                     "snapshot {} holds report {}, not {report_id}",
                     snapshot_path.display(),
-                    report.report_id
+                    found_id
                 )));
             }
-        } // R3: typed report dropped before publication; publish ships bytes only.
+        }
         match publish_bound(&bound, dest, state_dir) {
             Ok(file) => {
                 store

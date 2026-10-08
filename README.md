@@ -17,8 +17,9 @@ cargo build --release
 # binary: target/release/repo-scan
 ```
 
-No runtime dependencies: no LLM, cloud service, daemon, GUI, or TUI. Installed Git is
-an optional compatibility backend only. Locked deps: `turso =0.8.1`, `dua-core =4.1.0`,
+No service or daemon dependencies: no LLM, cloud service, or background daemon. The
+optional interactive TUI uses the terminal directly. Installed Git is an optional
+compatibility backend only. Locked deps: `turso =0.8.1`, `dua-core =4.1.0`,
 `gix =0.88.0` ([Cargo.toml](Cargo.toml:45)).
 
 ## Test
@@ -157,15 +158,15 @@ record vecs in full, elided here):
 
 ```text
 schema_version report_id created_at tool scan coverage resources
-volumes paths roots repositories checkouts branches remotes
-storage_links aliases candidates errors generated_artifacts
+volumes paths roots groups repositories checkouts branches remotes
+storage_links aliases candidates errors generated_artifacts totals
 ```
 
 A small fixture scan observed
 `repositories=2 checkouts=2 branches=4 remotes=4 candidates=1 errors=0`
 with `coverage.filesystem=complete`, `coverage.identity=unproven`,
 `coverage.status=incomplete`, `gaps=0`, `unresolvable_candidates=1`.
-Validate against [schemas/report-v1.4.schema.json](schemas/report-v1.4.schema.json).
+Validate against [schemas/report-v1.5.schema.json](schemas/report-v1.5.schema.json).
 
 ### JSONL event stream (observed)
 
@@ -190,11 +191,18 @@ Full contract: [docs/GOAL_CONTRACTS.md](docs/GOAL_CONTRACTS.md) D4.
 
 ## Counts
 
-Counts are record vec lengths plus three independent coverage
-properties. There is no top-level `totals` object and no `groups[]` in
-report `1.4.0`: count the vecs (`repositories`, `checkouts`, `branches`,
-`remotes`, `candidates`, `errors`) — the human `totals` line prints
-exactly those lengths.
+Report `1.5.0` includes `groups[]` and a top-level `totals` object. Each
+group contains its normalized `id`, `host`, `account`, and `repo`; only
+groups linked to included stores are emitted. `totals.accounts` counts
+distinct host/account pairs, `totals.groups` and `totals.stores` count
+their arrays, and `totals.bare_stores` is null if any store has unknown
+bare state. The remaining totals count present checkouts, present linked
+worktrees, paths, aliases, local branches, remote-tracking refs, analysis
+states, unresolved candidates, and errors. `analysis.pending` includes
+`not_requested`; `unsupported` is unavailable; partial, unstable, and
+error states are failed.
+
+The three coverage properties remain independent:
 
 - `coverage.filesystem`: `complete` / `incomplete` / `unknown`.
 - `coverage.identity`: `complete_under_policy` / `unproven`.

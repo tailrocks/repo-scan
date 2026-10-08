@@ -223,6 +223,7 @@ mod tests {
             volumes: vec![],
             paths: vec![],
             roots: vec![],
+            groups: vec![],
             repositories: vec![],
             checkouts: vec![],
             branches: vec![],
@@ -232,6 +233,7 @@ mod tests {
             candidates: vec![],
             errors: vec![],
             generated_artifacts: vec![],
+            totals: Default::default(),
         }
     }
 

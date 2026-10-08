@@ -20,11 +20,21 @@ Reuse existing Catalog tables; add what is missing. No renames.
 | Coverage gap | `errors` | `ErrorRecord` | existing `id` |
 | Candidate | derived | `Candidate` | existing `id`; identity `unknown` when unresolvable |
 
-Totals (NEW `totals` object in report): accounts/orgs, unique groups,
-stores (+bare), present checkouts (+linked worktrees), observed paths
-(+aliases), local branches, remote-tracking refs, analysis
-completed/pending/failed/unavailable, unresolved candidates, gaps.
-Unknown counts are `null`; pre-analysis fields are `pending`.
+Report `1.5.0` emits each `groups[]` row as `{id, host, account, repo}`;
+`id` is lowercase `host/account/repo`. It includes a group when at least
+one included store is linked to it. The row describes the normalized
+identity and does not enumerate store-member IDs.
+
+The `totals` keys are `accounts`, `groups`, `stores`, `bare_stores`,
+`present_checkouts`, `linked_worktrees`, `observed_paths`, `aliases`,
+`local_branches`, `remote_tracking_refs`, `analysis`,
+`unresolved_candidates`, and `gaps`. `accounts` counts distinct
+`(host, account)` pairs; the other count fields agree with their named
+records or dispositions. `bare_stores` is null if any included store has
+unknown bare state. `analysis` has `completed`, `pending`, `failed`, and
+`unavailable`: `not_requested` is pending, `unsupported` is unavailable,
+and partial/unstable/error are failed. Pre-analysis fields are pending.
+Unknown counts are null, never zero.
 Filesystem coverage, identity coverage, analysis completion, remote
 freshness stay separate properties.
 
@@ -41,6 +51,8 @@ freshness stay separate properties.
 - Report `1.3.0` → `1.4.0` (additive, Step 10: branch `comparison` /
   `ahead` / `behind`; no field removed/renamed; pre-1.4 snapshots
   deserialize as `pending` / null; validator accepts `1.3.0` + `1.4.0`).
+- Report `1.4.0` → `1.5.0` (additive: normalized `groups[]` and derived
+  `totals`; old snapshots remain valid without these fields).
 - Catalog migration v6: `refs.comparison_state` / `ahead` / `behind`
   (Step 10); legacy rows read `NULL` (`pending` / null counts).
 - NEW scan-event stream schema `1.0.0` (JSONL).
@@ -395,18 +407,17 @@ against fixture snapshots with no PTY (`tests/tui_impl.rs`).
 
 ## D12. Wave4b documentation decisions (Step 17, branch `work/fast-complete-scan`)
 
-Observed delivered behavior pinned by running the debug binary against
-fixture repos (one clone + one bare store under `--root`); README
-examples quote that output (IDs/paths trimmed, never invented).
+Historical Wave4b behavior, as observed at that time by running the debug
+binary against fixture repos (one clone + one bare store under `--root`);
+the `1.4.0` output claims below are superseded by report `1.5.0`.
 
-- Report `1.4.0` carries NO top-level `totals` object and NO `groups[]`:
+- Report `1.4.0` carried NO top-level `totals` object and NO `groups[]`:
   the D1 totals/groups plan is unimplemented in the delivered JSON.
   Counts are record vec lengths (the human `totals` line prints exactly
   those) plus the three independent `coverage` properties
   (`filesystem` / `identity` / `status`) with `gaps` ==
   `len(errors)` and `unresolvable_candidates` == unresolvable
-  `candidates`. Docs must not promise `totals`/`groups[]` until a wave
-  ships them (additive schema bump when it does).
+  `candidates`. The additive `1.5.0` schema now ships the D1 fields.
 - `query TARGET --cached` always prints the short human summary and
   ignores `--format` (observed: `--format json`/`jsonl` still print the
   summary, exit 0). `query --all` parses but is unimplemented (exit 1

@@ -582,6 +582,31 @@ impl FallbackGit {
         a_hex: &str,
         b_hex: &str,
     ) -> crate::Result<(u64, u64)> {
+        self.rev_list_count_inner(git_dir, work_tree, a_hex, b_hex, None)
+    }
+
+    /// [`Self::rev_list_count`] with an explicit cancellation/deadline token.
+    /// Graph walks use this so cancellation remains effective after a
+    /// primary gix walk fails and the installed-git fallback starts.
+    pub fn rev_list_count_cancel(
+        &self,
+        git_dir: &Path,
+        work_tree: Option<&Path>,
+        a_hex: &str,
+        b_hex: &str,
+        cancel: &WaitCancel,
+    ) -> crate::Result<(u64, u64)> {
+        self.rev_list_count_inner(git_dir, work_tree, a_hex, b_hex, Some(cancel))
+    }
+
+    fn rev_list_count_inner(
+        &self,
+        git_dir: &Path,
+        work_tree: Option<&Path>,
+        a_hex: &str,
+        b_hex: &str,
+        cancel: Option<&WaitCancel>,
+    ) -> crate::Result<(u64, u64)> {
         if a_hex.is_empty() || b_hex.is_empty() {
             return Err(crate::Error::Git(String::from(
                 "installed git: rev-list refuses empty tip OID",
@@ -590,11 +615,13 @@ impl FallbackGit {
         let spec = format!("{a_hex}...{b_hex}");
         // One argv element, no shell: hostile OID text cannot escape
         // into options or paths (and git re-validates the revision).
-        let out = self.run(
-            git_dir,
-            work_tree,
-            &["rev-list", "--left-right", "--count", &spec],
-        )?;
+        let args = ["rev-list", "--left-right", "--count", &spec];
+        let out = match cancel {
+            Some(cancel) => {
+                self.run_inner_with_cancel(git_dir, work_tree, &args, None, Some(cancel))?
+            }
+            None => self.run(git_dir, work_tree, &args)?,
+        };
         parse_rev_list_count(&out).ok_or_else(|| {
             crate::Error::Git(format!(
                 "installed git: unparseable rev-list --count output: {:?}",
@@ -1063,6 +1090,26 @@ impl FallbackGit {
         args: &[&str],
         isolation: Option<&StatusConfigIsolation>,
     ) -> crate::Result<Vec<u8>> {
+        self.run_inner_with_cancel(git_dir, work_tree, args, isolation, None)
+    }
+
+    /// [`run_inner`] with an explicit wait token. All spawn safety and
+    /// output limits remain shared; only the wait token source differs.
+    fn run_inner_with_cancel(
+        &self,
+        git_dir: &Path,
+        work_tree: Option<&Path>,
+        args: &[&str],
+        isolation: Option<&StatusConfigIsolation>,
+        cancel: Option<&WaitCancel>,
+    ) -> crate::Result<Vec<u8>> {
+        if cancel.is_some_and(WaitCancel::cancelled) {
+            return Err(crate::Error::Git(format!(
+                "installed git ({}): `{}` cancelled before spawn",
+                self.path.display(),
+                args.join(" ")
+            )));
+        }
         // Re-bind the executable before every spawn (XSEC-02): the
         // binary must still be the probed (dev, ino, owner, mode, size,
         // mtime) — a swapped, replaced, or re-permissioned binary is
@@ -1097,14 +1144,23 @@ impl FallbackGit {
         }
         apply_repo_neutralization(&mut command);
         command.args(args);
-        let outcome = spawn_enveloped(&mut command, false, GIT_SPAWN_TIMEOUT, MAX_CAPTURE_BYTES)
-            .map_err(|reason| {
-                crate::Error::Git(format!(
-                    "installed git ({}): `{}` spawn failed: {reason}",
-                    self.path.display(),
-                    args.join(" ")
-                ))
-            })?;
+        let spawn_result = match cancel {
+            Some(cancel) => spawn_enveloped_cancel(
+                &mut command,
+                false,
+                GIT_SPAWN_TIMEOUT,
+                MAX_CAPTURE_BYTES,
+                cancel,
+            ),
+            None => spawn_enveloped(&mut command, false, GIT_SPAWN_TIMEOUT, MAX_CAPTURE_BYTES),
+        };
+        let outcome = spawn_result.map_err(|reason| {
+            crate::Error::Git(format!(
+                "installed git ({}): `{}` spawn failed: {reason}",
+                self.path.display(),
+                args.join(" ")
+            ))
+        })?;
         if outcome.truncated {
             return Err(crate::Error::Git(format!(
                 "installed git ({}): `{}` output exceeded {MAX_CAPTURE_BYTES} bytes; \

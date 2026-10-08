@@ -9,7 +9,7 @@
 mod common;
 
 use common::fixture;
-use repo_scan::git::fallback::FallbackGit;
+use repo_scan::git::fallback::{FallbackGit, WaitCancel};
 use repo_scan::git::graph::{
     compare_branch, compare_oids, grafts_present, shallow_present, BranchTips, CompareContext,
     Comparison, ComparisonCache, COMPARISON_STATES,
@@ -22,6 +22,8 @@ use repo_scan::store::{
     NewCheckout, NewGitInstance, NewRef, NewRemote, NewStatus, NewVolume, Store, TursoStore,
 };
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Locate an installed git or skip the calling test.
 fn git_or_skip() -> Option<FallbackGit> {
@@ -58,6 +60,7 @@ fn compare_in(
         work_tree: Some(repo),
         cache,
         fallback,
+        cancel: None,
     };
     compare_oids(&ctx, local, upstream, "sha1")
 }
@@ -109,6 +112,7 @@ fn compare_branch_in(
         work_tree: Some(repo),
         cache,
         fallback,
+        cancel: None,
     };
     let local_hex = rev_parse_exact(repo, branch);
     let (upstream_hex, upstream_known) = match upstream {
@@ -202,6 +206,7 @@ fn malformed_oid_is_error_without_walk() {
         work_tree: None,
         cache: Some(&cache),
         fallback: None,
+        cancel: None,
     };
     for (local, upstream) in [
         ("zzz", "1111111111111111111111111111111111111111"),
@@ -242,6 +247,7 @@ fn equal_oid_fast_path_touches_nothing() {
         work_tree: None,
         cache: Some(&cache),
         fallback: None,
+        cancel: None,
     };
     let oid = "1111111111111111111111111111111111111111";
     let comparison = compare_oids(&ctx, oid, oid, "sha1");
@@ -264,6 +270,7 @@ fn branch_state_assignment_without_reads() {
         work_tree: None,
         cache: None,
         fallback: None,
+        cancel: None,
     };
     let none = compare_branch(
         &ctx,
@@ -742,6 +749,7 @@ fn unborn_branch_stays_explicit_error() {
         work_tree: Some(&repo),
         cache: None,
         fallback: Some(&fallback),
+        cancel: None,
     };
     let comparison = compare_branch(
         &ctx,
@@ -776,6 +784,115 @@ fn rev_list_fallback_matches_gix_counts() {
     assert!(fallback
         .rev_list_count(&git_dir, Some(repo.as_path()), "", &upstream)
         .is_err());
+}
+
+#[test]
+fn rev_list_fallback_observes_expired_deadline() {
+    let Some(fallback) = git_or_skip() else {
+        return;
+    };
+    let root = fixture::scratch_root("graph-fallback-cancel");
+    let repo = fixture::comparison_pair(root.path(), "pair", 100, 100);
+    let local = fixture::git_str(&repo, &["rev-parse", "refs/heads/main"]);
+    let upstream = fixture::git_str(&repo, &["rev-parse", "refs/remotes/origin/main"]);
+    let git_dir = repo.join(".git");
+    let cancel = WaitCancel::new(
+        || false,
+        Some(std::time::Instant::now() - std::time::Duration::from_millis(1)),
+    );
+
+    assert!(fallback
+        .rev_list_count_cancel(&git_dir, Some(&repo), &local, &upstream, &cancel)
+        .is_err());
+}
+
+#[test]
+fn canceled_graph_walk_stops_before_visiting_the_history() {
+    if git_or_skip().is_none() {
+        return;
+    }
+    let root = fixture::scratch_root("graph-cancel");
+    let repo = fixture::normal_clone(root.path(), "linear");
+    let first = fixture::git_str(&repo, &["rev-parse", "HEAD"]);
+    for i in 0..64 {
+        fixture::commit_file(
+            &repo,
+            "README.md",
+            &format!("commit {i}\n"),
+            &format!("commit {i}"),
+        );
+    }
+    let last = fixture::git_str(&repo, &["rev-parse", "HEAD"]);
+    let checks = Arc::new(AtomicUsize::new(0));
+    let check_counter = Arc::clone(&checks);
+    let cancel = WaitCancel::new(
+        move || check_counter.fetch_add(1, Ordering::Relaxed) >= 8,
+        None,
+    );
+    let git_dir = repo.join(".git");
+    let ctx = CompareContext {
+        git_dir: &git_dir,
+        common_dir: &git_dir,
+        store_id: "cancelled-walk",
+        work_tree: Some(&repo),
+        cache: None,
+        fallback: None,
+        cancel: Some(&cancel),
+    };
+
+    let comparison = compare_oids(&ctx, &last, &first, "sha1");
+    assert_eq!(comparison.state, "error");
+    assert!(
+        checks.load(Ordering::Relaxed) <= 10,
+        "walk did not stop early"
+    );
+}
+
+#[test]
+fn graph_control_files_fail_closed_when_unreadable_or_malformed() {
+    let root = fixture::scratch_root("graph-control-files");
+    let git_dir = root.path().join(".git");
+    std::fs::create_dir_all(git_dir.join("info")).expect("info dir");
+
+    // Missing and empty control files do not make a repository
+    // shallow or grafted.
+    assert!(!shallow_present(&git_dir, &git_dir));
+    assert!(!grafts_present(&git_dir, &git_dir));
+    std::fs::write(git_dir.join("shallow"), b" \n\t").expect("empty shallow");
+    std::fs::write(git_dir.join("info/grafts"), b"# comment\n\n").expect("empty grafts");
+    assert!(!shallow_present(&git_dir, &git_dir));
+    assert!(!grafts_present(&git_dir, &git_dir));
+
+    // Invalid UTF-8 in a comment must not hide a later live graft line.
+    std::fs::write(
+        git_dir.join("info/grafts"),
+        b"# invalid utf8: \xff\n1111111111111111111111111111111111111111\n",
+    )
+    .expect("malformed grafts");
+    assert!(grafts_present(&git_dir, &git_dir));
+
+    // An oversized file is unknown evidence, never silently treated as
+    // an empty file.
+    let oversized = vec![b' '; (repo_scan::git::MAX_GIT_CONTROL_BYTES + 1) as usize];
+    std::fs::write(git_dir.join("shallow"), &oversized).expect("oversized shallow");
+    std::fs::write(git_dir.join("info/grafts"), &oversized).expect("oversized grafts");
+    assert!(shallow_present(&git_dir, &git_dir));
+    assert!(grafts_present(&git_dir, &git_dir));
+}
+
+#[cfg(unix)]
+#[test]
+fn graph_control_file_probes_do_not_follow_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let root = fixture::scratch_root("graph-control-symlink");
+    let git_dir = root.path().join(".git");
+    std::fs::create_dir_all(git_dir.join("info")).expect("info dir");
+    symlink("/dev/zero", git_dir.join("shallow")).expect("shallow symlink");
+    symlink("/dev/zero", git_dir.join("info/grafts")).expect("grafts symlink");
+
+    assert!(shallow_present(&git_dir, &git_dir));
+    assert!(grafts_present(&git_dir, &git_dir));
 }
 
 // ---------------------------------------------------------------------------
@@ -1111,7 +1228,7 @@ fn builder_emits_pending_on_unlabeled_rows() {
         seed_base(&store, now).await;
         seed_ref(&store, now, "ref-1", b"refs/heads/main", None).await;
         let value = stream_value(&store, "rep-unlabeled").await;
-        assert_eq!(value["schema_version"], "1.4.0");
+        assert_eq!(value["schema_version"], "1.5.0");
         let branches = value["branches"].as_array().expect("branches");
         assert_eq!(branches.len(), 1);
         assert_eq!(branches[0]["comparison"], "pending");
@@ -1191,7 +1308,7 @@ fn shipped_v14_schema_accepts_compared_report() {
         let value = stream_value(&store, "rep-schema").await;
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/schemas/report-v1.4.schema.json"
+            "/schemas/report-v1.5.schema.json"
         );
         let bytes = std::fs::read(path).expect("read shipped schema");
         let schema: serde_json::Value = serde_json::from_slice(&bytes).expect("schema parses");
@@ -1283,7 +1400,7 @@ fn scan_emits_valid_branch_comparison() {
     );
     let bytes = std::fs::read(&report_path).expect("read report");
     let value: serde_json::Value = serde_json::from_slice(&bytes).expect("report is JSON");
-    assert_eq!(value["schema_version"], "1.4.0");
+    assert_eq!(value["schema_version"], "1.5.0");
     // The scanned branch carries a well-formed comparison: any of
     // the nine states (pre-v6 wiring the catalog cannot persist
     // labels, so analysis reads back `pending`; post-wiring this
