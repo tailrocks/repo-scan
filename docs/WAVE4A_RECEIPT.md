@@ -167,6 +167,22 @@ setting was deliberately NOT auto-selected. Full-corpus
 worker sensitivity is not re-measured (each point costs
 ~1h); recorded as a limit.
 
+## Target-scaling addendum (Step 16, series4, binary `new@962b2824`)
+
+Same dataset, same `--root`, fresh catalog each, `--workers 8`,
+`--format jsonl`. Full-corpus targeted runs prove one filesystem
+pass serves any target count (dirs/entries identical to --all).
+
+| run | targets | exit | wall_s | discovery_s | dirs | entries | txns | repos | note |
+|-----|---------|------|--------|-------------|------|---------|------|-------|------|
+| t1 | 1 | 3 | 771 | 721 | 104132 | 1160577 | 27060 | 5 | 4 unresolvable_identity cands |
+
+Semantic note (tested behavior, not a bug): targeted runs park
+the 4 identity-less candidates as `unresolvable_identity`
+(exit 3), while `--all` inventories the same stores with
+unknown identity (exit 0). Disposition pinned by
+`tests/fail_redact.rs`, `tests/accept_git.rs`.
+
 ## Series incident 2026-10-08 (attempt-2, after r4-base)
 
 - During r4-base, an unknown ambient process deleted the whole
