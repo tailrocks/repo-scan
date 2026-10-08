@@ -166,8 +166,26 @@ mod tests {
     fn scratch(case: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("repo-scan-scopekey-{}-{case}", std::process::id()));
+        // Pid-scoped: only this live process owns the name, so a leftover
+        // from a dead pid-holder is safe to clear (pid-reuse flake).
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch");
         dir
+    }
+
+    #[test]
+    fn scratch_survives_stale_pid_reuse() {
+        // A previous test process with a recycled pid leaves its scratch
+        // dir behind; scratch() must start clean so symlink creation below
+        // cannot fail with EEXIST (the spelling_variants_share_key flake).
+        let base = scratch("stale-reuse");
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).expect("real");
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("plant stale link");
+        let base = scratch("stale-reuse");
+        let link = base.join("link");
+        std::os::unix::fs::symlink(base.join("real"), &link).expect("reuse after stale");
     }
 
     #[test]
