@@ -56,9 +56,10 @@ cargo test --locked --offline --manifest-path Cargo.toml --package repo-scan --d
 cargo build --release
 fixture="$(mktemp -d)"
 state="$(mktemp -d)"
+output="$(mktemp -d)"
 git -C "$fixture" init -q
 git -C "$fixture" remote add origin https://github.com/tailrocks/repo-scan.git
-./target/release/repo-scan --state-dir "$state" scan https://github.com/tailrocks/repo-scan --root "$fixture" --report "$state/report.json"
+./target/release/repo-scan --state-dir "$state" scan https://github.com/tailrocks/repo-scan --root "$fixture" --report "$output/report.json"
 ```
 
 Expected: the report contains one checkout for `tailrocks/repo-scan` and records the explicit fixture root.
