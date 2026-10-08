@@ -75,8 +75,40 @@ LIMITATION (M6): single APFS volume, no latency/fault injection
 | r2-new | new@98ea5fde | `scan --all --root /tmp/corpus16/ws --status summary --workers 8 --format jsonl` | 8 | fresh-catalog | 12.44→15.37 | 0 | 2935 | 2850 | 85 | 104132 | 1160577 | 239819 | 29266 | 222/221 | 0 |
 | r3-base | base@94bb89c6 | `scan https://github.com/bench-special/family --root /tmp/corpus16/ws --status summary` | 1 | fresh-catalog | 15.37→11.92 | 3 | 4125 | 4083 | 42 | 104132 | 1160577 | 325059 | 218442 | 222/221 | 4 known |
 | r3-new | new@98ea5fde | `scan --all --root /tmp/corpus16/ws --status summary --workers 8 --format jsonl` | 8 | fresh-catalog | 11.92→15.60 | 0 | 3323 | 3162 | 161 | 104132 | 1160577 | 240115 | 29555 | 222/221 | 0 |
+| r4-base | base@94bb89c6 | `scan https://github.com/bench-special/family --root /tmp/corpus16/ws --status summary` | 1 | fresh-catalog | 15.23→10.28 | 3 | 4417 | 4388 | 29 | 104126 | 1160566 | 325436 | 218820 | 222/221 | 4 known |
 
 Raw logs per rep (git-ignored): `benches/results/w4a/<rep>.{stdout,stderr,time,meta,report.json}`,
 `.meta.json` carries cmd/exit/wall/digest. Claim microbench artifact:
-`benches/results/claim_bench.jsonl` (commit
-...[truncated 1474 chars]
+`benches/results/claim_bench.jsonl` (commit `3948d0c`).
+
+## Series incident 2026-10-08 (attempt-2, after r4-base)
+
+- During r4-base, an unknown ambient process deleted the whole
+  `/tmp/reps/new/` shelter checkout (dir mtime 11:06, disk 757Gi
+  free — not space pressure). `run_rep.sh` failed safe:
+  `missing binary ...` for r4-new, exit 1, no debug fallback.
+- The series runner (no `set -e`) skipped r4-new and started
+  r5-base. Coordinator stopped the runner ~10min into r5-base
+  (killed, state dir discarded) to preserve alternation.
+- Rebuilt the new binary from pristine `44315ee` (Wave8d tip):
+  digest `d2ef7208...` differs from the original `98ea5fde...`.
+  Cause: original build env irreproducible — the active
+  toolchain is a franken-pair (cargo 1.98.1 `797e8a9bc` +
+  rustc 1.98.1 `48a229cea`), no pins in repo, no spare binary
+  anywhere, and the `797e8a9bc` rustc build is no longer
+  installed. Rebuild determinism proven: two independent
+  pristine builds (shelter path + `$HOME` path) produce
+  identical `d2ef7208...` (embedded paths are relative, no
+  `[profile.release]`, no RUSTFLAGS, same committed lockfile).
+- Equivalence basis for r4-new/r5-new: identical source
+  commit, identical release profile, identical flags/lock;
+  discovery is IO/DB-bound (~20 dirs/s), so codegen drift
+  between two 1.98.1 builds is second-order. Smoke-tested
+  (`scan --all` on a scratch repo: exit 0, valid report +
+  JSONL events). Per-rep digests stay honest in `.meta.json`
+  and the ledger rows above/below.
+- Backups now kept outside the shelter for both binaries, so a
+  repeat deletion costs a copy instead of a rebuild.
+- Remaining order after the stop: r4-new, r5-base, r5-new
+  (strict alternation preserved; the killed r5-base partial
+  run is discarded, not recorded).
