@@ -38,6 +38,7 @@ Keep only sections that help reviewers understand this change. Use Related pull 
 <For Rust changes, run the relevant formatting, lint, documentation, and workflow checks used by CI. Keep only commands that apply to the files changed.>
 
 ```sh
+mise --no-config --no-env --no-hooks exec rust@1.98.1 -- rustup component add clippy rustfmt
 mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo fmt --check --manifest-path Cargo.toml
 mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo clippy --locked --offline --manifest-path Cargo.toml --package repo-scan --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" mise --no-config --no-env --no-hooks exec rust@1.98.1 -- cargo doc --locked --offline --manifest-path Cargo.toml --package repo-scan --no-deps
