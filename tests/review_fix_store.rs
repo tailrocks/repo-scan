@@ -756,3 +756,77 @@ fn dbm1_cross_spelling_invalidate_hits_live_task() {
         store.close().await.expect("close");
     });
 }
+
+/// DB-M1 + RSF-F940: the symlink fan-out is resolved before the write
+/// transaction, while the event cursor and all revision changes remain
+/// atomic. A fan-out revision overflow must roll back the cursor and the
+/// literal scope bump together.
+#[cfg(unix)]
+#[test]
+fn dbm1_event_fanout_failure_rolls_back_cursor_and_revisions() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).expect("mkdir");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let store = TursoStore::open(&db_in(&dir)).await.expect("open");
+        let now = now_ms();
+        let link_key = repo_scan::config::scope_key_for_dir(&link);
+        let real_key = repo_scan::config::scope_key_for_dir(&real);
+        store
+            .enqueue_task(
+                &NewTask {
+                    id: "task:link-overflow",
+                    kind: "enumerate_dir",
+                    generation: 1,
+                    dir_id: None,
+                    scope_key: &link_key,
+                    expected_rev: 0,
+                    idempotency_key: "idem:task:link-overflow",
+                },
+                now,
+            )
+            .await
+            .expect("enqueue live alias");
+        store
+            .connection()
+            .execute(
+                "INSERT OR REPLACE INTO scope_revisions (scope_key, rev, updated_at_ms) \
+                    VALUES (?1, ?2, ?3)",
+                vec![
+                    turso::Value::Text(link_key.clone()),
+                    turso::Value::Integer(i64::MAX),
+                    turso::Value::Integer(now),
+                ],
+            )
+            .await
+            .expect("seed max alias revision");
+
+        let error = store
+            .ingest_event_batch(
+                "vol-fanout",
+                "history-fanout",
+                "cursor-fanout",
+                true,
+                std::slice::from_ref(&real_key),
+                1,
+                now,
+            )
+            .await
+            .expect_err("alias revision overflow");
+        assert!(error.to_string().contains("exceeds i64 range"), "{error}");
+        assert_eq!(store.scope_rev(&real_key).await.expect("real rev"), 0);
+        assert_eq!(
+            store.scope_rev(&link_key).await.expect("link rev"),
+            i64::MAX as u64
+        );
+        assert!(store
+            .list_events("vol-fanout", "history-fanout")
+            .await
+            .expect("events")
+            .is_empty());
+        store.close().await.expect("close");
+    });
+}

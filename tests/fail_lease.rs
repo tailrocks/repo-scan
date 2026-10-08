@@ -453,3 +453,85 @@ fn release_claim_compensates_unrun_attempt() {
         store.close().await.unwrap();
     });
 }
+
+/// A handle that outlives its owner guard must not release work claimed by
+/// the next owner incarnation, even if it supplies that owner's epoch and
+/// token. Lease mutations are fenced by both the row lease and this
+/// handle's immutable epoch.
+#[test]
+fn stale_owner_cannot_release_new_owner_claim() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (old_guard, old_store) = TursoStore::open_owned(dir.path()).await.expect("old owner");
+        let old_epoch = old_store.epoch();
+        let t0 = now_ms();
+        old_store
+            .enqueue_task(
+                &NewTask {
+                    id: "t-owner-fence",
+                    kind: "probe_git",
+                    generation: 1,
+                    dir_id: None,
+                    scope_key: "s",
+                    expected_rev: 0,
+                    idempotency_key: "idem-owner-fence",
+                },
+                t0,
+            )
+            .await
+            .expect("enqueue");
+        let old_claim = old_store
+            .claim_tasks(old_epoch, 1, 60_000, t0)
+            .await
+            .expect("old claim");
+        assert_eq!(old_claim.len(), 1);
+
+        // Simulate owner replacement while a stale store handle remains.
+        drop(old_guard);
+        let (new_guard, new_store) = TursoStore::open_owned(dir.path()).await.expect("new owner");
+        let new_epoch = new_store.epoch();
+        assert_eq!(new_epoch, old_epoch + 1);
+        let takeover_at = t0 + 60_001;
+        let new_claim = new_store
+            .claim_tasks(new_epoch, 1, 60_000, takeover_at)
+            .await
+            .expect("new claim");
+        assert_eq!(new_claim.len(), 1);
+
+        // The old handle can see the current row, but cannot use the new
+        // owner's credentials to mutate it.
+        let err = old_store
+            .release_claim(
+                &new_claim[0].task.id,
+                new_claim[0].token,
+                new_epoch,
+                takeover_at,
+            )
+            .await
+            .expect_err("stale handle must be fenced");
+        assert!(err.to_string().contains("not this owner"), "{err}");
+        let row = new_store
+            .get_task("t-owner-fence")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.state, TaskState::Leased);
+        assert_eq!(row.lease_token, Some(new_claim[0].token));
+        assert_eq!(row.lease_epoch, Some(new_epoch));
+
+        new_store
+            .complete_task(
+                "t-owner-fence",
+                new_claim[0].token,
+                new_epoch,
+                &StoreOutcome::Complete,
+                takeover_at,
+            )
+            .await
+            .expect("new owner completes");
+        old_store.close().await.expect("close old handle");
+        new_store.close().await.expect("close new handle");
+        drop(new_guard);
+    });
+}

@@ -906,6 +906,7 @@ pub fn tui_empty_report() -> repo_scan::report::model::Report {
         volumes: vec![],
         paths: vec![],
         roots: vec![],
+        groups: vec![],
         repositories: vec![],
         checkouts: vec![],
         branches: vec![],
@@ -915,6 +916,7 @@ pub fn tui_empty_report() -> repo_scan::report::model::Report {
         candidates: vec![],
         errors: vec![],
         generated_artifacts: vec![],
+        totals: Default::default(),
     }
 }
 

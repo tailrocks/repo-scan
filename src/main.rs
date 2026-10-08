@@ -19,8 +19,9 @@ use repo_scan::identity;
 use repo_scan::model::{ExitCode, Scope, StatusMode, TaskState};
 use repo_scan::platform::MountTable;
 use repo_scan::report::builder::{
-    verify_staged_report, AliasInput, ArtifactInput, CandidateInput,
+    verify_staged_report_streaming, AliasInput, ArtifactInput, CandidateInput,
     ReportInputs as LibReportInputs, ReportPipeline, RootInput, StorageLinkInput,
+    DEFAULT_STAGED_VERIFY_RSS_TARGET_BYTES,
 };
 use repo_scan::scan_events::{
     classify_cursor, is_progress_coalescible, is_terminal_event, is_terminal_name,
@@ -1001,7 +1002,27 @@ impl ScanJournal {
         store: &TursoStore,
         event_type: EventType,
         records: &serde_json::Value,
-    ) -> repo_scan::Result<()> {
+    ) -> repo_scan::Result<u64> {
+        self.emit_with_retention(store, event_type, records, MAX_RETAINED_SCAN_EVENTS)
+            .await
+    }
+
+    /// Journal a lifecycle event and enforce the retention cap in the same
+    /// direct-emission path. The explicit limit keeps the production rule
+    /// testable with a small deterministic journal.
+    async fn emit_with_retention(
+        &mut self,
+        store: &TursoStore,
+        event_type: EventType,
+        records: &serde_json::Value,
+        keep_rows: u64,
+    ) -> repo_scan::Result<u64> {
+        // A terminal closes this scan's event stream. Resumed work may still
+        // refresh catalog rows, but it must not append records after the
+        // terminal already consumed by followers.
+        if self.has_terminal() {
+            return Ok(0);
+        }
         let (seq, off) = self.assign();
         let bytes =
             serde_json::to_vec(records).map_err(|e| repo_scan::Error::Report(e.to_string()))?;
@@ -1015,14 +1036,17 @@ impl ScanJournal {
             reset: false,
             records: &bytes,
         };
-        store.append_scan_event(&event).await?;
+        if !store.append_scan_event(&event).await? {
+            return Ok(0);
+        }
         if event_type == EventType::InventoryReady {
             self.ready_seq = Some(seq);
         }
         if is_terminal_event(event_type) {
             self.terminal_seq = Some(seq);
         }
-        Ok(())
+        let pruned = maybe_prune_scan_journal(store, self, keep_rows).await?;
+        Ok(1 + u64::from(pruned))
     }
 
     /// Buffer one `repository_found` into the writer batch: it commits
@@ -1035,6 +1059,9 @@ impl ScanJournal {
         store_id: &str,
         records: &[u8],
     ) -> repo_scan::Result<Option<bool>> {
+        if self.has_terminal() {
+            return Ok(None);
+        }
         if !self.emitted_stores.insert(store_id.to_string()) {
             return Ok(None);
         }
@@ -1060,6 +1087,9 @@ impl ScanJournal {
         checkout_id: &str,
         records: &[u8],
     ) -> repo_scan::Result<Option<bool>> {
+        if self.has_terminal() {
+            return Ok(None);
+        }
         if !self.emitted_checkouts.insert(checkout_id.to_string()) {
             return Ok(None);
         }
@@ -1087,6 +1117,9 @@ impl ScanJournal {
         batch: &mut WriterBatch,
         records: &[u8],
     ) -> repo_scan::Result<Option<bool>> {
+        if self.has_terminal() {
+            return Ok(None);
+        }
         let (seq, off) = self.assign();
         let event = NewScanEvent {
             scan_id: &self.scan_id,
@@ -1110,6 +1143,9 @@ impl ScanJournal {
         batch: &mut WriterBatch,
         records: &[u8],
     ) -> repo_scan::Result<Option<bool>> {
+        if self.has_terminal() {
+            return Ok(None);
+        }
         let (seq, off) = self.assign();
         let event = NewScanEvent {
             scan_id: &self.scan_id,
@@ -1133,6 +1169,9 @@ impl ScanJournal {
         batch: &mut WriterBatch,
         records: &[u8],
     ) -> repo_scan::Result<Option<bool>> {
+        if self.has_terminal() {
+            return Ok(None);
+        }
         let (seq, off) = self.assign();
         let event = NewScanEvent {
             scan_id: &self.scan_id,
@@ -1158,6 +1197,9 @@ impl ScanJournal {
         store_id: &str,
         records: &[u8],
     ) -> repo_scan::Result<Option<bool>> {
+        if self.has_terminal() {
+            return Ok(None);
+        }
         let first = self.emitted_branch_stores.insert(store_id.to_string());
         let op = if first { Op::Add } else { Op::Replace };
         let (seq, off) = self.assign();
@@ -1189,6 +1231,9 @@ impl ScanJournal {
         batch: &mut WriterBatch,
         records: &[u8],
     ) -> repo_scan::Result<Option<bool>> {
+        if self.has_terminal() {
+            return Ok(None);
+        }
         debug_assert!(is_progress_coalescible(EventType::DiscoveryProgress));
         // A pruned gauge row reads as absent: re-insert below at a fresh
         // seq (retention only deletes the prefix, so this test is exact).
@@ -1372,12 +1417,14 @@ async fn journal_emission_failed(
         &cfg.state_dir,
         scan_id,
     );
-    runner
+    let transactions = runner
         .journal
         .as_mut()
         .expect("scan journal opened above")
         .emit(store, EventType::ScanFailed, &failed)
-        .await
+        .await?;
+    runner.counters.db_transactions += transactions;
+    Ok(())
 }
 
 /// Replay one scan's full journal to stdout as JSONL (Wave2b
@@ -1619,17 +1666,26 @@ async fn maybe_publish_live_report(
 
 /// Prune completed snapshots beyond the retention bound (Wave2b case
 /// 17): the newest [`repo_scan::report::output::MAX_RETAINED_SNAPSHOTS`]
-/// files survive, and every snapshot a scan outcome references
-/// survives regardless of age. Pruned files lose their catalog rows
-/// too. Best-effort: never fails the scan.
-async fn prune_old_snapshots(store: &TursoStore, state_dir: &Path) {
+/// files survive, along with the latest prior running-scan recovery
+/// snapshot and this scan's current report. Old completed outcomes do not
+/// pin their snapshots forever. Pruned files lose their catalog rows too.
+/// Best-effort: never fails the scan.
+async fn prune_old_snapshots(
+    store: &TursoStore,
+    state_dir: &Path,
+    current_scan_id: &str,
+    current_report_id: Option<&str>,
+) {
     use repo_scan::report::output::{prune_snapshot_files, MAX_RETAINED_SNAPSHOTS};
     let outcome_rows: Vec<String> = async {
         let mut rows = store
             .connection()
             .query(
-                "SELECT outcome FROM scan_requests WHERE outcome IS NOT NULL",
-                (),
+                "SELECT outcome FROM scan_requests \
+                    WHERE outcome IS NOT NULL AND state LIKE 'running%' \
+                        AND id <> ?1 \
+                    ORDER BY updated_at_ms DESC, id DESC LIMIT 2",
+                vec![turso::Value::Text(current_scan_id.to_string())],
             )
             .await
             .map_err(store_err)?;
@@ -1643,10 +1699,21 @@ async fn prune_old_snapshots(store: &TursoStore, state_dir: &Path) {
     }
     .await
     .unwrap_or_default();
-    let referenced: HashSet<String> = outcome_rows
+    // The current running row is excluded from the query and its actual
+    // report ID is pinned explicitly below. Keep the newest other running
+    // outcome as its recovery snapshot; completed rows are intentionally
+    // not scanned.
+    let prior_recovery = outcome_rows
         .iter()
         .filter_map(|o| config::parse_outcome(o).map(|d| d.report_id))
-        .collect();
+        .find(|report_id| Some(report_id.as_str()) != current_report_id);
+    let mut referenced = HashSet::new();
+    if let Some(report_id) = prior_recovery {
+        referenced.insert(report_id);
+    }
+    if let Some(report_id) = current_report_id {
+        referenced.insert(report_id.to_string());
+    }
     let pruned = prune_snapshot_files(
         &snapshots_dir(state_dir),
         &referenced,
@@ -1894,7 +1961,7 @@ async fn run_scan_inner(
                 args.format,
                 resolved.all,
                 args.fetch,
-                args.workers,
+                Some(effective.max_enum_ops),
                 &mut runner.counters,
             )
             .await?
@@ -1974,13 +2041,13 @@ async fn run_scan_inner(
             },
             "resume_cmd": resume_cmd_for(&cfg.state_dir, &scan_id),
         });
-        runner
+        let transactions = runner
             .journal
             .as_mut()
             .expect("scan journal opened above")
             .emit(&store, EventType::ScanStarted, &started)
             .await?;
-        runner.counters.db_transactions += 1;
+        runner.counters.db_transactions += transactions;
     }
     upsert_volumes(&store, &policy, &roots, now, &mut runner.counters).await?;
     // Ingest available event history before traversal (R5).
@@ -2246,13 +2313,13 @@ async fn run_scan_inner(
         .expect("scan journal opened above")
         .has_ready()
     {
-        runner
+        let transactions = runner
             .journal
             .as_mut()
             .expect("scan journal opened above")
             .emit(&store, EventType::InventoryReady, &ready)
             .await?;
-        runner.counters.db_transactions += 1;
+        runner.counters.db_transactions += transactions;
     }
     // Step 8 order proof: the boundary is committed — analysis reads
     // may start from here. Set before the analysis drain below.
@@ -2723,10 +2790,10 @@ async fn run_scan_inner(
             print_snapshot_human(&snapshot_path, &mut out)?;
         }
     }
-    // Completed snapshots are retained bounded (case 17); referenced
-    // snapshots (including this scan's, once the outcome below binds
-    // it) are never pruned. Best-effort, never fatal.
-    prune_old_snapshots(&store, &cfg.state_dir).await;
+    // Completed snapshots are retained bounded (case 17); the newest
+    // window, latest prior running-scan recovery snapshot, and this scan's
+    // current report may survive. Best-effort, never fatal.
+    prune_old_snapshots(&store, &cfg.state_dir, &scan_id, Some(&report_id)).await;
     let exit = if outcome.interrupted {
         store
             .update_scan_state(
@@ -2850,12 +2917,13 @@ async fn run_scan_inner(
         .expect("scan journal opened above")
         .has_terminal()
     {
-        runner
+        let transactions = runner
             .journal
             .as_mut()
             .expect("scan journal opened above")
             .emit(&store, terminal, &terminal_records)
             .await?;
+        runner.counters.db_transactions += transactions;
     }
     let _ = store.close().await;
     // Wave6 success tails: machine lanes already printed (json) or
@@ -10877,8 +10945,20 @@ fn collect_analysis_reads(
     // checkout loop so identity-poll abandonment drops comparisons
     // together with the reads they derive from.
     let graph_cache = git::graph::ComparisonCache::new();
-    let comparisons =
-        compute_branch_comparisons(ctx, instance, &refs, &branch_upstreams, &graph_cache);
+    let Some(comparisons) = compute_branch_comparisons(
+        ctx,
+        instance,
+        &refs,
+        &branch_upstreams,
+        &graph_cache,
+        &cancel,
+    ) else {
+        return Ok(if deadline.expired() {
+            AnalysisOutcome::TimedOut
+        } else {
+            AnalysisOutcome::IdentityChanged
+        });
+    };
     if !poll.ok_throttled() {
         return Ok(AnalysisOutcome::IdentityChanged);
     }
@@ -10935,7 +11015,8 @@ fn compute_branch_comparisons(
     refs: &[git::RefObservation],
     upstreams: &HashMap<Vec<u8>, Vec<u8>>,
     cache: &git::graph::ComparisonCache,
-) -> HashMap<Vec<u8>, git::graph::Comparison> {
+    cancel: &git::fallback::WaitCancel,
+) -> Option<HashMap<Vec<u8>, git::graph::Comparison>> {
     audit_analysis_read_start("compare_branch");
     let mut oids: HashMap<&[u8], (&str, &str)> = HashMap::new();
     // Presence set: EVERY iterated ref name, including OID-less ones
@@ -10972,9 +11053,13 @@ fn compute_branch_comparisons(
         work_tree: instance.work_dir.as_deref(),
         cache: Some(cache),
         fallback: ctx.fallback(),
+        cancel: Some(cancel),
     };
     let mut out = HashMap::new();
     for reference in refs {
+        if cancel.cancelled() {
+            return None;
+        }
         if !reference.name.starts_with(b"refs/heads/") {
             continue;
         }
@@ -10995,12 +11080,20 @@ fn compute_branch_comparisons(
             upstream_algo,
             upstream_known,
         };
-        out.insert(
-            reference.name.clone(),
-            git::graph::compare_branch(&graph_ctx, &tips),
-        );
+        let comparison = git::graph::compare_branch(&graph_ctx, &tips);
+        if cancel.cancelled() {
+            // The graph layer returns an error-shaped placeholder when a
+            // cancellation interrupts a walk. Drop the whole observation
+            // rather than persisting that placeholder as branch state.
+            return None;
+        }
+        out.insert(reference.name.clone(), comparison);
     }
-    out
+    if cancel.cancelled() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// Worker-side result of one analysis task (Step 8 worker seam): every
@@ -12818,7 +12911,7 @@ fn plan_remote_fetch(
         }
     }
     let borrowed: Vec<&str> = refspecs.iter().map(String::as_str).collect();
-    match git::refspec::inspect_remote_fetch(&borrowed, mirror) {
+    match git::refspec::inspect_remote_fetch(name, &borrowed, mirror) {
         git::refspec::FetchVerdict::Safe => {}
         git::refspec::FetchVerdict::Unsupported { reason } => {
             return Ok(FetchPlan::Unsupported(reason));
@@ -13239,10 +13332,10 @@ async fn persist_remote_attempt(
             "deleted": deleted_values,
             "detail": attempt.detail,
         });
-        journal
+        let transactions = journal
             .emit(store, EventType::RemoteUpdated, &payload)
             .await?;
-        runner.counters.db_transactions += 1;
+        runner.counters.db_transactions += transactions;
     }
     Ok(())
 }
@@ -13420,7 +13513,7 @@ async fn fetch_one_store(
         // The recompute reads post-fetch oids from the catalog, so the
         // buffered ref updates commit before it runs.
         flush_runner_batch(runner, store).await?;
-        recompute_fetch_comparisons(runner, store, inst, &current).await?;
+        recompute_fetch_comparisons(runner, store, inst, &current, cancel).await?;
     }
     Ok(())
 }
@@ -13439,6 +13532,7 @@ async fn recompute_fetch_comparisons(
     store: &TursoStore,
     inst: &EmittedInstance,
     current: &HashSet<Vec<u8>>,
+    cancel: &git::fallback::WaitCancel,
 ) -> repo_scan::Result<()> {
     if !store.supports_ref_comparison().await? {
         return Ok(());
@@ -13477,9 +13571,13 @@ async fn recompute_fetch_comparisons(
             work_tree: None,
             cache: Some(&cache),
             fallback: Some(fallback),
+            cancel: Some(cancel),
         };
         let mut out = Vec::new();
         for row in &refs {
+            if cancel.cancelled() {
+                return Ok(());
+            }
             if row.kind != "local" {
                 continue;
             }
@@ -13501,6 +13599,11 @@ async fn recompute_fetch_comparisons(
                 upstream_known,
             };
             let comparison = git::graph::compare_branch(&ctx, &branch_tips);
+            if cancel.cancelled() {
+                // Discard this pass rather than persisting placeholders
+                // produced by cancellation inside an object walk.
+                return Ok(());
+            }
             out.push((
                 row.id.clone(),
                 comparison.state,
@@ -13510,6 +13613,9 @@ async fn recompute_fetch_comparisons(
         }
         out
     };
+    if cancel.cancelled() {
+        return Ok(());
+    }
     for (ref_id, state, ahead, behind) in &comparisons {
         let due = TursoStore::buffer_update_ref_comparison(
             &mut runner.batch,
@@ -13907,7 +14013,7 @@ async fn build_lib_inputs(
         enumerated_entries: inputs.counters.entries,
         db_transactions: inputs.counters.db_transactions,
         db_sync_calls: Some(inputs.counters.db_sync_calls),
-        source_commit: None,
+        source_commit: source_commit_from_build(),
         include_nonmatching: false,
         coverage_filesystem: None,
         coverage_identity: None,
@@ -13935,6 +14041,17 @@ async fn build_lib_inputs(
         },
         generated_artifacts: artifacts,
     })
+}
+
+/// Release builds may provide the exact checked-out source SHA at compile
+/// time. Local builds keep provenance nullable when no valid SHA was set.
+fn source_commit_from_build() -> Option<String> {
+    let source = option_env!("REPO_SCAN_SOURCE_COMMIT")?;
+    let bytes = source.as_bytes();
+    if !matches!(bytes.len(), 40 | 64) || !bytes.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    Some(source.to_string())
 }
 
 fn root_inputs_chunked(
@@ -14243,7 +14360,8 @@ async fn emit_file_report(
 
 /// Verify staged bytes, retain the immutable snapshot, then publish
 /// (RSF-7511725D-DC03-471A-9635-4F8173986489): production publication
-/// calls [`verify_staged_report`] (schema + cross-field rules) and
+/// calls [`verify_staged_report_streaming`] (schema + cross-field rules)
+/// under the fixed staged-report RSS budget and
 /// refuses invalid output before it can be retained or shipped. Returns
 /// the snapshot path.
 #[allow(clippy::too_many_arguments)]
@@ -14259,12 +14377,14 @@ async fn verified_retain_and_publish(
 ) -> repo_scan::Result<PathBuf> {
     use repo_scan::report::publish;
 
-    verify_staged_report(staged).map_err(|e| {
-        repo_scan::Error::Report(format!(
-            "refusing invalid staged report {}: {e}",
-            staged.display()
-        ))
-    })?;
+    verify_staged_report_streaming(staged, DEFAULT_STAGED_VERIFY_RSS_TARGET_BYTES)
+        .map(|_| ())
+        .map_err(|e| {
+            repo_scan::Error::Report(format!(
+                "refusing invalid staged report {}: {e}",
+                staged.display()
+            ))
+        })?;
     let receipt = publish::retain_snapshot(
         store,
         staged,
@@ -14402,7 +14522,10 @@ async fn replay_scan_pages(
                 return Ok(false);
             }
             *after = Some((row.catalog_rev, row.event_offset));
-            *terminal_seen |= is_terminal_event(env.event_type);
+            if is_terminal_event(env.event_type) {
+                *terminal_seen = true;
+                return Ok(true);
+            }
         }
         if short_page {
             break;
@@ -14429,10 +14552,12 @@ fn flush_replay(out: &mut impl std::io::Write) -> repo_scan::Result<bool> {
 /// the human and JSONL lanes read. Returns `Ok(false)` on a broken
 /// pipe (quiet stop).
 fn print_snapshot_json(snapshot: &Path, out: &mut impl std::io::Write) -> repo_scan::Result<bool> {
-    use repo_scan::report::builder::verify_bound_report;
+    use repo_scan::report::builder::{
+        verify_bound_report_streaming, DEFAULT_STAGED_VERIFY_RSS_TARGET_BYTES,
+    };
     use repo_scan::report::publish::BoundStaged;
     let bound = BoundStaged::open(snapshot)?;
-    verify_bound_report(&bound)?;
+    verify_bound_report_streaming(&bound, DEFAULT_STAGED_VERIFY_RSS_TARGET_BYTES)?;
     repo_scan::report::output::write_machine_bytes(out, bound.bytes())
 }
 
@@ -14503,9 +14628,12 @@ async fn resolve_after_cursor(
             reset_first: false,
         });
     }
-    let seq_i64 = i64::try_from(cursor.seq).map_err(|_| {
-        repo_scan::Error::Store(format!("cursor seq {} exceeds i64 range", cursor.seq))
-    })?;
+    let Ok(seq_i64) = i64::try_from(cursor.seq) else {
+        return Ok(ReplayPosition {
+            after: None,
+            reset_first: true,
+        });
+    };
     let mut rows = store
         .connection()
         .query(
@@ -14773,9 +14901,12 @@ async fn run_follow_human_tui(
             }
             snapshot.apply_envelope(&env);
             after_pos = Some((row.catalog_rev, row.event_offset));
-            terminal_seen |= is_terminal_event(env.event_type);
+            if is_terminal_event(env.event_type) {
+                terminal_seen = true;
+                break;
+            }
         }
-        if short_page {
+        if short_page || terminal_seen {
             break;
         }
     }
@@ -14851,7 +14982,10 @@ async fn run_follow_human_tui(
             }
             session.state.snapshot.apply_envelope(&env);
             after_pos = Some((row.catalog_rev, row.event_offset));
-            terminal |= is_terminal_event(env.event_type);
+            if is_terminal_event(env.event_type) {
+                terminal = true;
+                break;
+            }
         }
         if terminal && !final_loaded {
             final_loaded = true;
@@ -14993,9 +15127,12 @@ async fn run_follow_human_plain(
             for row in &rows {
                 let env = envelope_for_row(row)?;
                 after_pos = Some((row.catalog_rev, row.event_offset));
-                terminal_seen |= is_terminal_event(env.event_type);
+                if is_terminal_event(env.event_type) {
+                    terminal_seen = true;
+                    break;
+                }
             }
-            if short_page {
+            if short_page || terminal_seen {
                 break;
             }
         }
@@ -19071,6 +19208,37 @@ pub async fn test_prune_scan_events(
         cutoff: journal.pruned_through,
         pruned,
     })
+}
+
+/// Direct-emission regression hook: journal one event through the same
+/// append-plus-retention path used by scan lifecycle and remote events.
+#[cfg(test)]
+pub async fn test_emit_scan_event_with_retention(
+    store: &TursoStore,
+    scan_id: &str,
+    event_type: EventType,
+    keep_rows: u64,
+) -> repo_scan::Result<u64> {
+    let rev = store.next_revision().await?;
+    let mut journal = ScanJournal::open(store, scan_id, rev).await?;
+    journal
+        .emit_with_retention(store, event_type, &serde_json::json!({}), keep_rows)
+        .await
+}
+
+/// Terminal guard regression hook: attempt to buffer one location update
+/// after reopening a journal that already contains a terminal event.
+#[cfg(test)]
+pub async fn test_buffer_location_update_after_terminal(
+    store: &TursoStore,
+    scan_id: &str,
+) -> repo_scan::Result<bool> {
+    let rev = store.next_revision().await?;
+    let mut journal = ScanJournal::open(store, scan_id, rev).await?;
+    let mut batch = WriterBatch::default();
+    Ok(journal
+        .buffer_location_updated(&mut batch, b"{}")?
+        .is_some())
 }
 
 /// Observed cursor resolution for [`test_resolve_after_cursor`].

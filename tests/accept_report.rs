@@ -1,5 +1,5 @@
 //! Report acceptance (REPORT-01, REPORT-02): every CLI-emitted report
-//! structurally matches `schemas/report-v1.4.schema.json`, and publication is
+//! structurally matches `schemas/report-v1.5.schema.json`, and publication is
 //! atomic with honest retry semantics.
 //!
 //! REPORT-01: scan real tempdir fixtures through the built binary with
@@ -67,7 +67,7 @@ fn load_json(path: &Path) -> serde_json::Value {
 fn schema_doc() -> serde_json::Value {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/schemas/report-v1.4.schema.json"
+        "/schemas/report-v1.5.schema.json"
     );
     load_json(Path::new(path))
 }
@@ -77,7 +77,7 @@ fn schema_doc() -> serde_json::Value {
 // ---------------------------------------------------------------------------
 
 /// Minimal JSON-Schema evaluator over the constructs the shipped
-/// `report-v1.4.schema.json` uses: `$ref`, `type` (incl. unions), `const`,
+/// `report-v1.5.schema.json` uses: `$ref`, `type` (incl. unions), `const`,
 /// `enum`, `required`, `properties`, `additionalProperties: false`,
 /// `items`, `anyOf`, `allOf`, `if`/`then`, `minLength`/`maxLength`,
 /// `minimum`/`exclusiveMinimum`. `pattern`/`format` need a regex engine
@@ -567,13 +567,35 @@ fn report_01_shipped_example_validates() {
 /// Minimal verified prior report: schema marker + tool name + report ID.
 /// A filename extension alone is never proof (checked by the negative cases).
 fn prior_report_bytes(report_id: &str) -> Vec<u8> {
+    prior_report_bytes_version(report_id, repo_scan::report::model::SCHEMA_VERSION)
+}
+
+fn prior_report_bytes_version(report_id: &str, schema_version: &str) -> Vec<u8> {
     serde_json::json!({
-        "schema_version": repo_scan::report::model::SCHEMA_VERSION,
+        "schema_version": schema_version,
         "report_id": report_id,
         "tool": {"name": "repo-scan", "version": "0.1.0", "source_commit": null},
     })
     .to_string()
     .into_bytes()
+}
+
+#[test]
+fn prior_1_0_report_remains_state_bound_overwriteable() {
+    use repo_scan::report::publish::is_verified_prior_report_in_state;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    repo_scan::privacy::private_dir_0700(&state).expect("state dir");
+    let dest = dir.path().join("legacy-report.json");
+    let prior = prior_report_bytes_version("legacy-1-0", "1.0.0");
+    repo_scan::privacy::private_write_0600(&dest, &prior).expect("legacy report");
+
+    assert!(is_verified_prior_report_in_state(&dest, &state).expect("prior check"));
+    assert_eq!(
+        check_destination(&dest, &state).expect("legacy overwrite accepted"),
+        DestinationKind::VerifiedPriorReport
+    );
 }
 
 fn sibling_leftovers(parent: &Path) -> Vec<PathBuf> {

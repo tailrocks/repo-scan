@@ -1,6 +1,6 @@
 # repo-scan architecture
 
-Design contract and architecture for repo-scan. Qualification evidence: `docs/*_QUAL.md`. Report schema: `schemas/report-v1.4.schema.json`.
+Design contract and architecture for repo-scan. Qualification evidence: `docs/*_QUAL.md`. Report schema: `schemas/report-v1.5.schema.json`.
 Gate record: `docs/GATE_DECISION.md` (do not edit).
 
 ## Ownership and process model (as shipped)
@@ -82,7 +82,7 @@ Gate record: `docs/GATE_DECISION.md` (do not edit).
    The owner samples aggregate RSS each loop and calls `set_pressure`
    past the threshold (`src/main.rs`); the PERF-02/03 gate harness lives
    in `benches/perf_gates.rs`, asserted by `tests/accept_perf.rs`.
-7. **Reports.** Draft 2020-12 schema at `schemas/report-v1.4.schema.json`
+7. **Reports.** Draft 2020-12 schema at `schemas/report-v1.5.schema.json`
    (`schema_version` `1.4.0`: branch comparison/ahead/behind over 1.3.0
    status vocabulary over 1.2.0 freshness over 1.1.0); illustrative
    example at `tests/data/example-report.json`. The binary stages
@@ -91,7 +91,7 @@ Gate record: `docs/GATE_DECISION.md` (do not edit).
    `src/report/publish.rs`, `ReportPipeline` at
    `src/report/builder.rs`). Failed publication marks the snapshot and
    retries from it without repeating discovery
-   (`src/main.rs`, `docs/TURSO_QUAL.md`, `schemas/report-v1.4.schema.json`).
+   (`src/main.rs`, `docs/TURSO_QUAL.md`, `schemas/report-v1.5.schema.json`).
 8. **Phases.** `Discovery → inventory_ready → Analysis → (Fetch?) →
    Completed`. `inventory_ready` commits only when enumeration +
    metadata-expansion tasks are terminal, no Discovery worker is active,

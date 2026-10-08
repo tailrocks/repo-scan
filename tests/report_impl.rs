@@ -226,6 +226,7 @@ fn example_report_matches_schema_structure() {
         "volumes",
         "paths",
         "roots",
+        "groups",
         "repositories",
         "checkouts",
         "branches",
@@ -235,6 +236,7 @@ fn example_report_matches_schema_structure() {
         "candidates",
         "errors",
         "generated_artifacts",
+        "totals",
     ]
     .into_iter()
     .map(str::to_string)
@@ -277,6 +279,11 @@ fn example_report_matches_schema_structure() {
         "state",
         "observed_at",
         "error_ids",
+        "freshness",
+        "freshness_at",
+        "comparison",
+        "ahead",
+        "behind",
     ] {
         assert!(branch.get(key).is_some(), "branch.{key} present");
     }
@@ -320,6 +327,38 @@ fn count_agreement_is_checked() {
     report.coverage.gaps = 5;
     let err = validate_report(&report).expect_err("gaps must agree");
     assert!(err.to_string().contains("coverage.gaps"), "{err}");
+}
+
+#[test]
+fn totals_must_match_emitted_records() {
+    let mut report = example_report();
+    report.totals.stores += 1;
+    let err = validate_report(&report).expect_err("totals must agree");
+    assert!(err.to_string().contains("totals do not agree"), "{err}");
+}
+
+#[test]
+fn branch_kind_constrains_freshness_and_comparison() {
+    let mut report = example_report();
+    report.branches[0].freshness = "current".to_string();
+    report.branches[0].freshness_at = Some("2026-09-30T11:59:59Z".to_string());
+    let err = validate_report(&report).expect_err("local branch cannot carry remote freshness");
+    assert!(
+        err.to_string().contains("must have unknown freshness"),
+        "{err}"
+    );
+
+    let mut report = example_report();
+    let branch = &mut report.branches[0];
+    branch.kind = "remote_tracking".to_string();
+    branch.comparison = "ahead".to_string();
+    branch.ahead = Some(1);
+    branch.behind = Some(0);
+    let err = validate_report(&report).expect_err("remote branch cannot carry local comparison");
+    assert!(
+        err.to_string().contains("must have pending comparison"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -398,6 +437,48 @@ fn status_cross_field_rules() {
         &mut problems,
     );
     assert!(problems.is_empty(), "{problems:?}");
+
+    // A clean result requires a completed summary/full status. Metadata
+    // has not read working-tree state, and incomplete/failed observations
+    // cannot claim a clean result.
+    for (state, mode) in [
+        ("complete", "metadata"),
+        ("partial", "summary"),
+        ("unsupported", "summary"),
+        ("error", "full"),
+    ] {
+        problems.clear();
+        validate_status(
+            &Status {
+                state: state.to_string(),
+                mode: mode.to_string(),
+                started_at: None,
+                finished_at: None,
+                staged: None,
+                unstaged: None,
+                untracked: None,
+                conflicts: None,
+                working_state: "clean".to_string(),
+                untracked_units: match mode {
+                    "metadata" => "not_requested",
+                    "summary" => "collapsed_entries",
+                    _ => "files",
+                }
+                .to_string(),
+                submodules: "unknown".to_string(),
+                unknown_fields: Vec::new(),
+                error_ids: Vec::new(),
+            },
+            "probe",
+            &mut problems,
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("clean requires complete status")),
+            "{state}/{mode}: {problems:?}"
+        );
+    }
 }
 
 #[test]
@@ -811,7 +892,7 @@ fn caller_owned_sections_stream() {
 fn schema_validator() -> jsonschema::Validator {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/schemas/report-v1.4.schema.json"
+        "/schemas/report-v1.5.schema.json"
     );
     let bytes = std::fs::read(path).expect("read shipped schema");
     let schema: serde_json::Value = serde_json::from_slice(&bytes).expect("schema parses");
@@ -855,4 +936,33 @@ fn real_json_schema_rejects_broken_reports() {
         .map(|e| e.to_string())
         .collect();
     assert!(!errors.is_empty(), "violations must be reported");
+}
+
+#[test]
+fn real_json_schema_rejects_nested_unknown_properties() {
+    let validator = schema_validator();
+    let bytes = include_bytes!("data/example-report.json");
+
+    for section in ["tool", "scan", "coverage", "resources"] {
+        let mut report: serde_json::Value = serde_json::from_slice(bytes).expect("example parses");
+        report[section]["unexpected"] = serde_json::Value::Bool(true);
+        assert!(
+            !validator.is_valid(&report),
+            "{section} must reject undeclared properties"
+        );
+    }
+
+    let mut report: serde_json::Value = serde_json::from_slice(bytes).expect("example parses");
+    report["totals"]["unexpected"] = serde_json::Value::Bool(true);
+    assert!(
+        !validator.is_valid(&report),
+        "totals rejects unknown fields"
+    );
+
+    let mut report: serde_json::Value = serde_json::from_slice(bytes).expect("example parses");
+    report["totals"]["analysis"]["unexpected"] = serde_json::Value::Bool(true);
+    assert!(
+        !validator.is_valid(&report),
+        "analysis totals rejects unknown fields"
+    );
 }

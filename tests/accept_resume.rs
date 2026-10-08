@@ -833,6 +833,51 @@ fn resume_incomplete_replays_lifecycle_once_and_inspect_completes() {
         "follow over a resumed journal completes; stderr: {}",
         stderr_text(&follow)
     );
+
+    // Reopening a scan that already has its terminal event must not append
+    // buffered progress or catalog events after that terminal.
+    let rows_before = rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        let rows = store
+            .read_scan_events(&scan_id, 0, 10_000)
+            .await
+            .expect("events before second resume");
+        assert!(rows.last().is_some_and(|row| {
+            matches!(
+                row.event_type.as_str(),
+                "scan_completed" | "scan_incomplete" | "scan_interrupted" | "scan_failed"
+            )
+        }));
+        store.close().await.expect("close");
+        rows
+    });
+    let resumed_again = run(
+        &["resume", scan_id.as_str(), "--format", "human"],
+        tmp.path(),
+        &state,
+    );
+    assert_eq!(
+        resumed_again.status.code(),
+        Some(3),
+        "still incomplete after repeat resume; stderr: {}",
+        stderr_text(&resumed_again)
+    );
+    let rows_after = rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        let rows = store
+            .read_scan_events(&scan_id, 0, 10_000)
+            .await
+            .expect("events after second resume");
+        store.close().await.expect("close");
+        rows
+    });
+    assert_eq!(rows_after.len(), rows_before.len());
+    assert_eq!(
+        rows_after.last().expect("terminal").seq,
+        rows_before.last().expect("terminal").seq
+    );
 }
 
 /// OUTPUTS-M1: an interrupted multi-target scan resumes with the full

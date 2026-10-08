@@ -10,8 +10,421 @@
 
 use crate::error::Error;
 use crate::report::encode::{base64_decode, is_rfc3339_shape, object_id_error};
-use crate::report::model::{EncodedName, Report, Status};
+use crate::report::model::{
+    Alias, Branch, Candidate, Checkout, Coverage, EncodedName, ErrorRecord, GeneratedArtifact,
+    Group, PathRecord, Remote, Report, Repository, Resources, Root, Scan, Status, StorageLink,
+    Tool, Totals, Volume,
+};
+use serde::de::{DeserializeOwned, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::Deserialize;
+use serde_json::value::RawValue;
 use std::collections::{HashMap, HashSet};
+use std::marker::PhantomData;
+
+/// Maximum decoded bytes in any one streamed record. Report writers cap
+/// path/evidence fields below this limit; this guard keeps a hostile single
+/// record from becoming a large transient allocation during validation.
+pub const MAX_STREAMED_RECORD_BYTES: usize = 1024 * 1024;
+/// Maximum copied bytes retained in record-ID indexes during streaming.
+pub const MAX_STREAMED_ID_BYTES: usize = 24 * 1024 * 1024;
+/// Maximum copied bytes retained for unique `(host, account)` keys.
+pub const MAX_STREAMED_ACCOUNT_KEY_BYTES: usize = 24 * 1024 * 1024;
+/// Maximum aggregate metadata JSON retained while decoding the report
+/// envelope (`tool`, `scan`, `coverage`, and `resources`).
+pub const MAX_STREAMED_HEADER_BYTES: usize = 4 * 1024 * 1024;
+/// Conservative hash-table/string headers per emitted record, exclusive of
+/// the separately capped ID bytes.
+pub const STREAMED_INDEX_BYTES_PER_RECORD: u64 = 128;
+const STREAMED_VALIDATOR_FIXED_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_STREAMED_PROBLEM_BYTES: usize = 512;
+const MAX_STREAMED_DIAGNOSTIC_BYTES: usize = 4096;
+const MAX_STREAMED_SCHEMA_VERSION_BYTES: usize = 128;
+const MAX_STREAMED_TIMESTAMP_BYTES: usize = 128;
+
+/// Bound the streaming validator's peak against the caller's existing RSS
+/// budget. The estimate covers the staged bytes, copied ID/account indexes,
+/// per-record hash/set overhead, one decoded record, and fixed parser state.
+pub fn check_streaming_memory_budget(
+    staged_len: u64,
+    record_count: u64,
+    rss_target_bytes: u64,
+) -> crate::Result<()> {
+    let estimate = staged_len
+        .saturating_add((MAX_STREAMED_ID_BYTES + MAX_STREAMED_ACCOUNT_KEY_BYTES) as u64)
+        .saturating_add(record_count.saturating_mul(STREAMED_INDEX_BYTES_PER_RECORD))
+        .saturating_add(MAX_STREAMED_RECORD_BYTES as u64)
+        .saturating_add(STREAMED_VALIDATOR_FIXED_BYTES);
+    if estimate > rss_target_bytes {
+        return Err(Error::Report(format!(
+            "streaming staged-report validation needs an estimated {estimate} bytes, over the \
+             rss_target_bytes {rss_target_bytes} budget; coverage is incomplete (resource \
+             exhaustion), refusing validation"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawReport<'a> {
+    schema_version: &'a str,
+    report_id: &'a str,
+    created_at: &'a str,
+    #[serde(borrow)]
+    tool: &'a RawValue,
+    #[serde(borrow)]
+    scan: &'a RawValue,
+    #[serde(borrow)]
+    coverage: &'a RawValue,
+    #[serde(borrow)]
+    resources: &'a RawValue,
+    #[serde(borrow)]
+    volumes: &'a RawValue,
+    #[serde(borrow)]
+    paths: &'a RawValue,
+    #[serde(borrow)]
+    roots: &'a RawValue,
+    #[serde(default, borrow)]
+    groups: Option<&'a RawValue>,
+    #[serde(borrow)]
+    repositories: &'a RawValue,
+    #[serde(borrow)]
+    checkouts: &'a RawValue,
+    #[serde(borrow)]
+    branches: &'a RawValue,
+    #[serde(borrow)]
+    remotes: &'a RawValue,
+    #[serde(borrow)]
+    storage_links: &'a RawValue,
+    #[serde(borrow)]
+    aliases: &'a RawValue,
+    #[serde(borrow)]
+    candidates: &'a RawValue,
+    #[serde(borrow)]
+    errors: &'a RawValue,
+    #[serde(borrow)]
+    generated_artifacts: &'a RawValue,
+    #[serde(default)]
+    totals: Option<Totals>,
+}
+
+impl RawReport<'_> {
+    fn shell(&self) -> crate::Result<Report> {
+        let header_bytes = self.tool.get().len()
+            + self.scan.get().len()
+            + self.coverage.get().len()
+            + self.resources.get().len();
+        if header_bytes > MAX_STREAMED_HEADER_BYTES {
+            return Err(Error::Report(format!(
+                "report envelope metadata is {header_bytes} bytes, over the {}-byte streaming limit",
+                MAX_STREAMED_HEADER_BYTES
+            )));
+        }
+        if self.report_id.len() > 4096 {
+            return Err(Error::Report(
+                "report_id exceeds the 4096-byte streaming limit".to_string(),
+            ));
+        }
+        if self.schema_version.len() > MAX_STREAMED_SCHEMA_VERSION_BYTES {
+            return Err(Error::Report(format!(
+                "schema_version exceeds the {MAX_STREAMED_SCHEMA_VERSION_BYTES}-byte streaming limit"
+            )));
+        }
+        if self.created_at.len() > MAX_STREAMED_TIMESTAMP_BYTES {
+            return Err(Error::Report(format!(
+                "created_at exceeds the {MAX_STREAMED_TIMESTAMP_BYTES}-byte streaming limit"
+            )));
+        }
+        let tool: Tool = serde_json::from_str(self.tool.get()).map_err(|error| {
+            Error::Report(format!(
+                "report tool is invalid: {}",
+                json_error_location(&error)
+            ))
+        })?;
+        let mut scan: Scan = serde_json::from_str(self.scan.get()).map_err(|error| {
+            Error::Report(format!(
+                "report scan is invalid: {}",
+                json_error_location(&error)
+            ))
+        })?;
+        let mut coverage: Coverage =
+            serde_json::from_str(self.coverage.get()).map_err(|error| {
+                Error::Report(format!(
+                    "report coverage is invalid: {}",
+                    json_error_location(&error)
+                ))
+            })?;
+        let resources: Resources = serde_json::from_str(self.resources.get()).map_err(|error| {
+            Error::Report(format!(
+                "report resources is invalid: {}",
+                json_error_location(&error)
+            ))
+        })?;
+        // These fields are not inspected by validation. Replace their vectors
+        // so a large but bounded header cannot leave retained capacity in the
+        // per-record validation shell.
+        scan.targets = Vec::new();
+        coverage.scope_boundaries = Vec::new();
+        Ok(Report {
+            schema_version: self.schema_version.to_string(),
+            report_id: self.report_id.to_string(),
+            created_at: self.created_at.to_string(),
+            tool,
+            scan,
+            coverage,
+            resources,
+            volumes: Vec::new(),
+            paths: Vec::new(),
+            roots: Vec::new(),
+            groups: Vec::new(),
+            repositories: Vec::new(),
+            checkouts: Vec::new(),
+            branches: Vec::new(),
+            remotes: Vec::new(),
+            storage_links: Vec::new(),
+            aliases: Vec::new(),
+            candidates: Vec::new(),
+            errors: Vec::new(),
+            generated_artifacts: Vec::new(),
+            totals: self.totals.clone().unwrap_or_default(),
+        })
+    }
+}
+
+fn json_error_location(error: &serde_json::Error) -> String {
+    format!(
+        "invalid JSON at line {}, column {}",
+        error.line(),
+        error.column()
+    )
+}
+
+struct RawArraySeed<'a, T, F, C> {
+    visit: &'a mut F,
+    check: &'a mut C,
+    marker: PhantomData<T>,
+}
+
+impl<'de, T, F, C> DeserializeSeed<'de> for RawArraySeed<'_, T, F, C>
+where
+    T: DeserializeOwned,
+    F: FnMut(T) -> crate::Result<()>,
+    C: FnMut(&str) -> crate::Result<()>,
+{
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ArrayVisitor<'a, T, F, C> {
+            visit: &'a mut F,
+            check: &'a mut C,
+            marker: PhantomData<T>,
+        }
+
+        impl<'de, T, F, C> Visitor<'de> for ArrayVisitor<'_, T, F, C>
+        where
+            T: DeserializeOwned,
+            F: FnMut(T) -> crate::Result<()>,
+            C: FnMut(&str) -> crate::Result<()>,
+        {
+            type Value = ();
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an array of report records")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<(), A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                while let Some(raw) = seq.next_element::<&'de RawValue>()? {
+                    if raw.get().len() > MAX_STREAMED_RECORD_BYTES {
+                        return Err(serde::de::Error::custom(format!(
+                            "record is {} bytes, over the {}-byte streaming limit",
+                            raw.get().len(),
+                            MAX_STREAMED_RECORD_BYTES
+                        )));
+                    }
+                    (self.check)(raw.get()).map_err(serde::de::Error::custom)?;
+                    let item: T = serde_json::from_str(raw.get())
+                        .map_err(|error| serde::de::Error::custom(json_error_location(&error)))?;
+                    (self.visit)(item).map_err(serde::de::Error::custom)?;
+                }
+                Ok(())
+            }
+        }
+
+        deserializer.deserialize_seq(ArrayVisitor {
+            visit: self.visit,
+            check: self.check,
+            marker: PhantomData,
+        })
+    }
+}
+
+fn visit_raw_array<T, F>(raw: &RawValue, visit: F) -> crate::Result<()>
+where
+    T: DeserializeOwned,
+    F: FnMut(T) -> crate::Result<()>,
+{
+    visit_raw_array_checked(raw, |_| Ok(()), visit)
+}
+
+fn visit_raw_array_checked<T, F, C>(raw: &RawValue, mut check: C, mut visit: F) -> crate::Result<()>
+where
+    T: DeserializeOwned,
+    F: FnMut(T) -> crate::Result<()>,
+    C: FnMut(&str) -> crate::Result<()>,
+{
+    let mut deserializer = serde_json::Deserializer::from_str(raw.get());
+    RawArraySeed::<T, F, C> {
+        visit: &mut visit,
+        check: &mut check,
+        marker: PhantomData,
+    }
+    .deserialize(&mut deserializer)
+    .map_err(|error| Error::Report(format!("streamed report array is invalid: {error}")))?;
+    deserializer.end().map_err(|error| {
+        Error::Report(format!(
+            "streamed report array has trailing data: {}",
+            json_error_location(&error)
+        ))
+    })
+}
+
+struct RequiredFieldsSeed {
+    context: &'static str,
+    required: &'static [&'static str],
+    nested: Option<(&'static str, &'static str, &'static [&'static str])>,
+}
+
+impl<'de> DeserializeSeed<'de> for RequiredFieldsSeed {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(RequiredFieldsVisitor {
+            context: self.context,
+            required: self.required,
+            nested: self.nested,
+        })
+    }
+}
+
+struct RequiredFieldsVisitor {
+    context: &'static str,
+    required: &'static [&'static str],
+    nested: Option<(&'static str, &'static str, &'static [&'static str])>,
+}
+
+impl<'de> Visitor<'de> for RequiredFieldsVisitor {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an object with required report fields")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        if self.required.len() > u64::BITS as usize {
+            return Err(serde::de::Error::custom(
+                "required-field checker supports at most 64 fields",
+            ));
+        }
+
+        let mut found = 0u64;
+        while let Some(key) = map.next_key::<&str>()? {
+            if let Some(index) = self.required.iter().position(|required| *required == key) {
+                found |= 1u64 << index;
+            }
+            if let Some((parent_key, nested_context, nested_required)) = self.nested {
+                if key == parent_key {
+                    let nested: &'de RawValue = map.next_value()?;
+                    check_required_object_fields(nested.get(), nested_context, nested_required)
+                        .map_err(serde::de::Error::custom)?;
+                    continue;
+                }
+            }
+            let _: IgnoredAny = map.next_value()?;
+        }
+
+        for (index, required) in self.required.iter().enumerate() {
+            if found & (1u64 << index) == 0 {
+                return Err(serde::de::Error::custom(format!(
+                    "{} is missing required field {:?}",
+                    self.context, required
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Check required keys without building a JSON value tree. Values are skipped
+/// as `IgnoredAny`, except an explicitly selected nested object is checked in
+/// place. This keeps the v1.5 shape check within the existing one-record bound.
+fn check_required_object_fields(
+    json: &str,
+    context: &'static str,
+    required: &'static [&'static str],
+) -> crate::Result<()> {
+    check_required_object_fields_nested(json, context, required, None)
+}
+
+fn check_required_object_fields_nested(
+    json: &str,
+    context: &'static str,
+    required: &'static [&'static str],
+    nested: Option<(&'static str, &'static str, &'static [&'static str])>,
+) -> crate::Result<()> {
+    let mut deserializer = serde_json::Deserializer::from_str(json);
+    RequiredFieldsSeed {
+        context,
+        required,
+        nested,
+    }
+    .deserialize(&mut deserializer)
+    .map_err(|error| {
+        Error::Report(format!(
+            "{context} has invalid required-field shape: {error}"
+        ))
+    })?;
+    deserializer.end().map_err(|error| {
+        Error::Report(format!(
+            "{context} has trailing JSON data: {}",
+            json_error_location(&error)
+        ))
+    })
+}
+
+/// Validate staged report bytes without retaining the report's record
+/// vectors. Pass one validates each record and builds bounded ID indexes;
+/// pass two resolves cross-section references against those indexes.
+///
+/// `record_count` must be the exact count from the low-memory staged-report
+/// preprobe for these same bytes. The function is crate-private so the count
+/// cannot be supplied by an external caller and used to understate the index
+/// memory estimate.
+pub(crate) fn validate_report_streaming(
+    bytes: &[u8],
+    record_count: u64,
+    rss_target_bytes: u64,
+) -> crate::Result<String> {
+    check_streaming_memory_budget(bytes.len() as u64, record_count, rss_target_bytes)?;
+    let raw: RawReport<'_> = serde_json::from_slice(bytes).map_err(|error| {
+        Error::Report(format!(
+            "staged report bytes are not valid JSON: {}",
+            json_error_location(&error)
+        ))
+    })?;
+    validate_raw_report(&raw).map_err(|error| Error::Report(bounded_diagnostic(error.to_string())))
+}
 
 /// Validate a report. Returns `Ok` only when every check passes; otherwise
 /// returns all violations joined into one [`Error::Report`].
@@ -34,17 +447,636 @@ pub fn validate_report(report: &Report) -> crate::Result<()> {
     }
 }
 
+const MAX_STREAM_VALIDATION_PROBLEMS: usize = 64;
+
+fn append_stream_problems(target: &mut Vec<String>, source: Vec<String>) {
+    for problem in source {
+        if target.len() == MAX_STREAM_VALIDATION_PROBLEMS {
+            break;
+        }
+        target.push(bounded_problem(problem));
+    }
+}
+
+fn stream_problem(problems: &mut Vec<String>, problem: impl Into<String>) {
+    if problems.len() < MAX_STREAM_VALIDATION_PROBLEMS {
+        problems.push(bounded_problem(problem.into()));
+    }
+}
+
+fn bounded_problem(mut problem: String) -> String {
+    if problem.len() <= MAX_STREAMED_PROBLEM_BYTES {
+        return problem;
+    }
+    let mut end = MAX_STREAMED_PROBLEM_BYTES - 3;
+    while !problem.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = String::with_capacity(MAX_STREAMED_PROBLEM_BYTES);
+    bounded.push_str(&problem[..end]);
+    bounded.push_str("...");
+    // Do not retain an attacker-sized capacity in the diagnostic vector.
+    problem.clear();
+    bounded
+}
+
+fn bounded_diagnostic(mut diagnostic: String) -> String {
+    if diagnostic.len() <= MAX_STREAMED_DIAGNOSTIC_BYTES {
+        return diagnostic;
+    }
+    let mut end = MAX_STREAMED_DIAGNOSTIC_BYTES - 3;
+    while !diagnostic.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = String::with_capacity(MAX_STREAMED_DIAGNOSTIC_BYTES);
+    bounded.push_str(&diagnostic[..end]);
+    bounded.push_str("...");
+    // Drop any attacker-sized allocation before returning the diagnostic.
+    diagnostic.clear();
+    bounded
+}
+
+fn check_one_record<T>(
+    base: &Report,
+    record: T,
+    install: impl FnOnce(&mut Report, T),
+    problems: &mut Vec<String>,
+) {
+    let mut report = base.clone();
+    install(&mut report, record);
+    let mut local = Vec::new();
+    check_envelope(&report, &mut local);
+    check_encodings(&report, &mut local);
+    check_statuses(&report, &mut local);
+    append_stream_problems(problems, local);
+}
+
+#[derive(Default)]
+struct StreamIdIndex {
+    sections: HashMap<&'static str, HashSet<String>>,
+    id_bytes: usize,
+    account_keys: HashSet<(String, String)>,
+    account_key_bytes: usize,
+}
+
+impl StreamIdIndex {
+    fn register(
+        &mut self,
+        section: &'static str,
+        id: &str,
+        problems: &mut Vec<String>,
+    ) -> crate::Result<()> {
+        if id.is_empty() {
+            stream_problem(problems, format!("{section} has an empty id"));
+            return Ok(());
+        }
+        let ids = self.sections.entry(section).or_default();
+        if ids.contains(id) {
+            stream_problem(problems, format!("duplicate {section} id {id:?}"));
+            return Ok(());
+        }
+        let next = self.id_bytes.saturating_add(id.len());
+        if next > MAX_STREAMED_ID_BYTES {
+            return Err(Error::Report(format!(
+                "streamed report ID bytes exceed the {}-byte bound",
+                MAX_STREAMED_ID_BYTES
+            )));
+        }
+        self.id_bytes = next;
+        ids.insert(id.to_string());
+        Ok(())
+    }
+
+    fn register_account(&mut self, host: &str, account: &str) -> crate::Result<()> {
+        let key = (host.to_string(), account.to_string());
+        if self.account_keys.contains(&key) {
+            return Ok(());
+        }
+        let next = self
+            .account_key_bytes
+            .saturating_add(host.len())
+            .saturating_add(account.len());
+        if next > MAX_STREAMED_ACCOUNT_KEY_BYTES {
+            return Err(Error::Report(format!(
+                "streamed report account-key bytes exceed the {}-byte bound",
+                MAX_STREAMED_ACCOUNT_KEY_BYTES
+            )));
+        }
+        self.account_key_bytes = next;
+        self.account_keys.insert(key);
+        Ok(())
+    }
+
+    fn table(&self, section: &'static str) -> &HashSet<String> {
+        static EMPTY: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
+        self.sections
+            .get(section)
+            .unwrap_or_else(|| EMPTY.get_or_init(HashSet::new))
+    }
+}
+
+fn validate_raw_report(raw: &RawReport<'_>) -> crate::Result<String> {
+    let mut problems = Vec::new();
+    let base = raw.shell()?;
+    check_envelope(&base, &mut problems);
+    if raw.schema_version == crate::report::model::SCHEMA_VERSION {
+        if raw.groups.is_none() {
+            stream_problem(&mut problems, "groups is missing in report 1.5.0");
+        }
+        if raw.totals.is_none() {
+            stream_problem(&mut problems, "totals is missing in report 1.5.0");
+        }
+    }
+    let mut ids = StreamIdIndex::default();
+    let mut totals = Totals {
+        bare_stores: Some(0),
+        ..Totals::default()
+    };
+    let mut error_count = 0u64;
+    let mut unresolvable_candidates = 0u64;
+    let mut has_unresolvable_repo = false;
+    let mut has_incomplete_status = false;
+
+    visit_raw_array::<Volume, _>(raw.volumes, |record| {
+        ids.register("volume", &record.id, &mut problems)?;
+        check_one_record(&base, record, |r, v| r.volumes.push(v), &mut problems);
+        Ok(())
+    })?;
+    visit_raw_array::<PathRecord, _>(raw.paths, |record| {
+        ids.register("path", &record.id, &mut problems)?;
+        check_one_record(&base, record, |r, v| r.paths.push(v), &mut problems);
+        totals.observed_paths += 1;
+        Ok(())
+    })?;
+    visit_raw_array::<Root, _>(raw.roots, |record| {
+        ids.register("root", &record.id, &mut problems)?;
+        check_one_record(&base, record, |r, v| r.roots.push(v), &mut problems);
+        Ok(())
+    })?;
+    if let Some(groups) = raw.groups {
+        visit_raw_array::<Group, _>(groups, |record| {
+            ids.register("group", &record.id, &mut problems)?;
+            let expected = format!(
+                "{}/{}/{}",
+                record.host.to_ascii_lowercase(),
+                record.account.to_ascii_lowercase(),
+                record.repo.to_ascii_lowercase()
+            );
+            if record.id != expected {
+                stream_problem(
+                    &mut problems,
+                    format!("group {} id does not match {:?}", record.id, expected),
+                );
+            }
+            if record.host.is_empty() || record.account.is_empty() || record.repo.is_empty() {
+                stream_problem(
+                    &mut problems,
+                    format!("group {} host/account/repo must be nonempty", record.id),
+                );
+            }
+            ids.register_account(&record.host, &record.account)?;
+            check_one_record(&base, record, |r, v| r.groups.push(v), &mut problems);
+            totals.groups += 1;
+            Ok(())
+        })?;
+    }
+    visit_raw_array::<Repository, _>(raw.repositories, |record| {
+        ids.register("repository", &record.id, &mut problems)?;
+        if record.match_disposition == "unresolvable_identity" {
+            has_unresolvable_repo = true;
+        }
+        match record.bare {
+            Some(true) => {
+                if let Some(count) = totals.bare_stores.as_mut() {
+                    *count += 1;
+                }
+            }
+            Some(false) => {}
+            None => totals.bare_stores = None,
+        }
+        check_one_record(&base, record, |r, v| r.repositories.push(v), &mut problems);
+        totals.stores += 1;
+        Ok(())
+    })?;
+    visit_raw_array_checked::<Checkout, _, _>(
+        raw.checkouts,
+        |json| {
+            if raw.schema_version == crate::report::model::SCHEMA_VERSION {
+                check_required_object_fields_nested(
+                    json,
+                    "checkout",
+                    &[],
+                    Some(("status", "checkout.status", &["conflicts", "working_state"])),
+                )
+            } else {
+                Ok(())
+            }
+        },
+        |record| {
+            ids.register("checkout", &record.id, &mut problems)?;
+            if record.availability == "present" {
+                totals.present_checkouts += 1;
+                if record.kind == "linked" {
+                    totals.linked_worktrees += 1;
+                }
+            }
+            if record.status.state != "complete" {
+                has_incomplete_status = true;
+            }
+            match record.status.state.as_str() {
+                "complete" => totals.analysis.completed += 1,
+                "pending" | "not_requested" => totals.analysis.pending += 1,
+                "unsupported" => totals.analysis.unavailable += 1,
+                "partial" | "unstable" | "error" => totals.analysis.failed += 1,
+                _ => totals.analysis.pending += 1,
+            }
+            check_one_record(&base, record, |r, v| r.checkouts.push(v), &mut problems);
+            Ok(())
+        },
+    )?;
+    visit_raw_array_checked::<Branch, _, _>(
+        raw.branches,
+        |json| {
+            if raw.schema_version == crate::report::model::SCHEMA_VERSION {
+                check_required_object_fields(
+                    json,
+                    "branch",
+                    &["freshness", "freshness_at", "comparison", "ahead", "behind"],
+                )
+            } else {
+                Ok(())
+            }
+        },
+        |record| {
+            ids.register("branch", &record.id, &mut problems)?;
+            match record.kind.as_str() {
+                "local" => totals.local_branches += 1,
+                "remote_tracking" => totals.remote_tracking_refs += 1,
+                _ => {}
+            }
+            check_one_record(&base, record, |r, v| r.branches.push(v), &mut problems);
+            Ok(())
+        },
+    )?;
+    visit_raw_array_checked::<Remote, _, _>(
+        raw.remotes,
+        |json| {
+            if raw.schema_version == crate::report::model::SCHEMA_VERSION {
+                check_required_object_fields(json, "remote", &["refresh"])
+            } else {
+                Ok(())
+            }
+        },
+        |record| {
+            ids.register("remote", &record.id, &mut problems)?;
+            check_one_record(&base, record, |r, v| r.remotes.push(v), &mut problems);
+            Ok(())
+        },
+    )?;
+    visit_raw_array::<StorageLink, _>(raw.storage_links, |record| {
+        ids.register("storage_link", &record.id, &mut problems)?;
+        check_one_record(&base, record, |r, v| r.storage_links.push(v), &mut problems);
+        Ok(())
+    })?;
+    visit_raw_array::<Alias, _>(raw.aliases, |record| {
+        check_one_record(&base, record, |r, v| r.aliases.push(v), &mut problems);
+        totals.aliases += 1;
+        Ok(())
+    })?;
+    visit_raw_array::<Candidate, _>(raw.candidates, |record| {
+        ids.register("candidate", &record.id, &mut problems)?;
+        if record.disposition == "unresolvable_identity" {
+            unresolvable_candidates += 1;
+        }
+        check_one_record(&base, record, |r, v| r.candidates.push(v), &mut problems);
+        Ok(())
+    })?;
+    visit_raw_array::<ErrorRecord, _>(raw.errors, |record| {
+        ids.register("error", &record.id, &mut problems)?;
+        error_count += 1;
+        check_one_record(&base, record, |r, v| r.errors.push(v), &mut problems);
+        Ok(())
+    })?;
+    visit_raw_array::<GeneratedArtifact, _>(raw.generated_artifacts, |record| {
+        check_one_record(
+            &base,
+            record,
+            |r, v| r.generated_artifacts.push(v),
+            &mut problems,
+        );
+        Ok(())
+    })?;
+
+    totals.accounts = ids.account_keys.len() as u64;
+    totals.unresolved_candidates = unresolvable_candidates;
+    totals.gaps = error_count;
+    if raw.schema_version == crate::report::model::SCHEMA_VERSION
+        && raw.totals.as_ref() != Some(&totals)
+    {
+        stream_problem(
+            &mut problems,
+            format!(
+                "totals do not agree with records: got {:?}, want {totals:?}",
+                raw.totals
+            ),
+        );
+    }
+    if base.coverage.gaps != error_count {
+        stream_problem(
+            &mut problems,
+            format!(
+                "coverage.gaps is {}, but {error_count} error records were emitted",
+                base.coverage.gaps
+            ),
+        );
+    }
+    if base.coverage.unresolvable_candidates != unresolvable_candidates {
+        stream_problem(
+            &mut problems,
+            format!("coverage.unresolvable_candidates is {}, but {unresolvable_candidates} unresolved candidates were emitted", base.coverage.unresolvable_candidates),
+        );
+    }
+    if base.coverage.status == "complete" && has_incomplete_status {
+        stream_problem(
+            &mut problems,
+            "coverage.status is complete but a checkout status is incomplete",
+        );
+    }
+    if base.coverage.identity == "complete_under_policy"
+        && (unresolvable_candidates != 0 || has_unresolvable_repo)
+    {
+        stream_problem(
+            &mut problems,
+            "coverage.identity is complete_under_policy but unresolved identities are present",
+        );
+    }
+    check_coverage(&base, &mut problems);
+
+    validate_raw_references(raw, &ids, &mut problems)?;
+    if problems.is_empty() {
+        Ok(raw.report_id.to_string())
+    } else {
+        Err(Error::Report(format!(
+            "report {} invalid: {}",
+            raw.report_id,
+            problems.join("; ")
+        )))
+    }
+}
+
+fn stream_resolve(
+    problems: &mut Vec<String>,
+    context: impl Into<String>,
+    id: &str,
+    table: &HashSet<String>,
+) {
+    let context = context.into();
+    if id.is_empty() {
+        stream_problem(problems, format!("{context} is an empty id"));
+    } else if !table.contains(id) {
+        stream_problem(problems, format!("{context} references missing id {id:?}"));
+    }
+}
+
+fn stream_resolve_opt(
+    problems: &mut Vec<String>,
+    context: impl Into<String>,
+    id: Option<&str>,
+    table: &HashSet<String>,
+) {
+    if let Some(id) = id {
+        stream_resolve(problems, context, id, table);
+    }
+}
+
+fn stream_resolve_list(
+    problems: &mut Vec<String>,
+    context: &str,
+    ids: &[String],
+    table: &HashSet<String>,
+) {
+    for id in ids {
+        stream_resolve(problems, format!("{context} error reference"), id, table);
+    }
+}
+
+fn validate_raw_references(
+    raw: &RawReport<'_>,
+    ids: &StreamIdIndex,
+    problems: &mut Vec<String>,
+) -> crate::Result<()> {
+    visit_raw_array::<PathRecord, _>(raw.paths, |record| {
+        stream_resolve_opt(
+            problems,
+            format!("path {} volume_id", record.id),
+            record.volume_id.as_deref(),
+            ids.table("volume"),
+        );
+        Ok(())
+    })?;
+    visit_raw_array::<Volume, _>(raw.volumes, |record| {
+        stream_resolve_list(
+            problems,
+            &format!("volume {}", record.id),
+            &record.error_ids,
+            ids.table("error"),
+        );
+        Ok(())
+    })?;
+    visit_raw_array::<Root, _>(raw.roots, |record| {
+        stream_resolve(
+            problems,
+            format!("root {} path_id", record.id),
+            &record.path_id,
+            ids.table("path"),
+        );
+        stream_resolve_opt(
+            problems,
+            format!("root {} volume_id", record.id),
+            record.volume_id.as_deref(),
+            ids.table("volume"),
+        );
+        stream_resolve_list(
+            problems,
+            &format!("root {}", record.id),
+            &record.error_ids,
+            ids.table("error"),
+        );
+        Ok(())
+    })?;
+    visit_raw_array::<Repository, _>(raw.repositories, |record| {
+        stream_resolve(
+            problems,
+            format!("repository {} git_path_id", record.id),
+            &record.git_path_id,
+            ids.table("path"),
+        );
+        stream_resolve(
+            problems,
+            format!("repository {} common_path_id", record.id),
+            &record.common_path_id,
+            ids.table("path"),
+        );
+        stream_resolve_list(
+            problems,
+            &format!("repository {}", record.id),
+            &record.error_ids,
+            ids.table("error"),
+        );
+        Ok(())
+    })?;
+    visit_raw_array::<Checkout, _>(raw.checkouts, |record| {
+        stream_resolve(
+            problems,
+            format!("checkout {} repository_id", record.id),
+            &record.repository_id,
+            ids.table("repository"),
+        );
+        stream_resolve_opt(
+            problems,
+            format!("checkout {} root_path_id", record.id),
+            record.root_path_id.as_deref(),
+            ids.table("path"),
+        );
+        stream_resolve(
+            problems,
+            format!("checkout {} git_path_id", record.id),
+            &record.git_path_id,
+            ids.table("path"),
+        );
+        stream_resolve_list(
+            problems,
+            &format!("checkout {} status", record.id),
+            &record.status.error_ids,
+            ids.table("error"),
+        );
+        stream_resolve_list(
+            problems,
+            &format!("checkout {}", record.id),
+            &record.error_ids,
+            ids.table("error"),
+        );
+        Ok(())
+    })?;
+    visit_raw_array::<Branch, _>(raw.branches, |record| {
+        stream_resolve(
+            problems,
+            format!("branch {} repository_id", record.id),
+            &record.repository_id,
+            ids.table("repository"),
+        );
+        stream_resolve_opt(
+            problems,
+            format!("branch {} checkout_scope_id", record.id),
+            record.checkout_scope_id.as_deref(),
+            ids.table("checkout"),
+        );
+        stream_resolve_list(
+            problems,
+            &format!("branch {}", record.id),
+            &record.error_ids,
+            ids.table("error"),
+        );
+        Ok(())
+    })?;
+    visit_raw_array::<Remote, _>(raw.remotes, |record| {
+        stream_resolve(
+            problems,
+            format!("remote {} repository_id", record.id),
+            &record.repository_id,
+            ids.table("repository"),
+        );
+        stream_resolve_opt(
+            problems,
+            format!("remote {} checkout_scope_id", record.id),
+            record.checkout_scope_id.as_deref(),
+            ids.table("checkout"),
+        );
+        Ok(())
+    })?;
+    visit_raw_array::<StorageLink, _>(raw.storage_links, |record| {
+        stream_resolve(
+            problems,
+            format!("storage_link {} from_repository_id", record.id),
+            &record.from_repository_id,
+            ids.table("repository"),
+        );
+        stream_resolve(
+            problems,
+            format!("storage_link {} to_path_id", record.id),
+            &record.to_path_id,
+            ids.table("path"),
+        );
+        Ok(())
+    })?;
+    visit_raw_array::<Alias, _>(raw.aliases, |record| {
+        stream_resolve(
+            problems,
+            "alias path_id",
+            &record.path_id,
+            ids.table("path"),
+        );
+        stream_resolve(
+            problems,
+            "alias target_path_id",
+            &record.target_path_id,
+            ids.table("path"),
+        );
+        Ok(())
+    })?;
+    visit_raw_array::<Candidate, _>(raw.candidates, |record| {
+        stream_resolve(
+            problems,
+            format!("candidate {} path_id", record.id),
+            &record.path_id,
+            ids.table("path"),
+        );
+        stream_resolve_opt(
+            problems,
+            format!("candidate {} repository_id", record.id),
+            record.repository_id.as_deref(),
+            ids.table("repository"),
+        );
+        stream_resolve_list(
+            problems,
+            &format!("candidate {}", record.id),
+            &record.error_ids,
+            ids.table("error"),
+        );
+        Ok(())
+    })?;
+    visit_raw_array::<ErrorRecord, _>(raw.errors, |record| {
+        stream_resolve_opt(
+            problems,
+            format!("error {} path_id", record.id),
+            record.path_id.as_deref(),
+            ids.table("path"),
+        );
+        Ok(())
+    })?;
+    visit_raw_array::<GeneratedArtifact, _>(raw.generated_artifacts, |record| {
+        stream_resolve(
+            problems,
+            "generated_artifact path_id",
+            &record.path_id,
+            ids.table("path"),
+        );
+        Ok(())
+    })?;
+    Ok(())
+}
+
 fn check_envelope(report: &Report, problems: &mut Vec<String>) {
     // Report 1.4.0 is additive over 1.3.0 (comparison fields default
     // to `pending`/null), so both versions validate.
-    if report.schema_version != crate::report::model::SCHEMA_VERSION
-        && report.schema_version != crate::report::model::PREVIOUS_SCHEMA_VERSION
-    {
+    if !matches!(
+        report.schema_version.as_str(),
+        "1.3.0" | "1.4.0" | crate::report::model::SCHEMA_VERSION
+    ) {
         problems.push(format!(
-            "schema_version is {:?}, want {:?} or {:?}",
+            "schema_version is {:?}, want 1.3.0, 1.4.0, or {:?}",
             report.schema_version,
-            crate::report::model::SCHEMA_VERSION,
-            crate::report::model::PREVIOUS_SCHEMA_VERSION
+            crate::report::model::SCHEMA_VERSION
         ));
     }
     if report.report_id.is_empty() {
@@ -253,6 +1285,14 @@ fn check_envelope(report: &Report, problems: &mut Vec<String>) {
                 branch.id, branch.freshness
             ));
         }
+        if branch.kind != "remote_tracking"
+            && (branch.freshness != "unknown" || branch.freshness_at.is_some())
+        {
+            problems.push(format!(
+                "branch {} kind {:?} must have unknown freshness and null freshness_at",
+                branch.id, branch.kind
+            ));
+        }
         check_opt_time(
             &format!("branch {} freshness_at", branch.id),
             &branch.freshness_at,
@@ -294,6 +1334,14 @@ fn check_envelope(report: &Report, problems: &mut Vec<String>) {
                 "branch {} comparison {:?} carries ahead={:?} behind={:?}: \
                  counted states need exact counts, other states need nulls",
                 branch.id, branch.comparison, branch.ahead, branch.behind
+            ));
+        }
+        if branch.kind != "local"
+            && (branch.comparison != "pending" || branch.ahead.is_some() || branch.behind.is_some())
+        {
+            problems.push(format!(
+                "branch {} kind {:?} must have pending comparison and null counts",
+                branch.id, branch.kind
             ));
         }
         if let Some(oid) = &branch.oid {
@@ -465,6 +1513,27 @@ fn check_ids(report: &Report, problems: &mut Vec<String>) {
     }
     for root in &report.roots {
         collect_id(&mut seen, "root", &root.id, problems);
+    }
+    for group in &report.groups {
+        collect_id(&mut seen, "group", &group.id, problems);
+        let expected = format!(
+            "{}/{}/{}",
+            group.host.to_ascii_lowercase(),
+            group.account.to_ascii_lowercase(),
+            group.repo.to_ascii_lowercase()
+        );
+        if group.id != expected {
+            problems.push(format!(
+                "group {} id does not match lower(host)/lower(account)/lower(repo) {:?}",
+                group.id, expected
+            ));
+        }
+        if group.host.is_empty() || group.account.is_empty() || group.repo.is_empty() {
+            problems.push(format!(
+                "group {} host/account/repo must be nonempty",
+                group.id
+            ));
+        }
     }
     for repo in &report.repositories {
         collect_id(&mut seen, "repository", &repo.id, problems);
@@ -700,6 +1769,100 @@ fn check_counts(report: &Report, problems: &mut Vec<String>) {
             report.coverage.unresolvable_candidates
         ));
     }
+    if report.schema_version == crate::report::model::SCHEMA_VERSION {
+        check_totals(report, problems);
+    }
+}
+
+fn check_totals(report: &Report, problems: &mut Vec<String>) {
+    let total = &report.totals;
+    let accounts: HashSet<(&str, &str)> = report
+        .groups
+        .iter()
+        .map(|group| (group.host.as_str(), group.account.as_str()))
+        .collect();
+    let bare_unknown = report.repositories.iter().any(|repo| repo.bare.is_none());
+    let bare_stores = if bare_unknown {
+        None
+    } else {
+        Some(
+            report
+                .repositories
+                .iter()
+                .filter(|repo| repo.bare == Some(true))
+                .count() as u64,
+        )
+    };
+    let mut analysis = crate::report::model::AnalysisTotals::default();
+    for checkout in &report.checkouts {
+        match checkout.status.state.as_str() {
+            "complete" => analysis.completed += 1,
+            "pending" | "not_requested" => analysis.pending += 1,
+            "unsupported" => analysis.unavailable += 1,
+            "partial" | "unstable" | "error" => analysis.failed += 1,
+            _ => analysis.pending += 1,
+        }
+    }
+    let expected = crate::report::model::Totals {
+        accounts: accounts.len() as u64,
+        groups: report.groups.len() as u64,
+        stores: report.repositories.len() as u64,
+        bare_stores,
+        present_checkouts: report
+            .checkouts
+            .iter()
+            .filter(|checkout| checkout.availability == "present")
+            .count() as u64,
+        linked_worktrees: report
+            .checkouts
+            .iter()
+            .filter(|checkout| checkout.availability == "present" && checkout.kind == "linked")
+            .count() as u64,
+        observed_paths: report.paths.len() as u64,
+        aliases: report.aliases.len() as u64,
+        local_branches: report
+            .branches
+            .iter()
+            .filter(|branch| branch.kind == "local")
+            .count() as u64,
+        remote_tracking_refs: report
+            .branches
+            .iter()
+            .filter(|branch| branch.kind == "remote_tracking")
+            .count() as u64,
+        analysis,
+        unresolved_candidates: unresolvable_candidate_count(report),
+        gaps: report.errors.len() as u64,
+    };
+    if total.accounts != expected.accounts
+        || total.groups != expected.groups
+        || total.stores != expected.stores
+        || total.bare_stores != expected.bare_stores
+        || total.present_checkouts != expected.present_checkouts
+        || total.linked_worktrees != expected.linked_worktrees
+        || total.observed_paths != expected.observed_paths
+        || total.aliases != expected.aliases
+        || total.local_branches != expected.local_branches
+        || total.remote_tracking_refs != expected.remote_tracking_refs
+        || total.analysis.completed != expected.analysis.completed
+        || total.analysis.pending != expected.analysis.pending
+        || total.analysis.failed != expected.analysis.failed
+        || total.analysis.unavailable != expected.analysis.unavailable
+        || total.unresolved_candidates != expected.unresolved_candidates
+        || total.gaps != expected.gaps
+    {
+        problems.push(format!(
+            "totals do not agree with report records: got {total:?}, want {expected:?}"
+        ));
+    }
+}
+
+fn unresolvable_candidate_count(report: &Report) -> u64 {
+    report
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.disposition == "unresolvable_identity")
+        .count() as u64
 }
 
 /// Coverage honesty: completeness claims must agree with the emitted
@@ -864,6 +2027,12 @@ pub fn validate_status(status: &Status, context: &str, problems: &mut Vec<String
         }
         _ => {}
     }
+    if status.working_state == "clean" && (status.mode == "metadata" || status.state != "complete")
+    {
+        problems.push(format!(
+            "{context}: working_state clean requires complete status in summary or full mode"
+        ));
+    }
 }
 
 /// Encoding rules: `utf8`/`base64` membership, Base64 well-formedness, and
@@ -943,5 +2112,258 @@ fn check_encoding(
     }
     if display.chars().any(|c| c.is_control()) {
         problems.push(format!("{context}: display carries raw control characters"));
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use serde_json::Value;
+    use std::io::Write;
+
+    const FULL_REPORT_RECORDS: usize = 350_520;
+    const VALIDATOR_BUDGET: u64 = 256 * 1024 * 1024;
+
+    fn example_value() -> Value {
+        serde_json::from_str(include_str!("../../tests/data/example-report.json"))
+            .expect("example report")
+    }
+
+    fn record_count(value: &Value) -> usize {
+        [
+            "volumes",
+            "paths",
+            "roots",
+            "groups",
+            "repositories",
+            "checkouts",
+            "branches",
+            "remotes",
+            "storage_links",
+            "aliases",
+            "candidates",
+            "errors",
+            "generated_artifacts",
+        ]
+        .iter()
+        .map(|key| value[*key].as_array().map_or(0, Vec::len))
+        .sum()
+    }
+
+    fn streaming_error(value: &Value) -> String {
+        let bytes = serde_json::to_vec(value).expect("serialize report");
+        validate_report_streaming(&bytes, record_count(value) as u64, VALIDATOR_BUDGET)
+            .expect_err("malformed report must be rejected")
+            .to_string()
+    }
+
+    fn report_with_metadata_checkout() -> Value {
+        let mut value = example_value();
+        value["scan"]["status_mode"] = Value::String("metadata".to_string());
+        value["coverage"]["status"] = Value::String("not_requested".to_string());
+        value["totals"]["analysis"]["pending"] = Value::from(1u64);
+        value["checkouts"]
+            .as_array_mut()
+            .expect("checkouts")
+            .push(serde_json::json!({
+                "id": "checkout-extra",
+                "repository_id": "repo-fixture",
+                "root_path_id": null,
+                "git_path_id": "path-bare",
+                "kind": "unknown",
+                "availability": "unknown",
+                "head": { "state": "unknown", "ref_name": null, "oid": null },
+                "status": {
+                    "state": "not_requested",
+                    "mode": "metadata",
+                    "started_at": null,
+                    "finished_at": null,
+                    "staged": null,
+                    "unstaged": null,
+                    "untracked": null,
+                    "conflicts": null,
+                    "working_state": "unknown",
+                    "untracked_units": "not_requested",
+                    "submodules": "not_requested",
+                    "unknown_fields": [],
+                    "error_ids": []
+                },
+                "observed_at": "2026-09-30T11:59:59Z",
+                "error_ids": []
+            }));
+        value
+    }
+
+    #[test]
+    fn v15_rejects_missing_serde_defaulted_required_fields() {
+        let base = example_value();
+        for field in ["freshness", "freshness_at", "comparison", "ahead", "behind"] {
+            let mut value = base.clone();
+            value["branches"][0]
+                .as_object_mut()
+                .expect("branch object")
+                .remove(field);
+            let error = streaming_error(&value);
+            assert!(error.contains(field), "missing branch.{field}: {error}");
+        }
+
+        let mut value = base.clone();
+        value["remotes"][0]
+            .as_object_mut()
+            .expect("remote object")
+            .remove("refresh");
+        let error = streaming_error(&value);
+        assert!(error.contains("refresh"), "missing remote.refresh: {error}");
+
+        let baseline = report_with_metadata_checkout();
+        let bytes = serde_json::to_vec(&baseline).expect("serialize status report");
+        validate_report_streaming(&bytes, record_count(&baseline) as u64, VALIDATOR_BUDGET)
+            .expect("metadata checkout fixture validates before field removal");
+
+        for field in ["conflicts", "working_state"] {
+            let mut value = report_with_metadata_checkout();
+            value["checkouts"][0]["status"]
+                .as_object_mut()
+                .expect("status object")
+                .remove(field);
+            let error = streaming_error(&value);
+            assert!(
+                error.contains(field),
+                "missing checkout.status.{field}: {error}"
+            );
+        }
+
+        for field in ["groups", "totals"] {
+            let mut value = base.clone();
+            value.as_object_mut().expect("report object").remove(field);
+            let error = streaming_error(&value);
+            assert!(error.contains(field), "missing {field}: {error}");
+        }
+    }
+
+    #[test]
+    fn v15_rejects_unknown_nested_properties() {
+        let mut value = example_value();
+        value["totals"]["unexpected"] = Value::Bool(true);
+        let _ = streaming_error(&value);
+
+        let mut value = example_value();
+        value["totals"]["analysis"]["unexpected"] = Value::Bool(true);
+        let _ = streaming_error(&value);
+
+        for section in ["tool", "scan", "coverage", "resources"] {
+            let mut value = example_value();
+            value[section]["unexpected"] = Value::Bool(true);
+            let error = streaming_error(&value);
+            assert!(error.contains(section), "{section} property: {error}");
+        }
+
+        let mut value = example_value();
+        value["branches"][0]["name"]["unexpected"] = Value::Bool(true);
+        let _ = streaming_error(&value);
+    }
+
+    #[test]
+    fn legacy_13_reports_keep_defaulted_fields_compatible() {
+        let mut value = example_value();
+        value["schema_version"] = Value::String("1.3.0".to_string());
+        let object = value.as_object_mut().expect("report object");
+        object.remove("groups");
+        object.remove("totals");
+        for field in ["comparison", "ahead", "behind"] {
+            value["branches"][0]
+                .as_object_mut()
+                .expect("branch object")
+                .remove(field);
+        }
+
+        let bytes = serde_json::to_vec(&value).expect("serialize legacy report");
+        validate_report_streaming(&bytes, record_count(&value) as u64, VALIDATOR_BUDGET)
+            .expect("supported 1.3 report may omit fields added in later schemas");
+    }
+
+    #[test]
+    fn streaming_validator_accepts_350k_records_under_the_fixed_budget() {
+        let mut value = example_value();
+        value["groups"] = Value::Array(Vec::new());
+        let base_records = record_count(&value);
+        let groups = FULL_REPORT_RECORDS - base_records;
+        value["groups"] = Value::Array(Vec::new());
+        value["totals"]["groups"] = Value::from(groups as u64);
+        value["totals"]["accounts"] = Value::from(1u64);
+
+        let base = serde_json::to_vec(&value).expect("serialize base report");
+        let marker = b"\"groups\":[]";
+        let start = base
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("empty groups marker");
+        let array_start = start + marker.len() - 2;
+        let array_end = array_start + 2;
+        let mut bytes = Vec::with_capacity(base.len() + groups * 104);
+        bytes.extend_from_slice(&base[..array_start]);
+        bytes.push(b'[');
+        for index in 0..groups {
+            if index != 0 {
+                bytes.push(b',');
+            }
+            write!(
+                &mut bytes,
+                "{{\"id\":\"github.com/owner/synthetic-{index:06}\",\
+                 \"host\":\"github.com\",\"account\":\"owner\",\
+                 \"repo\":\"synthetic-{index:06}\"}}"
+            )
+            .expect("write synthetic group");
+        }
+        bytes.push(b']');
+        bytes.extend_from_slice(&base[array_end..]);
+
+        assert_eq!(record_count(&value) + groups, FULL_REPORT_RECORDS);
+        assert!(bytes.len() as u64 <= 128 * 1024 * 1024);
+        check_streaming_memory_budget(
+            128 * 1024 * 1024,
+            FULL_REPORT_RECORDS as u64,
+            VALIDATOR_BUDGET,
+        )
+        .expect("worst-case staged size and ID indexes fit 256 MiB");
+        assert_eq!(
+            validate_report_streaming(&bytes, FULL_REPORT_RECORDS as u64, VALIDATOR_BUDGET,)
+                .expect("350k-record report validates"),
+            value["report_id"].as_str().expect("report ID")
+        );
+    }
+
+    #[test]
+    fn streaming_diagnostics_truncate_repeated_large_ids() {
+        let long_id = "x".repeat(512 * 1024);
+        let mut duplicate = example_value();
+        let path = serde_json::json!({
+            "id": long_id,
+            "display": "/synthetic",
+            "encoding": "utf8",
+            "value": "/synthetic",
+            "volume_id": null,
+            "object_id": null,
+            "incarnation": null
+        });
+        let paths = duplicate["paths"].as_array_mut().expect("paths");
+        paths.push(path.clone());
+        paths.push(path);
+        duplicate["totals"]["observed_paths"] = Value::from(paths.len() as u64);
+        let bytes = serde_json::to_vec(&duplicate).expect("serialize duplicate report");
+        let count = record_count(&duplicate) as u64;
+        let error = validate_report_streaming(&bytes, count, VALIDATOR_BUDGET)
+            .expect_err("duplicate IDs are rejected");
+        assert!(error.to_string().contains("duplicate path id"));
+        assert!(error.to_string().len() < 4096, "diagnostic is bounded");
+
+        let mut missing = example_value();
+        missing["repositories"][0]["git_path_id"] = Value::String("m".repeat(512 * 1024));
+        let bytes = serde_json::to_vec(&missing).expect("serialize missing-reference report");
+        let count = record_count(&missing) as u64;
+        let error = validate_report_streaming(&bytes, count, VALIDATOR_BUDGET)
+            .expect_err("missing references are rejected");
+        assert!(error.to_string().contains("git_path_id"));
+        assert!(error.to_string().len() < 4096, "diagnostic is bounded");
     }
 }

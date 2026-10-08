@@ -541,6 +541,43 @@ pub fn canonical_scope_path(path: &Path) -> PathBuf {
     }
 }
 
+/// Normalize a scope path without consulting the filesystem. This is the
+/// deterministic fallback used when bounded root identity lookup cannot
+/// finish; symlinks remain distinct in that case, which may start a fresh
+/// generation but cannot reuse coverage under an unverified alias.
+pub fn normalize_scope_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    let mut rooted = false;
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => {
+                rooted = true;
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    normalized.pop();
+                } else if !rooted {
+                    normalized.push("..");
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        normalized
+    }
+}
+
 /// Scope key for directory enumeration / reconciliation of `path`.
 /// Keeps the observed spelling: execution derives task paths from
 /// keys, and cross-spelling invalidation is closed by fan-out (see
@@ -674,6 +711,18 @@ mod tests {
                 base.prefetch_tasks,
                 base.writer_rows,
             )
+        );
+    }
+
+    #[test]
+    fn normalize_scope_path_is_lexical_and_keeps_relative_roots_relative() {
+        assert_eq!(
+            normalize_scope_path(Path::new("a/./b/../c")),
+            PathBuf::from("a/c")
+        );
+        assert_eq!(
+            normalize_scope_path(Path::new("../../a/../b")),
+            PathBuf::from("../../b")
         );
     }
 

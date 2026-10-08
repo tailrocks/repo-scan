@@ -363,6 +363,33 @@ where
     rx.recv_timeout(IDENTITY_IO_TIMEOUT).ok()
 }
 
+/// Canonical paths and owning-volume device numbers for a set of scan roots.
+/// The whole batch runs inside one admitted identity-I/O worker, so even a
+/// stalled network mount cannot block the coordinator's generation-key
+/// construction past the standard identity timeout. Failed identities are
+/// returned as `None` entries; callers must retain a safe lexical key.
+pub fn bounded_scope_identities(roots: &[PathBuf]) -> Option<Vec<(PathBuf, Option<u64>)>> {
+    let owned = roots.to_vec();
+    bounded_identity_io(move || {
+        owned
+            .iter()
+            .map(|root| {
+                // A failed canonicalization must not leave lexical aliases
+                // such as `unused/../missing` as distinct generation scopes.
+                // Keep the same deterministic lexical fallback used when the
+                // bounded identity worker itself cannot complete.
+                let canonical = root
+                    .canonicalize()
+                    .unwrap_or_else(|_| crate::config::normalize_scope_path(root));
+                let dev = std::fs::metadata(&canonical)
+                    .ok()
+                    .map(|metadata| super::fs_entry_metadata(&metadata).dev);
+                (canonical, dev)
+            })
+            .collect()
+    })
+}
+
 /// Bounded physical identity for one coordinator path (R7 alias sharing:
 /// follows symlinks). Runs through `bounded_identity_io` (cap-2
 /// admission plus a 1 s timeout): `None` on stat failure, slot refusal,

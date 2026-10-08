@@ -14,7 +14,7 @@
 //! are all in scope).
 
 use crate::platform::{MountPoint, VolumeId};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Scheduling priority of one planned root. Priority orders first contact;
 /// every root is still attempted fairly.
@@ -111,19 +111,32 @@ pub fn plan_machine_roots(mounts: &[MountPoint]) -> Vec<PlannedRoot> {
 /// flags exist yet; traversal-time filesystem-class filtering is
 /// deterministic from the mount set, so it needs no extra key input.
 pub fn generation_scope_key(policy: &str, roots: &[PlannedRoot]) -> String {
+    let paths: Vec<PathBuf> = roots.iter().map(|root| root.path.clone()).collect();
+    // Root canonicalization and volume identity both run through the
+    // topology layer's bounded identity-I/O worker. If admission or the
+    // timeout fails, use the normalized lexical spelling and an explicit
+    // unknown-device marker; when the identity becomes available later,
+    // the key changes and safely starts a fresh generation.
+    let identities = crate::walk::topology::bounded_scope_identities(&paths);
     let mut entries: Vec<Vec<u8>> = roots
         .iter()
-        .map(|root| {
-            // One shared spelling rule (DB-M1) with the scope-key
-            // constructors: symlink spellings collapse onto the
-            // physical path, so task keys and generation keys agree.
-            let canonical = crate::config::canonical_scope_path(&root.path);
+        .enumerate()
+        .map(|(index, root)| {
+            let (canonical, dev) = identities
+                .as_ref()
+                .and_then(|items| items.get(index))
+                .map(|(path, dev)| (path.clone(), *dev))
+                .unwrap_or_else(|| (crate::config::normalize_scope_path(&root.path), None));
             let mut entry = Vec::new();
             entry.extend_from_slice(root.namespace.as_bytes());
             entry.push(0);
             entry.extend_from_slice(&crate::config::path_as_bytes(&canonical));
             entry.push(0);
-            entry.extend_from_slice(root_volume_dev(&root.path).to_string().as_bytes());
+            entry.extend_from_slice(
+                dev.map(|value| value.to_string())
+                    .unwrap_or_else(|| String::from("unknown"))
+                    .as_bytes(),
+            );
             entry
         })
         .collect();
@@ -135,24 +148,6 @@ pub fn generation_scope_key(policy: &str, roots: &[PlannedRoot]) -> String {
         joined.push(0);
     }
     format!("v2:{policy}:{}", crate::config::encode_hex(&joined))
-}
-
-/// Device number pinning a root's volume (unix; 0 elsewhere / on error).
-fn root_volume_dev(path: &Path) -> u64 {
-    std::fs::metadata(path)
-        .map(|md| volume_dev(&md))
-        .unwrap_or(0)
-}
-
-#[cfg(unix)]
-fn volume_dev(md: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    md.dev()
-}
-
-#[cfg(not(unix))]
-fn volume_dev(_md: &std::fs::Metadata) -> u64 {
-    0
 }
 
 #[cfg(test)]
@@ -225,5 +220,20 @@ mod tests {
         let via_real = generation_scope_key("roots", &[explicit(real)]);
         let via_link = generation_scope_key("roots", &[explicit(link)]);
         assert_eq!(via_real, via_link);
+    }
+
+    #[test]
+    fn missing_root_has_stable_lexical_scope_key() {
+        let base = scratch("missing-lexical");
+        let with_dotdot = base.join("unused").join("..").join("missing");
+        let normalized = base.join("missing");
+        let first = generation_scope_key("roots", &[explicit(with_dotdot)]);
+        let second = generation_scope_key("roots", &[explicit(normalized.clone())]);
+        let third = generation_scope_key("roots", &[explicit(normalized)]);
+        assert_eq!(
+            first, second,
+            "lexically equivalent paths share the fallback key"
+        );
+        assert_eq!(second, third, "the fallback key is deterministic");
     }
 }

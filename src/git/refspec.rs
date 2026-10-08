@@ -1,11 +1,13 @@
 //! Fetch-refspec safety inspection (goal Step 11).
 //!
 //! Before `--fetch` runs `git fetch` for a remote, the remote's
-//! effective fetch refspecs are examined: any mapping that can write to
-//! local branch tips (`refs/heads/*`) makes the refresh `unsupported`
-//! instead of executed. Pure functions over refspec text; the fetch
-//! phase reads the effective values through `git config` and applies
-//! [`inspect_remote_fetch`].
+//! effective fetch refspecs are examined: explicit destinations must
+//! stay under that remote's tracking namespace
+//! (`refs/remotes/<remote-name>/`).
+//! This keeps fetches away from local branch and tag tips, replacement
+//! and notes refs, and pseudo-refs such as `HEAD`. Pure functions over
+//! refspec text; the fetch phase reads the effective values through
+//! `git config` and applies [`inspect_remote_fetch`].
 //!
 //! Fail closed: `mirror = true`, unparseable values, and degenerate
 //! forms are all `unsupported`, never executed. Refspec text carries
@@ -14,6 +16,13 @@
 
 /// Local branch-tip namespace a fetch must never write.
 const HEADS_PREFIX: &str = "refs/heads/";
+/// Local tag namespace written only by explicit tag destinations. The
+/// fetch contract passes `--no-tags`, which disables automatic following
+/// but does not suppress destinations named by configured refspecs.
+const TAGS_PREFIX: &str = "refs/tags/";
+/// Base namespace for remote-tracking refs. The inspector adds the
+/// current remote name before accepting an explicit destination.
+const REMOTE_TRACKING_PREFIX: &str = "refs/remotes/";
 
 /// One parsed `remote.<name>.fetch` value: `[+][^]<src>[:<dst>]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +57,23 @@ impl FetchRefspec {
         match dst.split_once('*') {
             None => dst == "refs/heads" || dst.starts_with(HEADS_PREFIX),
             Some((pre, _post)) => HEADS_PREFIX.starts_with(pre) || pre.starts_with(HEADS_PREFIX),
+        }
+    }
+
+    /// True when this mapping can write into the local tag namespace.
+    /// `--no-tags` does not disable an explicit destination, so these
+    /// refspecs must be refused by the no-tag fetch contract.
+    #[must_use]
+    pub fn can_write_tag_refs(&self) -> bool {
+        if self.negative {
+            return false;
+        }
+        let Some(dst) = self.dst.as_deref() else {
+            return false;
+        };
+        match dst.split_once('*') {
+            None => dst == "refs/tags" || dst.starts_with(TAGS_PREFIX),
+            Some((pre, _post)) => TAGS_PREFIX.starts_with(pre) || pre.starts_with(TAGS_PREFIX),
         }
     }
 }
@@ -109,8 +135,8 @@ pub fn parse_fetch_refspec(value: &str) -> Option<FetchRefspec> {
 /// Verdict for one remote's effective fetch configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchVerdict {
-    /// Every mapping is confined away from local branch tips: `git
-    /// fetch <remote>` with its configured refspecs is safe to run.
+    /// Every explicit destination is confined to this remote's tracking refs:
+    /// `git fetch <remote>` with its configured refspecs is safe to run.
     Safe,
     /// Do not run the fetch; `reason` is a short detail (no URLs —
     /// refspec text carries ref patterns only).
@@ -368,15 +394,18 @@ pub fn parse_ls_remote_refs(out: &[u8]) -> Vec<Vec<u8>> {
 
 /// Inspect one remote's effective fetch configuration: `refspecs` are
 /// the `remote.<name>.fetch` values in config order, `mirror` is
-/// `remote.<name>.mirror`. A remote with no fetch values is safe (git
-/// fetches the remote HEAD into `FETCH_HEAD` only, writing no ref).
+/// `remote.<name>.mirror`. Explicit destinations must be under
+/// `refs/remotes/<remote-name>/`, the namespace reserved for that
+/// remote's remote-tracking refs. A remote with no fetch values is safe
+/// (git fetches the remote HEAD into `FETCH_HEAD` only, writing no ref).
 #[must_use]
-pub fn inspect_remote_fetch(refspecs: &[&str], mirror: bool) -> FetchVerdict {
+pub fn inspect_remote_fetch(remote_name: &str, refspecs: &[&str], mirror: bool) -> FetchVerdict {
     if mirror {
         return FetchVerdict::Unsupported {
-            reason: "remote mirror enabled: refspecs write to local branches".to_string(),
+            reason: "remote mirror enabled: refspecs can write local refs".to_string(),
         };
     }
+    let remote_tracking_prefix = format!("{REMOTE_TRACKING_PREFIX}{remote_name}/");
     for value in refspecs {
         let Some(parsed) = parse_fetch_refspec(value) else {
             return FetchVerdict::Unsupported {
@@ -386,6 +415,22 @@ pub fn inspect_remote_fetch(refspecs: &[&str], mirror: bool) -> FetchVerdict {
         if parsed.can_write_branch_tips() {
             return FetchVerdict::Unsupported {
                 reason: format!("fetch refspec can write to local branch tips: {value}"),
+            };
+        }
+        if parsed.can_write_tag_refs() {
+            return FetchVerdict::Unsupported {
+                reason: format!("fetch refspec can write to local tag refs: {value}"),
+            };
+        }
+        if parsed
+            .dst
+            .as_deref()
+            .is_some_and(|dst| !dst.starts_with(&remote_tracking_prefix))
+        {
+            return FetchVerdict::Unsupported {
+                reason: format!(
+                    "fetch refspec destination is outside this remote's tracking refs: {value}"
+                ),
             };
         }
     }
@@ -398,25 +443,87 @@ mod tests {
 
     #[test]
     fn standard_clone_refspec_is_safe() {
-        let verdict = inspect_remote_fetch(&["+refs/heads/*:refs/remotes/origin/*"], false);
+        let verdict =
+            inspect_remote_fetch("origin", &["+refs/heads/*:refs/remotes/origin/*"], false);
         assert_eq!(verdict, FetchVerdict::Safe);
     }
 
     #[test]
     fn single_branch_refspec_is_safe() {
-        let verdict = inspect_remote_fetch(&["+refs/heads/main:refs/remotes/origin/main"], false);
+        let verdict = inspect_remote_fetch(
+            "origin",
+            &["+refs/heads/main:refs/remotes/origin/main"],
+            false,
+        );
         assert_eq!(verdict, FetchVerdict::Safe);
     }
 
     #[test]
-    fn tag_only_refspec_is_safe() {
-        let verdict = inspect_remote_fetch(&["+refs/tags/*:refs/tags/*"], false);
+    fn upstream_refspec_is_safe() {
+        let verdict = inspect_remote_fetch(
+            "upstream",
+            &["+refs/heads/*:refs/remotes/upstream/*"],
+            false,
+        );
+        assert_eq!(verdict, FetchVerdict::Safe);
+    }
+
+    #[test]
+    fn remote_cannot_write_another_remotes_tracking_refs() {
+        let verdict =
+            inspect_remote_fetch("origin", &["+refs/heads/*:refs/remotes/upstream/*"], false);
+        assert!(matches!(verdict, FetchVerdict::Unsupported { .. }));
+    }
+
+    #[test]
+    fn special_ref_destinations_are_unsupported() {
+        for value in [
+            "+refs/heads/main:refs/replace/0123456789abcdef0123456789abcdef01234567",
+            "+refs/heads/main:refs/notes/commits",
+            "+refs/heads/main:HEAD",
+            "+refs/heads/main:refs/stash",
+        ] {
+            let verdict = inspect_remote_fetch("origin", &[value], false);
+            assert!(
+                matches!(verdict, FetchVerdict::Unsupported { .. }),
+                "{value} must be unsupported"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_tag_destination_is_unsupported() {
+        let verdict = inspect_remote_fetch("origin", &["+refs/tags/*:refs/tags/*"], false);
+        assert!(matches!(verdict, FetchVerdict::Unsupported { .. }));
+    }
+
+    #[test]
+    fn wildcard_destination_that_overlaps_tags_is_unsupported() {
+        let verdict = inspect_remote_fetch("origin", &["refs/*:refs/tags-backup/*"], false);
+        // `refs/tags-backup` does not overlap `refs/tags/`; this mapping
+        // is still refused because it leaves the remote-tracking namespace.
+        assert!(!parse_fetch_refspec("refs/*:refs/tags-backup/*")
+            .expect("parses")
+            .can_write_tag_refs());
+        assert!(matches!(verdict, FetchVerdict::Unsupported { .. }));
+        let verdict = inspect_remote_fetch("origin", &["refs/heads/*:refs/tags*"], false);
+        assert!(matches!(verdict, FetchVerdict::Unsupported { .. }));
+    }
+
+    #[test]
+    fn tag_sources_mapped_outside_local_tags_are_safe() {
+        let verdict = inspect_remote_fetch(
+            "origin",
+            &["+refs/tags/*:refs/remotes/origin/tags/*"],
+            false,
+        );
         assert_eq!(verdict, FetchVerdict::Safe);
     }
 
     #[test]
     fn negative_refspec_is_safe() {
         let verdict = inspect_remote_fetch(
+            "origin",
             &["+refs/heads/*:refs/remotes/origin/*", "^refs/heads/secret"],
             false,
         );
@@ -426,14 +533,14 @@ mod tests {
     #[test]
     fn destination_less_refspec_is_safe() {
         // Fetches into FETCH_HEAD only; writes no ref.
-        let verdict = inspect_remote_fetch(&["main"], false);
+        let verdict = inspect_remote_fetch("origin", &["main"], false);
         assert_eq!(verdict, FetchVerdict::Safe);
     }
 
     #[test]
     fn empty_refspec_list_is_safe() {
         // No fetch lines: git fetches remote HEAD into FETCH_HEAD only.
-        let verdict = inspect_remote_fetch(&[], false);
+        let verdict = inspect_remote_fetch("origin", &[], false);
         assert_eq!(verdict, FetchVerdict::Safe);
     }
 
@@ -659,9 +766,9 @@ mod tests {
 
     #[test]
     fn mirror_clone_is_unsupported() {
-        let verdict = inspect_remote_fetch(&["+refs/*:refs/*"], false);
+        let verdict = inspect_remote_fetch("origin", &["+refs/*:refs/*"], false);
         assert!(matches!(verdict, FetchVerdict::Unsupported { .. }));
-        match inspect_remote_fetch(&[], true) {
+        match inspect_remote_fetch("origin", &[], true) {
             FetchVerdict::Unsupported { reason } => {
                 assert!(reason.contains("mirror"), "{reason}");
             }
@@ -676,7 +783,7 @@ mod tests {
             "refs/heads/main:refs/heads/main",
             "+refs/heads:refs/heads",
         ] {
-            let verdict = inspect_remote_fetch(&[value], false);
+            let verdict = inspect_remote_fetch("origin", &[value], false);
             assert!(
                 matches!(verdict, FetchVerdict::Unsupported { .. }),
                 "{value} must be unsupported"
@@ -686,26 +793,31 @@ mod tests {
 
     #[test]
     fn wildcard_destination_verdicts() {
-        // Each (refspec, can_write) pair: wildcard destinations whose
-        // static prefix overlaps refs/heads/ are unsafe; confined ones
-        // are safe even with a broad source.
-        for (value, can_write) in [
-            ("+refs/*:refs/*", true),
-            ("+*:*", true),
-            ("+refs/heads/*:refs/heads/*", true),
-            ("refs/*:refs/remotes/o/*", false),
-            ("+refs/heads/*:refs/remotes/origin/*", false),
-            ("+refs/tags/*:refs/tags/*", false),
+        // Each tuple checks branch and tag destinations separately,
+        // then verifies the combined no-branch/no-tag fetch policy.
+        for (value, can_write_branches, can_write_tags, fetch_is_safe) in [
+            ("+refs/*:refs/*", true, true, false),
+            ("+*:*", true, true, false),
+            ("+refs/heads/*:refs/heads/*", true, false, false),
+            ("refs/*:refs/remotes/origin/*", false, false, true),
+            ("+refs/heads/*:refs/remotes/origin/*", false, false, true),
+            ("+refs/tags/*:refs/tags/*", false, true, false),
             // Shares a string prefix with refs/heads/ but lives
-            // outside the namespace: safe.
-            ("+refs/heads-foo/*:refs/heads-foo/*", false),
-            ("+refs/heads:refs/heads", true),
+            // outside that namespace; it is still unsafe as a fetch
+            // destination because it is not a remote-tracking ref.
+            ("+refs/heads-foo/*:refs/heads-foo/*", false, false, false),
+            ("+refs/heads:refs/heads", true, false, false),
         ] {
             let parsed = parse_fetch_refspec(value).expect("parses");
-            assert_eq!(parsed.can_write_branch_tips(), can_write, "{value}");
             assert_eq!(
-                inspect_remote_fetch(&[value], false).is_safe(),
-                !can_write,
+                parsed.can_write_branch_tips(),
+                can_write_branches,
+                "{value}"
+            );
+            assert_eq!(parsed.can_write_tag_refs(), can_write_tags, "{value}");
+            assert_eq!(
+                inspect_remote_fetch("origin", &[value], false).is_safe(),
+                fetch_is_safe,
                 "{value}"
             );
         }
@@ -716,7 +828,7 @@ mod tests {
         for value in [
             "", "+", ":", "+:", "a:b:c", "*:refs/x", "x:*", "++a:b", "^+a", "+^a", "^^a",
         ] {
-            let verdict = inspect_remote_fetch(&[value], false);
+            let verdict = inspect_remote_fetch("origin", &[value], false);
             assert!(
                 matches!(verdict, FetchVerdict::Unsupported { .. }),
                 "{value:?} must fail closed"
@@ -859,6 +971,7 @@ mod tests {
     #[test]
     fn one_unsafe_mapping_taints_the_remote() {
         let verdict = inspect_remote_fetch(
+            "origin",
             &[
                 "+refs/heads/*:refs/remotes/origin/*",
                 "+refs/heads/*:refs/heads/*",
