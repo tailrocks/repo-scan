@@ -153,6 +153,20 @@ Raw logs per rep (git-ignored): `benches/results/w4a/<rep>.{stdout,stderr,time,m
 `.meta.json` carries cmd/exit/wall/digest. Claim microbench artifact:
 `benches/results/claim_bench.jsonl` (commit `3948d0c`).
 
+## Worker-setting basis (Step 16)
+
+Small-scope sweep (426 dirs, n=2 per setting, raw
+`benches/results/w4a/sweep.log`, git-ignored): wall medians
+w1 110.3s / w2 46.1s / w4 24.4s / w8 19.0s / w16 16.1s.
+Caveats: n=2 only, small scope, all reps exit 3
+(`incomplete`) — trend evidence, not a sizing proof. The
+primary series pins `--workers 8`: scaling flattens past 8
+(8→16 buys ~15%) while 8 stays well under the 18-core
+machine and the descriptor/queue budgets; the largest
+setting was deliberately NOT auto-selected. Full-corpus
+worker sensitivity is not re-measured (each point costs
+~1h); recorded as a limit.
+
 ## Series incident 2026-10-08 (attempt-2, after r4-base)
 
 - During r4-base, an unknown ambient process deleted the whole
