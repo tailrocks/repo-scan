@@ -132,6 +132,14 @@ interleaves probes with enumeration).
 | r9-base | base@94bb89c6 | `scan https://github.com/bench-special/family --root /tmp/corpus16/ws --status summary` | 1 | fresh-catalog | 19.80→11.85 | 3 | 3840 | 3818 | 22 | 104124 | 1160577 | 324100 | 217483 | 222/221 | 4 known |
 | r9-new | new@962b2824 | `scan --all --root /tmp/corpus16/ws --status summary --workers 8 --format jsonl` | 8 | fresh-catalog | 11.85→12.04 | 0 | 771 | 730 | 41 | 104132 | 1160577 | 27263 | 27041 | 222/221 | 0 |
 | r10-base | base@94bb89c6 | `scan https://github.com/bench-special/family --root /tmp/corpus16/ws --status summary` | 1 | fresh-catalog | 12.04→10.88 | 3 | 3241 | 3223 | 18 | 104120 | 1160554 | 323281 | 216665 | 222/221 | 4 known |
+| r10-new | new@962b2824 | `scan --all --root /tmp/corpus16/ws --status summary --workers 8 --format jsonl` | 8 | fresh-catalog | 10.88→13.69 | 0 | 609 | 559 | 50 | 104132 | 1160577 | 27219 | 26997 | 222/221 | 0 |
+
+Attempt-3 medians (r6–r10, fix `06b1e54`): base discovery
+3639/3716/3706/3818/3223s → median 3706s; new discovery
+565/785/1084/730/559s → median 730s; per-pair ratios
+0.155/0.211/0.293/0.191/0.173 → median 0.191 ≤ 0.33 target
+MET. All new reps exit 0, recall 222/221, gaps 0; all base
+reps exit 3 with the 4 known unresolvables.
 
 Raw logs per rep (git-ignored): `benches/results/w4a/<rep>.{stdout,stderr,time,meta,report.json}`,
 `.meta.json` carries cmd/exit/wall/digest. Claim microbench artifact:
