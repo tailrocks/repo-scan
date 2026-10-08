@@ -181,15 +181,12 @@ fn termsink_lower_layer_remote_never_emits_raw() {
     assert_no_canary_in_state(&state_f, canary);
 }
 
-/// Secret-pair path components redact on the terminal display channel
-/// only: stderr and the readable terminal render stay clean while the
-/// machine lanes (report file, JSON snapshot, JSONL journal) keep the
-/// lossless `value` bytes (display/value split, mirroring the query path
-/// display). Wave6: redirected scans replay the journal, so the legacy
-/// terminal render is pinned through the real pipeline report instead of
-/// captured stdout (no PTY here).
+/// Secret-pair path components never enter the JSONL journal, while the
+/// protected report retains exact path bytes and the terminal renderer
+/// redacts them. Wave6: redirected scans replay the journal; pin the
+/// policy through the real pipeline (no PTY here).
 #[test]
-fn termsink_secret_pair_path_redacted_on_terminal_only() {
+fn termsink_secret_pair_path_omitted_from_jsonl_and_redacted_on_terminal() {
     let dir = tempfile::tempdir_in("/tmp").expect("tmpdir under /tmp");
     let canary = "TERMSINKPATH04";
     let root = dir.path().join("root");
@@ -200,9 +197,9 @@ fn termsink_secret_pair_path_redacted_on_terminal_only() {
     );
     let root_str = root.to_str().expect("utf8").to_string();
 
-    // Redirected mode: the scan replays the journal (machine lane), which
-    // carries the lossless path like the JSON report does; stderr stays
-    // scrubbed either way.
+    // Redirected mode: the scan replays the journal (machine lane). The
+    // event keeps stable IDs but omits local path text and reversible hex;
+    // stderr stays scrubbed either way.
     let state = dir.path().join("state-term");
     let cwd = dir.path().join("cwd-term");
     repo_scan::privacy::private_dir_0700(&cwd).expect("mkdir");
@@ -223,12 +220,35 @@ fn termsink_secret_pair_path_redacted_on_terminal_only() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut found_location = false;
     for line in stdout.lines() {
-        let _: serde_json::Value = serde_json::from_str(line).expect("JSONL replay");
+        let event: serde_json::Value = serde_json::from_str(line).expect("JSONL replay");
+        if event["type"] == "location_found" {
+            let records = &event["records"];
+            assert!(records["checkout_id"].is_string(), "checkout id retained");
+            assert!(records["store_id"].is_string(), "store id retained");
+            for key in ["path", "path_hex", "git_path", "git_path_hex"] {
+                assert!(
+                    records.get(key).is_none(),
+                    "{key} omitted from location event"
+                );
+            }
+            found_location = true;
+        }
     }
     assert!(
-        contains_bytes(&out.stdout, canary.as_bytes()),
-        "lossless path value retained in the journal lane"
+        found_location,
+        "journal includes a location_found event with stable IDs"
+    );
+    let canary_hex = repo_scan::config::encode_hex(canary.as_bytes());
+    assert!(!contains_bytes(&out.stdout, canary.as_bytes()));
+    let leaked_hex_lines: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.contains(&canary_hex))
+        .collect();
+    assert!(
+        leaked_hex_lines.is_empty(),
+        "reversible path appears in JSONL: {leaked_hex_lines:?}"
     );
     assert!(!contains_bytes(&out.stderr, canary.as_bytes()));
 
@@ -260,7 +280,7 @@ fn termsink_secret_pair_path_redacted_on_terminal_only() {
     let report = std::fs::read(cwd_f.join("rep.json")).expect("read report");
     assert!(
         contains_bytes(&report, canary.as_bytes()),
-        "lossless path value retained in report"
+        "protected report retains exact path value"
     );
     let parsed: repo_scan::report::model::Report =
         serde_json::from_slice(&report).expect("report parses");

@@ -29,7 +29,7 @@ fn round_trip_persists_across_reopen() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = db_in(&dir);
         let store = TursoStore::open(&db).await.expect("open");
-        assert_eq!(store.schema_version().expect("version"), 6);
+        assert_eq!(store.schema_version().expect("version"), 7);
         assert!(store.epoch() >= 1);
 
         let proof = store.durability_proof().await.expect("proof");
@@ -360,6 +360,127 @@ fn round_trip_persists_across_reopen() {
         assert_eq!(scan_row.outcome.as_deref(), Some("ok"));
         assert_eq!(reopened.list_statuses("co-1").await.expect("list").len(), 1);
         reopened.close().await.expect("close");
+    });
+}
+
+#[test]
+fn record_error_scrubs_sensitive_detail_before_persistence() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TursoStore::open(&db_in(&dir)).await.expect("open");
+        let now = now_ms();
+        store
+            .record_error(
+                "err-secret-detail",
+                "scope-a",
+                "probe-failed",
+                "fetch failed for \
+                 https://ghp_R5T1STOREUSER:store-secret@example.invalid/repo?token=query-secret",
+                None,
+                now,
+            )
+            .await
+            .expect("record error");
+
+        let error = store
+            .get_error("err-secret-detail")
+            .await
+            .expect("get error")
+            .expect("row");
+        assert!(!error.detail.contains("ghp_R5T1STOREUSER"));
+        assert!(!error.detail.contains("store-secret"));
+        assert!(!error.detail.contains("query-secret"));
+        assert!(error.detail.contains("fetch failed"));
+    });
+}
+
+#[test]
+fn dir_observation_errors_are_scrubbed_before_persistence() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TursoStore::open(&db_in(&dir)).await.expect("open");
+        let now = now_ms();
+        store
+            .upsert_volume(
+                &NewVolume {
+                    id: "vol-observation-scrub",
+                    native_identity: None,
+                    namespace: "observation-scrub",
+                    filesystem: None,
+                    kind: "local",
+                    state: "available",
+                },
+                Some(now),
+            )
+            .await
+            .expect("volume");
+        let dir_id = store
+            .upsert_dir(
+                None,
+                b"repo",
+                "repo",
+                "vol-observation-scrub",
+                "obj-observation-scrub",
+                "",
+                now,
+            )
+            .await
+            .expect("directory");
+
+        let direct_canary = "ghp_R4H1DIRECTCANARY00000000000000000000";
+        store
+            .record_dir_observation(
+                dir_id,
+                1,
+                false,
+                0,
+                0,
+                Some(&format!("enumeration failed password={direct_canary}")),
+                now,
+            )
+            .await
+            .expect("direct observation");
+
+        let buffered_canary = "ghp_R4H1BUFFEREDCANARY00000000000000000";
+        let bumped_canary = "ghp_R4H1BUMPEDCANARY000000000000000000";
+        let mut batch = WriterBatch::new();
+        TursoStore::buffer_record_dir_observation(
+            &mut batch,
+            dir_id,
+            2,
+            false,
+            0,
+            0,
+            Some(&format!("enumeration failed password={buffered_canary}")),
+            now,
+        );
+        TursoStore::buffer_record_dir_observation_bumped(
+            &mut batch,
+            dir_id,
+            3,
+            false,
+            0,
+            Some(&format!("enumeration failed password={bumped_canary}")),
+            now,
+        );
+        store.flush(&mut batch).await.expect("flush observations");
+
+        for (generation, canary) in [(1, direct_canary), (2, buffered_canary), (3, bumped_canary)] {
+            let observation = store
+                .get_dir_observation(dir_id, generation)
+                .await
+                .expect("get observation")
+                .expect("observation row");
+            let error = observation.error.expect("observation error");
+            assert!(error.contains("enumeration failed"));
+            assert!(
+                !error.contains(canary),
+                "credential-shaped detail persisted for generation {generation}"
+            );
+        }
+        store.close().await.expect("close");
     });
 }
 
@@ -942,6 +1063,57 @@ fn negative_workers_reads_as_none() {
         let row = store.get_scan("scan-neg").await.expect("get").expect("row");
         assert_eq!(row.workers, None);
         assert_eq!(repo_scan::config::restore_workers(row.workers), None);
+        store.close().await.expect("close");
+    });
+}
+
+#[test]
+fn scan_target_persistence_scrubs_credential_shaped_local_paths() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TursoStore::open(&db_in(&dir)).await.expect("open");
+        let now = now_ms();
+        let secret_path = "/tmp/password=ghp_TESTTARGETCANARY00000000000000000000/repo";
+        let canonical = format!("file://{secret_path}");
+        let targets = serde_json::json!([{
+            "raw": secret_path,
+            "canonical": canonical.as_str(),
+        }])
+        .to_string();
+        store
+            .create_scan_request(
+                &NewScan {
+                    id: "scan-local-secret-target",
+                    url_raw: secret_path.as_bytes(),
+                    url_canonical: Some(canonical.as_bytes()),
+                    scope: "roots",
+                    status_mode: "summary",
+                    report_dest: None,
+                    targets_json: Some(&targets),
+                    format: Some("human"),
+                    all_targets: Some(false),
+                    fetch: Some(false),
+                    workers: None,
+                },
+                now,
+            )
+            .await
+            .expect("create scan");
+        let row = store
+            .get_scan("scan-local-secret-target")
+            .await
+            .expect("get scan")
+            .expect("scan row");
+        assert!(!String::from_utf8_lossy(&row.url_raw).contains("TESTTARGETCANARY"));
+        assert!(!row
+            .url_canonical
+            .as_deref()
+            .is_some_and(|bytes| String::from_utf8_lossy(bytes).contains("TESTTARGETCANARY")));
+        assert!(!row
+            .targets_json
+            .as_deref()
+            .is_some_and(|text| text.contains("TESTTARGETCANARY")));
         store.close().await.expect("close");
     });
 }

@@ -526,18 +526,30 @@ pub enum ScopeRef {
 }
 
 /// Shared scope-path canonicalizer (DB-M1): absolute paths resolve
-/// through the filesystem (`std::fs::canonicalize`, so symlink
-/// spellings collapse onto the physical path); failures (missing
-/// paths, permission errors) and relative paths pass through
-/// unchanged. The generation key, execution paths, and invalidation
-/// fan-out share this one spelling rule — while scope keys
-/// themselves keep observed spellings (execution derives task paths
-/// from keys, and reports show observed paths per goal Step 7).
+/// through the bounded identity-I/O worker (`canonicalize`, so symlink
+/// spellings collapse onto the physical path). Missing paths and
+/// relative paths retain their lexical spelling. If the worker times
+/// out, this convenience API uses a normalized lexical fallback; callers
+/// that commit invalidation must use [`try_canonical_scope_path`] and
+/// stop before their transaction on `None`.
 pub fn canonical_scope_path(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-    } else {
-        path.to_path_buf()
+    try_canonical_scope_path(path).unwrap_or_else(|| normalize_scope_path(path))
+}
+
+/// Bounded form of [`canonical_scope_path`]. `None` means the identity
+/// worker could not resolve the path within its admission and timeout
+/// limits; transactional invalidation callers must return before writing.
+pub fn try_canonical_scope_path(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return Some(path.to_path_buf());
+    }
+    match crate::walk::topology::bounded_canonicalize(path) {
+        Some(Ok(canonical)) => Some(canonical),
+        // A missing path has no live alias to fan out, so its normalized
+        // lexical spelling is a safe fallback. Other resolution failures
+        // and worker timeouts are unknown identities and fail closed.
+        Some(Err(std::io::ErrorKind::NotFound)) => Some(normalize_scope_path(path)),
+        Some(Err(_)) | None => None,
     }
 }
 
@@ -575,6 +587,55 @@ pub fn normalize_scope_path(path: &Path) -> PathBuf {
         PathBuf::from(".")
     } else {
         normalized
+    }
+}
+
+/// True when `path` is lexically at or below one of the explicit roots.
+/// Both sides normalize `.`/`..` without filesystem access, so this is
+/// safe for report filtering and remains component-boundary aware.
+pub fn path_is_within_roots(path: &Path, roots: &[PathBuf]) -> bool {
+    let path = normalize_scope_path(path);
+    roots
+        .iter()
+        .any(|root| path.starts_with(normalize_scope_path(root)))
+}
+
+/// Stable identity for report-derivation gaps attached to an explicit
+/// root set. Paths are normalized lexically, sorted, and deduplicated so
+/// root order does not create duplicate gap families.
+pub fn report_derivation_gap_scope_key(roots: Option<&[PathBuf]>) -> String {
+    let Some(roots) = roots else {
+        return String::from("gap:report-derivation");
+    };
+    use sha2::Digest;
+    let mut paths: Vec<Vec<u8>> = roots
+        .iter()
+        .map(|root| path_as_bytes(&normalize_scope_path(root)))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    let mut hasher = sha2::Sha256::new();
+    for path in paths {
+        hasher.update((path.len() as u64).to_be_bytes());
+        hasher.update(path);
+    }
+    format!(
+        "gap:report-derivation:roots:{}",
+        encode_hex(&hasher.finalize())
+    )
+}
+
+/// Stable error-row ID for one report-derivation family. Explicit root
+/// scopes get independent IDs so an old root's truncation cannot appear
+/// in a later root's report.
+pub fn report_derivation_gap_id(family: &str, roots: Option<&[PathBuf]>) -> String {
+    match roots {
+        Some(_) => format!(
+            "gap:report-derivation:{family}:{}",
+            report_derivation_gap_scope_key(roots)
+                .trim_start_matches("gap:report-derivation:roots:")
+        ),
+        None => format!("gap:report-derivation:{family}"),
     }
 }
 
@@ -723,6 +784,30 @@ mod tests {
         assert_eq!(
             normalize_scope_path(Path::new("../../a/../b")),
             PathBuf::from("../../b")
+        );
+    }
+
+    #[test]
+    fn report_derivation_gap_identity_is_stable_and_root_specific() {
+        let a = vec![PathBuf::from("/scope/a")];
+        let b = vec![PathBuf::from("/scope/b")];
+        let reversed = vec![PathBuf::from("/scope/b"), PathBuf::from("/scope/a")];
+        let ordered = vec![PathBuf::from("/scope/a"), PathBuf::from("/scope/b")];
+        assert_ne!(
+            report_derivation_gap_scope_key(Some(&a)),
+            report_derivation_gap_scope_key(Some(&b))
+        );
+        assert_eq!(
+            report_derivation_gap_scope_key(Some(&ordered)),
+            report_derivation_gap_scope_key(Some(&reversed))
+        );
+        assert_ne!(
+            report_derivation_gap_id("errors", Some(&a)),
+            report_derivation_gap_id("errors", Some(&b))
+        );
+        assert_eq!(
+            report_derivation_gap_scope_key(None),
+            "gap:report-derivation"
         );
     }
 

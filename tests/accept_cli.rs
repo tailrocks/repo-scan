@@ -10,10 +10,15 @@
 
 mod common;
 
+#[path = "../src/main.rs"]
+#[allow(dead_code)]
+mod main_under_test;
+
 use clap::Parser;
 use common::fixture;
 use repo_scan::cli::{CacheAction, Cli, Command};
 use repo_scan::model::{Scope, StatusMode};
+use repo_scan::store::Store;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcCommand;
 
@@ -814,6 +819,454 @@ fn step6_all_finds_without_target_filter() {
     assert_eq!(report["scan"]["state"], "complete");
 }
 
+/// Explicit roots are report boundaries even when the catalog already has
+/// matching records from an earlier `--all` run at a different root.
+#[test]
+fn sequential_all_root_scans_exclude_prior_out_of_scope_records() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let cwd = dir.path().join("cwd");
+    let root_a = dir.path().join("root-a");
+    let root_b = dir.path().join("root-b");
+    for path in [&cwd, &root_a, &root_b] {
+        repo_scan::privacy::private_dir_0700(path).expect("mkdir");
+    }
+    fixture::normal_clone(&root_a, "repo");
+    fixture::normal_clone(&root_b, "repo");
+
+    let scan = |root: &Path, report_name: &str| {
+        let out = run(
+            &[
+                "scan",
+                "--all",
+                "--root",
+                root.to_str().expect("utf8 root"),
+                "--report",
+                report_name,
+                "--format",
+                "human",
+            ],
+            &cwd,
+            &state,
+        );
+        assert!(
+            matches!(out.status.code(), Some(0) | Some(3)),
+            "usable report: {}",
+            stderr_text(&out)
+        );
+        read_report(&cwd.join(report_name))
+    };
+
+    let first = scan(&root_a, "root-a.json");
+    assert_eq!(first["repositories"].as_array().unwrap().len(), 1);
+
+    // Model a persisted root-A report-derivation gap. Root B must not
+    // surface it when both scopes share the same catalog.
+    let root_a_set = [root_a.clone()];
+    let old_gap_id = repo_scan::config::report_derivation_gap_id("errors", Some(&root_a_set));
+    let old_gap_scope = repo_scan::config::report_derivation_gap_scope_key(Some(&root_a_set));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = repo_scan::store::TursoStore::open(&db)
+            .await
+            .expect("open catalog");
+        store
+            .record_error(
+                &old_gap_id,
+                &old_gap_scope,
+                "report-derivation-truncated",
+                "root A derivation budget reached",
+                None,
+                repo_scan::store::now_ms(),
+            )
+            .await
+            .expect("seed root A gap");
+        store.close().await.expect("close catalog");
+    });
+
+    let second = scan(&root_b, "root-b.json");
+    assert_eq!(second["repositories"].as_array().unwrap().len(), 1);
+    assert_eq!(second["checkouts"].as_array().unwrap().len(), 1);
+    assert_eq!(second["repositories"][0]["match"], "confirmed");
+    assert!(
+        second["errors"]
+            .as_array()
+            .expect("errors array")
+            .iter()
+            .all(|error| error["id"].as_str() != Some(old_gap_id.as_str())),
+        "root B report must exclude root A's persisted derivation gap: {}",
+        second["errors"]
+    );
+
+    let paths = second["paths"].as_array().expect("paths array");
+    for record in paths {
+        let value = record["value"].as_str().unwrap_or_default();
+        assert!(
+            !value.contains(root_a.to_str().expect("root A UTF-8")),
+            "out-of-scope path was persisted in the second report: {value}"
+        );
+    }
+    let checkout = &second["checkouts"][0];
+    let path_id = checkout["root_path_id"].as_str().expect("root path id");
+    let checkout_path = paths
+        .iter()
+        .find(|path| path["id"] == path_id)
+        .expect("checkout path record")["value"]
+        .as_str()
+        .expect("UTF-8 checkout path");
+    assert!(
+        checkout_path.starts_with(root_b.to_str().expect("root B UTF-8")),
+        "second report checkout belongs to root B: {checkout_path}"
+    );
+}
+
+/// Sibling symlink spellings share one generation and refresh catalog rows
+/// persisted through the first alias.
+#[cfg(unix)]
+#[test]
+fn roots_symlink_alias_reuses_catalog_rows() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let cwd = dir.path().join("cwd");
+    let physical_lexical = dir.path().join("physical");
+    let alias_a = dir.path().join("alias-a");
+    let alias_c = dir.path().join("alias-c");
+    for path in [&cwd, &physical_lexical] {
+        repo_scan::privacy::private_dir_0700(path).expect("mkdir");
+    }
+    fixture::normal_clone(&physical_lexical, "repo");
+    let physical = std::fs::canonicalize(&physical_lexical).expect("canonical physical root");
+    symlink(&physical, &alias_a).expect("first symlink root alias");
+    symlink(&physical, &alias_c).expect("second symlink root alias");
+
+    let scan = |root: &Path, report_name: &str| {
+        let out = run(
+            &[
+                "scan",
+                "--all",
+                "--root",
+                root.to_str().expect("utf8 root"),
+                "--report",
+                report_name,
+            ],
+            &cwd,
+            &state,
+        );
+        assert!(
+            matches!(out.status.code(), Some(0) | Some(3)),
+            "usable report: {}",
+            stderr_text(&out)
+        );
+        read_report(&cwd.join(report_name))
+    };
+
+    let alias_a_root = alias_a.join("repo");
+    let alias_c_root = alias_c.join("repo");
+    let alias_a_report = scan(&alias_a_root, "alias-a.json");
+    let updated_commit = fixture::commit_file(
+        &physical.join("repo"),
+        "README.md",
+        "# fixture after alias A scan\n",
+        "advance before alias C scan",
+    );
+    repo_scan::privacy::private_write_0600(
+        &physical.join("repo/alias-refresh-untracked"),
+        b"untracked after alias A scan",
+    )
+    .expect("write dirty status marker");
+    let alias_report = scan(&alias_c_root, "alias-c.json");
+    assert_eq!(
+        alias_report["scan"]["generation"], alias_a_report["scan"]["generation"],
+        "sibling root spellings share the canonical generation"
+    );
+    assert_eq!(
+        alias_report["repositories"].as_array().unwrap().len(),
+        1,
+        "alias report must retain physical catalog rows: {alias_report}"
+    );
+    assert_eq!(alias_report["checkouts"].as_array().unwrap().len(), 1);
+    assert!(!alias_report["branches"].as_array().unwrap().is_empty());
+    assert_eq!(
+        alias_report["checkouts"][0]["status"]["working_state"], "dirty",
+        "status is refreshed for the prior alias-A checkout"
+    );
+    assert_eq!(
+        alias_report["branches"][0]["oid"]["hex"], updated_commit,
+        "branch analysis refreshes the prior alias-A store"
+    );
+
+    let git_path_id = alias_report["repositories"][0]["git_path_id"]
+        .as_str()
+        .expect("repository git path id");
+    let git_path = alias_report["paths"]
+        .as_array()
+        .expect("paths")
+        .iter()
+        .find(|path| path["id"].as_str() == Some(git_path_id))
+        .expect("repository git path")["value"]
+        .as_str()
+        .expect("UTF-8 git path");
+    assert_eq!(
+        git_path,
+        alias_a.join("repo/.git").to_str().expect("utf8 path"),
+        "alias scope retains the prior alias-A catalog spelling"
+    );
+
+    let root_gap_id = "shared-root-gap";
+    let physical_repo = physical.join("repo");
+    let alias_a_repo = alias_a.join("repo");
+    let root_scope_key = repo_scan::config::scope_key_for_dir(&physical_repo);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = repo_scan::store::TursoStore::open(&db)
+            .await
+            .expect("open catalog");
+        store
+            .record_error(
+                root_gap_id,
+                &root_scope_key,
+                "permission-denied",
+                "synthetic shared-root gap",
+                None,
+                repo_scan::store::now_ms(),
+            )
+            .await
+            .expect("seed root gap");
+        store.close().await.expect("close catalog");
+    });
+
+    let both = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            physical_repo.to_str().expect("utf8 physical repo root"),
+            "--root",
+            alias_a_repo.to_str().expect("utf8 alias A repo root"),
+            "--report",
+            "both.json",
+        ],
+        &cwd,
+        &state,
+    );
+    assert!(
+        matches!(both.status.code(), Some(0) | Some(3)),
+        "usable paired-root report: {}",
+        stderr_text(&both)
+    );
+    let both_report = read_report(&cwd.join("both.json"));
+    assert_eq!(
+        both_report["scan"]["generation"],
+        alias_a_report["scan"]["generation"]
+    );
+    assert_eq!(both_report["roots"].as_array().unwrap().len(), 2);
+    assert_eq!(both_report["repositories"].as_array().unwrap().len(), 1);
+    assert!(both_report["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|error| error["id"].as_str() == Some(root_gap_id)));
+    assert!(both_report["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|root| root["error_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id.as_str() == Some(root_gap_id))));
+
+    let reversed = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            alias_a_repo.to_str().expect("utf8 alias A repo root"),
+            "--root",
+            physical_repo.to_str().expect("utf8 physical repo root"),
+            "--report",
+            "both-reversed.json",
+        ],
+        &cwd,
+        &state,
+    );
+    assert!(
+        matches!(reversed.status.code(), Some(0) | Some(3)),
+        "usable reversed paired-root report: {}",
+        stderr_text(&reversed)
+    );
+    let reversed_report = read_report(&cwd.join("both-reversed.json"));
+    assert_eq!(reversed_report["roots"].as_array().unwrap().len(), 2);
+    assert_eq!(reversed_report["repositories"].as_array().unwrap().len(), 1);
+    assert!(reversed_report["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|root| root["error_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id.as_str() == Some(root_gap_id))));
+
+    // Start with an alias-only root and a lexically keyed identity gap.
+    // Both its own rows and the safety gap must survive report filtering.
+    let fresh_lexical = dir.path().join("fresh-physical");
+    let fresh_alias = dir.path().join("fresh-alias");
+    repo_scan::privacy::private_dir_0700(&fresh_lexical).expect("mkdir fresh root");
+    fixture::normal_clone(&fresh_lexical, "repo");
+    let fresh_physical = std::fs::canonicalize(&fresh_lexical).expect("canonical fresh root");
+    symlink(&fresh_physical, &fresh_alias).expect("fresh symlink root");
+    let fresh_gap_id = "fresh-alias-identity-gap";
+    let fresh_scope = repo_scan::config::scope_key_for_dir(&fresh_alias);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = repo_scan::store::TursoStore::open(&db)
+            .await
+            .expect("open catalog");
+        store
+            .record_error(
+                fresh_gap_id,
+                &fresh_scope,
+                "fence-identity-unknown",
+                "synthetic unresolved alias identity",
+                None,
+                repo_scan::store::now_ms(),
+            )
+            .await
+            .expect("seed fresh alias gap");
+        store.close().await.expect("close catalog");
+    });
+    let fresh = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            fresh_alias.to_str().expect("utf8 fresh alias"),
+            "--report",
+            "fresh-alias.json",
+        ],
+        &cwd,
+        &state,
+    );
+    assert!(
+        matches!(fresh.status.code(), Some(0) | Some(3)),
+        "usable fresh alias report: {}",
+        stderr_text(&fresh)
+    );
+    let fresh_report = read_report(&cwd.join("fresh-alias.json"));
+    assert!(fresh_report["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|error| error["id"].as_str() == Some(fresh_gap_id)));
+    assert!(fresh_report["roots"][0]["error_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|id| id.as_str() == Some(fresh_gap_id)));
+}
+
+#[test]
+fn local_target_credentials_are_scrubbed_from_persistence_and_report() {
+    use repo_scan::store::{Store, TursoStore};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let cwd = dir.path().join("cwd");
+    repo_scan::privacy::private_dir_0700(&cwd).expect("cwd");
+    // Synthetic credential-shaped path component, used only as a canary.
+    let root = dir
+        .path()
+        .join("password=ghp_TESTTARGETCANARY00000000000000000000");
+    repo_scan::privacy::private_dir_0700(&root).expect("root");
+    let repo = fixture::normal_clone(&root, "repo");
+    let target = repo.to_str().expect("UTF-8 target");
+    let root_arg = root.to_str().expect("UTF-8 root");
+    let output = run(
+        &[
+            "scan",
+            target,
+            "--root",
+            root_arg,
+            "--report",
+            "report.json",
+            "--format",
+            "human",
+        ],
+        &cwd,
+        &state,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&output)
+    );
+    let report = read_report(&cwd.join("report.json"));
+    let scan_id = report["scan"]["id"].as_str().expect("scan id");
+    let scan_json = serde_json::to_string(&report["scan"]).expect("scan JSON");
+    assert!(
+        !scan_json.contains("TESTTARGETCANARY"),
+        "report scan target fields must not retain the synthetic credential"
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open catalog");
+        let saved = store
+            .get_scan(scan_id)
+            .await
+            .expect("get scan")
+            .expect("scan row");
+        assert!(
+            !String::from_utf8_lossy(&saved.url_raw).contains("TESTTARGETCANARY"),
+            "scan url_raw must be scrubbed"
+        );
+        assert!(
+            !saved
+                .url_canonical
+                .as_deref()
+                .is_some_and(|bytes| String::from_utf8_lossy(bytes).contains("TESTTARGETCANARY")),
+            "scan url_canonical must be scrubbed"
+        );
+        assert!(
+            !saved
+                .targets_json
+                .as_deref()
+                .is_some_and(|text| text.contains("TESTTARGETCANARY")),
+            "targets_json must be scrubbed"
+        );
+        let rows = store
+            .read_scan_events(scan_id, 0, 10_000)
+            .await
+            .expect("read scan events");
+        let started = rows
+            .iter()
+            .find(|row| row.event_type == "scan_started")
+            .expect("scan_started event");
+        let records = String::from_utf8_lossy(&started.records);
+        assert!(
+            !records.contains("TESTTARGETCANARY"),
+            "scan_started target and root fields must be scrubbed"
+        );
+        store.close().await.expect("close catalog");
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Step 15 case 5: distinct explicit root sets never share a generation.
 // ---------------------------------------------------------------------------
@@ -1158,6 +1611,37 @@ fn query_scan_replays_journaled_lifecycle_as_jsonl() {
         serde_json::Value::String("scan_completed".to_string())
     );
 
+    // A cursor on the terminal event closes replay. The malformed row we
+    // appended after terminal above must never be treated as a live tail.
+    let terminal = lines.last().expect("terminal");
+    let terminal_cursor = Cursor {
+        seq: terminal["seq"].as_u64().expect("terminal seq"),
+        catalog_rev: terminal["catalog_rev"].as_u64().expect("terminal rev"),
+        event_offset: terminal["event_offset"].as_u64().expect("terminal offset"),
+    }
+    .encode();
+    let terminal_tail = run(
+        &[
+            "query",
+            "--scan",
+            &scan_id,
+            "--follow",
+            "--format",
+            "jsonl",
+            "--after",
+            &terminal_cursor,
+        ],
+        &cwd,
+        &state,
+    );
+    assert_eq!(
+        terminal_tail.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&terminal_tail)
+    );
+    assert!(stdout_text(&terminal_tail).is_empty());
+
     // A validly encoded seq beyond SQLite's signed range cannot exist in
     // this journal. Treat it as an expired cursor and explicitly reset.
     let overflow = Cursor {
@@ -1198,6 +1682,62 @@ fn query_scan_replays_journaled_lifecycle_as_jsonl() {
         "stderr: {}",
         stderr_text(&missing)
     );
+}
+
+#[test]
+fn human_footers_and_destination_errors_scrub_local_paths() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("password=STATEPATHCANARY");
+    let cwd = dir.path().join("cwd");
+    repo_scan::privacy::private_dir_0700(&cwd).expect("cwd");
+    let root = dir.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("root");
+    fixture::normal_clone(&root, "repo");
+    let report_dir = cwd.join("password=REPORTPATHCANARY");
+    repo_scan::privacy::private_dir_0700(&report_dir).expect("report dir");
+    let report = report_dir.join("report.json");
+    let successful = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            root.to_str().expect("root UTF-8"),
+            "--report",
+            report.to_str().expect("report UTF-8"),
+            "--format",
+            "human",
+        ],
+        &cwd,
+        &state,
+    );
+    assert_eq!(
+        successful.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&successful)
+    );
+    assert!(!stdout_text(&successful).contains("STATEPATHCANARY"));
+    assert!(!stdout_text(&successful).contains("REPORTPATHCANARY"));
+
+    let rejected_dest = state.join("password=ERRORPATHCANARY").join("report.json");
+    let rejected = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            root.to_str().expect("root UTF-8"),
+            "--report",
+            rejected_dest.to_str().expect("rejected path UTF-8"),
+            "--format",
+            "human",
+        ],
+        &cwd,
+        &state,
+    );
+    assert_ne!(rejected.status.code(), Some(0));
+    let diagnostic = stderr_text(&rejected);
+    assert!(!diagnostic.contains("STATEPATHCANARY"));
+    assert!(!diagnostic.contains("ERRORPATHCANARY"));
 }
 
 /// JSON output stays a single report document with an explicit report
@@ -1682,8 +2222,22 @@ fn github_groups_link_stores_to_canonical_identities() {
             assert!(g.observed_at_ms > 0, "observation time kept");
         }
 
-        // Store -> clone mapping from location_found paths (lossy display
-        // keeps our ASCII dir names intact).
+        // Event IDs are opaque projections of the owner-local catalog IDs.
+        // Build the expected projection from each fixture's common dir so
+        // the stream can be joined without exposing path encodings.
+        let event_store_id = |path: &Path| {
+            let common = std::fs::canonicalize(path.join(".git")).expect("canonical .git");
+            let catalog_id = format!(
+                "git:{}",
+                repo_scan::config::encode_hex(&repo_scan::config::path_as_bytes(&common))
+            );
+            main_under_test::test_event_opaque_id(&catalog_id)
+        };
+        let fixture_names = HashMap::from([
+            (event_store_id(&clone_a), String::from("clone-a")),
+            (event_store_id(&clone_b), String::from("clone-b")),
+            (event_store_id(&clone_c), String::from("clone-c")),
+        ]);
         let rows = store
             .read_scan_events(&scan_id, 0, 1_000)
             .await
@@ -1693,15 +2247,12 @@ fn github_groups_link_stores_to_canonical_identities() {
         for row in &rows {
             let v: serde_json::Value = serde_json::from_slice(&row.records).expect("json");
             if row.event_type == "location_found" {
-                let path = v["path"].as_str().expect("path").to_string();
-                let name = ["clone-a", "clone-b", "clone-c"]
-                    .into_iter()
-                    .find(|n| path.contains(n))
-                    .expect("fixture clone path");
-                store_clone.insert(
-                    v["store_id"].as_str().expect("store").to_string(),
-                    name.into(),
-                );
+                let store_id = v["store_id"].as_str().expect("store id").to_string();
+                let name = fixture_names
+                    .get(&store_id)
+                    .expect("fixture store id")
+                    .clone();
+                store_clone.insert(store_id, name);
             } else if row.event_type == "repository_found" {
                 let found: Vec<String> = v["github_groups"]
                     .as_array()
@@ -1723,7 +2274,7 @@ fn github_groups_link_stores_to_canonical_identities() {
         for m in &main_members {
             assert!(m.observed_at_ms > 0, "member observation time kept");
             main_by_store
-                .entry(m.instance_id.clone())
+                .entry(main_under_test::test_event_opaque_id(&m.instance_id))
                 .or_default()
                 .insert((
                     String::from_utf8_lossy(&m.remote_name).into_owned(),
@@ -1741,12 +2292,15 @@ fn github_groups_link_stores_to_canonical_identities() {
             assert_eq!(pairs, &expect, "{clone} origin edges match git");
         }
         assert_eq!(up_members.len(), 2, "upstream edges: fetch + push");
-        let up_store = &up_members[0].instance_id;
+        let up_store = up_members[0].instance_id.clone();
+        let up_event_store = main_under_test::test_event_opaque_id(&up_store);
         assert_eq!(
-            store_clone.get(up_store).map(String::as_str),
+            store_clone.get(&up_event_store).map(String::as_str),
             Some("clone-c")
         );
-        assert!(up_members.iter().all(|m| &m.instance_id == up_store));
+        assert!(up_members
+            .iter()
+            .all(|m| main_under_test::test_event_opaque_id(&m.instance_id) == up_event_store));
         let up_pairs: HashSet<(String, String)> = up_members
             .iter()
             .map(|m| {
@@ -1763,10 +2317,10 @@ fn github_groups_link_stores_to_canonical_identities() {
             .collect();
         assert_eq!(up_pairs, expect_up, "clone-c upstream edges match git");
         assert!(
-            main_by_store.contains_key(up_store),
+            main_by_store.contains_key(&up_event_store),
             "one store belongs to both groups"
         );
-        let both = store.groups_for_instance(up_store).await.expect("groups");
+        let both = store.groups_for_instance(&up_store).await.expect("groups");
         let both_ids: HashSet<&str> = both.iter().map(|m| m.group_id.as_str()).collect();
         assert_eq!(both_ids, HashSet::from([GROUP_MAIN, GROUP_UP]));
 
@@ -1941,7 +2495,7 @@ fn error_events_journal_completion_gaps() {
             assert_eq!(row.op, "add", "D4 op for error");
             let v: serde_json::Value = serde_json::from_slice(&row.records).expect("json");
             let id = v["id"].as_str().expect("event id");
-            assert!(id.starts_with("gap:"), "gap id: {id}");
+            assert!(id.starts_with("evt:"), "opaque gap id: {id}");
             assert!(
                 v["category"].as_str().is_some_and(|c| !c.is_empty()),
                 "category carried"
@@ -1952,7 +2506,18 @@ fn error_events_journal_completion_gaps() {
             );
             // Join: the payload names a real open catalog row; attempts and
             // open state are read there, never from the event.
-            let gap = store.get_error(id).await.expect("get").expect("gap row");
+            let raw_id = store
+                .list_open_error_ids()
+                .await
+                .expect("open gap ids")
+                .into_iter()
+                .find(|raw| main_under_test::test_event_opaque_id(raw).as_str() == id)
+                .expect("opaque event id maps to an open catalog gap");
+            let gap = store
+                .get_error(&raw_id)
+                .await
+                .expect("get")
+                .expect("gap row");
             assert!(gap.open, "gap row is open");
             assert!(gap.attempts >= 1, "recorded at least once");
             assert_eq!(gap.category, v["category"].as_str().expect("category"));
@@ -2067,7 +2632,7 @@ fn gappy_scan_journal_complete_and_ordered() {
         assert!(!open_rows.is_empty(), "world holds open gaps");
         for id in &open_rows {
             assert!(
-                journaled.contains(id),
+                journaled.contains(&main_under_test::test_event_opaque_id(id)),
                 "open gap {id} has a journaled error event"
             );
         }
@@ -2139,6 +2704,8 @@ fn branch_batch_journals_persisted_refs() {
         assert_eq!(v["batch_count"].as_u64(), Some(1));
         let branches = v["branches"].as_array().expect("branches array");
         assert_eq!(branches.len(), expected.len(), "every ref journaled");
+        let common = std::fs::canonicalize(repo.join(".git")).expect("canonical common dir");
+        let common_hex = repo_scan::config::encode_hex(&repo_scan::config::path_as_bytes(&common));
         let mut seen = HashSet::new();
         for b in branches {
             let name = b["name"].as_str().expect("name");
@@ -2162,10 +2729,11 @@ fn branch_batch_journals_persisted_refs() {
                 "state of {name}"
             );
             assert!(seen.insert(name.to_string()), "no duplicate {name}");
+            let catalog_id = format!("ref:{common_hex}:{}", hex_of(name.as_bytes()));
             assert_eq!(
-                b["id"].as_str().expect("id").split(':').count(),
-                3,
-                "ref id"
+                b["id"],
+                main_under_test::test_event_opaque_id(&catalog_id),
+                "opaque event id for catalog ref {name}"
             );
         }
         // Ordering: the batch lands after its store's repository_found.
@@ -2290,18 +2858,38 @@ fn coverage_updated_reports_gap_deltas() {
         // retry/re-record count; every probe's unconditional close of a
         // never-open row stays silent.
         assert_eq!(opened.len(), 1, "one open transition: {opened:?}");
-        assert!(opened[0].starts_with("gap:"), "gap id: {}", opened[0]);
+        assert!(
+            opened[0].starts_with("evt:"),
+            "opaque gap id: {}",
+            opened[0]
+        );
         assert!(closed.is_empty(), "no genuine closes: {closed:?}");
+        let raw_gap_id = store
+            .list_open_error_ids()
+            .await
+            .expect("open gap ids")
+            .into_iter()
+            .find(|raw| main_under_test::test_event_opaque_id(raw).as_str() == opened[0].as_str())
+            .expect("event id maps to open catalog gap");
         let gap = store
-            .get_error(&opened[0])
+            .get_error(&raw_gap_id)
             .await
             .expect("get")
             .expect("gap row");
         assert!(gap.open, "opened id names an open row");
         // The remote-less clone joined as an unresolvable candidate.
         assert_eq!(unresolvable.len(), 1, "{unresolvable:?}");
+        let common = std::fs::canonicalize(noremote.join(".git")).expect("canonical common dir");
+        let instance_id = format!(
+            "git:{}",
+            repo_scan::config::encode_hex(&repo_scan::config::path_as_bytes(&common))
+        );
+        assert_eq!(
+            unresolvable[0],
+            main_under_test::test_event_opaque_id(&instance_id)
+        );
         let instance = store
-            .get_git_instance(&unresolvable[0])
+            .get_git_instance(&instance_id)
             .await
             .expect("get")
             .expect("instance row");

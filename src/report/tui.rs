@@ -37,12 +37,19 @@
 //! row also carries a text label, so the view stays readable with
 //! color disabled.
 
+use crate::identity::scrub_text;
 use crate::report::encode::escape_display;
 use crate::report::model::Report;
 use crate::scan_events::{Envelope, EventType};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::time::Instant;
+
+/// Scrub credential-shaped text before escaping it for terminal display.
+/// Machine report values stay lossless; this helper is for TUI presentation.
+fn safe_display(text: &str) -> String {
+    escape_display(&scrub_text(text))
+}
 
 /// Sane minimum terminal width: below this the frame degrades to a
 /// truncated header plus a narrow-terminal notice instead of the row
@@ -1054,8 +1061,8 @@ impl TuiSnapshot {
         let show_path = |id: &str| -> String {
             paths
                 .get(id)
-                .map(|d| escape_display(d))
-                .unwrap_or_else(|| format!("<missing path {}>", escape_display(id)))
+                .map(|d| safe_display(d))
+                .unwrap_or_else(|| format!("<missing path {}>", safe_display(id)))
         };
         // First canonical URL per store (fetch role wins ties).
         let mut store_group: HashMap<&str, (String, String, String, String)> = HashMap::new();
@@ -1082,7 +1089,7 @@ impl TuiSnapshot {
         snapshot.header.target = if report.scan.target_url.is_empty() {
             "--all".to_string()
         } else {
-            report.scan.target_url.clone()
+            safe_tui_target(&report.scan.target_url)
         };
         snapshot.header.phase = match report.scan.state.as_str() {
             "running" => "discovery".to_string(),
@@ -1109,7 +1116,7 @@ impl TuiSnapshot {
                     path: checkout
                         .root_path_id
                         .as_deref()
-                        .map(&show_path)
+                        .map(show_path)
                         .unwrap_or_else(|| show_path(&checkout.git_path_id)),
                     git_path: show_path(&checkout.git_path_id),
                     kind: checkout.kind.clone(),
@@ -1119,7 +1126,7 @@ impl TuiSnapshot {
                         .head
                         .ref_name
                         .as_ref()
-                        .map(|n| escape_display(&n.display)),
+                        .map(|n| safe_display(&n.display)),
                     head_oid: checkout.head.oid.as_ref().map(|o| o.hex.clone()),
                     status_state: checkout.status.state.clone(),
                     working_state: checkout.status.working_state.clone(),
@@ -1137,13 +1144,13 @@ impl TuiSnapshot {
         for branch in &report.branches {
             let record = TuiBranch {
                 id: format!("branch:{}", branch.id),
-                name: escape_display(&branch.name.display),
+                name: safe_display(&branch.name.display),
                 full_name: None,
                 kind: branch.kind.clone(),
                 comparison: branch.comparison.clone(),
                 ahead: branch.ahead,
                 behind: branch.behind,
-                upstream: branch.upstream.as_ref().map(|u| escape_display(&u.display)),
+                upstream: branch.upstream.as_ref().map(|u| safe_display(&u.display)),
                 oid: branch.oid.as_ref().map(|o| o.hex.clone()),
                 error_ids: branch.error_ids.clone(),
             };
@@ -1274,6 +1281,40 @@ fn json_str(value: &serde_json::Value, key: &str) -> Option<String> {
     value.get(key)?.as_str().map(str::to_string)
 }
 
+pub fn safe_tui_target(target: &str) -> String {
+    if target == "--all" {
+        target.to_string()
+    } else {
+        crate::identity::redact_target_for_display(target)
+    }
+}
+
+fn scan_started_target(records: &serde_json::Value) -> Option<String> {
+    json_str(records, "target")
+        .or_else(|| json_str(records, "target_url"))
+        .or_else(|| {
+            records
+                .get("targets")?
+                .as_array()?
+                .first()
+                .and_then(|target| {
+                    target
+                        .get("raw")
+                        .and_then(serde_json::Value::as_str)
+                        .or_else(|| target.get("canonical").and_then(serde_json::Value::as_str))
+                })
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            records
+                .get("options")?
+                .get("all")?
+                .as_bool()
+                .filter(|all| *all)
+                .map(|_| String::from("--all"))
+        })
+}
+
 fn json_u64(value: &serde_json::Value, key: &str) -> Option<u64> {
     value.get(key)?.as_u64()
 }
@@ -1292,10 +1333,8 @@ impl TuiSnapshot {
             EventType::ScanStarted => {
                 self.header.scan_state = "running".to_string();
                 self.header.phase = "discovery".to_string();
-                if let Some(target) = json_str(&env.records, "target")
-                    .or_else(|| json_str(&env.records, "target_url"))
-                {
-                    self.header.target = target;
+                if let Some(target) = scan_started_target(&env.records) {
+                    self.header.target = safe_tui_target(&target);
                 }
             }
             EventType::DiscoveryProgress => {
@@ -1364,7 +1403,7 @@ impl TuiSnapshot {
                         group.stores.push(TuiStore {
                             id: store_key.clone(),
                             path: json_str(&env.records, "git_path")
-                                .map(|p| escape_display(&p))
+                                .map(|p| safe_display(&p))
                                 .unwrap_or_else(|| "<discovering>".to_string()),
                             match_disposition: "unknown".to_string(),
                             ..TuiStore::default()
@@ -1374,10 +1413,10 @@ impl TuiSnapshot {
                 let checkout = TuiCheckout {
                     id,
                     path: json_str(&env.records, "path")
-                        .map(|p| escape_display(&p))
+                        .map(|p| safe_display(&p))
                         .unwrap_or_else(|| "<discovering>".to_string()),
                     git_path: json_str(&env.records, "git_path")
-                        .map(|p| escape_display(&p))
+                        .map(|p| safe_display(&p))
                         .unwrap_or_default(),
                     kind: "unknown".to_string(),
                     availability: "present".to_string(),
@@ -1416,14 +1455,14 @@ impl TuiSnapshot {
                     let record = TuiBranch {
                         id: id.clone(),
                         name: json_str(value, "name")
-                            .map(|n| escape_display(&n))
+                            .map(|n| safe_display(&n))
                             .unwrap_or_else(|| branch_id.clone()),
                         kind: json_str(value, "kind").unwrap_or_else(|| "other".to_string()),
                         comparison: json_str(value, "comparison")
                             .unwrap_or_else(|| "pending".to_string()),
                         ahead: value.get("ahead").and_then(serde_json::Value::as_u64),
                         behind: value.get("behind").and_then(serde_json::Value::as_u64),
-                        upstream: json_str(value, "upstream"),
+                        upstream: json_str(value, "upstream").map(|u| safe_display(&u)),
                         oid: json_str(value, "oid"),
                         ..TuiBranch::default()
                     };
@@ -1677,8 +1716,8 @@ pub async fn load_live_snapshot(store: &crate::store::TursoStore) -> crate::Resu
         .map_err(|e| crate::Error::Store(e.to_string()))?
     {
         let id = live_text(&row, 0)?;
-        let git_path = escape_display(&String::from_utf8_lossy(&live_blob(&row, 1)?));
-        let common_path = escape_display(&String::from_utf8_lossy(&live_blob(&row, 2)?));
+        let git_path = safe_display(&String::from_utf8_lossy(&live_blob(&row, 1)?));
+        let common_path = safe_display(&String::from_utf8_lossy(&live_blob(&row, 2)?));
         let bare = live_opt_int(&row, 3)?.map(|flag| flag != 0);
         let disposition = live_text(&row, 4)?;
         let group_key = store_group
@@ -1808,14 +1847,14 @@ pub async fn load_live_snapshot(store: &crate::store::TursoStore) -> crate::Resu
         let analysis_pending = status_state == "pending" || working_state == "pending";
         let checkout = TuiCheckout {
             id: format!("checkout:{id}"),
-            path: escape_display(&String::from_utf8_lossy(
+            path: safe_display(&String::from_utf8_lossy(
                 root_path.as_deref().unwrap_or(&git_path),
             )),
-            git_path: escape_display(&String::from_utf8_lossy(&git_path)),
+            git_path: safe_display(&String::from_utf8_lossy(&git_path)),
             kind: relationship,
             availability,
             head_state,
-            head_ref: head_ref.map(|b| escape_display(&String::from_utf8_lossy(&b))),
+            head_ref: head_ref.map(|b| safe_display(&String::from_utf8_lossy(&b))),
             head_oid: None,
             status_state,
             working_state,
@@ -1870,7 +1909,7 @@ pub async fn load_live_snapshot(store: &crate::store::TursoStore) -> crate::Resu
         let id = live_text(&row, 0)?;
         let instance_id = live_text(&row, 1)?;
         let kind = live_text(&row, 2)?;
-        let name = escape_display(&String::from_utf8_lossy(&live_blob(&row, 3)?));
+        let name = safe_display(&String::from_utf8_lossy(&live_blob(&row, 3)?));
         let (comparison, ahead, behind) = if rows.1 {
             (
                 live_opt_text(&row, 4)?.unwrap_or_else(|| "pending".to_string()),

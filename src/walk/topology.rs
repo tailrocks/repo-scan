@@ -305,6 +305,24 @@ pub fn identity_io_calls() -> u64 {
     IDENTITY_IO_CALLS.load(Ordering::Relaxed) as u64
 }
 
+/// Canonicalize one scope path on the bounded identity-I/O lane. `None`
+/// means admission, timeout, or worker creation failed; callers that use
+/// canonical paths to commit invalidation must stop before their
+/// transaction so the event remains retryable.
+pub(crate) fn bounded_canonicalize(path: &Path) -> Option<Result<PathBuf, std::io::ErrorKind>> {
+    let path = path.to_path_buf();
+    bounded_identity_io(move || path.canonicalize().map_err(|error| error.kind()))
+}
+
+/// Injected resolver seam for proving a stalled filesystem operation
+/// cannot hold the current-thread coordinator indefinitely.
+#[cfg(test)]
+fn bounded_canonicalize_with(
+    resolve: impl FnOnce() -> Option<PathBuf> + Send + 'static,
+) -> Option<PathBuf> {
+    bounded_identity_io(resolve).flatten()
+}
+
 /// Run blocking identity I/O (`canonicalize`/`metadata`) on a worker
 /// thread with bounded admission plus a timeout. `None` means the slot
 /// wait expired, the worker timed out, or the spawn failed: the caller
@@ -1293,10 +1311,10 @@ mod tests {
             let (release_tx, release_rx) = mpsc::channel::<()>();
             releases.push(release_tx);
             callers.push(std::thread::spawn(move || {
-                bounded_identity_io(move || {
+                bounded_canonicalize_with(move || {
                     let _ = started_tx.send(());
                     let _ = release_rx.recv();
-                    7u32
+                    Some(PathBuf::from("/resolved"))
                 })
             }));
             started_rx

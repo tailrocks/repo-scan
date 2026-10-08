@@ -2203,6 +2203,10 @@ impl FallbackGit {
         cap_bytes: u64,
     ) -> Result<(), String> {
         let mut cmd = self.fetch_command(dir)?;
+        // A repository can redirect objects/info/commit-graphs through a
+        // filesystem symlink. Keep fetch limited to refs, FETCH_HEAD, and
+        // fetched objects even when repo-local config opts into graph writes.
+        cmd.arg("-c").arg("fetch.writeCommitGraph=false");
         for arg in Self::fetch_argv() {
             cmd.arg(arg);
         }

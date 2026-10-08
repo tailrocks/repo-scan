@@ -52,6 +52,10 @@ fn report_inputs(report_id: &str, generation: u64, scan_state: &str) -> ReportIn
         catalog_revision: 0,
         target_url: "https://github.com/OWNER/REPO".to_string(),
         canonical_url: Some("https://github.com/owner/repo".to_string()),
+        // The scripted monitor observed this event volume. Root-scoped
+        // reports only include volume-keyed event errors when their source
+        // volume is explicitly linked to the request.
+        event_volume_ids: vec!["vol-a".to_string()],
         targets: vec![],
         scope: "roots".to_string(),
         scan_state: scan_state.to_string(),

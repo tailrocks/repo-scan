@@ -2123,10 +2123,16 @@ fn wave1d_resume_reconciles_unjournaled_gap_events() {
         assert_eq!(errors.len(), 1, "exactly the missing event is restored");
         let records: serde_json::Value =
             serde_json::from_slice(&errors[0].records).expect("records JSON");
-        assert_eq!(records["id"], "gap:task:x");
-        assert_eq!(records["scope_key"], "dir:x");
+        assert_eq!(
+            records["id"],
+            main_under_test::test_event_opaque_id("gap:task:x")
+        );
+        assert_eq!(
+            records["scope_key"],
+            main_under_test::test_event_opaque_id("dir:x")
+        );
         assert_eq!(records["category"], "retry-cat");
-        assert_eq!(records["detail"], "retry detail");
+        assert_eq!(records["detail"], "diagnostic details omitted for privacy");
         assert!(
             rows.iter().all(|r| r.event_type != "coverage_updated"),
             "pre-existing opens emit no coverage delta"
@@ -2554,6 +2560,131 @@ fn wave1d_direct_emit_enforces_journal_retention() {
     });
 }
 
+/// `inventory_ready` is authoritative scan state even after its journal row
+/// falls out of the retained tail, so resume never emits the milestone twice.
+#[test]
+fn inventory_ready_survives_journal_retention_and_resume() {
+    use repo_scan::scan_events::EventType;
+    use repo_scan::store::{NewScan, NewScanEvent};
+
+    let hook = Wave1dHookStore::new();
+    hook.rt.block_on(async {
+        hook.store
+            .create_scan_request(
+                &NewScan {
+                    id: "scan-ready-retention-1",
+                    url_raw: b"--all",
+                    url_canonical: None,
+                    scope: "roots",
+                    status_mode: "metadata",
+                    report_dest: None,
+                    targets_json: None,
+                    format: Some("jsonl"),
+                    all_targets: Some(true),
+                    fetch: Some(false),
+                    workers: None,
+                },
+                1,
+            )
+            .await
+            .expect("create request");
+        hook.store
+            .append_scan_event(&NewScanEvent {
+                scan_id: "scan-ready-retention-1",
+                seq: 1,
+                catalog_rev: 1,
+                event_offset: 0,
+                event_type: "scan_started",
+                op: "add",
+                reset: false,
+                records: b"{}",
+            })
+            .await
+            .expect("append start");
+    });
+
+    hook.rt
+        .block_on(main_under_test::test_emit_scan_event_with_retention(
+            &hook.store,
+            "scan-ready-retention-1",
+            EventType::InventoryReady,
+            1,
+        ))
+        .expect("emit ready");
+    hook.rt.block_on(async {
+        hook.store
+            .connection()
+            .execute(
+                "UPDATE scan_requests SET inventory_ready_seq = NULL WHERE id = ?1",
+                vec![turso::Value::Text(String::from("scan-ready-retention-1"))],
+            )
+            .await
+            .expect("simulate retained event before marker backfill");
+    });
+    hook.rt
+        .block_on(main_under_test::test_emit_scan_event_with_retention(
+            &hook.store,
+            "scan-ready-retention-1",
+            EventType::LocationFound,
+            1,
+        ))
+        .expect("emit after ready");
+
+    hook.rt.block_on(async {
+        let scan = hook
+            .store
+            .get_scan("scan-ready-retention-1")
+            .await
+            .expect("get scan")
+            .expect("scan row");
+        assert_eq!(scan.inventory_ready_seq, Some(2));
+        let retained = hook
+            .store
+            .read_scan_events("scan-ready-retention-1", 0, 10)
+            .await
+            .expect("read retained tail");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].seq, 3);
+        assert_eq!(retained[0].event_type, "location_found");
+        assert!(
+            main_under_test::test_scan_journal_has_ready(&hook.store, "scan-ready-retention-1")
+                .await
+                .expect("reopen journal"),
+            "resume reads the durable milestone after its event row was pruned"
+        );
+    });
+
+    // Mirror the production resume guard: a ready journal skips the emit.
+    let has_ready = hook
+        .rt
+        .block_on(main_under_test::test_scan_journal_has_ready(
+            &hook.store,
+            "scan-ready-retention-1",
+        ))
+        .expect("reopen journal");
+    if !has_ready {
+        hook.rt
+            .block_on(main_under_test::test_emit_scan_event_with_retention(
+                &hook.store,
+                "scan-ready-retention-1",
+                EventType::InventoryReady,
+                1,
+            ))
+            .expect("would re-emit ready");
+    }
+    hook.rt.block_on(async {
+        let rows = hook
+            .store
+            .read_scan_events("scan-ready-retention-1", 0, 10)
+            .await
+            .expect("read final tail");
+        assert!(
+            rows.iter().all(|row| row.event_type != "inventory_ready"),
+            "resume must not append a second ready row: {rows:?}"
+        );
+    });
+}
+
 /// Cursor resolution matrix through the production resolver: covered
 /// cursors resume after their `(rev, off)` position; missing, diverged,
 /// and beyond-tip cursors reset; the coalescible gauge never diverges;
@@ -2714,4 +2845,240 @@ fn wave1d_progress_ticks_coalesce_newest_survives_records_kept() {
         "the survivor is the newest tick"
     );
     assert_eq!(outcome.error_rows, 1, "record events are never dropped");
+}
+
+#[test]
+fn replay_sanitizes_legacy_path_identifiers_and_fields() {
+    let path = "/tmp/proj-token=TERMSINKPATH04/.git";
+    let path_hex = repo_scan::config::encode_hex(path.as_bytes());
+    let store_id = format!("git:{path_hex}");
+    let checkout_id = format!("co:{path_hex}");
+    let branch_id = format!("ref:{store_id}:refs/heads/main");
+
+    let location = main_under_test::test_event_safe_records(
+        "location_found",
+        serde_json::json!({
+            "checkout_id": checkout_id,
+            "store_id": store_id,
+            "path": path,
+            "path_hex": path_hex,
+            "git_path": path,
+            "git_path_hex": path_hex,
+        }),
+    );
+    assert_eq!(
+        location["store_id"],
+        main_under_test::test_event_opaque_id(&store_id)
+    );
+    assert_eq!(
+        location["checkout_id"],
+        main_under_test::test_event_opaque_id(&checkout_id)
+    );
+    for key in ["path", "path_hex", "git_path", "git_path_hex"] {
+        assert!(location.get(key).is_none(), "legacy {key} removed");
+    }
+
+    let branch = main_under_test::test_event_safe_records(
+        "branch_batch",
+        serde_json::json!({
+            "store_id": store_id,
+            "branches": [{"id": branch_id}],
+        }),
+    );
+    assert_eq!(
+        branch["branches"][0]["id"],
+        main_under_test::test_event_opaque_id(&branch_id)
+    );
+
+    let error = main_under_test::test_event_safe_records(
+        "error",
+        serde_json::json!({
+            "id": format!("gap:{path_hex}"),
+            "scope_key": format!("dir:{path_hex}"),
+            "detail": format!("cannot read {path}: permission denied"),
+        }),
+    );
+    assert_eq!(
+        error["scope_key"],
+        main_under_test::test_event_opaque_id(&format!("dir:{path_hex}"))
+    );
+    let lifecycle = main_under_test::test_event_safe_records(
+        "scan_started",
+        serde_json::json!({
+            "scope": {"scope_key": format!("dir:{path_hex}"), "roots": [path]},
+            "targets": [
+                {"raw": path, "canonical": format!("file://{path}")},
+                {"raw": "owner/repo", "canonical": "https://github.com/owner/repo"},
+            ],
+            "resume_cmd": format!("repo-scan --state-dir '{path}/state' resume 'scan-legacy'"),
+        }),
+    );
+    let repository = main_under_test::test_event_safe_records(
+        "repository_found",
+        serde_json::json!({
+            "remotes": [{
+                "url": format!("file://{path}"),
+                "canonical_url": format!("file://{path}"),
+            }],
+        }),
+    );
+    let remote_update = main_under_test::test_event_safe_records(
+        "remote_updated",
+        serde_json::json!({"detail": format!("fetch failed for {path}: denied")}),
+    );
+    let failed = main_under_test::test_event_safe_records(
+        "scan_failed",
+        serde_json::json!({
+            "error": format!("cannot open {path}"),
+            "resume_cmd": format!("repo-scan --state-dir '{path}/state' resume 'scan-legacy'"),
+        }),
+    );
+
+    assert_eq!(
+        lifecycle["targets"][0]["raw"],
+        "repo-scan:redacted-target-spelling"
+    );
+    assert_eq!(
+        lifecycle["resume_cmd"],
+        "repo-scan --state-dir \"${REPO_SCAN_STATE_DIR:?set REPO_SCAN_STATE_DIR to this scan's state dir}\" resume 'scan-legacy'"
+    );
+    assert_eq!(error["detail"], "diagnostic details omitted for privacy");
+    assert_eq!(
+        remote_update["detail"],
+        "diagnostic details omitted for privacy"
+    );
+    assert_eq!(failed["error"], "diagnostic details omitted for privacy");
+    assert_eq!(
+        repository["remotes"][0]["url"],
+        "repo-scan:redacted-local-target"
+    );
+
+    for records in [
+        location,
+        branch,
+        error,
+        lifecycle,
+        repository,
+        remote_update,
+        failed,
+    ] {
+        let text = serde_json::to_string(&records).expect("JSON");
+        assert!(!text.contains(path), "raw local path omitted");
+        assert!(
+            !text.contains(&path_hex),
+            "reversible path encoding omitted"
+        );
+        assert!(!text.contains("TERMSINKPATH04"), "canary omitted");
+        assert!(!text.contains("file://"), "local file URL omitted");
+    }
+}
+
+#[test]
+fn event_records_redact_local_targets_and_file_remotes() {
+    let path = "/tmp/LOCAL_TARGET_EVENT_CANARY/repo";
+    let path_hex = repo_scan::config::encode_hex(path.as_bytes());
+    let target = main_under_test::test_event_safe_records(
+        "scan_started",
+        serde_json::json!({
+            "targets": [
+                {
+                    "raw": path,
+                    "canonical": "https://github.com/owner/repo",
+                },
+                {
+                    "raw": "owner/repo",
+                    "canonical": "https://github.com/owner/repo",
+                },
+            ],
+        }),
+    );
+    assert_eq!(
+        target["targets"][0]["raw"],
+        "repo-scan:redacted-target-spelling"
+    );
+    assert_eq!(
+        target["targets"][0]["canonical"],
+        "https://github.com/owner/repo"
+    );
+    assert_eq!(
+        target["targets"][1]["raw"],
+        "repo-scan:redacted-target-spelling"
+    );
+
+    let remote = main_under_test::test_event_safe_records(
+        "repository_found",
+        serde_json::json!({
+            "remotes": [
+                {"url": format!("file://{path}")},
+                {
+                    "url": format!("FILE://{path}"),
+                    "canonical_url": format!("FiLe://{path}"),
+                },
+            ],
+        }),
+    );
+    assert_eq!(
+        remote["remotes"][0]["url"],
+        "repo-scan:redacted-local-target"
+    );
+    assert_eq!(
+        remote["remotes"][1]["url"],
+        "repo-scan:redacted-local-target"
+    );
+    assert_eq!(
+        remote["remotes"][1]["canonical_url"],
+        "repo-scan:redacted-local-target"
+    );
+
+    for records in [target, remote] {
+        let text = serde_json::to_string(&records).expect("JSON");
+        assert!(!text.contains(path));
+        assert!(!text.contains(&path_hex));
+        assert!(!text.contains("LOCAL_TARGET_EVENT_CANARY"));
+    }
+}
+
+#[test]
+fn replay_hashes_malformed_opaque_id_and_root_sentinels() {
+    let path = "/tmp/MALFORMED_EVENT_SENTINEL_CANARY/private";
+    let malformed_id = format!("evt:{path}");
+    let malformed_root = format!("root:{path}");
+    let valid_id = format!("evt:{}", "a".repeat(64));
+    let valid_root = format!("root:{}", "b".repeat(64));
+
+    let ids = main_under_test::test_event_safe_records(
+        "location_found",
+        serde_json::json!({
+            "checkout_id": valid_id,
+            "store_id": malformed_id,
+        }),
+    );
+    assert_eq!(ids["checkout_id"], format!("evt:{}", "a".repeat(64)));
+    assert_eq!(
+        ids["store_id"],
+        main_under_test::test_event_opaque_id(&malformed_id)
+    );
+
+    let roots = main_under_test::test_event_safe_records(
+        "scan_started",
+        serde_json::json!({
+            "scope": {"roots": [malformed_root, valid_root]},
+        }),
+    );
+    let mut path_material = b"repo-scan-event-path-v1\0".to_vec();
+    path_material.extend_from_slice(malformed_root.as_bytes());
+    let expected_root = format!(
+        "root:{}",
+        repo_scan::report::publish::sha256_hex(&path_material)
+    );
+    assert_eq!(roots["scope"]["roots"][0], expected_root);
+    assert_eq!(
+        roots["scope"]["roots"][1],
+        format!("root:{}", "b".repeat(64))
+    );
+
+    let text =
+        serde_json::to_string(&serde_json::json!({"ids": ids, "roots": roots})).expect("JSON");
+    assert!(!text.contains(path), "malformed sentinels must be hashed");
+    assert!(text.contains(&expected_root));
 }

@@ -8,7 +8,7 @@ use repo_scan::identity::{
 use repo_scan::model::StatusMode;
 use repo_scan::report::builder::{
     quarantine_staging, stream_report_from_store, verify_staged_report_capped, AliasInput,
-    CandidateInput, FullPathCache, ReportInputs, ReportPipeline,
+    CandidateInput, FullPathCache, ReportInputs, ReportPipeline, RootInput,
 };
 use repo_scan::report::model::Report;
 use repo_scan::report::publish::{
@@ -38,6 +38,7 @@ fn test_inputs(report_id: &str) -> ReportInputs {
         catalog_revision: 7,
         target_url: "https://github.com/OWNER/REPO".to_string(),
         canonical_url: Some("https://github.com/owner/repo".to_string()),
+        event_volume_ids: vec!["vol-1".to_string()],
         targets: vec![],
         scope: "roots".to_string(),
         scan_state: "complete".to_string(),
@@ -62,7 +63,22 @@ fn test_inputs(report_id: &str) -> ReportInputs {
         coverage_filesystem: None,
         coverage_identity: None,
         coverage_status: None,
-        roots: Vec::new(),
+        // `seed_minimal` persists its fixture repository below `/repo`.
+        // Root-scoped report tests must explicitly link that repository and
+        // its event volume instead of relying on the old catalog-wide view.
+        roots: vec![RootInput {
+            id: "root-1".to_string(),
+            dir_id: None,
+            path_bytes: Some(b"/repo".to_vec()),
+            scope_path_bytes: None,
+            volume_id: None,
+            state: "complete".to_string(),
+            observed_at_ms: Some(1_759_154_400_000),
+            event_history_uuid: None,
+            ingested_cursor: None,
+            reconciled_cursor: None,
+            error_ids: Vec::new(),
+        }],
         storage_links: Vec::new(),
         aliases: Vec::new(),
         candidates: Vec::new(),
@@ -747,7 +763,10 @@ fn rsp011_error_text_scrubbed() {
         store
             .record_error(
                 "err-cred-1",
-                "probe:git",
+                // The monitored volume is linked by `test_inputs`; an
+                // unscoped legacy error is intentionally omitted from
+                // roots-only reports.
+                "volume:vol-1",
                 "fetch-failed",
                 "clone of https://deploy:s3cr3t-pw@git.internal/o/r?token=abc123 failed; access_token=zzz-top",
                 None,

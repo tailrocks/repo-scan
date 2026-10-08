@@ -206,15 +206,16 @@ fn db02_reader_checkpoint_migration_durability() {
             store.schema_version().expect("version"),
             CURRENT_SCHEMA_VERSION
         );
-        assert_eq!(CURRENT_SCHEMA_VERSION, 6);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 7);
         let chain = repo_scan::store::migrations();
-        assert_eq!(chain.len(), 6);
+        assert_eq!(chain.len(), 7);
         assert_eq!(chain[0].version, 1);
         assert_eq!(chain[1].version, 2);
         assert_eq!(chain[2].version, 3);
         assert_eq!(chain[3].version, 4);
         assert_eq!(chain[4].version, 5);
         assert_eq!(chain[5].version, 6);
+        assert_eq!(chain[6].version, 7);
 
         let proof = store.durability_proof().await.expect("proof");
         assert_eq!(proof.synchronous, 2);
@@ -248,7 +249,7 @@ fn db02_reader_checkpoint_migration_durability() {
         store.close().await.expect("close");
 
         let store = TursoStore::open(&db).await.expect("reopen");
-        assert_eq!(store.schema_version().expect("version"), 6);
+        assert_eq!(store.schema_version().expect("version"), 7);
         assert!(store.get_volume("vol-r1").await.expect("get").is_some());
         assert!(store.get_volume("vol-r2").await.expect("get").is_some());
         store.close().await.expect("close");

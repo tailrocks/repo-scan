@@ -1,7 +1,9 @@
 # Privacy Defaults (CONSUMER-SCOPE-PRIVACY-001)
 
-All tool and fixture outputs are owner-only by default: directories `0o700`,
-files `0o600` (unix). No group/other read, write, or traversal.
+All tool-written files and fixture outputs are owner-only by default:
+directories `0o700`, files `0o600` (unix). Machine-readable stdout is
+caller-owned and may be redirected outside that boundary. Those artifacts
+grant no group/other read, write, or traversal permission.
 
 ## Constructors
 
@@ -54,3 +56,21 @@ constructors — build them with `private_dir_0700` first.
   refusal (builder runs `cargo test`; workers never run cargo here).
 - Manual: `stat -c '%a %n' <state_dir> <state_dir>/payload/*` must show
   `700` dirs and `600` files.
+
+## Local paths in event output
+
+The JSONL event stream uses opaque IDs for path-derived catalog identifiers
+and root paths; it omits local path text and reversible encodings such as hex.
+Local or ambiguous bare target spellings, `file:` remote URLs, and
+state-directory paths in resume commands are redacted; canonical remote target
+identities remain. Free-form event error/detail strings are
+replaced with stable path-free text because paths cannot be separated
+reliably from arbitrary diagnostics; structured categories and status fields
+remain. The owner-only catalog/report retains original details where those
+producers persist them. Those IDs join related event records but do not
+identify catalog rows. JSONL is written to stdout, which may be
+redirected outside the owner-only state directory. Exact local paths and
+catalog IDs remain available through the owner-only catalog and protected
+report artifacts; terminal rendering scrubs secret-shaped path components. A
+live TUI that has only the event stream uses `<discovering>` until its
+catalog-backed view is available.

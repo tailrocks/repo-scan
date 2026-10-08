@@ -259,7 +259,11 @@ fn dispatch() -> ExitCode {
 /// input echoed by validation, git/config paths), and terminal
 /// diagnostics must never emit them raw.
 fn fail(e: &repo_scan::Error) -> ExitCode {
-    eprintln!("repo-scan: error: {}", identity::scrub_text(&e.to_string()));
+    let scrubbed = identity::scrub_text(&e.to_string());
+    eprintln!(
+        "repo-scan: error: {}",
+        repo_scan::report::encode::escape_display(&scrubbed)
+    );
     e.exit_code()
 }
 
@@ -323,7 +327,7 @@ fn acquire_guard_with(
                     return Err(repo_scan::Error::OwnerBusy(format!(
                         "another repo-scan owner holds {} (waited {} ms); \
                          refusing to open the database independently",
-                        store::owner::lock_path(state_dir).display(),
+                        safe_path_display(&store::owner::lock_path(state_dir)),
                         config::OWNER_WAIT_MAX_MS,
                     )));
                 }
@@ -377,7 +381,7 @@ async fn write_owner_marker(store: &TursoStore, state_dir: &Path) -> repo_scan::
     if is_symlink_path(&path)? {
         return Err(repo_scan::Error::Store(format!(
             "refusing to write through a symlinked ownership marker: {}",
-            path.display()
+            safe_path_display(&path)
         )));
     }
     #[cfg(unix)]
@@ -394,7 +398,7 @@ async fn write_owner_marker(store: &TursoStore, state_dir: &Path) -> repo_scan::
                 if e.raw_os_error() == Some(libc::ELOOP) {
                     repo_scan::Error::Store(format!(
                         "refusing to write through a symlinked ownership marker: {}",
-                        path.display()
+                        safe_path_display(&path)
                     ))
                 } else {
                     repo_scan::Error::from(e)
@@ -470,6 +474,16 @@ fn escape_display(bytes: &[u8]) -> String {
         .chars()
         .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
         .collect()
+}
+
+/// Credential-scrub and control-escape a local path before human output.
+fn safe_path_display(path: &Path) -> String {
+    safe_human_text(&path.display().to_string())
+}
+
+fn safe_human_text(text: &str) -> String {
+    let scrubbed = identity::scrub_text(text);
+    repo_scan::report::encode::escape_display(&scrubbed)
 }
 
 fn status_mode_str(mode: StatusMode) -> &'static str {
@@ -574,14 +588,19 @@ async fn reclassify_for_target(
     canonical: &str,
     ssh_aliases: &HashMap<String, String>,
     counters: &mut RunCounters,
+    scope_roots: Option<&[PathBuf]>,
 ) -> repo_scan::Result<u64> {
     // RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1: chunked pages, one
     // in flight at a time; per-row work is unchanged.
     let mut offset: i64 = 0;
     let mut confirmed = 0u64;
+    let scoped_repositories = match scope_roots {
+        Some(roots) => Some(checkouts_within_roots(store, roots).await?.repository_ids),
+        None => None,
+    };
     loop {
         let sql = format!(
-            "SELECT id, evidence FROM git_instances ORDER BY id ASC \
+            "SELECT id, evidence, git_path FROM git_instances ORDER BY id ASC \
              LIMIT {LOAD_CHUNK_ROWS} OFFSET {offset}"
         );
         let mut rows = store
@@ -589,9 +608,13 @@ async fn reclassify_for_target(
             .query(sql.as_str(), ())
             .await
             .map_err(store_err)?;
-        let mut page: Vec<(String, String)> = Vec::new();
+        let mut page: Vec<(String, String, Vec<u8>)> = Vec::new();
         while let Some(row) = rows.next().await.map_err(store_err)? {
-            page.push((cell_text(&row, 0)?, cell_text(&row, 1)?));
+            page.push((
+                cell_text(&row, 0)?,
+                cell_text(&row, 1)?,
+                cell_blob(&row, 2)?,
+            ));
             if page.len() as i64 >= LOAD_CHUNK_ROWS {
                 break;
             }
@@ -600,7 +623,14 @@ async fn reclassify_for_target(
             break;
         }
         let full_page = page.len() as i64 >= LOAD_CHUNK_ROWS;
-        for (id, evidence_json) in &page {
+        for (id, evidence_json, git_path) in &page {
+            if let (Some(roots), Some(repositories)) = (scope_roots, scoped_repositories.as_ref()) {
+                if !config::path_is_within_roots(&config::path_from_bytes(git_path.clone()), roots)
+                    && !repositories.contains(id)
+                {
+                    continue;
+                }
+            }
             let remotes = store.list_remotes(id).await?;
             let pairs: Vec<(String, String)> = remotes
                 .iter()
@@ -692,12 +722,17 @@ async fn reclassify_for_targets(
     canonicals: &[String],
     ssh_aliases: &HashMap<String, String>,
     counters: &mut RunCounters,
+    scope_roots: Option<&[PathBuf]>,
 ) -> repo_scan::Result<Vec<u64>> {
     let mut matched = vec![0u64; canonicals.len()];
     let mut offset: i64 = 0;
+    let scoped_repositories = match scope_roots {
+        Some(roots) => Some(checkouts_within_roots(store, roots).await?.repository_ids),
+        None => None,
+    };
     loop {
         let sql = format!(
-            "SELECT id, evidence FROM git_instances ORDER BY id ASC \
+            "SELECT id, evidence, git_path FROM git_instances ORDER BY id ASC \
              LIMIT {LOAD_CHUNK_ROWS} OFFSET {offset}"
         );
         let mut rows = store
@@ -705,9 +740,13 @@ async fn reclassify_for_targets(
             .query(sql.as_str(), ())
             .await
             .map_err(store_err)?;
-        let mut page: Vec<(String, String)> = Vec::new();
+        let mut page: Vec<(String, String, Vec<u8>)> = Vec::new();
         while let Some(row) = rows.next().await.map_err(store_err)? {
-            page.push((cell_text(&row, 0)?, cell_text(&row, 1)?));
+            page.push((
+                cell_text(&row, 0)?,
+                cell_text(&row, 1)?,
+                cell_blob(&row, 2)?,
+            ));
             if page.len() as i64 >= LOAD_CHUNK_ROWS {
                 break;
             }
@@ -716,7 +755,14 @@ async fn reclassify_for_targets(
             break;
         }
         let full_page = page.len() as i64 >= LOAD_CHUNK_ROWS;
-        for (id, evidence_json) in &page {
+        for (id, evidence_json, git_path) in &page {
+            if let (Some(roots), Some(repositories)) = (scope_roots, scoped_repositories.as_ref()) {
+                if !config::path_is_within_roots(&config::path_from_bytes(git_path.clone()), roots)
+                    && !repositories.contains(id)
+                {
+                    continue;
+                }
+            }
             let remotes = store.list_remotes(id).await?;
             let pairs: Vec<(String, String)> = remotes
                 .iter()
@@ -855,6 +901,282 @@ struct ScanJournal {
     pruned_through: u64,
 }
 
+/// Project path-derived catalog identifiers into stable, opaque IDs before
+/// they enter the JSONL journal. Catalog/report IDs remain unchanged and
+/// owner-local; event consumers treat these values as opaque join keys.
+fn event_opaque_id(value: &str) -> String {
+    let mut material = b"repo-scan-event-id-v1\0".to_vec();
+    material.extend_from_slice(value.as_bytes());
+    format!("evt:{}", repo_scan::report::publish::sha256_hex(&material))
+}
+
+fn event_opaque_path(path: &Path) -> String {
+    let mut material = b"repo-scan-event-path-v1\0".to_vec();
+    material.extend_from_slice(&config::path_as_bytes(path));
+    format!("root:{}", repo_scan::report::publish::sha256_hex(&material))
+}
+
+fn event_id_from_journal(value: &str) -> String {
+    if has_canonical_event_hash(value, "evt:") {
+        value.to_string()
+    } else {
+        // Old journals stored catalog IDs directly. Normalize those for
+        // resume deduplication. Only accept the exact opaque-ID encoding;
+        // malformed prefixed values may still contain the original path.
+        event_opaque_id(value)
+    }
+}
+
+fn event_path_from_journal(value: &str) -> String {
+    if has_canonical_event_hash(value, "root:") {
+        value.to_string()
+    } else {
+        let mut material = b"repo-scan-event-path-v1\0".to_vec();
+        material.extend_from_slice(value.as_bytes());
+        format!("root:{}", repo_scan::report::publish::sha256_hex(&material))
+    }
+}
+
+fn has_canonical_event_hash(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+const EVENT_REDACTED_LOCAL_TARGET: &str = "repo-scan:redacted-local-target";
+const EVENT_REDACTED_TARGET_SPELLING: &str = "repo-scan:redacted-target-spelling";
+const EVENT_REDACTED_PATH_DETAIL: &str = "diagnostic details omitted for privacy";
+const EVENT_RESUME_STATE_ARGUMENT: &str =
+    "\"${REPO_SCAN_STATE_DIR:?set REPO_SCAN_STATE_DIR to this scan's state dir}\"";
+
+/// A target pair may include a local checkout path even when its Git remote
+/// supplies a public canonical identity. Keep that identity, but never put
+/// the local spelling into the event stream.
+fn event_target_spelling_needs_redaction(raw: &str, canonical: &str) -> bool {
+    identity::is_local_target(raw)
+        || is_local_path_target(raw)
+        || identity::is_local_target(canonical)
+        || is_local_path_target(canonical)
+        || identity::normalize_target_input(raw).as_deref() != Some(canonical)
+        // A bare `owner/repo` target is ambiguous with a relative local path
+        // after its original working directory disappears. The canonical URL
+        // carries the remote identity, so omit this spelling on the wire.
+        || !raw.contains("://") && identity::normalize_github_url(raw).is_none()
+}
+
+fn event_safe_remote_url(value: &str) -> String {
+    let value = value.trim();
+    if value == EVENT_REDACTED_LOCAL_TARGET {
+        value.to_string()
+    } else if value
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
+        || is_local_path_target(value)
+    {
+        EVENT_REDACTED_LOCAL_TARGET.to_string()
+    } else {
+        identity::redact_remote_url(value)
+    }
+}
+
+/// Free-form diagnostics can contain absolute, relative, or embedded paths
+/// that cannot be distinguished safely from ordinary text. Keep the event
+/// contract path-free; structured category/status fields remain available.
+fn event_safe_detail(_value: &str) -> String {
+    EVENT_REDACTED_PATH_DETAIL.to_string()
+}
+
+/// Legacy lifecycle rows carried shell-quoted state paths in `resume_cmd`.
+/// Retain a validated scan id and rebuild the command around the environment
+/// variable so replay does not expose the old state directory.
+fn event_safe_resume_cmd(value: &str) -> String {
+    let Some((_, scan_arg)) = value.rsplit_once(" resume ") else {
+        return format!(
+            "repo-scan --state-dir {EVENT_RESUME_STATE_ARGUMENT} resume '<scan-id unavailable>'"
+        );
+    };
+    let scan_id = scan_arg.trim().trim_matches('\'');
+    if scan_id.is_empty()
+        || !scan_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        return format!(
+            "repo-scan --state-dir {EVENT_RESUME_STATE_ARGUMENT} resume '<scan-id unavailable>'"
+        );
+    }
+    format!(
+        "repo-scan --state-dir {EVENT_RESUME_STATE_ARGUMENT} resume {}",
+        shell_quote(scan_id)
+    )
+}
+
+fn event_safe_fields(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                event_safe_fields(value);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for (key, value) in object.iter_mut() {
+                match key.as_str() {
+                    "detail" | "error" => {
+                        if let Some(text) = value.as_str() {
+                            *value = serde_json::Value::String(event_safe_detail(text));
+                        }
+                    }
+                    "resume_cmd" => {
+                        if let Some(text) = value.as_str() {
+                            *value = serde_json::Value::String(event_safe_resume_cmd(text));
+                        }
+                    }
+                    "url" | "canonical_url" => {
+                        if let Some(text) = value.as_str() {
+                            *value = serde_json::Value::String(event_safe_remote_url(text));
+                        }
+                    }
+                    _ => event_safe_fields(value),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn event_safe_targets(records: &mut serde_json::Value) {
+    let Some(targets) = records
+        .get_mut("targets")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for target in targets {
+        let Some(object) = target.as_object_mut() else {
+            continue;
+        };
+        let raw = object
+            .get("raw")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let canonical = object
+            .get("canonical")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if event_target_spelling_needs_redaction(&raw, &canonical) {
+            object.insert(
+                "raw".to_string(),
+                serde_json::Value::String(EVENT_REDACTED_TARGET_SPELLING.to_string()),
+            );
+        } else {
+            object.insert(
+                "raw".to_string(),
+                serde_json::Value::String(identity::sanitize_target_url(&raw)),
+            );
+        }
+        object.insert(
+            "canonical".to_string(),
+            serde_json::Value::String(event_safe_remote_url(&canonical)),
+        );
+    }
+}
+
+fn opaque_event_id_field(records: &mut serde_json::Value, key: &str) {
+    if let Some(value) = records.get(key).and_then(serde_json::Value::as_str) {
+        records[key] = serde_json::Value::String(event_id_from_journal(value));
+    }
+}
+
+fn opaque_event_id_array(records: &mut serde_json::Value, key: &str) {
+    if let Some(values) = records
+        .get_mut(key)
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for value in values {
+            if let Some(id) = value.as_str() {
+                *value = serde_json::Value::String(event_id_from_journal(id));
+            }
+        }
+    }
+}
+
+/// Older retained journals used catalog IDs and root paths directly.
+/// Sanitize at the replay boundary as well as at emit time so upgrading
+/// the binary does not re-expose path encodings from existing state.
+fn event_safe_records(event_type: EventType, mut records: serde_json::Value) -> serde_json::Value {
+    match event_type {
+        EventType::RepositoryFound | EventType::BranchBatch | EventType::RemoteUpdated => {
+            opaque_event_id_field(&mut records, "store_id");
+            if event_type == EventType::BranchBatch {
+                if let Some(branches) = records
+                    .get_mut("branches")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    for branch in branches {
+                        opaque_event_id_field(branch, "id");
+                    }
+                }
+            }
+        }
+        EventType::LocationFound | EventType::LocationUpdated => {
+            opaque_event_id_field(&mut records, "checkout_id");
+            opaque_event_id_field(&mut records, "store_id");
+            if event_type == EventType::LocationFound {
+                if let Some(object) = records.as_object_mut() {
+                    for key in ["path", "path_hex", "git_path", "git_path_hex"] {
+                        object.remove(key);
+                    }
+                }
+            }
+        }
+        EventType::Error => {
+            opaque_event_id_field(&mut records, "id");
+            opaque_event_id_field(&mut records, "scope_key");
+        }
+        EventType::CoverageUpdated => {
+            opaque_event_id_array(&mut records, "opened");
+            opaque_event_id_array(&mut records, "closed");
+            opaque_event_id_array(&mut records, "unresolvable_added");
+        }
+        EventType::ScanStarted | EventType::ScanInterrupted => {
+            event_safe_targets(&mut records);
+            if let Some(scope) = records.get_mut("scope") {
+                opaque_event_id_field(scope, "scope_key");
+                if let Some(roots) = scope
+                    .get_mut("roots")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    for root in roots {
+                        if let Some(path) = root.as_str() {
+                            *root = serde_json::Value::String(event_path_from_journal(path));
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    event_safe_fields(&mut records);
+    records
+}
+
+#[cfg(test)]
+pub fn test_event_opaque_id(value: &str) -> String {
+    event_opaque_id(value)
+}
+
+#[cfg(test)]
+pub fn test_event_safe_records(event_type: &str, records: serde_json::Value) -> serde_json::Value {
+    let event_type = serde_json::from_value(serde_json::Value::String(event_type.to_string()))
+        .expect("known event type");
+    event_safe_records(event_type, records)
+}
+
 impl ScanJournal {
     async fn open(store: &TursoStore, scan_id: &str, rev: u64) -> repo_scan::Result<Self> {
         let mut max_seq = 0u64;
@@ -904,7 +1226,7 @@ impl ScanJournal {
                             ))
                         })?;
                     if let Some(id) = v.get(key).and_then(|v| v.as_str()) {
-                        set.insert(id.to_string());
+                        set.insert(event_id_from_journal(id));
                     }
                 }
                 if row.event_type == "coverage_updated" {
@@ -917,13 +1239,27 @@ impl ScanJournal {
                         })?;
                     if let Some(added) = v.get("unresolvable_added").and_then(|v| v.as_array()) {
                         for id in added.iter().filter_map(|v| v.as_str()) {
-                            emitted_unresolvable.insert(id.to_string());
+                            emitted_unresolvable.insert(event_id_from_journal(id));
                         }
                     }
                 }
             }
             if short {
                 break;
+            }
+        }
+        // The ready row can age out with the pruned prefix. Its sequence
+        // is also stored on the scan request before retention runs, so a
+        // resumed scan keeps the lifecycle boundary authoritative. A
+        // retained event with a NULL marker is the crash/legacy window:
+        // backfill it before any later emit can prune that event.
+        if let Some(scan) = store.get_scan(scan_id).await? {
+            match (ready_seq, scan.inventory_ready_seq) {
+                (Some(event_seq), None) => {
+                    store.mark_scan_inventory_ready(scan_id, event_seq).await?;
+                }
+                (None, Some(stored_seq)) => ready_seq = Some(stored_seq),
+                _ => {}
             }
         }
         Ok(Self {
@@ -1024,8 +1360,9 @@ impl ScanJournal {
             return Ok(0);
         }
         let (seq, off) = self.assign();
-        let bytes =
-            serde_json::to_vec(records).map_err(|e| repo_scan::Error::Report(e.to_string()))?;
+        let safe_records = event_safe_records(event_type, records.clone());
+        let bytes = serde_json::to_vec(&safe_records)
+            .map_err(|e| repo_scan::Error::Report(e.to_string()))?;
         let event = NewScanEvent {
             scan_id: &self.scan_id,
             seq,
@@ -1041,12 +1378,13 @@ impl ScanJournal {
         }
         if event_type == EventType::InventoryReady {
             self.ready_seq = Some(seq);
+            store.mark_scan_inventory_ready(&self.scan_id, seq).await?;
         }
         if is_terminal_event(event_type) {
             self.terminal_seq = Some(seq);
         }
         let pruned = maybe_prune_scan_journal(store, self, keep_rows).await?;
-        Ok(1 + u64::from(pruned))
+        Ok(1 + u64::from(event_type == EventType::InventoryReady) + u64::from(pruned))
     }
 
     /// Buffer one `repository_found` into the writer batch: it commits
@@ -1062,7 +1400,7 @@ impl ScanJournal {
         if self.has_terminal() {
             return Ok(None);
         }
-        if !self.emitted_stores.insert(store_id.to_string()) {
+        if !self.emitted_stores.insert(event_opaque_id(store_id)) {
             return Ok(None);
         }
         let (seq, off) = self.assign();
@@ -1090,7 +1428,7 @@ impl ScanJournal {
         if self.has_terminal() {
             return Ok(None);
         }
-        if !self.emitted_checkouts.insert(checkout_id.to_string()) {
+        if !self.emitted_checkouts.insert(event_opaque_id(checkout_id)) {
             return Ok(None);
         }
         let (seq, off) = self.assign();
@@ -1200,7 +1538,7 @@ impl ScanJournal {
         if self.has_terminal() {
             return Ok(None);
         }
-        let first = self.emitted_branch_stores.insert(store_id.to_string());
+        let first = self.emitted_branch_stores.insert(event_opaque_id(store_id));
         let op = if first { Op::Add } else { Op::Replace };
         let (seq, off) = self.assign();
         let event = NewScanEvent {
@@ -1353,16 +1691,26 @@ async fn maybe_prune_scan_journal(
     Ok(true)
 }
 
-/// Resume command recorded in lifecycle payloads (D4): replays the exact
-/// state dir + scan id a follower needs to reconnect.
-fn resume_cmd_for(state_dir: &Path, scan_id: &str) -> String {
+/// Resume command recorded in lifecycle payloads (D4): the owner supplies
+/// the protected state directory through the environment, so no local path is
+/// copied into the event journal or JSONL stream.
+fn resume_cmd_for(_state_dir: &Path, scan_id: &str) -> String {
     format!(
-        "repo-scan --state-dir {} resume {scan_id}",
-        state_dir.display()
+        "repo-scan --state-dir {EVENT_RESUME_STATE_ARGUMENT} resume {}",
+        shell_quote(scan_id)
     )
 }
 
-/// `scan_failed` payload (Step 12): last committed cursor, scrubbed error,
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+pub fn test_resume_cmd_for(state_dir: &Path, scan_id: &str) -> String {
+    resume_cmd_for(state_dir, scan_id)
+}
+
+/// `scan_failed` payload (Step 12): last committed cursor, path-free error,
 /// resume capability + command. The staged snapshot survives a publication
 /// failure, so `resumable` is always true here.
 fn failed_records(
@@ -1386,7 +1734,7 @@ fn failed_records(
 }
 
 /// Journal one `scan_failed` lifecycle event for an emission failure
-/// (Wave2b: last cursor + scrubbed error + resume capability +
+/// (Wave2b: last cursor + path-free error + resume capability +
 /// resume command travel on the event).
 async fn journal_emission_failed(
     runner: &mut Runner,
@@ -1525,14 +1873,16 @@ async fn scan_failure_tail(
         // back from the committed event row (never reconstructed),
         // so the tail agrees with the journal byte for byte.
         let cursor = failed_event_cursor(cfg, scan_id).await?;
+        let error = event_safe_detail(err);
+        let resume_cmd = event_safe_resume_cmd(&resume_cmd_for(&cfg.state_dir, scan_id));
         let object = serde_json::json!({
             "scan_id": scan_id,
             "state": "failed",
             "report_id": report_id,
             "cursor": cursor,
-            "error": err,
+            "error": error,
             "resumable": true,
-            "resume_cmd": resume_cmd_for(&cfg.state_dir, scan_id),
+            "resume_cmd": resume_cmd,
         });
         let line =
             serde_json::to_string(&object).map_err(|e| repo_scan::Error::Report(e.to_string()))?;
@@ -1541,7 +1891,7 @@ async fn scan_failure_tail(
     }
     println!("scan_id: {scan_id}");
     println!("report_id: {report_id}");
-    println!("snapshot: {}", snapshot_path.display());
+    println!("snapshot: {}", safe_path_display(&snapshot_path));
     Ok(ExitCode::OperationalFailure)
 }
 
@@ -1588,6 +1938,8 @@ async fn maybe_publish_live_report(
     started_ms: i64,
     pending: u64,
     roots: &[PlannedRoot],
+    scope_roots: Option<&[PathBuf]>,
+    scope_identity_roots: Option<&[PathBuf]>,
     aliases: &[ObservedAlias],
     root_cursors: Vec<RootCursors>,
     event_note: &str,
@@ -1615,6 +1967,13 @@ async fn maybe_publish_live_report(
         finished_ms: now_ms,
         report_dest: Some(dest.clone()),
         roots: roots.to_vec(),
+        scope_roots: scope_identity_roots.map(|roots| roots.to_vec()),
+        scope_filter_roots: scope_roots.map(|roots| roots.to_vec()),
+        scope_identity_roots: scope_identity_roots.map(|roots| roots.to_vec()),
+        event_volume_ids: root_cursors
+            .iter()
+            .filter_map(|cursor| cursor.event_volume_id.clone())
+            .collect(),
         counters: runner.counters.clone(),
         pending,
         aliases: aliases.to_vec(),
@@ -1636,7 +1995,7 @@ async fn maybe_publish_live_report(
     )
     .await
     {
-        Ok(inputs) => inputs,
+        Ok((inputs, _derivation_truncated)) => inputs,
         Err(e) => {
             eprintln!(
                 "repo-scan: live report: build skipped: {}",
@@ -1812,6 +2171,51 @@ fn resolve_scan_targets(args: &repo_scan::cli::ScanArgs) -> repo_scan::Result<Re
     }
 }
 
+/// Add a prior spelling to explicit-root filters only when this run observed
+/// a same-object edge at one of the requested/canonical roots and both
+/// endpoints still have the same bounded filesystem identity.
+fn extend_scope_filter_roots_with_verified_aliases(
+    roots: &mut Vec<PathBuf>,
+    aliases: &[ObservedAlias],
+) {
+    let anchors: HashSet<PathBuf> = roots
+        .iter()
+        .map(|root| config::normalize_scope_path(root))
+        .collect();
+    for alias in aliases {
+        if alias.kind != "same_object" {
+            continue;
+        }
+        let path = config::path_from_bytes(alias.path.clone());
+        let target = config::path_from_bytes(alias.target.clone());
+        let path_key = config::normalize_scope_path(&path);
+        let target_key = config::normalize_scope_path(&target);
+        let counterpart = if anchors.contains(&path_key) {
+            &target
+        } else if anchors.contains(&target_key) {
+            &path
+        } else {
+            continue;
+        };
+        let (Some(path_identity), Some(target_identity)) = (
+            repo_scan::walk::topology::bounded_dir_identity(&path),
+            repo_scan::walk::topology::bounded_dir_identity(&target),
+        ) else {
+            continue;
+        };
+        if path_identity != target_identity {
+            continue;
+        }
+        let counterpart_key = config::normalize_scope_path(counterpart);
+        if !roots
+            .iter()
+            .any(|root| config::normalize_scope_path(root) == counterpart_key)
+        {
+            roots.push(counterpart.clone());
+        }
+    }
+}
+
 /// Scan entry shared by `scan` and `resume`. `resumed` carries the restored
 /// saved request for resume; `None` for a fresh scan (which mints a scan ID
 /// and persists the request row first).
@@ -1850,6 +2254,32 @@ async fn run_scan_inner(
         .map(|p| config::resolve_report_dest(p))
         .transpose()?;
     let (policy, roots, state_roots) = plan_roots(args)?;
+    // Resolve root identities once and share them between the generation
+    // key and catalog/report filters. Planned spellings remain in `roots`
+    // for traversal and presentation.
+    let root_identities = repo_scan::walk::roots::scope_root_identities(&roots);
+    let scope_roots = (policy == "roots").then(|| {
+        root_identities
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>()
+    });
+    // Catalog paths may have been persisted through either the requested
+    // spelling (for example, a symlink) or the physical root identity.
+    // Keep both for membership filters while generation and derivation-gap
+    // identity continue to use the canonical roots above.
+    let mut scope_filter_roots = (policy == "roots").then(|| {
+        let mut paths = Vec::with_capacity(roots.len().saturating_mul(2));
+        for (root, (identity, _)) in roots.iter().zip(&root_identities) {
+            for path in [&root.path, identity] {
+                let path = config::normalize_scope_path(path);
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+        }
+        paths
+    });
     let (_guard, store) = open_owned_with_wait(&cfg.state_dir).await?;
     let epoch = store.epoch();
     // Step 8 worker pool: admission scales with the effective worker
@@ -1857,6 +2287,8 @@ async fn run_scan_inner(
     // process budgets stay fixed inside `effective_limits`.
     let effective = config::effective_limits(args.workers);
     let mut runner = Runner::new(&effective);
+    runner.scope_filter_roots = scope_filter_roots.clone();
+    runner.scope_identity_roots = scope_roots.clone();
     // Finding 12: the traversal fence is built once from the planned
     // roots; every enum task re-verifies its directory against it through
     // a pinned descriptor-relative open before listing.
@@ -1890,7 +2322,12 @@ async fn run_scan_inner(
     }
     runner.fence = Some(fence);
     // Event monitoring opens before any traversal decision (R5).
-    let mut events = open_event_session(&store, &cfg.state_dir, &policy, &roots).await?;
+    let mut events =
+        open_event_session(&store, &cfg.state_dir, &policy, &roots, &root_identities).await?;
+    runner.scope_event_volumes = root_event_volume_ids_for(&roots, &root_identities, &events)
+        .into_iter()
+        .flatten()
+        .collect();
     // One fresh catalog revision per run: status observations keyed by it
     // refresh matching metadata on every scan without duplicating rows.
     let run_rev = store.next_revision().await?;
@@ -1901,7 +2338,11 @@ async fn run_scan_inner(
     let saved_generation = resumed.as_ref().and_then(|r| r.generation);
     let events_live = events.live && events.degraded.is_empty();
     // Full scope key (D5): generation reuse requires equal coverage roots.
-    let scope_key = repo_scan::walk::roots::generation_scope_key(&policy, &roots);
+    let scope_key = repo_scan::walk::roots::generation_scope_key_with_identities(
+        &policy,
+        &roots,
+        &root_identities,
+    );
     let generation = match saved_generation {
         Some(saved) if store.get_generation(saved).await?.is_some() => {
             store.set_generation_state(saved, "running").await?;
@@ -2025,11 +2466,14 @@ async fn run_scan_inner(
             "scan_id": &scan_id,
             "scope": {
                 "policy": &policy,
-                "roots": roots.iter().map(|r| r.path.display().to_string()).collect::<Vec<_>>(),
-                "scope_key": &scope_key,
+                "roots": journal_root_paths(&roots),
+                "scope_key": event_opaque_id(&scope_key),
             },
             "targets": resolved.targets.iter().map(|(raw, canonical)| {
-                serde_json::json!({"raw": raw, "canonical": canonical})
+                serde_json::json!({
+                    "raw": identity::scrub_text(&identity::sanitize_target_url(raw)),
+                    "canonical": identity::scrub_text(canonical),
+                })
             }).collect::<Vec<_>>(),
             "options": {
                 "all": resolved.all,
@@ -2066,6 +2510,10 @@ async fn run_scan_inner(
         );
     }
     seed_root_tasks(&store, &mut runner, generation, &roots, now).await?;
+    if let Some(paths) = scope_filter_roots.as_mut() {
+        extend_scope_filter_roots_with_verified_aliases(paths, &runner.aliases);
+    }
+    runner.scope_filter_roots = scope_filter_roots.clone();
     // Per-target dispositions before traversal and staging (R1): status
     // refresh, probes, and the report all classify this scan's target.
     let mut matched_counts = if resolved.is_set() {
@@ -2074,6 +2522,7 @@ async fn run_scan_inner(
             &resolved.canonicals(),
             &runner.ssh_aliases,
             &mut runner.counters,
+            scope_filter_roots.as_deref(),
         )
         .await?
     } else {
@@ -2083,15 +2532,32 @@ async fn run_scan_inner(
                 primary_canonical,
                 &runner.ssh_aliases,
                 &mut runner.counters,
+                scope_filter_roots.as_deref(),
             )
             .await?,
         ]
     };
-    enqueue_status_refresh(&store, &mut runner, generation, run_rev, now).await?;
+    enqueue_status_refresh(
+        &store,
+        &mut runner,
+        generation,
+        run_rev,
+        now,
+        scope_filter_roots.as_deref(),
+    )
+    .await?;
     // Pre-existing stores schedule branch/HEAD analysis here; stores
     // discovered this run schedule from their probe persist. Claims
     // gate execution to the post-boundary drain.
-    enqueue_analysis_refresh(&store, &mut runner, generation, run_rev, now).await?;
+    enqueue_analysis_refresh(
+        &store,
+        &mut runner,
+        generation,
+        run_rev,
+        now,
+        scope_filter_roots.as_deref(),
+    )
+    .await?;
 
     // Step 13: explicit `scan --format human` on a TTY opens the
     // interactive live view for the drains below (plain lane when
@@ -2117,7 +2583,7 @@ async fn run_scan_inner(
             header.scan_id = scan_id.clone();
             header.scan_state = "running".to_string();
             header.phase = "discovery".to_string();
-            header.target = target.clone();
+            header.target = repo_scan::report::tui::safe_tui_target(&target);
         });
         view.session.redraw();
         runner.tui = Some(view);
@@ -2132,6 +2598,8 @@ async fn run_scan_inner(
         primary_canonical,
         args.status,
         &scan_id,
+        scope_filter_roots.as_deref(),
+        scope_roots.as_deref(),
         DrainPhase::Discovery,
     )
     .await?;
@@ -2150,10 +2618,18 @@ async fn run_scan_inner(
                 &resolved.canonicals(),
                 &runner.ssh_aliases,
                 &mut runner.counters,
+                scope_filter_roots.as_deref(),
             )
             .await?;
-            enqueue_status_refresh(&store, &mut runner, generation, run_rev, store::now_ms())
-                .await?;
+            enqueue_status_refresh(
+                &store,
+                &mut runner,
+                generation,
+                run_rev,
+                store::now_ms(),
+                scope_filter_roots.as_deref(),
+            )
+            .await?;
             let union_next = run_until_boundary(
                 &mut runner,
                 &store,
@@ -2163,6 +2639,8 @@ async fn run_scan_inner(
                 primary_canonical,
                 args.status,
                 &scan_id,
+                scope_filter_roots.as_deref(),
+                scope_roots.as_deref(),
                 DrainPhase::Discovery,
             )
             .await?;
@@ -2240,6 +2718,8 @@ async fn run_scan_inner(
             primary_canonical,
             args.status,
             &scan_id,
+            scope_filter_roots.as_deref(),
+            scope_roots.as_deref(),
             DrainPhase::Discovery,
         )
         .await?;
@@ -2351,8 +2831,10 @@ async fn run_scan_inner(
             started_ms,
             outcome.pending,
             &roots,
+            scope_filter_roots.as_deref(),
+            scope_roots.as_deref(),
             &runner.aliases,
-            root_cursors_for(&roots, &events, &cursors),
+            root_cursors_for(&roots, &root_identities, &events, &cursors),
             &live_note,
             &report_dest,
             &effective,
@@ -2375,6 +2857,8 @@ async fn run_scan_inner(
             primary_canonical,
             args.status,
             &scan_id,
+            scope_filter_roots.as_deref(),
+            scope_roots.as_deref(),
             DrainPhase::Analysis,
         )
         .await?;
@@ -2410,8 +2894,10 @@ async fn run_scan_inner(
             started_ms,
             outcome.pending,
             &roots,
+            scope_filter_roots.as_deref(),
+            scope_roots.as_deref(),
             &runner.aliases,
-            root_cursors_for(&roots, &events, &cursors),
+            root_cursors_for(&roots, &root_identities, &events, &cursors),
             &live_note,
             &report_dest,
             &effective,
@@ -2424,7 +2910,13 @@ async fn run_scan_inner(
     // unresolved gaps (exit 3); `unsupported` verdicts are examined
     // terminal states, not gaps; interruption folds into 130 below.
     if args.fetch {
-        let fetch = run_fetch_phase(&mut runner, &store, started_ms).await?;
+        let fetch = run_fetch_phase(
+            &mut runner,
+            &store,
+            started_ms,
+            scope_filter_roots.as_deref(),
+        )
+        .await?;
         outcome.interrupted |= fetch.interrupted;
         scan_incomplete |= fetch.failed > 0;
         eprintln!(
@@ -2464,8 +2956,10 @@ async fn run_scan_inner(
                 started_ms,
                 outcome.pending,
                 &roots,
+                scope_filter_roots.as_deref(),
+                scope_roots.as_deref(),
                 &runner.aliases,
-                root_cursors_for(&roots, &events, &cursors),
+                root_cursors_for(&roots, &root_identities, &events, &cursors),
                 &live_note,
                 &report_dest,
                 &effective,
@@ -2473,7 +2967,7 @@ async fn run_scan_inner(
             .await;
         }
     }
-    let discovery_code = if scan_incomplete { 3 } else { 0 };
+    let mut discovery_code = if scan_incomplete { 3 } else { 0 };
     // The report's scan verdict covers the whole run (analysis + fetch),
     // not just the discovery boundary: `gen_state` above stays the
     // discovery verdict for the generation row and the `inventory_ready`
@@ -2514,15 +3008,22 @@ async fn run_scan_inner(
         finished_ms,
         report_dest: report_dest.clone(),
         roots: roots.clone(),
+        scope_roots: scope_roots.clone(),
+        scope_filter_roots: scope_filter_roots.clone(),
+        scope_identity_roots: scope_roots.clone(),
+        event_volume_ids: root_cursors_for(&roots, &root_identities, &events, &cursors)
+            .iter()
+            .filter_map(|cursor| cursor.event_volume_id.clone())
+            .collect(),
         counters: runner.counters.clone(),
         pending: outcome.pending,
         aliases: runner.aliases.clone(),
-        root_cursors: root_cursors_for(&roots, &events, &cursors),
+        root_cursors: root_cursors_for(&roots, &root_identities, &events, &cursors),
         event_note,
         cpu_target_cores: effective.cpu_target_cores,
         rss_target_bytes: effective.rss_target_bytes,
     };
-    let lib_inputs = build_lib_inputs(
+    let (mut lib_inputs, derivation_truncated) = build_lib_inputs(
         &store,
         &inputs,
         &report_id,
@@ -2531,6 +3032,24 @@ async fn run_scan_inner(
         &snapshot_path,
     )
     .await?;
+    // Derivation caps are enforced while assembling the report. They open a
+    // durable coverage gap, so fold that result into the scan verdict before
+    // staging the snapshot, updating the scan row, or emitting its terminal
+    // journal event.
+    if derivation_truncated {
+        scan_incomplete = true;
+        discovery_code = 3;
+        outcome.open_gaps = count_open_errors_for_scope(
+            &store,
+            scope_filter_roots.as_deref(),
+            scope_roots.as_deref(),
+            &runner.scope_event_volumes,
+        )
+        .await?;
+        if !outcome.interrupted {
+            lib_inputs.scan_state = String::from("incomplete");
+        }
+    }
     // Wave6 output matrix (Step 6 auto-selection): an explicit
     // `--format` wins; no explicit format resolves through
     // [`OutputFormat::resolve`][repo_scan::cli::OutputFormat::resolve] —
@@ -2870,8 +3389,8 @@ async fn run_scan_inner(
                 "generation": generation,
                 "scope": {
                     "policy": &policy,
-                    "roots": roots.iter().map(|r| r.path.display().to_string()).collect::<Vec<_>>(),
-                    "scope_key": &scope_key,
+                    "roots": journal_root_paths(&roots),
+                    "scope_key": event_opaque_id(&scope_key),
                 },
                 "options": {
                     "all": resolved.all,
@@ -2941,9 +3460,9 @@ async fn run_scan_inner(
     println!("scan_id: {scan_id}");
     println!("generation: {generation}");
     println!("report_id: {report_id}");
-    println!("snapshot: {}", snapshot_path.display());
+    println!("snapshot: {}", safe_path_display(&snapshot_path));
     if let Some(dest) = &report_dest {
-        println!("report: {}", dest.display());
+        println!("report: {}", safe_path_display(dest));
     }
     Ok(exit)
 }
@@ -2959,6 +3478,8 @@ struct ResumedRequest {
 
 /// True when `input` designates a local filesystem path (starts with `file://`,
 /// is a relative/absolute path syntax, or exists as a path on disk).
+const RESUME_REDACTED_LOCAL_TARGET: &str = "repo-scan:redacted-local-target";
+
 fn is_local_path_target(input: &str) -> bool {
     let trimmed = input.trim();
     if trimmed.starts_with("file://") {
@@ -2980,6 +3501,12 @@ fn is_local_path_target(input: &str) -> bool {
 /// Resolve scan target identity: supports remote GitHub URLs and local repository
 /// paths (worktrees, bare repositories, or standard repositories with `.git`).
 fn resolve_target_identity(input: &str) -> repo_scan::Result<(String, String)> {
+    if input == RESUME_REDACTED_LOCAL_TARGET {
+        return Err(repo_scan::Error::Store(
+            "saved local target path was redacted for privacy and cannot be reopened; rerun the scan with the original path"
+                .to_string(),
+        ));
+    }
     let trimmed = input.trim();
     if is_local_path_target(trimmed) {
         let raw_path = if let Some(stripped) = trimmed.strip_prefix("file://") {
@@ -3034,6 +3561,11 @@ fn resolve_target_identity(input: &str) -> repo_scan::Result<(String, String)> {
         }
     };
     Ok((target, canonical))
+}
+
+#[cfg(test)]
+pub fn test_resolve_target_identity(input: &str) -> repo_scan::Result<(String, String)> {
+    resolve_target_identity(input)
 }
 
 /// Resolve scan roots: explicit `--root`s (absolute, recorded as `roots`
@@ -3186,7 +3718,8 @@ async fn mint_scan_id(
     }
     // Redact-before-persist (EXACT-2): the catalog row carries the
     // sanitized target (scp user normalized), never the raw login.
-    let safe_url = identity::sanitize_target_url(raw_url);
+    let safe_url = identity::scrub_text(&identity::sanitize_target_url(raw_url));
+    let safe_canonical = canonical.map(identity::scrub_text);
     let now = store::now_ms();
     let dest_bytes = report_dest.as_ref().map(|p| config::path_as_bytes(p));
     // v2 request shape (D5/D6): the full target set served by one
@@ -3195,7 +3728,12 @@ async fn mint_scan_id(
     let targets_json = serde_json::to_string(
         &targets
             .iter()
-            .map(|(raw, canonical)| serde_json::json!({"raw": raw, "canonical": canonical}))
+            .map(|(raw, canonical)| {
+                serde_json::json!({
+                    "raw": identity::scrub_text(&identity::sanitize_target_url(raw)),
+                    "canonical": identity::scrub_text(canonical),
+                })
+            })
             .collect::<Vec<_>>(),
     )
     .map_err(|e| repo_scan::Error::Report(e.to_string()))?;
@@ -3211,7 +3749,7 @@ async fn mint_scan_id(
                 &NewScan {
                     id: &id,
                     url_raw: safe_url.as_bytes(),
-                    url_canonical: canonical.map(str::as_bytes),
+                    url_canonical: safe_canonical.as_deref().map(str::as_bytes),
                     scope: policy,
                     status_mode: status_mode_str(status),
                     report_dest: dest_bytes.as_deref(),
@@ -3413,11 +3951,17 @@ async fn enqueue_status_refresh(
     generation: u64,
     run_rev: u64,
     now_ms: i64,
+    scope_roots: Option<&[PathBuf]>,
 ) -> repo_scan::Result<()> {
+    let scoped_checkout_ids = match scope_roots {
+        Some(roots) => Some(checkouts_within_roots(store, roots).await?.checkout_ids),
+        None => None,
+    };
     let mut rows = store
         .connection()
         .query(
-            "SELECT c.id FROM checkouts c JOIN git_instances g ON g.id = c.instance_id \
+            "SELECT c.id \
+             FROM checkouts c JOIN git_instances g ON g.id = c.instance_id \
              WHERE g.disposition IN ('confirmed', 'related', 'probable')",
             (),
         )
@@ -3429,6 +3973,12 @@ async fn enqueue_status_refresh(
         .map_err(|e| repo_scan::Error::Store(e.to_string()))?
     {
         let checkout_id = cell_text(&row, 0)?;
+        if scoped_checkout_ids
+            .as_ref()
+            .is_some_and(|ids| !ids.contains(&checkout_id))
+        {
+            continue;
+        }
         enqueue_status_task(store, runner, generation, run_rev, &checkout_id, now_ms).await?;
     }
     flush_runner_batch(runner, store).await?;
@@ -3476,10 +4026,15 @@ async fn enqueue_analysis_refresh(
     generation: u64,
     run_rev: u64,
     now_ms: i64,
+    scope_roots: Option<&[PathBuf]>,
 ) -> repo_scan::Result<()> {
+    let scoped_repositories = match scope_roots {
+        Some(roots) => Some(checkouts_within_roots(store, roots).await?.repository_ids),
+        None => None,
+    };
     let mut rows = store
         .connection()
-        .query("SELECT id, common_path FROM git_instances", ())
+        .query("SELECT id, common_path, git_path FROM git_instances", ())
         .await
         .map_err(|e| repo_scan::Error::Store(e.to_string()))?;
     while let Some(row) = rows
@@ -3489,6 +4044,14 @@ async fn enqueue_analysis_refresh(
     {
         let instance_id = cell_text(&row, 0)?;
         let common = cell_blob(&row, 1)?;
+        if let (Some(roots), Some(repositories)) = (scope_roots, scoped_repositories.as_ref()) {
+            let git_path = config::path_from_bytes(cell_blob(&row, 2)?);
+            if !config::path_is_within_roots(&git_path, roots)
+                && !repositories.contains(&instance_id)
+            {
+                continue;
+            }
+        }
         enqueue_analysis_task(
             store,
             runner,
@@ -3592,16 +4155,22 @@ struct ScanVolume {
 /// Volumes behind this command: every mount for machine scope, the mounts
 /// containing the explicit roots for roots scope.
 #[cfg(target_os = "macos")]
-fn scan_volumes(policy: &str, roots: &[PlannedRoot]) -> repo_scan::Result<Vec<ScanVolume>> {
+fn scan_volumes(
+    policy: &str,
+    roots: &[PlannedRoot],
+    root_identities: &[(PathBuf, Option<u64>)],
+) -> repo_scan::Result<Vec<ScanVolume>> {
     let table = repo_scan::platform::macos::MacOsMountTable;
     let mounts = table.mounts()?;
     if policy == "roots" {
         let mut out: Vec<ScanVolume> = Vec::new();
-        for root in roots {
-            let deepest = mounts
-                .iter()
-                .filter(|m| root.path.starts_with(&m.mount_path))
-                .max_by_key(|m| m.mount_path.as_os_str().len());
+        let mount_paths: Vec<PathBuf> = mounts.iter().map(|m| m.mount_path.clone()).collect();
+        for (index, root) in roots.iter().enumerate() {
+            let identity = root_identities
+                .get(index)
+                .map(|(path, _)| path.as_path())
+                .unwrap_or(&root.path);
+            let deepest = deepest_mount_index(identity, &mount_paths).and_then(|n| mounts.get(n));
             if let Some(mount) = deepest {
                 if !out.iter().any(|v| v.key == mount.volume.0) {
                     out.push(ScanVolume {
@@ -3620,6 +4189,23 @@ fn scan_volumes(policy: &str, roots: &[PlannedRoot]) -> repo_scan::Result<Vec<Sc
             mount: m.mount_path,
         })
         .collect())
+}
+
+/// Select the deepest lexical mount containing an already-resolved root
+/// identity. Kept platform-independent so alias selection is regression-testable.
+#[cfg(any(target_os = "macos", test))]
+fn deepest_mount_index(root_identity: &Path, mount_paths: &[PathBuf]) -> Option<usize> {
+    mount_paths
+        .iter()
+        .enumerate()
+        .filter(|(_, mount)| root_identity.starts_with(mount))
+        .max_by_key(|(_, mount)| mount.as_os_str().len())
+        .map(|(index, _)| index)
+}
+
+#[cfg(test)]
+pub fn test_deepest_mount_index(root_identity: &Path, mount_paths: &[PathBuf]) -> Option<usize> {
+    deepest_mount_index(root_identity, mount_paths)
 }
 
 /// Durable per-volume cursors, read one volume at a time
@@ -3750,6 +4336,7 @@ async fn open_event_session(
     state_dir: &Path,
     policy: &str,
     roots: &[PlannedRoot],
+    root_identities: &[(PathBuf, Option<u64>)],
 ) -> repo_scan::Result<EventSession> {
     let stored = load_stored_cursors(store).await?;
     let mut session = EventSession {
@@ -3771,7 +4358,7 @@ async fn open_event_session(
     let _ = session.reconciler.own_bookkeeping_mut().register(state_dir);
     #[cfg(target_os = "macos")]
     {
-        let volumes = scan_volumes(policy, roots)?;
+        let volumes = scan_volumes(policy, roots, root_identities)?;
         let mut source = repo_scan::platform::macos::FsEventsSource;
         for volume in &volumes {
             let vid = repo_scan::platform::VolumeId(volume.key.clone());
@@ -4517,6 +5104,7 @@ async fn report_cursor_for_volume(
         }
     }
     scan.cursors = Some(RootCursors {
+        event_volume_id: None,
         history_uuid: Some(current),
         ingested: ingested.map(|c| c.0.to_string()),
         reconciled: reconciled.map(|c| c.0.to_string()),
@@ -4525,29 +5113,131 @@ async fn report_cursor_for_volume(
 }
 
 /// Per-root cursors aligned with `roots`, via the root's mount volume.
+fn root_event_volume_ids_for(
+    roots: &[PlannedRoot],
+    root_identities: &[(PathBuf, Option<u64>)],
+    session: &EventSession,
+) -> Vec<Option<String>> {
+    roots
+        .iter()
+        .enumerate()
+        .map(|(index, root)| {
+            if let Some(volume) = &root.volume {
+                return Some(volume.0.clone());
+            }
+            let identity = root_identities
+                .get(index)
+                .map(|(path, _)| path.as_path())
+                .unwrap_or(&root.path);
+            session
+                .mounts
+                .iter()
+                .filter(|(_, mount)| identity.starts_with(mount))
+                .max_by(|(left_key, left_mount), (right_key, right_mount)| {
+                    left_mount
+                        .as_os_str()
+                        .len()
+                        .cmp(&right_mount.as_os_str().len())
+                        .then_with(|| left_key.cmp(right_key))
+                })
+                .map(|(key, _)| key.clone())
+        })
+        .collect()
+}
+
+fn journal_root_paths(roots: &[PlannedRoot]) -> Vec<String> {
+    roots
+        .iter()
+        .map(|root| event_opaque_path(&root.path))
+        .collect()
+}
+
+/// Per-root cursors aligned with `roots`, via the mount selected for the
+/// root's resolved identity. The same volume mapping also scopes event errors.
 fn root_cursors_for(
     roots: &[PlannedRoot],
+    root_identities: &[(PathBuf, Option<u64>)],
     session: &EventSession,
     cursors: &HashMap<String, RootCursors>,
 ) -> Vec<RootCursors> {
-    roots
-        .iter()
-        .map(|root| {
-            if let Some(volume) = &root.volume {
-                if let Some(c) = cursors.get(&volume.0) {
-                    return c.clone();
-                }
-            }
-            let deepest = session
-                .mounts
-                .iter()
-                .filter(|(_, mount)| root.path.starts_with(mount))
-                .max_by_key(|(_, mount)| mount.as_os_str().len());
-            deepest
-                .and_then(|(key, _)| cursors.get(key).cloned())
-                .unwrap_or_default()
+    root_event_volume_ids_for(roots, root_identities, session)
+        .into_iter()
+        .map(|event_volume_id| {
+            let mut cursor = event_volume_id
+                .as_deref()
+                .and_then(|volume_id| cursors.get(volume_id))
+                .cloned()
+                .unwrap_or_default();
+            cursor.event_volume_id = event_volume_id;
+            cursor
         })
         .collect()
+}
+
+#[cfg(test)]
+pub fn test_root_cursor_alias_mapping(
+    lexical_root: &Path,
+    canonical_root: &Path,
+    mount: &Path,
+    volume_id: &str,
+    history_uuid: &str,
+) -> (Option<String>, Option<String>) {
+    let roots = [PlannedRoot {
+        path: lexical_root.to_path_buf(),
+        priority: RootPriority::Normal,
+        namespace: String::from("test"),
+        volume: None,
+    }];
+    let root_identities = [(canonical_root.to_path_buf(), None)];
+    let session = EventSession {
+        reconciler: events::Reconciler::new(events::MemoryCursorJournal::new()),
+        monitored: Vec::new(),
+        mounts: HashMap::from([(volume_id.to_string(), mount.to_path_buf())]),
+        applied_scopes: HashMap::new(),
+        applied_overflow: HashSet::new(),
+        history_invalid: false,
+        degraded: Vec::new(),
+        live: true,
+    };
+    let cursors = HashMap::from([(
+        volume_id.to_string(),
+        RootCursors {
+            event_volume_id: Some(volume_id.to_string()),
+            history_uuid: Some(history_uuid.to_string()),
+            ingested: Some(String::from("7")),
+            reconciled: Some(String::from("6")),
+        },
+    )]);
+    let cursor = root_cursors_for(&roots, &root_identities, &session, &cursors)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    (cursor.event_volume_id, cursor.history_uuid)
+}
+
+#[cfg(test)]
+pub async fn test_append_interrupted_roots_event(
+    store: &TursoStore,
+    scan_id: &str,
+    roots: &[PlannedRoot],
+) -> repo_scan::Result<()> {
+    let records = serde_json::json!({"scope": {"roots": journal_root_paths(roots)}});
+    let bytes = serde_json::to_vec(&records)
+        .map_err(|error| repo_scan::Error::Report(error.to_string()))?;
+    let revision = store.current_revision().await?;
+    store
+        .append_scan_event(&store::NewScanEvent {
+            scan_id,
+            seq: 1,
+            catalog_rev: revision,
+            event_offset: 0,
+            event_type: "scan_interrupted",
+            op: "add",
+            reset: false,
+            records: &bytes,
+        })
+        .await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -4693,6 +5383,11 @@ struct Runner {
     current_scope: String,
     /// Breaker key of the task currently executing (progress volume).
     current_volume: String,
+    /// Explicit roots and resolved aliases used to scope live progress.
+    scope_filter_roots: Option<Vec<PathBuf>>,
+    scope_identity_roots: Option<Vec<PathBuf>>,
+    /// Event volume UUIDs belonging to this run's explicit roots.
+    scope_event_volumes: HashSet<String>,
     /// Frontier denominator at the previous progress tick, for
     /// RSF-CHAINARGOS-PROGRESS-002 growth detection: `None` until the
     /// first tick, then the last tick's `total_tasks`.
@@ -4750,6 +5445,9 @@ impl Runner {
             run_started: Instant::now(),
             current_scope: String::new(),
             current_volume: String::new(),
+            scope_filter_roots: None,
+            scope_identity_roots: None,
+            scope_event_volumes: HashSet::new(),
             progress_last_total: None,
             pending_alias_checks: Vec::new(),
             journal: None,
@@ -5127,6 +5825,8 @@ async fn run_until_boundary(
     canonical: &str,
     status_mode: StatusMode,
     scan_id: &str,
+    scope_roots: Option<&[PathBuf]>,
+    scope_identity_roots: Option<&[PathBuf]>,
     phase: DrainPhase,
 ) -> repo_scan::Result<RunOutcome> {
     loop {
@@ -5381,8 +6081,17 @@ async fn run_until_boundary(
         DrainPhase::Discovery => store.pending_count_kinds(generation, phase.kinds()).await?,
         DrainPhase::Analysis => store.pending_count(generation).await?,
     };
-    let open_gaps = count_open_errors(store).await?;
-    let unresolvable = count_unresolvable(store).await?;
+    let open_gaps = count_open_errors_for_scope(
+        store,
+        scope_roots,
+        scope_identity_roots,
+        &runner.scope_event_volumes,
+    )
+    .await?;
+    let unresolvable = match scope_roots {
+        Some(roots) => count_unresolvable_in_roots(store, roots).await?,
+        None => count_unresolvable(store).await?,
+    };
     let status_pending = match phase {
         DrainPhase::Discovery => 0,
         DrainPhase::Analysis => count_status_pending(store, generation).await?,
@@ -5799,7 +6508,13 @@ async fn emit_progress(
         eprintln!("{line}");
     }
     if journal_progress {
-        let open_gaps = count_open_errors(store).await?;
+        let open_gaps = count_open_errors_for_scope(
+            store,
+            runner.scope_filter_roots.as_deref(),
+            runner.scope_identity_roots.as_deref(),
+            &runner.scope_event_volumes,
+        )
+        .await?;
         let records = discovery_progress_records(phase, elapsed, &totals, open_gaps)?;
         journal_discovery_progress(runner, store, &records).await?;
         if let Some(view) = runner.tui.as_mut() {
@@ -6042,9 +6757,12 @@ fn coverage_updated_value(
     unresolvable_added: &[String],
 ) -> serde_json::Value {
     serde_json::json!({
-        "opened": opened,
-        "closed": closed,
-        "unresolvable_added": unresolvable_added,
+        "opened": opened.iter().map(|id| event_opaque_id(id)).collect::<Vec<_>>(),
+        "closed": closed.iter().map(|id| event_opaque_id(id)).collect::<Vec<_>>(),
+        "unresolvable_added": unresolvable_added
+            .iter()
+            .map(|id| event_opaque_id(id))
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -6082,9 +6800,10 @@ fn error_records_value(
     category: &str,
     detail: &str,
 ) -> serde_json::Value {
+    let detail = event_safe_detail(detail);
     serde_json::json!({
-        "id": id,
-        "scope_key": scope_key,
+        "id": event_opaque_id(id),
+        "scope_key": event_opaque_id(scope_key),
         "category": category,
         "detail": detail,
     })
@@ -6109,11 +6828,12 @@ fn buffer_record_error(
     next_retry_ms: Option<i64>,
     now_ms: i64,
 ) -> repo_scan::Result<bool> {
+    let detail = identity::scrub_text(detail);
     runner.batch.push(
         "UPDATE errors SET attempts = attempts + 1, detail = ?1, last_seen_ms = ?2, \
          next_retry_ms = ?3, open = 1 WHERE id = ?4",
         vec![
-            turso::Value::Text(detail.to_string()),
+            turso::Value::Text(detail.clone()),
             turso::Value::Integer(now_ms),
             next_retry_ms.map_or(turso::Value::Null, turso::Value::Integer),
             turso::Value::Text(id.to_string()),
@@ -6127,7 +6847,7 @@ fn buffer_record_error(
             turso::Value::Text(id.to_string()),
             turso::Value::Text(scope_key.to_string()),
             turso::Value::Text(category.to_string()),
-            turso::Value::Text(detail.to_string()),
+            turso::Value::Text(detail.clone()),
             turso::Value::Integer(now_ms),
             next_retry_ms.map_or(turso::Value::Null, turso::Value::Integer),
         ],
@@ -6140,7 +6860,7 @@ fn buffer_record_error(
     // cause has committed. Unit-test runners (journal: None) persist rows
     // without journaling.
     if let Some(journal) = runner.journal.as_mut() {
-        let records = error_records(id, scope_key, category, detail)?;
+        let records = error_records(id, scope_key, category, &detail)?;
         journal.buffer_error(&mut runner.batch, &records)?;
         if fresh_open {
             let opened = vec![id.to_string()];
@@ -6149,6 +6869,29 @@ fn buffer_record_error(
         }
     }
     Ok(runner.batch.should_flush())
+}
+
+/// Exercise the production buffered error persistence and journal path.
+#[cfg(test)]
+pub async fn test_buffer_record_error(
+    store: &TursoStore,
+    scan_id: &str,
+    detail: &str,
+) -> repo_scan::Result<()> {
+    let mut runner = Runner::new(&config::ResourceLimits::default());
+    let rev = store.next_revision().await?;
+    runner.journal = Some(ScanJournal::open(store, scan_id, rev).await?);
+    buffer_record_error(
+        &mut runner,
+        "gap:test-secret-detail",
+        "scope:test",
+        "test-error",
+        detail,
+        None,
+        store::now_ms(),
+    )?;
+    flush_runner_batch(&mut runner, store).await?;
+    Ok(())
 }
 
 /// Buffer a gap close (RSF-AC461500-609D-4D55-991E-09C60D382D67), mirroring
@@ -6862,12 +7605,13 @@ fn buffer_completion_gap(
     outcome_state: &str,
     now_ms: i64,
 ) {
+    let detail = identity::scrub_text(detail);
     runner.batch.push(
         "UPDATE errors SET attempts = attempts + 1, detail = ?1, last_seen_ms = ?2, \
             next_retry_ms = ?3, open = 1 WHERE id = ?4 AND EXISTS ( \
             SELECT 1 FROM frontier_tasks WHERE id = ?5 AND state = ?6 AND updated_at_ms = ?7)",
         vec![
-            turso::Value::Text(detail.to_string()),
+            turso::Value::Text(detail.clone()),
             turso::Value::Integer(now_ms),
             next_retry_ms.map_or(turso::Value::Null, turso::Value::Integer),
             turso::Value::Text(gap_id.to_string()),
@@ -6886,7 +7630,7 @@ fn buffer_completion_gap(
             turso::Value::Text(gap_id.to_string()),
             turso::Value::Text(scope_key.to_string()),
             turso::Value::Text(category.to_string()),
-            turso::Value::Text(detail.to_string()),
+            turso::Value::Text(detail),
             turso::Value::Integer(now_ms),
             turso::Value::Integer(now_ms),
             next_retry_ms.map_or(turso::Value::Null, turso::Value::Integer),
@@ -6896,6 +7640,36 @@ fn buffer_completion_gap(
             turso::Value::Text(gap_id.to_string()),
         ],
     );
+}
+
+/// Exercise the production completion-gap follow-up SQL after the task's
+/// outcome transaction has committed. The matching task state and timestamp
+/// gate ensure this writes the same row shape as the live drain path.
+#[cfg(test)]
+pub async fn test_buffer_completion_gap_detail(
+    store: &TursoStore,
+    task_id: &str,
+    detail: &str,
+    now_ms: i64,
+) -> repo_scan::Result<()> {
+    let task = store
+        .get_task(task_id)
+        .await?
+        .ok_or_else(|| repo_scan::Error::Store("test task is missing".to_string()))?;
+    let mut runner = Runner::new(&config::ResourceLimits::default());
+    buffer_completion_gap(
+        &mut runner,
+        &format!("gap:{task_id}"),
+        &task.scope_key,
+        "test-completion-gap",
+        detail,
+        None,
+        task_id,
+        "retry_wait",
+        now_ms,
+    );
+    flush_runner_batch(&mut runner, store).await?;
+    Ok(())
 }
 
 /// Committed task row fields one completion classification reads.
@@ -7077,7 +7851,7 @@ async fn reconcile_missing_gap_events(
     let gaps = store.list_open_task_gaps(generation).await?;
     let mut caught_up = 0usize;
     for gap in &gaps {
-        if !journal.error_ids.insert(gap.id.clone()) {
+        if !journal.error_ids.insert(event_opaque_id(&gap.id)) {
             continue;
         }
         // Newly inserted above = missing from the journal prefix.
@@ -9196,7 +9970,7 @@ fn repository_found_records(
     github_groups.sort_unstable();
     github_groups.dedup();
     let records = serde_json::json!({
-        "store_id": store_id,
+        "store_id": event_opaque_id(store_id),
         "identity": identity,
         "identity_state": identity_state,
         "remotes": remotes.iter().map(|r| serde_json::json!({
@@ -9205,8 +9979,8 @@ fn repository_found_records(
                 git::RemoteRole::Fetch => "fetch",
                 git::RemoteRole::Push => "push",
             },
-            "url": r.url,
-            "canonical_url": r.canonical_url,
+            "url": event_safe_remote_url(&r.url),
+            "canonical_url": r.canonical_url.as_deref().map(event_safe_remote_url),
         })).collect::<Vec<_>>(),
         "github_groups": github_groups,
         "analysis": "pending",
@@ -9214,24 +9988,21 @@ fn repository_found_records(
     serde_json::to_vec(&records).map_err(|e| repo_scan::Error::Report(e.to_string()))
 }
 
-/// `location_found` records (D4): checkout/store ids, observed path
-/// (lossy display + exact hex), identity or `unknown`, and
-/// `analysis: "pending"`. Alias deltas arrive via `location_updated`.
+/// `location_found` records (D4): checkout/store ids, identity or
+/// `unknown`, and `analysis: "pending"`. Local filesystem paths stay in
+/// the protected catalog/report and are not copied into the JSONL journal.
+/// Alias deltas arrive via `location_updated`.
 fn location_found_records(
     checkout_id: &str,
     store_id: &str,
-    path: &[u8],
-    git_path: &[u8],
+    _path: &[u8],
+    _git_path: &[u8],
     remotes: &[git::RemoteObservation],
 ) -> repo_scan::Result<Vec<u8>> {
     let (identity, identity_state) = found_identity(remotes);
     let records = serde_json::json!({
-        "checkout_id": checkout_id,
-        "store_id": store_id,
-        "path": String::from_utf8_lossy(path),
-        "path_hex": config::encode_hex(path),
-        "git_path": String::from_utf8_lossy(git_path),
-        "git_path_hex": config::encode_hex(git_path),
+        "checkout_id": event_opaque_id(checkout_id),
+        "store_id": event_opaque_id(store_id),
         "identity": identity,
         "identity_state": identity_state,
         "analysis": "pending",
@@ -9265,7 +10036,7 @@ fn branch_record_value(
     behind: Option<u64>,
 ) -> serde_json::Value {
     serde_json::json!({
-        "id": id,
+        "id": event_opaque_id(id),
         "kind": kind,
         "name": String::from_utf8_lossy(name),
         "name_hex": config::encode_hex(name),
@@ -9293,7 +10064,7 @@ fn branch_batch_records(
     branches: &[serde_json::Value],
 ) -> repo_scan::Result<Vec<u8>> {
     let records = serde_json::json!({
-        "store_id": store_id,
+        "store_id": event_opaque_id(store_id),
         "rev": rev,
         "batch_index": batch_index,
         "batch_count": batch_count,
@@ -9375,8 +10146,8 @@ fn location_updated_records(
     observed_rev: u64,
 ) -> repo_scan::Result<Vec<u8>> {
     let records = serde_json::json!({
-        "checkout_id": checkout_id,
-        "store_id": store_id,
+        "checkout_id": event_opaque_id(checkout_id),
+        "store_id": event_opaque_id(store_id),
         "rev": observed_rev,
         "status_state": state,
         "mode": mode,
@@ -9707,10 +10478,11 @@ async fn persist_probe(
         disposition,
         identity::MatchDisposition::UnresolvableIdentity
     ) {
-        let fresh = runner
-            .journal
-            .as_mut()
-            .is_some_and(|journal| journal.emitted_unresolvable.insert(instance_id.clone()));
+        let fresh = runner.journal.as_mut().is_some_and(|journal| {
+            journal
+                .emitted_unresolvable
+                .insert(event_opaque_id(&instance_id))
+        });
         if fresh {
             journal_coverage_updated(runner, store, &[], &[], std::slice::from_ref(&instance_id))
                 .await?;
@@ -12356,6 +13128,82 @@ async fn count_unresolvable(store: &TursoStore) -> repo_scan::Result<u64> {
     .await
 }
 
+async fn count_open_errors_for_scope(
+    store: &TursoStore,
+    scope_roots: Option<&[PathBuf]>,
+    scope_identity_roots: Option<&[PathBuf]>,
+    event_volume_ids: &HashSet<String>,
+) -> repo_scan::Result<u64> {
+    match scope_roots {
+        Some(roots) => {
+            count_open_errors_in_roots(
+                store,
+                roots,
+                scope_identity_roots.unwrap_or(roots),
+                event_volume_ids,
+            )
+            .await
+        }
+        None => count_open_errors(store).await,
+    }
+}
+
+async fn count_open_errors_in_roots(
+    store: &TursoStore,
+    roots: &[PathBuf],
+    identity_roots: &[PathBuf],
+    event_volume_ids: &HashSet<String>,
+) -> repo_scan::Result<u64> {
+    let mut scoped = checkouts_within_roots(store, roots).await?;
+    scoped.volume_ids.extend(event_volume_ids.iter().cloned());
+    let mut rows = store
+        .connection()
+        .query("SELECT scope_key FROM errors WHERE open = 1", ())
+        .await
+        .map_err(store_err)?;
+    let mut count = 0u64;
+    while let Some(row) = rows.next().await.map_err(store_err)? {
+        let scope_key = cell_text(&row, 0)?;
+        if error_is_within_roots(
+            &scope_key,
+            roots,
+            identity_roots,
+            &scoped.checkout_ids,
+            &scoped.volume_ids,
+        ) {
+            count = count.saturating_add(1);
+        }
+    }
+    Ok(count)
+}
+
+async fn count_unresolvable_in_roots(
+    store: &TursoStore,
+    roots: &[PathBuf],
+) -> repo_scan::Result<u64> {
+    let scoped = checkouts_within_roots(store, roots).await?;
+    let mut rows = store
+        .connection()
+        .query(
+            "SELECT id, git_path FROM git_instances \
+             WHERE disposition = 'unresolvable_identity'",
+            (),
+        )
+        .await
+        .map_err(store_err)?;
+    let mut count = 0u64;
+    while let Some(row) = rows.next().await.map_err(store_err)? {
+        let repository_id = cell_text(&row, 0)?;
+        let git_path = config::path_from_bytes(cell_blob(&row, 1)?);
+        if scoped.repository_ids.contains(&repository_id)
+            || config::path_is_within_roots(&git_path, roots)
+        {
+            count = count.saturating_add(1);
+        }
+    }
+    Ok(count)
+}
+
 /// Status tasks still needing scheduler action (m10): the same terminal
 /// exclusion as `TursoStore::pending_count`, so both lanes union on one
 /// pending definition when they share a task. `unsupported` is terminal
@@ -12493,6 +13341,8 @@ async fn count_dirs_complete(store: &TursoStore, generation: u64) -> repo_scan::
 /// Per-root event cursors for the report (R5).
 #[derive(Debug, Clone, Default)]
 struct RootCursors {
+    /// Actual per-root event volume UUID, when the session monitors it.
+    event_volume_id: Option<String>,
     history_uuid: Option<String>,
     ingested: Option<String>,
     reconciled: Option<String>,
@@ -12515,6 +13365,13 @@ struct ScanReportInputs {
     finished_ms: i64,
     report_dest: Option<PathBuf>,
     roots: Vec<PlannedRoot>,
+    /// Canonicalized explicit-root identities used for generation and gap keys.
+    scope_roots: Option<Vec<PathBuf>>,
+    /// Requested and canonical explicit-root spellings used for catalog filters.
+    scope_filter_roots: Option<Vec<PathBuf>>,
+    scope_identity_roots: Option<Vec<PathBuf>>,
+    /// Event-monitor volume identities attached to the requested roots.
+    event_volume_ids: Vec<String>,
     counters: RunCounters,
     pending: u64,
     aliases: Vec<ObservedAlias>,
@@ -12547,25 +13404,70 @@ struct OpenError {
     next_retry_ms: Option<i64>,
 }
 
-/// One page of open gaps, oldest first
+const DERIVATION_RESUME_MARKER: &str = "resume_after_id_hex=";
+
+/// Read the durable source-ID cursor embedded in a derivation gap detail.
+/// `Some(None)` means the previous pass wrapped to the first row; `None`
+/// means no resumable cursor was recorded.
+fn derivation_cursor_from_detail(detail: &str) -> Option<Option<String>> {
+    let value = detail
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix(DERIVATION_RESUME_MARKER))?;
+    if value == "-" {
+        return Some(None);
+    }
+    let id = config::decode_hex(value)?;
+    String::from_utf8(id).ok().map(Some)
+}
+
+async fn derivation_resume_state(
+    store: &TursoStore,
+    gap_id: &str,
+) -> repo_scan::Result<(bool, Option<Option<String>>)> {
+    let Some(error) = store.get_error(gap_id).await? else {
+        return Ok((false, None));
+    };
+    if !error.open || error.category != "report-derivation-truncated" {
+        return Ok((false, None));
+    }
+    Ok((true, derivation_cursor_from_detail(&error.detail)))
+}
+
+fn derivation_detail_with_cursor(detail: &str, after_id: Option<&str>) -> String {
+    let cursor = after_id
+        .map(|id| config::encode_hex(id.as_bytes()))
+        .unwrap_or_else(|| String::from("-"));
+    format!("{detail}; {DERIVATION_RESUME_MARKER}{cursor}")
+}
+
+/// One page of open gaps after a source ID, oldest first
 /// (RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1). Page bounds are
-/// interpolated numerics (owner-controlled), never bound parameters:
-/// the pinned engine needs no bound-`LIMIT` support. The defensive
-/// length cap holds even if the engine ignored `LIMIT`.
+/// interpolated numerics (owner-controlled), never bound parameters;
+/// the source cursor is a bound value. The defensive length cap holds
+/// even if the engine ignored `LIMIT`.
 async fn load_open_errors_page(
     store: &TursoStore,
     limit: i64,
-    offset: i64,
+    after_id: Option<&str>,
 ) -> repo_scan::Result<Vec<OpenError>> {
     let limit = limit.max(1);
-    let offset = offset.max(0);
-    let sql = format!(
-        "SELECT id, scope_key, category, detail, next_retry_ms FROM errors \
-         WHERE open = 1 ORDER BY id ASC LIMIT {limit} OFFSET {offset}"
-    );
+    let sql = if after_id.is_some() {
+        format!(
+            "SELECT id, scope_key, category, detail, next_retry_ms FROM errors \
+             WHERE open = 1 AND id > ?1 ORDER BY id ASC LIMIT {limit}"
+        )
+    } else {
+        format!(
+            "SELECT id, scope_key, category, detail, next_retry_ms FROM errors \
+             WHERE open = 1 ORDER BY id ASC LIMIT {limit}"
+        )
+    };
+    let params = after_id
+        .map(|id| vec![turso::Value::Text(id.to_string())])
+        .unwrap_or_default();
     let mut rows = store
         .connection()
-        .query(sql.as_str(), ())
+        .query(sql.as_str(), params)
         .await
         .map_err(store_err)?;
     let mut out = Vec::new();
@@ -12638,12 +13540,113 @@ pub struct ErrorDerivations {
     pub truncated: bool,
     /// Truncation detail (empty unless `truncated`).
     pub trunc_detail: String,
+    /// Last source row successfully passed by the bounded derivation page.
+    resume_after_id: Option<String>,
+}
+
+struct RootScopedCheckouts {
+    checkout_ids: HashSet<String>,
+    repository_ids: HashSet<String>,
+    volume_ids: HashSet<String>,
+}
+
+async fn checkouts_within_roots(
+    store: &TursoStore,
+    roots: &[PathBuf],
+) -> repo_scan::Result<RootScopedCheckouts> {
+    let mut rows = store
+        .connection()
+        .query("SELECT id, git_path FROM git_instances ORDER BY id ASC", ())
+        .await
+        .map_err(store_err)?;
+    let mut included_repositories = HashSet::new();
+    while let Some(row) = rows.next().await.map_err(store_err)? {
+        let id = cell_text(&row, 0)?;
+        let git_path = config::path_from_bytes(cell_blob(&row, 1)?);
+        if config::path_is_within_roots(&git_path, roots) {
+            included_repositories.insert(id);
+        }
+    }
+    let mut rows = store
+        .connection()
+        .query(
+            "SELECT id, instance_id, root_path, git_path FROM checkouts ORDER BY id ASC",
+            (),
+        )
+        .await
+        .map_err(store_err)?;
+    let mut included = RootScopedCheckouts {
+        checkout_ids: HashSet::new(),
+        repository_ids: included_repositories,
+        volume_ids: repo_scan::report::builder::volume_ids_within_roots(store.connection(), roots)
+            .await?,
+    };
+    while let Some(row) = rows.next().await.map_err(store_err)? {
+        let checkout_id = cell_text(&row, 0)?;
+        let instance_id = cell_text(&row, 1)?;
+        let path = cell_opt_blob(&row, 2)?.unwrap_or(cell_blob(&row, 3)?);
+        let path = config::path_from_bytes(path);
+        if config::path_is_within_roots(&path, roots) {
+            included.repository_ids.insert(instance_id.clone());
+        }
+        if included.repository_ids.contains(&instance_id) {
+            included.checkout_ids.insert(checkout_id);
+        }
+    }
+    // A registered linked worktree is part of an in-scope repository even
+    // when its checkout path is outside the requested enumeration root.
+    // The root checkout above establishes membership; retain its siblings.
+    let mut rows = store
+        .connection()
+        .query("SELECT id, instance_id FROM checkouts ORDER BY id ASC", ())
+        .await
+        .map_err(store_err)?;
+    while let Some(row) = rows.next().await.map_err(store_err)? {
+        let checkout_id = cell_text(&row, 0)?;
+        let instance_id = cell_text(&row, 1)?;
+        if included.repository_ids.contains(&instance_id) {
+            included.checkout_ids.insert(checkout_id);
+        }
+    }
+    Ok(included)
+}
+
+fn error_is_within_roots(
+    scope_key: &str,
+    roots: &[PathBuf],
+    identity_roots: &[PathBuf],
+    checkouts: &HashSet<String>,
+    volumes: &HashSet<String>,
+) -> bool {
+    match config::parse_scope_key(scope_key) {
+        Some(config::ScopeRef::Dir(path) | config::ScopeRef::Git(path)) => {
+            config::path_is_within_roots(&path, roots)
+        }
+        Some(config::ScopeRef::Status(checkout_id)) => checkouts.contains(&checkout_id),
+        None => {
+            scope_key == config::report_derivation_gap_scope_key(Some(identity_roots))
+                || scope_key
+                    .strip_prefix("volume:")
+                    .is_some_and(|id| volumes.contains(id))
+        }
+    }
 }
 
 pub async fn scan_error_derivations(
     store: &TursoStore,
     root_scopes: &[String],
     caps: &DerivationCaps,
+) -> repo_scan::Result<ErrorDerivations> {
+    scan_error_derivations_scoped(store, root_scopes, None, caps, None, None).await
+}
+
+async fn scan_error_derivations_scoped(
+    store: &TursoStore,
+    root_scopes: &[String],
+    root_scope_aliases: Option<&[String]>,
+    caps: &DerivationCaps,
+    scope_roots: Option<&[PathBuf]>,
+    scope_identity_roots: Option<&[PathBuf]>,
 ) -> repo_scan::Result<ErrorDerivations> {
     let mut out = ErrorDerivations {
         candidates: Vec::new(),
@@ -12653,25 +13656,63 @@ pub async fn scan_error_derivations(
         peak_chunk: 0,
         truncated: false,
         trunc_detail: String::new(),
+        resume_after_id: None,
     };
     // Pressure backstop (SR-STATE-03): sample the aggregate footprint per
     // page against the spec §5 threshold (`Config::load` always installs
     // `ResourceLimits::default`, so this is the effective threshold).
     let sampler = FootprintSampler::new();
     let pressure_at = config::ResourceLimits::default().pressure_threshold_bytes;
+    let gap_id = config::report_derivation_gap_id("errors", scope_identity_roots.or(scope_roots));
+    let (prior_gap_open, resume_marker) = derivation_resume_state(store, &gap_id).await?;
+    let resuming = resume_marker.is_some();
+    let resumed_after = resume_marker.as_ref().and_then(|after| after.clone());
+    let mut after_id = resumed_after.clone();
+    out.resume_after_id = after_id.clone();
     let mut root_id_total: usize = 0;
-    let mut offset: i64 = 0;
+    let scoped_checkout_repos = match scope_roots {
+        Some(roots) => Some(checkouts_within_roots(store, roots).await?),
+        None => None,
+    };
     loop {
-        let chunk = load_open_errors_page(store, LOAD_CHUNK_ROWS, offset).await?;
+        let chunk = load_open_errors_page(store, LOAD_CHUNK_ROWS, after_id.as_deref()).await?;
         if chunk.is_empty() {
             break;
         }
         out.chunks += 1;
         out.peak_chunk = out.peak_chunk.max(chunk.len());
         for error in &chunk {
-            if out.candidates.len() >= caps.max_error_candidates
-                || root_id_total >= caps.max_root_error_ids
-            {
+            if let (Some(roots), Some(checkouts)) = (scope_roots, scoped_checkout_repos.as_ref()) {
+                let identity_roots = scope_identity_roots.unwrap_or(roots);
+                if !error_is_within_roots(
+                    &error.scope_key,
+                    roots,
+                    identity_roots,
+                    &checkouts.checkout_ids,
+                    &checkouts.volume_ids,
+                ) {
+                    after_id = Some(error.id.clone());
+                    out.resume_after_id = after_id.clone();
+                    continue;
+                }
+            }
+            let candidate = error_candidate(error);
+            let matching_roots: Vec<usize> = root_scopes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, scope)| {
+                    let primary_match = error.scope_key == *scope;
+                    let alias_match = root_scope_aliases
+                        .and_then(|aliases| aliases.get(index))
+                        .is_some_and(|alias| error.scope_key == *alias);
+                    (primary_match || alias_match).then_some(index)
+                })
+                .collect();
+            let candidate_over_cap =
+                candidate.is_some() && out.candidates.len() >= caps.max_error_candidates;
+            let root_ids_over_cap =
+                matching_roots.len() > caps.max_root_error_ids.saturating_sub(root_id_total);
+            if candidate_over_cap || root_ids_over_cap {
                 out.truncated = true;
                 out.trunc_detail = format!(
                     "error derivations stopped: {} candidates (cap {}) and {} root error ids \
@@ -12685,13 +13726,15 @@ pub async fn scan_error_derivations(
                 break;
             }
             out.scanned += 1;
-            push_error_candidate(&mut out.candidates, error);
-            for (n, scope) in root_scopes.iter().enumerate() {
-                if error.scope_key == *scope {
-                    out.root_error_ids[n].push(error.id.clone());
-                    root_id_total += 1;
-                }
+            if let Some(candidate) = candidate {
+                push_error_candidate(&mut out.candidates, error, candidate);
             }
+            for n in matching_roots {
+                out.root_error_ids[n].push(error.id.clone());
+                root_id_total += 1;
+            }
+            after_id = Some(error.id.clone());
+            out.resume_after_id = after_id.clone();
         }
         if out.truncated {
             break;
@@ -12712,27 +13755,38 @@ pub async fn scan_error_derivations(
             );
             break;
         }
-        if chunk.len() as i64 >= LOAD_CHUNK_ROWS {
-            offset += chunk.len() as i64;
-        } else {
+        if (chunk.len() as i64) < LOAD_CHUNK_ROWS {
             break;
         }
+    }
+    if !out.truncated && resuming && resumed_after.is_some() {
+        out.truncated = true;
+        out.resume_after_id = None;
+        out.trunc_detail = format!(
+            "error derivations reached the end of the resumed source window after {} scanned rows; \
+             next pass wraps to the first row",
+            out.scanned,
+        );
     }
     if out.truncated {
         // Stable gap id: repeated truncated runs refresh one row instead
         // of growing the table (attempts count the truncations). The gap
         // streams into the report's errors section with the resume note.
+        let detail =
+            derivation_detail_with_cursor(&out.trunc_detail, out.resume_after_id.as_deref());
         store
             .record_error(
-                "gap:report-derivation:errors",
-                "gap:report-derivation",
+                &gap_id,
+                &config::report_derivation_gap_scope_key(scope_identity_roots.or(scope_roots)),
                 "report-derivation-truncated",
-                &out.trunc_detail,
+                &detail,
                 None,
                 store::now_ms(),
             )
             .await?;
         eprintln!("repo-scan: {}", out.trunc_detail);
+    } else if prior_gap_open {
+        store.resolve_error(&gap_id, store::now_ms()).await?;
     }
     Ok(out)
 }
@@ -12740,15 +13794,21 @@ pub async fn scan_error_derivations(
 /// One gap's candidate contribution, if it is a failed/unsupported probe.
 /// Pure coverage gaps (permission, symlink, status) are errors, not
 /// candidates.
-fn push_error_candidate(out: &mut Vec<CandidateInput>, error: &OpenError) {
+fn error_candidate(error: &OpenError) -> Option<(&'static str, PathBuf)> {
     let disposition = match error.category.as_str() {
         "probe-failed" => "probe_failed",
         "unsupported-git-format" => "unsupported",
-        _ => return,
+        _ => return None,
     };
-    let Some(path) = scope_path(&error.scope_key) else {
-        return;
-    };
+    let path = scope_path(&error.scope_key)?;
+    Some((disposition, path))
+}
+
+fn push_error_candidate(
+    out: &mut Vec<CandidateInput>,
+    error: &OpenError,
+    (disposition, path): (&'static str, PathBuf),
+) {
     out.push(CandidateInput {
         id: format!("cand-err:{}", error.id),
         path_bytes: config::path_as_bytes(&path),
@@ -12982,13 +14042,15 @@ fn plan_fetch_transport(
 /// config and local transports execute it (probed: a wrapper set as
 /// `remote.origin.uploadpack` runs on `git fetch` from a local path);
 /// `receivepack` refuses for symmetry (a fetch never reads it, but a
-/// repo overriding pack commands is hostile either way).
+/// repo overriding pack commands is hostile either way); `remote.*.vcs`
+/// can select a repo-chosen remote helper and is refused before fetch.
 ///
-/// True for lowercase `remote.<name>.uploadpack` / `receivepack` keys
+/// True for lowercase `remote.<name>.uploadpack` / `receivepack` / `vcs` keys
 /// (the origin parser lowercases whole keys, so subsection case never
 /// hides these suffixes).
-fn is_remote_pack_override(key: &str) -> bool {
-    key.starts_with("remote.") && (key.ends_with(".uploadpack") || key.ends_with(".receivepack"))
+fn is_remote_exec_override(key: &str) -> bool {
+    key.starts_with("remote.")
+        && (key.ends_with(".uploadpack") || key.ends_with(".receivepack") || key.ends_with(".vcs"))
 }
 
 fn plan_fetch_exec_config(git: &git::fallback::FallbackGit, dir: &Path) -> Result<(), FetchGate> {
@@ -13016,14 +14078,25 @@ fn plan_fetch_exec_config(git: &git::fallback::FallbackGit, dir: &Path) -> Resul
             || key == "core.sshcommand"
             || key.starts_with("include.")
             || key.starts_with("includeif.")
-            || is_remote_pack_override(key);
+            || is_remote_exec_override(key);
         if !gated {
             continue;
         }
         if let Some(file) = origin.file.as_deref() {
             if git::fallback::config_origin_within_repo(file, dir) {
+                let setting = if is_remote_exec_override(key) {
+                    "remote executable setting"
+                } else if key == "credential.helper" {
+                    "credential.helper"
+                } else if key == "core.sshcommand" {
+                    "core.sshcommand"
+                } else if key.starts_with("includeif.") {
+                    "includeIf setting"
+                } else {
+                    "include setting"
+                };
                 return Err(FetchGate::refused(format!(
-                    "repo-scope `{key}` would run repo-chosen commands during fetch; refusing"
+                    "repo-scope {setting} would run repo-chosen commands during fetch; refusing"
                 )));
             }
         }
@@ -13054,6 +14127,203 @@ impl From<FetchGate> for Result<FetchPlan, String> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchRefStorage {
+    Files,
+    Reftable,
+}
+
+/// Check the active backend's writable ref storage before inspecting
+/// refs. This is a local preflight; concurrent external mutation can
+/// still race the subsequent Git fetch transaction.
+fn fetch_ref_storage_path_safety(
+    git_dir: &Path,
+    remote_name: &str,
+    refspecs: &[git::refspec::FetchRefspec],
+    storage: FetchRefStorage,
+) -> Result<(), &'static str> {
+    if !refspecs
+        .iter()
+        .any(|refspec| !refspec.negative && refspec.dst.is_some())
+    {
+        return Ok(());
+    }
+    let namespace = match storage {
+        FetchRefStorage::Files => {
+            // Check namespace ancestors as well as the namespace root,
+            // including when no mapped refs exist yet.
+            let probe = format!("refs/remotes/{remote_name}/__repo_scan_preflight__");
+            match fetch_ref_path_has_symlink_component(git_dir, probe.as_bytes()) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Err(
+                        "fetch destination namespace uses a filesystem symlink; refusing fetch",
+                    )
+                }
+                Err(_) => return Err("cannot verify fetch destination paths; refusing fetch"),
+            }
+            git_dir.join(config::path_from_bytes(
+                format!("refs/remotes/{remote_name}").into_bytes(),
+            ))
+        }
+        FetchRefStorage::Reftable => git_dir.join("reftable"),
+    };
+    match fetch_ref_namespace_has_symlink(&namespace) {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err("fetch destination storage contains a filesystem symlink; refusing fetch")
+        }
+        Err(()) => return Err("cannot verify fetch destination storage; refusing fetch"),
+    }
+    Ok(())
+}
+
+/// Check existing destination refs from the byte-exact local ref
+/// observation. Git symbolic refs can redirect tracking destinations
+/// to local branches, including through transitive links.
+fn fetch_destination_symref_safety(
+    remote_name: &str,
+    refspecs: &[git::refspec::FetchRefspec],
+    refs: &[git::fallback::TrackingRef],
+) -> Result<(), &'static str> {
+    let remote_prefix = format!("refs/remotes/{remote_name}/").into_bytes();
+    let symrefs: HashMap<&[u8], &[u8]> = refs
+        .iter()
+        .filter(|reference| !reference.symref.is_empty())
+        .map(|reference| (reference.name.as_slice(), reference.symref.as_slice()))
+        .collect();
+    for reference in refs {
+        if !git::refspec::covered_by_positive(refspecs, &reference.name) {
+            continue;
+        }
+        if reference.symref.is_empty() {
+            continue;
+        }
+
+        // Follow the full chain: `origin/HEAD -> origin/main ->
+        // refs/heads/main` is as unsafe as a direct link. A cycle is
+        // also refused because its final write target is indeterminate.
+        let mut seen = HashSet::<Vec<u8>>::new();
+        seen.insert(reference.name.clone());
+        let mut target = reference.symref.as_slice();
+        loop {
+            if !target.starts_with(&remote_prefix) {
+                return Err(
+                    "fetch destination symbolic ref escapes this remote's tracking namespace; refusing fetch",
+                );
+            }
+            if !seen.insert(target.to_vec()) {
+                return Err("fetch destination symbolic ref cycle; refusing fetch");
+            }
+            match symrefs.get(target) {
+                Some(next) => target = *next,
+                None => break,
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Check every existing component of a loose ref path without following
+/// links. Missing loose paths are normal for packed/reftable stores.
+fn fetch_ref_path_has_symlink_component(git_dir: &Path, refname: &[u8]) -> std::io::Result<bool> {
+    let Some(relative_bytes) = refname.strip_prefix(b"refs/") else {
+        return Ok(true);
+    };
+    #[cfg(not(unix))]
+    if std::str::from_utf8(refname).is_err() {
+        return Ok(true);
+    }
+    let relative = config::path_from_bytes(relative_bytes.to_vec());
+    let components: Vec<_> = relative.components().collect();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Ok(true);
+    }
+
+    let mut path = git_dir.join("refs");
+    let root = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if root.file_type().is_symlink() {
+        return Ok(true);
+    }
+    if !root.is_dir() {
+        return Ok(true);
+    }
+
+    let component_count = components.len();
+    for (index, component) in components.into_iter().enumerate() {
+        let std::path::Component::Normal(part) = component else {
+            return Ok(true);
+        };
+        path.push(part);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_symlink() {
+            return Ok(true);
+        }
+        if index + 1 < component_count && !metadata.is_dir() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Walk a writable ref-storage directory without following symlinks.
+/// Ref stores can contain many paths, so both the number of entries and
+/// recursion depth are bounded; any limit or I/O failure refuses the
+/// fetch rather than assuming the storage is safe.
+fn fetch_ref_namespace_has_symlink(namespace: &Path) -> Result<bool, ()> {
+    const MAX_ENTRIES: usize = 16_384;
+    const MAX_DEPTH: usize = 64;
+
+    let metadata = match std::fs::symlink_metadata(namespace) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(()),
+    };
+    if metadata.file_type().is_symlink() {
+        return Ok(true);
+    }
+    if !metadata.is_dir() {
+        return Ok(true);
+    }
+
+    let mut pending = vec![(namespace.to_path_buf(), 0usize)];
+    let mut visited = 0usize;
+    while let Some((directory, depth)) = pending.pop() {
+        let entries = std::fs::read_dir(&directory).map_err(|_| ())?;
+        for entry in entries {
+            visited = visited.saturating_add(1);
+            if visited > MAX_ENTRIES {
+                return Err(());
+            }
+            let entry = entry.map_err(|_| ())?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(|_| ())?;
+            if metadata.file_type().is_symlink() {
+                return Ok(true);
+            }
+            if metadata.is_dir() {
+                if depth >= MAX_DEPTH {
+                    return Err(());
+                }
+                pending.push((path, depth + 1));
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Run the fetch + post-fetch audit (sync git section; called only
 /// for a `Ready` plan). Snapshot tracking refs, fetch, re-read,
 /// audit upstream via ls-remote, then attribute each post-fetch
@@ -13075,6 +14345,43 @@ fn execute_remote_fetch(
     started: Instant,
 ) -> GitAttempt {
     let elapsed_ms = || started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+    let parsed: Vec<git::refspec::FetchRefspec> = refspecs
+        .iter()
+        .filter_map(|s| git::refspec::parse_fetch_refspec(s))
+        .collect();
+    if parsed.len() != refspecs.len() {
+        return GitAttempt::unsupported(
+            "fetch refspec changed after verification; refusing fetch".to_string(),
+            Some(elapsed_ms()),
+        );
+    }
+    let storage_values = match git.git_config_get_all(
+        dir,
+        std::ffi::OsStr::new("extensions.refStorage"),
+        FETCH_TIMEOUT,
+    ) {
+        Ok(values) => values,
+        Err(_) => {
+            return GitAttempt::unsupported(
+                "cannot read effective ref storage backend; refusing fetch".to_string(),
+                Some(elapsed_ms()),
+            )
+        }
+    };
+    let storage = match storage_values.as_slice() {
+        [] => FetchRefStorage::Files,
+        [value] if value.as_slice() == b"files" => FetchRefStorage::Files,
+        [value] if value.as_slice() == b"reftable" => FetchRefStorage::Reftable,
+        _ => {
+            return GitAttempt::unsupported(
+                "unknown or multiple ref storage backend values; refusing fetch".to_string(),
+                Some(elapsed_ms()),
+            )
+        }
+    };
+    if let Err(reason) = fetch_ref_storage_path_safety(dir, name, &parsed, storage) {
+        return GitAttempt::unsupported(reason.to_string(), Some(elapsed_ms()));
+    }
     let pre = match git.git_remote_tracking_refs(dir, FETCH_TIMEOUT) {
         Ok(refs) => refs,
         Err(e) => {
@@ -13087,6 +14394,9 @@ fn execute_remote_fetch(
             );
         }
     };
+    if let Err(reason) = fetch_destination_symref_safety(name, &parsed, &pre) {
+        return GitAttempt::unsupported(reason.to_string(), Some(elapsed_ms()));
+    }
     let pre_map: HashMap<&[u8], &[u8]> = pre
         .iter()
         .map(|t| (t.name.as_slice(), t.oid.as_slice()))
@@ -13137,12 +14447,6 @@ fn execute_remote_fetch(
             HashSet::new()
         }
     };
-    // `Ready` implies every refspec parsed; re-parse infallibly.
-    let parsed: Vec<git::refspec::FetchRefspec> = refspecs
-        .iter()
-        .filter_map(|s| git::refspec::parse_fetch_refspec(s))
-        .collect();
-    debug_assert_eq!(parsed.len(), refspecs.len());
     let known: HashSet<&[u8]> = post.iter().map(|t| t.name.as_slice()).collect();
     // This remote's default namespace: refs this fetch could never
     // cover but owns (narrowed refspecs) label `stale` per Step 11
@@ -13322,7 +14626,7 @@ async fn persist_remote_attempt(
     drain_runner_batch(runner, store).await?;
     if let Some(journal) = runner.journal.as_mut() {
         let payload = serde_json::json!({
-            "store_id": instance_id,
+            "store_id": event_opaque_id(instance_id),
             "rev": at_ms,
             "remote": String::from_utf8_lossy(remote_name),
             "remote_hex": config::encode_hex(remote_name),
@@ -13330,7 +14634,7 @@ async fn persist_remote_attempt(
             "refs_updated": attempt.refs_updated,
             "current": current_values,
             "deleted": deleted_values,
-            "detail": attempt.detail,
+            "detail": attempt.detail.as_deref().map(event_safe_detail),
         });
         let transactions = journal
             .emit(store, EventType::RemoteUpdated, &payload)
@@ -13355,10 +14659,33 @@ async fn fetch_one_remote(
     cancel: &git::fallback::WaitCancel,
     inst: &EmittedInstance,
     remote_name: &[u8],
+    namespace_overlap: bool,
     existing_refs: &HashMap<Vec<u8>, String>,
     started_ms: i64,
     outcome: &mut FetchOutcome,
 ) -> repo_scan::Result<Option<Vec<Vec<u8>>>> {
+    // This check precedes resume-skip: a prior successful attempt must
+    // not bypass a namespace conflict discovered for the current store.
+    if namespace_overlap {
+        let attempt = GitAttempt::unsupported(
+            "remote tracking namespaces overlap; refusing fetch".to_string(),
+            None,
+        );
+        persist_remote_attempt(
+            runner,
+            store,
+            &inst.id,
+            &inst.common_path,
+            &inst.object_format,
+            remote_name,
+            existing_refs,
+            &attempt,
+            store::now_ms(),
+        )
+        .await?;
+        outcome.unsupported += 1;
+        return Ok(None);
+    }
     // Resume: a `success` recorded during this scan is completed work,
     // never repeated. `failed` retries; `unsupported` re-verdicts
     // (re-inspection is local-only and config may have changed).
@@ -13479,6 +14806,20 @@ async fn fetch_one_store(
     if !remotes.iter().any(|r| r.role == "fetch") {
         return Ok(());
     }
+    // A remote name may contain `/`, and Git's config permits manually
+    // configured names such as `foo` and `foo/bar` even though their
+    // tracking namespaces are nested. The parent's default wildcard
+    // mapping can then overwrite the child's refs. Discover every
+    // collision before the loop so neither fetch can mutate shared refs.
+    let overlapping_remote_names: HashSet<Vec<u8>> = remotes
+        .iter()
+        .filter(|remote| {
+            remotes.iter().any(|other| {
+                git::refspec::remote_tracking_namespaces_overlap(&remote.name, &other.name)
+            })
+        })
+        .map(|remote| remote.name.clone())
+        .collect();
     // One ref read per fetched store: name -> STORED row id.
     // Existing rows take the UPDATE path by stored id (never a
     // recomputed id: the instance row keeps the raw path spelling
@@ -13500,6 +14841,7 @@ async fn fetch_one_store(
             cancel,
             inst,
             &remote.name,
+            overlapping_remote_names.contains(&remote.name),
             &existing,
             started_ms,
             outcome,
@@ -13649,9 +14991,14 @@ async fn run_fetch_phase(
     runner: &mut Runner,
     store: &TursoStore,
     started_ms: i64,
+    scope_roots: Option<&[PathBuf]>,
 ) -> repo_scan::Result<FetchOutcome> {
     let mut outcome = FetchOutcome::default();
     let cancel = git::fallback::WaitCancel::new(|| INTERRUPTED.load(Ordering::SeqCst), None);
+    let scoped_repositories = match scope_roots {
+        Some(roots) => Some(checkouts_within_roots(store, roots).await?.repository_ids),
+        None => None,
+    };
     let mut offset = 0i64;
     loop {
         if interrupted() {
@@ -13667,6 +15014,15 @@ async fn run_fetch_phase(
             if interrupted() {
                 outcome.interrupted = true;
                 break;
+            }
+            if let (Some(roots), Some(repositories)) = (scope_roots, scoped_repositories.as_ref()) {
+                if !config::path_is_within_roots(
+                    &config::path_from_bytes(inst.git_path.clone()),
+                    roots,
+                ) && !repositories.contains(&inst.id)
+                {
+                    continue;
+                }
             }
             fetch_one_store(runner, store, &cancel, inst, started_ms, &mut outcome).await?;
         }
@@ -13698,6 +15054,41 @@ async fn load_emitted_instances_page(
         .query(sql.as_str(), ())
         .await
         .map_err(store_err)?;
+    read_emitted_instances(&mut rows, limit).await
+}
+
+async fn load_emitted_instances_after(
+    store: &TursoStore,
+    limit: i64,
+    after_id: Option<&str>,
+) -> repo_scan::Result<Vec<EmittedInstance>> {
+    let limit = limit.max(1);
+    let sql = if after_id.is_some() {
+        format!(
+            "SELECT id, git_path, common_path, disposition, object_format FROM git_instances \
+             WHERE disposition != 'nonmatch' AND id > ?1 ORDER BY id ASC LIMIT {limit}"
+        )
+    } else {
+        format!(
+            "SELECT id, git_path, common_path, disposition, object_format FROM git_instances \
+             WHERE disposition != 'nonmatch' ORDER BY id ASC LIMIT {limit}"
+        )
+    };
+    let params = after_id
+        .map(|id| vec![turso::Value::Text(id.to_string())])
+        .unwrap_or_default();
+    let mut rows = store
+        .connection()
+        .query(sql.as_str(), params)
+        .await
+        .map_err(store_err)?;
+    read_emitted_instances(&mut rows, limit).await
+}
+
+async fn read_emitted_instances(
+    rows: &mut turso::Rows,
+    limit: i64,
+) -> repo_scan::Result<Vec<EmittedInstance>> {
     let mut out = Vec::new();
     while let Some(row) = rows.next().await.map_err(store_err)? {
         out.push(EmittedInstance {
@@ -13731,11 +15122,22 @@ pub struct InstanceDerivations {
     pub truncated: bool,
     /// Truncation detail (empty unless `truncated`).
     pub trunc_detail: String,
+    /// Last source row successfully passed by the bounded derivation page.
+    resume_after_id: Option<String>,
 }
 
 pub async fn scan_instance_derivations(
     store: &TursoStore,
     caps: &DerivationCaps,
+) -> repo_scan::Result<InstanceDerivations> {
+    scan_instance_derivations_scoped(store, caps, None, None).await
+}
+
+async fn scan_instance_derivations_scoped(
+    store: &TursoStore,
+    caps: &DerivationCaps,
+    scope_roots: Option<&[PathBuf]>,
+    scope_identity_roots: Option<&[PathBuf]>,
 ) -> repo_scan::Result<InstanceDerivations> {
     let mut out = InstanceDerivations {
         candidates: Vec::new(),
@@ -13745,6 +15147,7 @@ pub async fn scan_instance_derivations(
         peak_chunk: 0,
         truncated: false,
         trunc_detail: String::new(),
+        resume_after_id: None,
     };
     // First instance id per common path (the shared-store hub). Chunk
     // order is id-ascending, so the hub is the same lowest id the old
@@ -13754,15 +15157,36 @@ pub async fn scan_instance_derivations(
     // scan above; `Config::load` always installs the default limits.
     let sampler = FootprintSampler::new();
     let pressure_at = config::ResourceLimits::default().pressure_threshold_bytes;
-    let mut offset: i64 = 0;
+    let scoped_checkout_repos = match scope_roots {
+        Some(roots) => Some(checkouts_within_roots(store, roots).await?),
+        None => None,
+    };
+    let gap_id =
+        config::report_derivation_gap_id("instances", scope_identity_roots.or(scope_roots));
+    let (prior_gap_open, resume_marker) = derivation_resume_state(store, &gap_id).await?;
+    let resuming = resume_marker.is_some();
+    let resumed_after = resume_marker.as_ref().and_then(|after| after.clone());
+    let mut after_id = resumed_after.clone();
+    out.resume_after_id = after_id.clone();
     loop {
-        let chunk = load_emitted_instances_page(store, LOAD_CHUNK_ROWS, offset).await?;
+        let chunk =
+            load_emitted_instances_after(store, LOAD_CHUNK_ROWS, after_id.as_deref()).await?;
         if chunk.is_empty() {
             break;
         }
         out.chunks += 1;
         out.peak_chunk = out.peak_chunk.max(chunk.len());
         for instance in &chunk {
+            if let (Some(roots), Some(checkouts)) = (scope_roots, scoped_checkout_repos.as_ref()) {
+                let git_path = config::path_from_bytes(instance.git_path.clone());
+                if !config::path_is_within_roots(&git_path, roots)
+                    && !checkouts.repository_ids.contains(&instance.id)
+                {
+                    after_id = Some(instance.id.clone());
+                    out.resume_after_id = after_id.clone();
+                    continue;
+                }
+            }
             // Checked per row, before this instance's links: one instance
             // can add a bounded handful of edges, so the overshoot past
             // the cap is at most one instance's contribution.
@@ -13801,6 +15225,8 @@ pub async fn scan_instance_derivations(
                 });
             }
             push_instance_links(&mut out.storage_links, &mut first_common, instance);
+            after_id = Some(instance.id.clone());
+            out.resume_after_id = after_id.clone();
         }
         if out.truncated {
             break;
@@ -13821,25 +15247,36 @@ pub async fn scan_instance_derivations(
             );
             break;
         }
-        if chunk.len() as i64 >= LOAD_CHUNK_ROWS {
-            offset += chunk.len() as i64;
-        } else {
+        if (chunk.len() as i64) < LOAD_CHUNK_ROWS {
             break;
         }
     }
+    if !out.truncated && resuming && resumed_after.is_some() {
+        out.truncated = true;
+        out.resume_after_id = None;
+        out.trunc_detail = format!(
+            "instance derivations reached the end of the resumed source window after {} scanned rows; \
+             next pass wraps to the first row",
+            out.scanned,
+        );
+    }
     if out.truncated {
         // Stable gap id (see the error scan above).
+        let detail =
+            derivation_detail_with_cursor(&out.trunc_detail, out.resume_after_id.as_deref());
         store
             .record_error(
-                "gap:report-derivation:instances",
-                "gap:report-derivation",
+                &gap_id,
+                &config::report_derivation_gap_scope_key(scope_identity_roots.or(scope_roots)),
                 "report-derivation-truncated",
-                &out.trunc_detail,
+                &detail,
                 None,
                 store::now_ms(),
             )
             .await?;
         eprintln!("repo-scan: {}", out.trunc_detail);
+    } else if prior_gap_open {
+        store.resolve_error(&gap_id, store::now_ms()).await?;
     }
     Ok(out)
 }
@@ -13923,20 +15360,43 @@ async fn build_lib_inputs(
     catalog_rev: u64,
     dirs_complete: u64,
     snapshot_path: &Path,
-) -> repo_scan::Result<LibReportInputs> {
+) -> repo_scan::Result<(LibReportInputs, bool)> {
     // RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1: bounded chunked
     // derivation scans — one page in flight, report-required records only.
-    let root_scopes: Vec<String> = inputs
+    let report_root_paths = inputs
+        .scope_roots
+        .clone()
+        .unwrap_or_else(|| inputs.roots.iter().map(|root| root.path.clone()).collect());
+    let root_scopes: Vec<String> = report_root_paths
+        .iter()
+        .map(|path| config::scope_key_for_dir(path))
+        .collect();
+    let root_scope_aliases: Vec<String> = inputs
         .roots
         .iter()
         .map(|root| config::scope_key_for_dir(&root.path))
         .collect();
+    let scope_roots = inputs.scope_filter_roots.as_deref();
+    let scope_identity_roots = inputs.scope_identity_roots.as_deref();
     // SR-STATE-03: bounded derivation scans — aggregate caps plus
     // per-page pressure sampling; truncation records a gap row and leaves
     // the remaining rows open for a later pass.
-    let errors =
-        scan_error_derivations(store, &root_scopes, &DerivationCaps::default_caps()).await?;
-    let instances = scan_instance_derivations(store, &DerivationCaps::default_caps()).await?;
+    let errors = scan_error_derivations_scoped(
+        store,
+        &root_scopes,
+        Some(&root_scope_aliases),
+        &DerivationCaps::default_caps(),
+        scope_roots.as_deref(),
+        scope_identity_roots,
+    )
+    .await?;
+    let instances = scan_instance_derivations_scoped(
+        store,
+        &DerivationCaps::default_caps(),
+        scope_roots.as_deref(),
+        scope_identity_roots,
+    )
+    .await?;
     let volumes = load_volume_ids(store).await?;
     let mut boundaries = Vec::new();
     if inputs.scope_policy == "roots" {
@@ -13974,73 +15434,78 @@ async fn build_lib_inputs(
             created_after_status: true,
         });
     }
-    Ok(LibReportInputs {
-        report_id: report_id.to_string(),
-        created_at_ms: inputs.finished_ms,
-        scan_id: inputs.scan_id.clone(),
-        generation: inputs.generation,
-        epoch: inputs.epoch,
-        catalog_revision: catalog_rev,
-        // Defense-in-depth (RSF-SEC-TARGET-URL): the report's `Scan.target_url`
-        // never carries credentials even if a legacy stored target did.
-        // Strict form (RETEST-2): opaque query/fragment tails drop too.
-        target_url: identity::redact_remote_url(&inputs.target_raw),
-        canonical_url: inputs.canonical.clone(),
-        targets: inputs.targets.clone(),
-        scope: inputs.scope_policy.clone(),
-        scan_state: inputs.scan_state.clone(),
-        started_at_ms: inputs.started_ms,
-        // Wave2b live snapshots (`scan_state == "running"`) have no
-        // finish time yet; terminal snapshots always do.
-        finished_at_ms: if inputs.scan_state == "running" {
-            None
-        } else {
-            Some(inputs.finished_ms)
-        },
-        superseded_by: None,
-        cached: false,
-        status_mode: inputs.status_mode,
-        directories_complete: dirs_complete,
-        tasks_pending: inputs.pending,
-        scope_boundaries: boundaries,
-        profile: String::from("conservative"),
-        cpu_target_cores: inputs.cpu_target_cores,
-        rss_target_bytes: inputs.rss_target_bytes,
-        // RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1: measured run-loop
-        // telemetry — never None-after-run.
-        peak_rss_bytes: Some(inputs.counters.peak_rss_bytes),
-        cpu_seconds: Some(inputs.counters.cpu_seconds),
-        enumerated_entries: inputs.counters.entries,
-        db_transactions: inputs.counters.db_transactions,
-        db_sync_calls: Some(inputs.counters.db_sync_calls),
-        source_commit: source_commit_from_build(),
-        include_nonmatching: false,
-        coverage_filesystem: None,
-        coverage_identity: None,
-        coverage_status: None,
-        roots: {
-            // SR-STATE-03: a truncated derivation must never report a root
-            // "complete" — its error list is partial. Force "error" (the
-            // gap rows in `errors` name the truncation explicitly).
-            let mut roots = root_inputs_chunked(inputs, &errors.root_error_ids, &volumes);
-            if errors.truncated || instances.truncated {
-                for root in &mut roots {
-                    if root.state == "complete" {
-                        root.state = String::from("error");
+    let derivation_truncated = errors.truncated || instances.truncated;
+    Ok((
+        LibReportInputs {
+            report_id: report_id.to_string(),
+            created_at_ms: inputs.finished_ms,
+            scan_id: inputs.scan_id.clone(),
+            generation: inputs.generation,
+            epoch: inputs.epoch,
+            catalog_revision: catalog_rev,
+            // Defense-in-depth (RSF-SEC-TARGET-URL): the report's `Scan.target_url`
+            // never carries credentials even if a legacy stored target did.
+            // Strict form (RETEST-2): opaque query/fragment tails drop too.
+            target_url: identity::redact_remote_url(&inputs.target_raw),
+            canonical_url: inputs.canonical.clone(),
+            event_volume_ids: inputs.event_volume_ids.clone(),
+            targets: inputs.targets.clone(),
+            scope: inputs.scope_policy.clone(),
+            scan_state: inputs.scan_state.clone(),
+            started_at_ms: inputs.started_ms,
+            // Wave2b live snapshots (`scan_state == "running"`) have no
+            // finish time yet; terminal snapshots always do.
+            finished_at_ms: if inputs.scan_state == "running" {
+                None
+            } else {
+                Some(inputs.finished_ms)
+            },
+            superseded_by: None,
+            cached: false,
+            status_mode: inputs.status_mode,
+            directories_complete: dirs_complete,
+            tasks_pending: inputs.pending,
+            scope_boundaries: boundaries,
+            profile: String::from("conservative"),
+            cpu_target_cores: inputs.cpu_target_cores,
+            rss_target_bytes: inputs.rss_target_bytes,
+            // RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1: measured run-loop
+            // telemetry — never None-after-run.
+            peak_rss_bytes: Some(inputs.counters.peak_rss_bytes),
+            cpu_seconds: Some(inputs.counters.cpu_seconds),
+            enumerated_entries: inputs.counters.entries,
+            db_transactions: inputs.counters.db_transactions,
+            db_sync_calls: Some(inputs.counters.db_sync_calls),
+            source_commit: source_commit_from_build(),
+            include_nonmatching: false,
+            coverage_filesystem: None,
+            coverage_identity: None,
+            coverage_status: None,
+            roots: {
+                // SR-STATE-03: a truncated derivation must never report a root
+                // "complete" — its error list is partial. Force "error" (the
+                // gap rows in `errors` name the truncation explicitly).
+                let mut roots = root_inputs_chunked(inputs, &errors.root_error_ids, &volumes);
+                if errors.truncated || instances.truncated {
+                    for root in &mut roots {
+                        if root.state == "complete" {
+                            root.state = String::from("error");
+                        }
                     }
                 }
-            }
-            roots
+                roots
+            },
+            storage_links: instances.storage_links,
+            aliases: alias_inputs(&inputs.aliases),
+            candidates: {
+                let mut candidates = instances.candidates;
+                candidates.extend(errors.candidates);
+                candidates
+            },
+            generated_artifacts: artifacts,
         },
-        storage_links: instances.storage_links,
-        aliases: alias_inputs(&inputs.aliases),
-        candidates: {
-            let mut candidates = instances.candidates;
-            candidates.extend(errors.candidates);
-            candidates
-        },
-        generated_artifacts: artifacts,
-    })
+        derivation_truncated,
+    ))
 }
 
 /// Release builds may provide the exact checked-out source SHA at compile
@@ -14066,11 +15531,12 @@ fn root_inputs_chunked(
         .map(|(n, root)| {
             let volume_id = match &root.volume {
                 Some(volume) if volumes.contains(&volume.0) => Some(volume.0.clone()),
-                _ if inputs.scope_policy == "roots" && volumes.contains("explicit-roots") => {
-                    Some(String::from("explicit-roots"))
-                }
                 _ => None,
-            };
+            }
+            .or_else(|| {
+                (inputs.scope_policy == "roots" && volumes.contains("explicit-roots"))
+                    .then(|| String::from("explicit-roots"))
+            });
             let error_ids: Vec<String> = root_error_ids.get(n).cloned().unwrap_or_default();
             let state = if !error_ids.is_empty() {
                 "error"
@@ -14084,6 +15550,11 @@ fn root_inputs_chunked(
                 id: format!("root-{}", n + 1),
                 dir_id: None,
                 path_bytes: Some(config::path_as_bytes(&root.path)),
+                scope_path_bytes: inputs
+                    .scope_identity_roots
+                    .as_ref()
+                    .and_then(|paths| paths.get(n))
+                    .map(|path| config::path_as_bytes(path)),
                 volume_id,
                 state: state.to_string(),
                 observed_at_ms: Some(inputs.finished_ms),
@@ -14213,7 +15684,7 @@ fn reject_state_dir_dest(dest: &Path, state_dir: &Path) -> repo_scan::Result<()>
     if dest == state_dir || dest.starts_with(state_dir) {
         return Err(repo_scan::Error::Report(format!(
             "refusing to publish inside tool state dir: {}",
-            dest.display()
+            safe_path_display(dest)
         )));
     }
     Ok(())
@@ -14463,7 +15934,7 @@ fn envelope_for_row(row: &ScanEventRow) -> repo_scan::Result<Envelope> {
         row.event_offset,
         event_type,
         row.reset,
-        records,
+        event_safe_records(event_type, records),
     );
     env.op = op;
     Ok(env)
@@ -14601,6 +16072,7 @@ fn snapshot_for_scan(state_dir: &Path, row: &store::ScanRow) -> Option<PathBuf> 
 struct ReplayPosition {
     after: Option<(u64, u64)>,
     reset_first: bool,
+    terminal_seen: bool,
 }
 
 /// Resolve an `--after` cursor to its replay position (Step 12): seq 0
@@ -14626,12 +16098,14 @@ async fn resolve_after_cursor(
         return Ok(ReplayPosition {
             after: None,
             reset_first: false,
+            terminal_seen: false,
         });
     }
     let Ok(seq_i64) = i64::try_from(cursor.seq) else {
         return Ok(ReplayPosition {
             after: None,
             reset_first: true,
+            terminal_seen: false,
         });
     };
     let mut rows = store
@@ -14683,10 +16157,17 @@ async fn resolve_after_cursor(
         ResumeAction::ResumeAfterCursor => Ok(ReplayPosition {
             after: Some((cursor.catalog_rev, cursor.event_offset)),
             reset_first: false,
+            terminal_seen: false,
+        }),
+        ResumeAction::StopAtTerminal => Ok(ReplayPosition {
+            after: Some((cursor.catalog_rev, cursor.event_offset)),
+            reset_first: false,
+            terminal_seen: true,
         }),
         ResumeAction::ResetSnapshot => Ok(ReplayPosition {
             after: None,
             reset_first: true,
+            terminal_seen: false,
         }),
     }
 }
@@ -14831,7 +16312,7 @@ async fn open_follow_store(
     if !db_path.exists() {
         eprintln!(
             "repo-scan: cached query: no catalog at {}; no live verification performed",
-            db_path.display()
+            safe_path_display(&db_path)
         );
         return Ok(None);
     }
@@ -14873,6 +16354,7 @@ async fn run_follow_human_tui(
         None => ReplayPosition {
             after: None,
             reset_first: false,
+            terminal_seen: false,
         },
         Some(cursor) => match resolve_after_cursor(&store, scan_id, cursor).await {
             Ok(position) => position,
@@ -14888,26 +16370,29 @@ async fn run_follow_human_tui(
     snapshot.header.scan_state = "running".to_string();
     // Initial replay: fold committed rows oldest-first (bounded
     // pages); a reset position drops buffered state first.
-    let mut terminal_seen = false;
-    loop {
-        let rows =
-            read_scan_events_after_position(&store, scan_id, after_pos, REPLAY_PAGE_ROWS).await?;
-        let short_page = rows.len() < REPLAY_PAGE_ROWS as usize;
-        for row in &rows {
-            let env = envelope_for_row(row)?;
-            if env.reset || reset_first {
-                snapshot = TuiSnapshot::empty();
-                reset_first = false;
+    let mut terminal_seen = start.terminal_seen;
+    if !terminal_seen {
+        loop {
+            let rows =
+                read_scan_events_after_position(&store, scan_id, after_pos, REPLAY_PAGE_ROWS)
+                    .await?;
+            let short_page = rows.len() < REPLAY_PAGE_ROWS as usize;
+            for row in &rows {
+                let env = envelope_for_row(row)?;
+                if env.reset || reset_first {
+                    snapshot = TuiSnapshot::empty();
+                    reset_first = false;
+                }
+                snapshot.apply_envelope(&env);
+                after_pos = Some((row.catalog_rev, row.event_offset));
+                if is_terminal_event(env.event_type) {
+                    terminal_seen = true;
+                    break;
+                }
             }
-            snapshot.apply_envelope(&env);
-            after_pos = Some((row.catalog_rev, row.event_offset));
-            if is_terminal_event(env.event_type) {
-                terminal_seen = true;
+            if short_page || terminal_seen {
                 break;
             }
-        }
-        if short_page || terminal_seen {
-            break;
         }
     }
     // A terminal scan browses its exact retained bytes (selection
@@ -15318,6 +16803,7 @@ async fn run_query_scan_replay(
         None => ReplayPosition {
             after: None,
             reset_first: false,
+            terminal_seen: false,
         },
         Some(after) => match resolve_after_cursor(&store, scan_id, after).await {
             Ok(position) => position,
@@ -15336,7 +16822,11 @@ async fn run_query_scan_replay(
     let mut out = std::io::BufWriter::new(stdout.lock());
     // Initial replay: page through committed rows; a short page (or an
     // empty one) means the reader caught up to the tip.
-    let mut terminal_seen = false;
+    let mut terminal_seen = start.terminal_seen;
+    if terminal_seen {
+        let _ = store.close().await;
+        return Ok(ExitCode::Success);
+    }
     if !replay_scan_pages(
         &store,
         scan_id,
@@ -15938,7 +17428,7 @@ async fn run_resume_inner(
             println!("scan_id: {}", row.id);
             println!("state: complete (replayed; no new scan started)");
             println!("report_id: {}", recorded.report_id);
-            println!("snapshot: {}", snapshot.display());
+            println!("snapshot: {}", safe_path_display(&snapshot));
             let _ = store.close().await;
             drop(guard);
             Ok(code)
@@ -16032,7 +17522,7 @@ async fn retry_publication(
         if !dest.is_absolute() {
             return Err(repo_scan::Error::Config(format!(
                 "saved report destination is not absolute: {}",
-                dest.display()
+                safe_path_display(&dest)
             )));
         }
     }
@@ -16133,7 +17623,7 @@ async fn retry_publication(
     println!("state: {state} (publication retried from saved snapshot; no new scan)");
     println!("report_id: {}", recorded.report_id);
     if let Some(dest) = &dest {
-        println!("report: {}", dest.display());
+        println!("report: {}", safe_path_display(dest));
     }
     Ok(exit)
 }
@@ -16145,14 +17635,61 @@ async fn retry_publication(
 /// sanitized raw URL so the resumed scan resolves the same
 /// repository without carrying the secret into state or reports.
 fn redacted_resume_target(raw: &str, canonical: Option<&str>) -> String {
-    if identity::must_reject_target(raw) {
+    // Persisted free-text scrubbing can redact a credential-shaped path
+    // component without making it a URL rejected by `must_reject_target`.
+    // When that happens, resume from the separately retained canonical
+    // target, which is the operational identity for the scan.
+    if identity::must_reject_target(raw) || raw.contains(identity::REDACTED) {
         match canonical {
-            Some(kept) => kept.to_string(),
+            Some(kept) if !kept.contains(identity::REDACTED) => kept.to_string(),
+            Some(kept) if kept.starts_with("file://") => RESUME_REDACTED_LOCAL_TARGET.to_string(),
             None => identity::sanitize_target_url(raw),
+            Some(_) => identity::sanitize_target_url(raw),
         }
     } else {
         raw.to_string()
     }
+}
+
+#[cfg(test)]
+pub fn test_resume_targets_for_row(row: &store::ScanRow) -> Vec<String> {
+    resume_targets_for(row)
+}
+
+#[cfg(test)]
+pub async fn test_mint_resume_target(
+    store: &TursoStore,
+    raw: &str,
+    canonical: &str,
+) -> repo_scan::Result<String> {
+    let mut counters = RunCounters::default();
+    let report_dest = None;
+    let targets = vec![(raw.to_string(), canonical.to_string())];
+    mint_scan_id(
+        store,
+        raw,
+        Some(canonical),
+        "machine",
+        StatusMode::Summary,
+        &report_dest,
+        &targets,
+        Some(repo_scan::cli::OutputFormat::Json),
+        false,
+        false,
+        None,
+        &mut counters,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub fn test_resolve_saved_targets(
+    row: &store::ScanRow,
+) -> repo_scan::Result<Vec<(String, String)>> {
+    resume_targets_for(row)
+        .into_iter()
+        .map(|target| resolve_target_identity(&target))
+        .collect()
 }
 
 /// Restore the resume target list (OUTPUTS-M1): the v2 multi-target
@@ -16214,7 +17751,7 @@ async fn continue_saved_scan(
             if !dest.is_absolute() {
                 return Err(repo_scan::Error::Config(format!(
                     "saved report destination is not absolute: {}",
-                    dest.display()
+                    safe_path_display(&dest)
                 )));
             }
             Some(dest)
@@ -16342,7 +17879,9 @@ async fn run_invalidate_inner(
             namespace: String::from("explicit"),
             volume: None,
         }];
-        let mut events = open_event_session(&store, &cfg.state_dir, "roots", &roots).await?;
+        let identities = repo_scan::walk::roots::scope_root_identities(&roots);
+        let mut events =
+            open_event_session(&store, &cfg.state_dir, "roots", &roots, &identities).await?;
         let mut counters = RunCounters::default();
         ingest_available_events(&mut events, &store, generation, &roots, &mut counters).await?
     };
@@ -16475,7 +18014,7 @@ async fn run_clear_inner(state_dir: &Path) -> repo_scan::Result<()> {
             // report INCOMPLETE, never success-with-uninspected. The
             // degraded pin re-validates symlink/dir-ness, so a swapped
             // victim still refuses instead of degrading.
-            st.incomplete.push(format!(
+            st.note_incomplete(format!(
                 "cannot pin {} for FD-relative clear; path-validated removal only ({e})",
                 payload.display()
             ));
@@ -16498,7 +18037,7 @@ async fn run_clear_inner(state_dir: &Path) -> repo_scan::Result<()> {
     let (snapshot_rows, snapshot_truncated) =
         load_snapshot_rows(&db_path, db_ours, &snapshots, &mut st).await;
     if snapshot_truncated {
-        st.incomplete.push(format!(
+        st.note_incomplete(format!(
             "snapshot checksum rows truncated at the {SNAPSHOT_MAX_STEMS}-stem budget; \
              unscanned files stay preserved"
         ));
@@ -16530,7 +18069,7 @@ async fn run_clear_inner(state_dir: &Path) -> repo_scan::Result<()> {
     let payload_entries = match std::fs::read_dir(&payload) {
         Ok(entries) => Some(entries),
         Err(e) => {
-            st.incomplete.push(format!(
+            st.note_incomplete(format!(
                 "cannot list {}; payload-root coverage incomplete ({e})",
                 payload.display()
             ));
@@ -16547,7 +18086,7 @@ async fn run_clear_inner(state_dir: &Path) -> repo_scan::Result<()> {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(e) => {
-                    st.incomplete.push(format!(
+                    st.note_incomplete(format!(
                         "cannot read a payload-root entry; coverage incomplete ({e})"
                     ));
                     st.note_preserved(format!(
@@ -16559,7 +18098,7 @@ async fn run_clear_inner(state_dir: &Path) -> repo_scan::Result<()> {
             };
             scanned += 1;
             if scanned > CLEAR_MAX_FILES_PER_DIR {
-                st.incomplete.push(format!(
+                st.note_incomplete(format!(
                     "payload listing truncated at the {CLEAR_MAX_FILES_PER_DIR}-entry budget; \
                      coverage incomplete"
                 ));
@@ -16610,7 +18149,7 @@ async fn run_clear_inner(state_dir: &Path) -> repo_scan::Result<()> {
             state_pin.remove_empty_child_dir("payload", payload_pin.identity(), &mut st);
         }
         Err(e) => {
-            st.incomplete.push(format!(
+            st.note_incomplete(format!(
                 "cannot re-validate the state dir for payload removal; preserved ({e})"
             ));
             st.note_preserved(format!("{} (preserved)", payload.display()));
@@ -16658,10 +18197,14 @@ impl ClearState {
     /// overflow count grows (the list itself stays bounded).
     fn note_preserved(&mut self, item: String) {
         if self.preserved.len() < CLEAR_MAX_PRESERVED {
-            self.preserved.push(item);
+            self.preserved.push(safe_human_text(&item));
         } else {
             self.preserved_overflow += 1;
         }
+    }
+
+    fn note_incomplete(&mut self, detail: String) {
+        self.incomplete.push(safe_human_text(&detail));
     }
 
     fn expired(&self) -> bool {
@@ -17066,7 +18609,7 @@ impl ClearPinnedDir {
     fn remove_empty_child_dir(&self, name: &str, expect: (u64, u64), st: &mut ClearState) {
         let display = self.path.join(name);
         if let Err(e) = self.verify() {
-            st.incomplete.push(format!(
+            st.note_incomplete(format!(
                 "parent {} changed during clear; {} preserved ({e})",
                 self.path.display(),
                 display.display()
@@ -17080,7 +18623,7 @@ impl ClearPinnedDir {
             use std::os::unix::io::{AsRawFd, FromRawFd};
             let bytes = std::ffi::OsStr::new(name).as_bytes();
             if bytes.is_empty() || bytes.contains(&0) || name.contains('/') {
-                st.incomplete.push(format!(
+                st.note_incomplete(format!(
                     "refusing unsafe clear name for {}; preserved",
                     display.display()
                 ));
@@ -17090,7 +18633,7 @@ impl ClearPinnedDir {
             let cname = match std::ffi::CString::new(bytes) {
                 Ok(cname) => cname,
                 Err(_) => {
-                    st.incomplete.push(format!(
+                    st.note_incomplete(format!(
                         "bad clear name for {}; preserved",
                         display.display()
                     ));
@@ -17118,10 +18661,9 @@ impl ClearPinnedDir {
                     return;
                 }
                 if errno.raw_os_error() == Some(libc::ELOOP) {
-                    st.incomplete
-                        .push(format!("{} is a symlink; preserved", display.display()));
+                    st.note_incomplete(format!("{} is a symlink; preserved", display.display()));
                 } else {
-                    st.incomplete.push(format!(
+                    st.note_incomplete(format!(
                         "cannot open {}; preserved ({errno})",
                         display.display()
                     ));
@@ -17132,7 +18674,7 @@ impl ClearPinnedDir {
             // SAFETY: `fd` is a fresh owned FD from the successful `openat`.
             let file = unsafe { std::fs::File::from_raw_fd(fd) };
             if store::owner::fd_identity(&file).unwrap_or((u64::MAX, u64::MAX)) != expect {
-                st.incomplete.push(format!(
+                st.note_incomplete(format!(
                     "{} changed (dev, ino) before removal; preserved",
                     display.display()
                 ));
@@ -17153,12 +18695,12 @@ impl ClearPinnedDir {
                     errno.raw_os_error(),
                     Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
                 ) {
-                    st.incomplete.push(format!(
+                    st.note_incomplete(format!(
                         "{} is non-empty after clear; content preserved",
                         display.display()
                     ));
                 } else {
-                    st.incomplete.push(format!(
+                    st.note_incomplete(format!(
                         "cannot remove {}; preserved ({errno})",
                         display.display()
                     ));
@@ -17172,15 +18714,14 @@ impl ClearPinnedDir {
             match std::fs::symlink_metadata(&display) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Ok(md) if md.file_type().is_symlink() => {
-                    st.incomplete
-                        .push(format!("{} is a symlink; preserved", display.display()));
+                    st.note_incomplete(format!("{} is a symlink; preserved", display.display()));
                     st.note_preserved(format!("{} (preserved)", display.display()));
                 }
                 Ok(_) => match std::fs::remove_dir(&display) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => {
-                        st.incomplete.push(format!(
+                        st.note_incomplete(format!(
                             "cannot remove {}; preserved ({e})",
                             display.display()
                         ));
@@ -17188,7 +18729,7 @@ impl ClearPinnedDir {
                     }
                 },
                 Err(e) => {
-                    st.incomplete.push(format!(
+                    st.note_incomplete(format!(
                         "cannot inspect {}; preserved ({e})",
                         display.display()
                     ));
@@ -17211,7 +18752,7 @@ impl ClearPinnedDir {
         let meta = match std::fs::symlink_metadata(&display) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
             Err(e) => {
-                st.incomplete.push(format!(
+                st.note_incomplete(format!(
                     "cannot inspect {}; preserved ({e})",
                     display.display()
                 ));
@@ -17219,15 +18760,14 @@ impl ClearPinnedDir {
                 return;
             }
             Ok(md) if md.file_type().is_symlink() => {
-                st.incomplete
-                    .push(format!("{} is a symlink; preserved", display.display()));
+                st.note_incomplete(format!("{} is a symlink; preserved", display.display()));
                 st.note_preserved(format!("{} (preserved)", display.display()));
                 return;
             }
             Ok(md) => md,
         };
         if (meta.dev(), meta.ino()) != expect || !meta.is_dir() {
-            st.incomplete.push(format!(
+            st.note_incomplete(format!(
                 "{} changed (dev, ino) before removal; preserved",
                 display.display()
             ));
@@ -17238,14 +18778,14 @@ impl ClearPinnedDir {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
-                st.incomplete.push(format!(
+                st.note_incomplete(format!(
                     "{} is non-empty after clear; content preserved",
                     display.display()
                 ));
                 st.note_preserved(format!("{} (preserved)", display.display()));
             }
             Err(e) => {
-                st.incomplete.push(format!(
+                st.note_incomplete(format!(
                     "cannot remove {}; preserved ({e})",
                     display.display()
                 ));
@@ -17276,7 +18816,7 @@ fn remove_known_empty_dir_expected(
         match std::fs::symlink_metadata(&display) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
             Err(e) => {
-                st.incomplete.push(format!(
+                st.note_incomplete(format!(
                     "cannot inspect {}; preserved ({e})",
                     display.display()
                 ));
@@ -17284,7 +18824,7 @@ fn remove_known_empty_dir_expected(
                 return;
             }
             Ok(md) if md.file_type().is_symlink() => {
-                st.incomplete.push(format!(
+                st.note_incomplete(format!(
                     "{} raced in as a symlink after preflight; preserved",
                     display.display()
                 ));
@@ -17292,7 +18832,7 @@ fn remove_known_empty_dir_expected(
                 return;
             }
             Ok(_) => {
-                st.incomplete.push(format!(
+                st.note_incomplete(format!(
                     "{} raced in after preflight; preserved",
                     display.display()
                 ));
@@ -17302,7 +18842,7 @@ fn remove_known_empty_dir_expected(
         }
     };
     if let Err(e) = pin.verify() {
-        st.incomplete.push(format!(
+        st.note_incomplete(format!(
             "{} changed during clear; preserved ({e})",
             display.display()
         ));
@@ -17826,7 +19366,7 @@ async fn load_snapshot_rows(
     let snapshot_entries = match std::fs::read_dir(snapshots) {
         Ok(entries) => Some(entries),
         Err(e) => {
-            st.incomplete.push(format!(
+            st.note_incomplete(format!(
                 "cannot list {}; checksum rows unresolved, files stay preserved ({e})",
                 snapshots.display()
             ));
@@ -17836,7 +19376,7 @@ async fn load_snapshot_rows(
     if let Some(entries) = snapshot_entries {
         for entry in entries {
             if st.expired() {
-                st.incomplete.push(format!(
+                st.note_incomplete(format!(
                     "snapshot stem scan hit the {CLEAR_DEADLINE_SECS}s time budget; \
                      unresolved files stay preserved"
                 ));
@@ -17849,7 +19389,7 @@ async fn load_snapshot_rows(
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(e) => {
-                    st.incomplete.push(format!(
+                    st.note_incomplete(format!(
                         "cannot read a snapshot entry; its checksum row stays unresolved ({e})"
                     ));
                     continue;
@@ -17865,7 +19405,7 @@ async fn load_snapshot_rows(
         return (rows, truncated);
     }
     if st.expired() {
-        st.incomplete.push(format!(
+        st.note_incomplete(format!(
             "snapshot checksum loading hit the {CLEAR_DEADLINE_SECS}s time budget; \
              unresolved files stay preserved"
         ));
@@ -17877,7 +19417,7 @@ async fn load_snapshot_rows(
     };
     for stem in stems.iter().take(SNAPSHOT_MAX_STEMS) {
         if st.expired() {
-            st.incomplete.push(format!(
+            st.note_incomplete(format!(
                 "snapshot checksum loading hit the {CLEAR_DEADLINE_SECS}s time budget; \
                  unresolved files stay preserved"
             ));
@@ -17895,7 +19435,7 @@ async fn load_snapshot_rows(
             }
         }
         if slow {
-            st.incomplete.push(format!(
+            st.note_incomplete(format!(
                 "a snapshot checksum read exceeded the {}s per-read bound; \
                  remaining rows unresolved, files stay preserved",
                 SNAPSHOT_READ_TIMEOUT.as_secs()
@@ -17975,7 +19515,7 @@ fn clear_tool_dir_expected(
     for entry in entries {
         scanned += 1;
         if scanned > CLEAR_MAX_FILES_PER_DIR {
-            st.incomplete.push(format!(
+            st.note_incomplete(format!(
                 "{} listing truncated at the {CLEAR_MAX_FILES_PER_DIR}-entry budget; \
                  coverage incomplete",
                 dir.display()
@@ -17983,7 +19523,7 @@ fn clear_tool_dir_expected(
             break;
         }
         if st.expired() {
-            st.incomplete.push(format!(
+            st.note_incomplete(format!(
                 "{} scan hit the {CLEAR_DEADLINE_SECS}s time budget; coverage incomplete",
                 dir.display()
             ));
@@ -18070,7 +19610,7 @@ fn clear_tool_dir_expected(
         };
         st.bytes_hashed += bytes.len() as u64;
         if st.bytes_hashed > CLEAR_MAX_BYTES_HASHED {
-            st.incomplete.push(format!(
+            st.note_incomplete(format!(
                 "clear hashing hit the {CLEAR_MAX_BYTES_HASHED}-byte budget; coverage incomplete"
             ));
             st.note_preserved(format!(
@@ -18742,6 +20282,17 @@ pub struct TestRunStats {
     pub breakers_open: Vec<String>,
 }
 
+#[cfg(test)]
+pub async fn test_count_open_errors_for_roots_with_event_volumes(
+    store: &TursoStore,
+    roots: &[PathBuf],
+    identity_roots: &[PathBuf],
+    event_volume_ids: &[String],
+) -> repo_scan::Result<u64> {
+    let event_volume_ids = event_volume_ids.iter().cloned().collect();
+    count_open_errors_for_scope(store, Some(roots), Some(identity_roots), &event_volume_ids).await
+}
+
 /// Drive the production run loop to its boundary (RSF-3E2FDCF3-78C5-401A-84DD-A799688ED84F):
 /// the same `run_until_boundary` the scan path executes.
 #[cfg(test)]
@@ -18765,6 +20316,36 @@ pub async fn test_run_boundary(
         canonical,
         status_mode,
         scan_id,
+        None,
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub async fn test_run_boundary_for_roots(
+    store: &TursoStore,
+    epoch: u64,
+    generation: u64,
+    run_rev: u64,
+    canonical: &str,
+    status_mode: StatusMode,
+    scan_id: &str,
+    roots: &[PathBuf],
+) -> repo_scan::Result<TestRunStats> {
+    let mut runner = Runner::new(&config::ResourceLimits::default());
+    test_run_boundary_with(
+        &mut runner,
+        store,
+        epoch,
+        generation,
+        run_rev,
+        canonical,
+        status_mode,
+        scan_id,
+        Some(roots),
+        Some(roots),
     )
     .await
 }
@@ -18794,6 +20375,8 @@ pub async fn test_run_boundary_with_grace(
         canonical,
         status_mode,
         scan_id,
+        None,
+        None,
     )
     .await
 }
@@ -18828,6 +20411,8 @@ pub async fn test_run_boundary_with_checkpoint(
         canonical,
         status_mode,
         scan_id,
+        None,
+        None,
     )
     .await
 }
@@ -18843,6 +20428,8 @@ async fn test_run_boundary_with(
     canonical: &str,
     status_mode: StatusMode,
     scan_id: &str,
+    scope_roots: Option<&[PathBuf]>,
+    scope_identity_roots: Option<&[PathBuf]>,
 ) -> repo_scan::Result<TestRunStats> {
     // Test harness drains both phases like the scan path: discovery to
     // its boundary, then analysis — preserving "drain everything"
@@ -18856,6 +20443,8 @@ async fn test_run_boundary_with(
         canonical,
         status_mode,
         scan_id,
+        scope_roots,
+        scope_identity_roots,
         DrainPhase::Discovery,
     )
     .await?;
@@ -18868,6 +20457,8 @@ async fn test_run_boundary_with(
         canonical,
         status_mode,
         scan_id,
+        scope_roots,
+        scope_identity_roots,
         DrainPhase::Analysis,
     )
     .await?;
@@ -18952,6 +20543,7 @@ pub struct TestDerivationScan {
     pub chunks: u64,
     pub peak_chunk: usize,
     pub candidates: usize,
+    pub candidate_ids: Vec<String>,
     pub storage_links: usize,
 }
 
@@ -18968,6 +20560,47 @@ pub async fn test_scan_error_derivations(
         chunks: derived.chunks,
         peak_chunk: derived.peak_chunk,
         candidates: derived.candidates.len(),
+        candidate_ids: derived
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.id)
+            .collect(),
+        storage_links: 0,
+    })
+}
+
+/// Production roots-scoped error derivation scan, including checkout
+/// status scopes selected by their checkout root path.
+#[cfg(test)]
+pub async fn test_scan_error_derivations_for_roots(
+    store: &TursoStore,
+    root_scopes: &[String],
+    scope_roots: &[PathBuf],
+    max_error_candidates: usize,
+) -> repo_scan::Result<TestDerivationScan> {
+    let caps = DerivationCaps {
+        max_error_candidates,
+        ..DerivationCaps::default_caps()
+    };
+    let derived = scan_error_derivations_scoped(
+        store,
+        root_scopes,
+        None,
+        &caps,
+        Some(scope_roots),
+        Some(scope_roots),
+    )
+    .await?;
+    Ok(TestDerivationScan {
+        scanned: derived.scanned,
+        chunks: derived.chunks,
+        peak_chunk: derived.peak_chunk,
+        candidates: derived.candidates.len(),
+        candidate_ids: derived
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.id)
+            .collect(),
         storage_links: 0,
     })
 }
@@ -18983,6 +20616,35 @@ pub async fn test_scan_instance_derivations(
         chunks: derived.chunks,
         peak_chunk: derived.peak_chunk,
         candidates: derived.candidates.len(),
+        candidate_ids: derived
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.id)
+            .collect(),
+        storage_links: derived.storage_links.len(),
+    })
+}
+
+#[cfg(test)]
+pub async fn test_scan_instance_derivations_with_cap(
+    store: &TursoStore,
+    max_instance_candidates: usize,
+) -> repo_scan::Result<TestDerivationScan> {
+    let caps = DerivationCaps {
+        max_instance_candidates,
+        ..DerivationCaps::default_caps()
+    };
+    let derived = scan_instance_derivations_scoped(store, &caps, None, None).await?;
+    Ok(TestDerivationScan {
+        scanned: derived.scanned,
+        chunks: derived.chunks,
+        peak_chunk: derived.peak_chunk,
+        candidates: derived.candidates.len(),
+        candidate_ids: derived
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.id)
+            .collect(),
         storage_links: derived.storage_links.len(),
     })
 }
@@ -19224,6 +20886,17 @@ pub async fn test_emit_scan_event_with_retention(
     journal
         .emit_with_retention(store, event_type, &serde_json::json!({}), keep_rows)
         .await
+}
+
+/// Resume-milestone regression hook: reopen the production journal and
+/// inspect whether `inventory_ready` remains authoritative after pruning.
+#[cfg(test)]
+pub async fn test_scan_journal_has_ready(
+    store: &TursoStore,
+    scan_id: &str,
+) -> repo_scan::Result<bool> {
+    let rev = store.next_revision().await?;
+    Ok(ScanJournal::open(store, scan_id, rev).await?.has_ready())
 }
 
 /// Terminal guard regression hook: attempt to buffer one location update

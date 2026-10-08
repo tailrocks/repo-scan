@@ -46,6 +46,45 @@ fn load_json(path: &Path) -> serde_json::Value {
     serde_json::from_str(&text).expect("report is valid JSON")
 }
 
+#[cfg(unix)]
+fn snapshot_files(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    fn collect(root: &Path, directory: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+        let mut entries: Vec<_> = std::fs::read_dir(directory)
+            .unwrap_or_else(|e| panic!("read {}: {e}", directory.display()))
+            .map(|entry| entry.expect("read directory entry"))
+            .collect();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            let file_type = entry.file_type().expect("read entry type");
+            assert!(
+                !file_type.is_symlink(),
+                "unexpected symlink in snapshot: {}",
+                path.display()
+            );
+            if file_type.is_dir() {
+                collect(root, &path, out);
+            } else {
+                assert!(
+                    file_type.is_file(),
+                    "unexpected entry in snapshot: {}",
+                    path.display()
+                );
+                out.push((
+                    path.strip_prefix(root)
+                        .expect("relative path")
+                        .to_path_buf(),
+                    std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display())),
+                ));
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    collect(root, root, &mut files);
+    files
+}
+
 /// Find a branch row by kind + full ref name. Unique in single-clone
 /// worlds (seed upstreams have no remotes, hence no tracking rows).
 fn branch<'r>(report: &'r serde_json::Value, kind: &str, name: &str) -> &'r serde_json::Value {
@@ -344,6 +383,409 @@ fn fetch03_mirror_is_unsupported_branch_tips_untouched() {
         fixture::git_str(&mirror, &["rev-parse", "refs/heads/other"]),
         c1,
         "mirror second branch untouched"
+    );
+}
+
+/// Slash-delimited remote names can have overlapping tracking
+/// namespaces: `foo`'s `bar/main` branch and `foo/bar`'s `main` branch
+/// both map to `refs/remotes/foo/bar/main`. Refuse both before either
+/// fetch can overwrite or claim that shared ref.
+#[test]
+fn fetch_remote_namespace_overlap_refuses_both_without_ref_update() {
+    let tmp = fixture::scratch_root("fetch-remote-namespace-overlap");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+
+    let (foo_upstream, _) = seed_upstream(&root, "foo-upstream");
+    fixture::git(&foo_upstream, &["checkout", "-q", "-b", "bar/main"]);
+    let foo_nested = fixture::commit_file(
+        &foo_upstream,
+        "foo-bar-main.txt",
+        "foo bar/main\n",
+        "foo bar/main",
+    );
+    fixture::git(&foo_upstream, &["checkout", "-q", "main"]);
+
+    let (foo_bar_upstream, _) = seed_upstream(&root, "foo-bar-upstream");
+    let foo_bar_main = fixture::commit_file(
+        &foo_bar_upstream,
+        "foo-bar-main.txt",
+        "foo/bar main\n",
+        "foo/bar main",
+    );
+    assert_ne!(foo_nested, foo_bar_main);
+
+    let clone = clone_from(&root, &foo_upstream, "clone");
+    fixture::git(&clone, &["remote", "rename", "origin", "foo"]);
+    let foo_bar_url = foo_bar_upstream.to_str().expect("utf8");
+    fixture::git(
+        &clone,
+        &["config", "--add", "remote.foo/bar.url", foo_bar_url],
+    );
+    fixture::git(
+        &clone,
+        &[
+            "config",
+            "--add",
+            "remote.foo/bar.fetch",
+            "+refs/heads/*:refs/remotes/foo/bar/*",
+        ],
+    );
+
+    let shared_ref = "refs/remotes/foo/bar/main";
+    let before = fixture::git_str(&clone, &["rev-parse", shared_ref]);
+    assert_eq!(
+        before, foo_nested,
+        "clone has foo's nested branch at the shared ref"
+    );
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "usable scan result: {}",
+        stderr_text(&out)
+    );
+    let report = load_json(&report_path);
+    for name in ["foo", "foo/bar"] {
+        let refresh = remote(&report, name, "fetch");
+        assert_eq!(
+            refresh["refresh"]["status"].as_str(),
+            Some("unsupported"),
+            "overlapping remote {name} must not fetch"
+        );
+    }
+    assert_eq!(
+        fixture::git_str(&clone, &["rev-parse", shared_ref]),
+        before,
+        "neither overlapping remote may overwrite the shared tracking ref"
+    );
+    for item in report["branches"].as_array().expect("branches") {
+        if item["name"]["value"].as_str() == Some(shared_ref) {
+            assert_ne!(
+                item["freshness"].as_str(),
+                Some("current"),
+                "unsupported fetches cannot claim the shared ref as current"
+            );
+        }
+    }
+}
+
+/// A standard clone refspec is safe only while its destinations resolve
+/// inside the remote's tracking namespace. An existing Git symref can
+/// redirect that destination to a local branch, so refuse before fetch.
+#[test]
+fn fetch_destination_symref_escape_refused_without_branch_update() {
+    let tmp = fixture::scratch_root("fetch-destination-symref");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+
+    let (upstream, c1) = seed_upstream(&root, "upstream");
+    let clone = clone_from(&root, &upstream, "clone");
+    let c2 = fixture::commit_file(&upstream, "advance.txt", "v2\n", "advance main");
+    assert_ne!(c1, c2);
+    assert_eq!(
+        fixture::git_str(&clone, &["config", "--get", "remote.origin.fetch"]),
+        "+refs/heads/*:refs/remotes/origin/*",
+        "the standard clone mapping passes refspec validation"
+    );
+
+    // Keep local main out of the checked-out worktree so an unchecked
+    // fetch destination can update it. Replace origin/main with a Git
+    // symbolic ref to the local branch.
+    fixture::git(&clone, &["checkout", "-q", "-b", "local"]);
+    fixture::git(&clone, &["update-ref", "-d", "refs/remotes/origin/main"]);
+    fixture::git(
+        &clone,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/main",
+            "refs/heads/main",
+        ],
+    );
+    assert_eq!(
+        fixture::git_str(&clone, &["symbolic-ref", "refs/remotes/origin/main"]),
+        "refs/heads/main"
+    );
+    let branch_before = fixture::git_str(&clone, &["rev-parse", "refs/heads/main"]);
+    assert_eq!(branch_before, c1);
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "usable scan result: {}",
+        stderr_text(&out)
+    );
+    let report = load_json(&report_path);
+    assert_eq!(
+        remote(&report, "origin", "fetch")["refresh"]["status"].as_str(),
+        Some("unsupported"),
+        "the symbolic-ref destination is refused"
+    );
+    let detail = origin_refresh_detail(&state).unwrap_or_default();
+    assert!(
+        detail.contains("symbolic ref"),
+        "refusal describes the unsafe ref relationship: {detail}"
+    );
+    assert_eq!(
+        fixture::git_str(&clone, &["rev-parse", "refs/heads/main"]),
+        branch_before,
+        "fetch refusal leaves the local branch oid unchanged"
+    );
+}
+
+/// An empty nested filesystem symlink is invisible to `for-each-ref`
+/// until a newly fetched branch traverses it. Refuse before creating a
+/// ref outside the repository.
+#[cfg(unix)]
+#[test]
+fn fetch_empty_nested_ref_symlink_refused_without_external_write() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = fixture::scratch_root("fetch-empty-nested-ref-symlink");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    let escaped = tmp.path().join("escaped-refs");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir root");
+    repo_scan::privacy::private_dir_0700(&escaped).expect("mkdir escaped ref target");
+
+    let (upstream, c1) = seed_upstream(&root, "upstream");
+    let clone = clone_from(&root, &upstream, "clone");
+    fixture::git(&upstream, &["branch", "nested/new"]);
+    let namespace = clone.join(".git/refs/remotes/origin");
+    std::fs::create_dir_all(&namespace).expect("remote ref namespace exists");
+    symlink(&escaped, namespace.join("nested")).expect("create empty nested ref symlink");
+    assert!(!escaped.join("new").exists());
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "usable scan result: {}",
+        stderr_text(&out)
+    );
+    let report = load_json(&report_path);
+    assert_eq!(
+        remote(&report, "origin", "fetch")["refresh"]["status"].as_str(),
+        Some("unsupported"),
+        "the empty nested symlink is refused before fetch"
+    );
+    let detail = origin_refresh_detail(&state).unwrap_or_default();
+    assert!(
+        detail.contains("filesystem symlink"),
+        "refusal identifies the unsafe namespace class: {detail}"
+    );
+    assert_eq!(
+        fixture::git_str(&clone, &["rev-parse", "refs/heads/main"]),
+        c1,
+        "fetch refusal leaves the local branch tip unchanged"
+    );
+    assert!(
+        !escaped.join("new").exists(),
+        "fetch did not create the mapped ref outside the repository"
+    );
+}
+
+/// The reftable backend uses one directory rather than loose refs. A
+/// symlink at that directory's root must be refused before fetch can
+/// append a table outside the repository.
+#[cfg(unix)]
+#[test]
+fn fetch_reftable_root_symlink_refused_without_external_write() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = fixture::scratch_root("fetch-reftable-root-symlink");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    let saved_reftable = tmp.path().join("saved-reftable");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir root");
+
+    let (upstream, c1) = seed_upstream(&root, "upstream");
+    let clone = root.join("clone");
+    fixture::git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--ref-format=reftable",
+            upstream.to_str().expect("utf8"),
+            clone.to_str().expect("utf8"),
+        ],
+    );
+    assert_eq!(
+        fixture::git_str(&clone, &["config", "--get", "extensions.refStorage"]),
+        "reftable"
+    );
+    fixture::git(&upstream, &["branch", "nested/new"]);
+
+    let reftable_path = clone.join(".git/reftable");
+    std::fs::rename(&reftable_path, &saved_reftable).expect("preserve initial reftable store");
+    let original_content = snapshot_files(&saved_reftable);
+    symlink(&saved_reftable, &reftable_path).expect("symlink reftable root");
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "usable scan result: {}",
+        stderr_text(&out)
+    );
+    let report = load_json(&report_path);
+    assert_eq!(
+        remote(&report, "origin", "fetch")["refresh"]["status"].as_str(),
+        Some("unsupported"),
+        "the reftable root symlink is refused before fetch"
+    );
+    let detail = origin_refresh_detail(&state).unwrap_or_default();
+    assert!(
+        detail.contains("filesystem symlink"),
+        "refusal identifies unsafe ref storage: {detail}"
+    );
+    assert_eq!(
+        fixture::git_str(&clone, &["rev-parse", "refs/heads/main"]),
+        c1,
+        "fetch refusal leaves the local branch tip unchanged"
+    );
+    assert_eq!(
+        snapshot_files(&saved_reftable),
+        original_content,
+        "external reftable files remain unchanged"
+    );
+}
+
+/// Repository config may ask fetch to write commit-graph files. Since
+/// objects/info/commit-graphs is repository-controlled, keep that optional
+/// write disabled so a symlink there cannot redirect writes outside the
+/// object database.
+#[cfg(unix)]
+#[test]
+fn fetch_commit_graph_symlink_is_not_written_through() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = fixture::scratch_root("fetch-commit-graph-symlink");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    let external_graphs = tmp.path().join("external-commit-graphs");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir root");
+    repo_scan::privacy::private_dir_0700(&external_graphs).expect("mkdir external graph dir");
+
+    let (upstream, c1) = seed_upstream(&root, "upstream");
+    let clone = root.join("clone");
+    fixture::git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--ref-format=reftable",
+            upstream.to_str().expect("utf8"),
+            clone.to_str().expect("utf8"),
+        ],
+    );
+    let c2 = fixture::commit_file(&upstream, "advance.txt", "v2\n", "advance main");
+    assert_ne!(c1, c2);
+    fixture::git(&clone, &["config", "fetch.writeCommitGraph", "true"]);
+    let graph_dir = clone.join(".git/objects/info/commit-graphs");
+    std::fs::create_dir_all(graph_dir.parent().expect("objects info dir"))
+        .expect("create objects info dir");
+    symlink(&external_graphs, &graph_dir).expect("redirect commit-graph directory");
+    let original_external_content = snapshot_files(&external_graphs);
+    assert!(original_external_content.is_empty());
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "usable scan result: {}",
+        stderr_text(&out)
+    );
+    let report = load_json(&report_path);
+    assert_eq!(
+        remote(&report, "origin", "fetch")["refresh"]["status"].as_str(),
+        Some("success"),
+        "fetch still advances the safe reftable-backed clone"
+    );
+    assert_eq!(
+        fixture::git_str(&clone, &["rev-parse", "refs/remotes/origin/main"]),
+        c2,
+        "the tracking ref advances to the fetched tip"
+    );
+    assert_eq!(
+        fixture::git_str(&clone, &["rev-parse", "refs/heads/main"]),
+        c1,
+        "fetch does not move the local branch"
+    );
+    assert_eq!(
+        fixture::git_str(&clone, &["config", "--get", "fetch.writeCommitGraph"]),
+        "true",
+        "the per-command safety override does not rewrite repository config"
+    );
+    assert_eq!(
+        snapshot_files(&external_graphs),
+        original_external_content,
+        "fetch leaves the external graph directory unchanged"
     );
 }
 
@@ -1173,8 +1615,8 @@ fn fetch13_repo_uploadpack_refused_without_execution() {
     assert_eq!(refresh["refresh"]["status"].as_str(), Some("unsupported"));
     let detail = origin_refresh_detail(&state).unwrap_or_default();
     assert!(
-        detail.contains("remote.origin.uploadpack"),
-        "refusal names the repo-scope key: {detail}"
+        detail.contains("remote executable setting"),
+        "refusal identifies the safe setting class: {detail}"
     );
     for b in report["branches"].as_array().expect("branches") {
         assert_ne!(
@@ -1197,6 +1639,63 @@ fn run_with_path(args: &[&str], cwd: &Path, state: &Path, path_dir: &Path) -> st
     let mut command = cmd(state, cwd);
     command.env("PATH", joined);
     command.args(args).output().expect("spawn repo-scan")
+}
+
+/// FETCH-GATE-07: repo-local `remote.<name>.vcs` can select executable
+/// helper code, so it must be refused before the fetch spawn.
+#[cfg(unix)]
+#[test]
+fn fetch15_repo_remote_vcs_helper_refused_without_execution() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = fixture::scratch_root("fetch15");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    let helper_dir = tmp.path().join("helpers");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir root");
+    repo_scan::privacy::private_dir_0700(&helper_dir).expect("mkdir helpers");
+
+    let (upstream, _) = seed_upstream(&root, "upstream");
+    let clone = clone_from(&root, &upstream, "clone");
+    let sentinel = tmp.path().join("SENTINEL-remote-vcs");
+    let helper = helper_dir.join("git-remote-fetch15-sentinel");
+    repo_scan::privacy::private_write_0600(
+        &helper,
+        format!("#!/bin/sh\ntouch \"{}\"\nexit 1\n", sentinel.display()).as_bytes(),
+    )
+    .expect("write helper");
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    fixture::git(&clone, &["config", "remote.origin.vcs", "fetch15-sentinel"]);
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run_with_path(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+        &helper_dir,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "usable scan result: {}",
+        stderr_text(&out)
+    );
+    assert!(!sentinel.exists(), "repo remote helper must not execute");
+    let report = load_json(&report_path);
+    let refresh = remote(&report, "origin", "fetch");
+    assert_eq!(refresh["refresh"]["status"].as_str(), Some("unsupported"));
+    let detail = origin_refresh_detail(&state).unwrap_or_default();
+    assert!(
+        detail.contains("remote executable setting"),
+        "refusal identifies the safe setting class: {detail}"
+    );
 }
 
 /// FETCH-GATE-06: a repo-scope `remote.origin.receivepack` refuses the
@@ -1240,9 +1739,236 @@ fn fetch14_repo_receivepack_refused() {
     assert_eq!(refresh["refresh"]["status"].as_str(), Some("unsupported"));
     let detail = origin_refresh_detail(&state).unwrap_or_default();
     assert!(
-        detail.contains("remote.origin.receivepack"),
-        "refusal names the repo-scope key: {detail}"
+        detail.contains("remote executable setting"),
+        "refusal identifies the safe setting class: {detail}"
     );
+}
+
+#[test]
+fn fetch_remote_exec_refusal_scrubs_credential_shaped_subsection() {
+    let tmp = fixture::scratch_root("fetch-remote-key-privacy");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+
+    let (upstream, _) = seed_upstream(&root, "upstream");
+    let clone = clone_from(&root, &upstream, "clone");
+    let secret = "https://alice:super-secret@example.invalid/repo";
+    let key = format!("remote.\"{secret}\".vcs");
+    fixture::git(&clone, &["config", "--add", &key, "fetch-secret-helper"]);
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "usable scan result: {}",
+        stderr_text(&out)
+    );
+    let report = load_json(&report_path);
+    assert_eq!(
+        remote(&report, "origin", "fetch")["refresh"]["status"].as_str(),
+        Some("unsupported")
+    );
+    let rt = runtime();
+    let rows = rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open catalog");
+        let rows = refresh_rows(&store).await;
+        store.close().await.expect("close");
+        rows
+    });
+    assert!(
+        rows.len() >= 1,
+        "fetch refusal should be persisted: {rows:?}"
+    );
+    for (_, _, status, _, detail) in rows {
+        assert_eq!(status, "unsupported");
+        let detail = detail.expect("refusal detail");
+        assert!(
+            detail.contains("remote executable setting"),
+            "safe refusal class should remain useful: {detail}"
+        );
+        assert!(!detail.contains("alice"), "refusal leaked user: {detail}");
+        assert!(
+            !detail.contains("super-secret"),
+            "refusal leaked password: {detail}"
+        );
+        assert!(
+            !detail.contains("example.invalid"),
+            "refusal leaked host: {detail}"
+        );
+    }
+}
+
+/// FETCH-GATE-08: malformed raw refspec text is treated as untrusted
+/// input. Neither the catalog's refusal detail nor the report may persist
+/// the credential-shaped value supplied through repo-local config.
+#[test]
+fn fetch16_untrusted_refspec_text_is_not_persisted_or_reported() {
+    let tmp = fixture::scratch_root("fetch16");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+
+    let (upstream, _) = seed_upstream(&root, "upstream");
+    let clone = clone_from(&root, &upstream, "clone");
+    let secret = "https://alice:super-secret@example.invalid/repo";
+    let untrusted = format!("refs/heads/main:{secret}");
+    fixture::git(
+        &clone,
+        &["config", "--add", "remote.origin.fetch", &untrusted],
+    );
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "usable scan result: {}",
+        stderr_text(&out)
+    );
+    let report_bytes = std::fs::read(&report_path).expect("read report bytes");
+    assert!(!String::from_utf8_lossy(&report_bytes).contains(secret));
+    let report = load_json(&report_path);
+    let refresh = remote(&report, "origin", "fetch");
+    assert_eq!(refresh["refresh"]["status"].as_str(), Some("unsupported"));
+    let detail = origin_refresh_detail(&state).unwrap_or_default();
+    assert!(
+        !detail.contains("alice"),
+        "catalog refusal leaked user: {detail}"
+    );
+    assert!(
+        !detail.contains("super-secret"),
+        "catalog refusal leaked password: {detail}"
+    );
+    assert!(
+        !detail.contains("example.invalid"),
+        "catalog refusal leaked host: {detail}"
+    );
+}
+
+/// A later explicit-root fetch does not revisit a store discovered by a
+/// prior root. The old store is made locally invalid after its first
+/// successful fetch; a global fetch pass would change its refresh status.
+#[test]
+fn fetch_scope_filter_skips_prior_root_stores() {
+    let tmp = fixture::scratch_root("fetch-scope");
+    let state = tmp.path().join("state");
+    let root_a = tmp.path().join("root-a");
+    let root_b = tmp.path().join("root-b");
+    repo_scan::privacy::private_dir_0700(&root_a).expect("mkdir root A");
+    repo_scan::privacy::private_dir_0700(&root_b).expect("mkdir root B");
+
+    let (upstream, _) = seed_upstream(tmp.path(), "upstream");
+    let clone_a = clone_from(&root_a, &upstream, "repo");
+    let _clone_b = clone_from(&root_b, &upstream, "repo");
+    let report_a = tmp.path().join("root-a.json");
+    let first = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root_a.to_str().expect("utf8"),
+            "--report",
+            report_a.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert!(
+        matches!(first.status.code(), Some(0) | Some(3)),
+        "root A fetch scan: {}",
+        stderr_text(&first)
+    );
+    assert_eq!(
+        remote(&load_json(&report_a), "origin", "fetch")["refresh"]["status"],
+        "success"
+    );
+
+    // This URL is rejected before a Git transport spawn. If root B's scan
+    // still inspects root A's store, its durable status changes to failed.
+    fixture::git(
+        &clone_a,
+        &["remote", "set-url", "origin", "not a valid fetch URL"],
+    );
+    let report_b = tmp.path().join("root-b.json");
+    let second = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root_b.to_str().expect("utf8"),
+            "--report",
+            report_b.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert!(
+        matches!(second.status.code(), Some(0) | Some(3)),
+        "root B fetch scan: {}",
+        stderr_text(&second)
+    );
+    assert_eq!(
+        remote(&load_json(&report_b), "origin", "fetch")["refresh"]["status"],
+        "success"
+    );
+
+    let rt = runtime();
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open catalog");
+        let mut rows = store
+            .connection()
+            .query(
+                "SELECT status FROM remote_refreshes ORDER BY store_id ASC",
+                (),
+            )
+            .await
+            .expect("query refreshes");
+        let mut statuses = Vec::new();
+        while let Some(row) = rows.next().await.expect("next refresh") {
+            let turso::Value::Text(status) = row.get_value(0).expect("status") else {
+                panic!("expected text refresh status");
+            };
+            statuses.push(status);
+        }
+        assert_eq!(
+            statuses.len(),
+            2,
+            "each in-scope store fetched once: {statuses:?}"
+        );
+        assert!(
+            statuses.iter().all(|status| status == "success"),
+            "root B left root A's earlier success untouched: {statuses:?}"
+        );
+        store.close().await.expect("close catalog");
+    });
 }
 
 /// FETCH-GATE-07: a remote-helper transport URL refuses end to end

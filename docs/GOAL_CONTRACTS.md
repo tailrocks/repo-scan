@@ -56,12 +56,16 @@ freshness stay separate properties.
 - Catalog migration v6: `refs.comparison_state` / `ahead` / `behind`
   (Step 10); legacy rows read `NULL` (`pending` / null counts).
 - NEW scan-event stream schema `1.0.0` (JSONL).
+- Scan-event `1.0.0` starts with opaque event join IDs for path-derived
+  catalog IDs; they are not catalog IDs. This is the initial wire contract
+  (the target `main` has no scan-event schema), so no prior released event
+  shape is being changed. Legacy development rows are normalized on replay.
 - Catalog migration v2: `github_groups`, `scan_events` journal,
   `scan_requests` multi-target columns, full scope key (D5). v1 data migrates.
 - Catalog migration v5: `status_observations.conflicts` /
   `working_state` (Step 10); legacy rows read `NULL` (unknown).
-- Reason for new IDs: only `github_groups` and `scan_events` IDs are new;
-  both are new entities, so no stability break.
+- Event IDs are wire join keys and never promise identity with owner-local
+  catalog IDs; report and catalog IDs keep their existing formats.
 
 ## D3. Phase transitions (Step 8)
 
@@ -87,19 +91,33 @@ record/error events never silently dropped (durable replay or backpressure).
 
 | `type` | `op` | Payload |
 |---|---|---|
-| `scan_started` | add | scan id, scope, targets, options, resume cmd |
+| `scan_started` | add | scan id, scope, targets, options, resume cmd (local target/state paths redacted) |
 | `discovery_progress` | replace | phase, elapsed, discovered, pending, gaps (no % of unknown total) |
-| `location_found` | add | checkout/store/path/alias ids, identity or `unknown`, analysis=`pending` |
-| `repository_found` | add | store id + GitHub group assoc |
+| `location_found` | add | opaque checkout/store IDs, identity or `unknown`, analysis=`pending`; no raw or reversible local paths |
+| `repository_found` | add | store id + GitHub group assoc; local `file:` remote URLs redacted |
 | `inventory_ready` | add | complete\|incomplete, generation, counts, gaps |
 | `branch_batch` | add/replace | branch records w/ `rev` |
 | `location_updated` | replace | checkout analysis/state change w/ `rev` |
 | `coverage_updated` | replace | gaps/candidates delta |
-| `error` | add | ErrorRecord |
+| `error` | add | ErrorRecord with path-free event detail |
 | `remote_updated` | replace | per-store remote op: success/failure/time/ref coverage |
 | `scan_completed`/`scan_incomplete` | add | final counts + resume cmd + boundary audit |
 | `scan_interrupted` | add | scan id, cursor, saved scope/options + boundary audit |
 | `scan_failed` | add | last cursor, error, resume capability + boundary audit |
+
+Path-derived catalog IDs are projected to stable, domain-separated SHA-256
+event IDs before serialization. The same projection is used across related
+event records so JSONL replay can join them without exposing reversible path
+encodings. These event IDs are opaque and do not identify rows in the local
+catalog; consumers that need exact paths or catalog IDs use the local
+catalog/report flow. Root paths in lifecycle events use opaque root IDs.
+Local or ambiguous bare target spellings, `file:` remote URLs, and
+state-directory paths in resume commands are redacted in lifecycle records;
+canonical remote target identities remain. Free-form event error and
+detail strings use stable path-free text because local paths cannot be
+distinguished reliably from arbitrary diagnostic text. Structured categories
+and status fields remain available; original details stay in owner-only
+storage where the producer persists them.
 
 Cursor: opaque; `scan seq` + `(catalog_rev, event offset)`. Snapshot cursor
 = exact end of included changes. Events sent only after their Catalog
@@ -141,7 +159,7 @@ Wave2b deltas (Steps 6 + 12 output matrix, branch `work/fast-complete-scan`):
   `scan_interrupted` carries `scan_id` + `cursor` + `generation` +
   `scope` + `options` + `resume_cmd` + `boundary_audit`; `scan_failed`
   carries `cursor` (last committed event, null when nothing journaled)
-  + `error` (scrubbed) + `resumable` (always true) + `resume_cmd` +
+  + `error` (path-free and scrubbed) + `resumable` (always true) + `resume_cmd` +
   `boundary_audit`. `boundary_audit` is
   `{pre_boundary_analysis_reads}` — the Step 8 order-proof counter
   (zero on every healthy scan): analysis read entries (refs, head,

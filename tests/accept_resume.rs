@@ -1169,6 +1169,17 @@ fn failure_json_tail_mirrors_scan_failed_payload() {
     );
     let tail: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("json tail is one JSON document");
+    let stdout_text = String::from_utf8_lossy(&out.stdout);
+    let temp_path = tmp.path().display().to_string();
+    let state_path = state.display().to_string();
+    assert!(
+        !stdout_text.contains(&temp_path),
+        "temporary path leaked in JSON failure tail: {tail}"
+    );
+    assert!(
+        !stdout_text.contains(&state_path),
+        "state path leaked in JSON failure tail: {tail}"
+    );
     assert_eq!(tail["state"], "failed");
     let scan_id = tail["scan_id"].as_str().expect("scan_id").to_string();
     assert!(tail.get("report_id").is_some(), "tail: {tail}");

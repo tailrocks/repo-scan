@@ -318,6 +318,34 @@ fn empty_dirs_removed_nonempty_report_incomplete() {
     );
 }
 
+fn clear_preserved_and_incomplete_paths_are_scrubbed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("password=CLEARPATHCANARY");
+    let payload = state.join("payload");
+    let snapshots = payload.join("report-snapshots");
+    let staging = payload.join("staging");
+    repo_scan::privacy::private_dir_0700(&snapshots).expect("snapshots");
+    repo_scan::privacy::private_dir_0700(&staging).expect("staging");
+    runtime().block_on(async {
+        let store = TursoStore::open(&payload.join("catalog.db"))
+            .await
+            .expect("open catalog");
+        store.close().await.expect("close catalog");
+    });
+    write_private(&snapshots.join("password=CLEARPATHCANARY.txt"), b"preserve");
+
+    let out = run(&["cache", "clear", "--all"], dir.path(), &state);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let stdout = stdout_text(&out);
+    assert!(
+        stdout.contains("INCOMPLETE"),
+        "incomplete reported: {stdout}"
+    );
+    assert!(stdout.contains("preserved"), "preserved reported: {stdout}");
+    assert!(!stdout.contains("CLEARPATHCANARY"));
+    assert!(!stderr_text(&out).contains("CLEARPATHCANARY"));
+}
+
 /// Finding 5: the deadline/per-read-bounded snapshot loading loop still
 /// resolves every checksum row on the normal path — row-bound files
 /// with opaque (non-marker) bytes are all removed with no INCOMPLETE.
@@ -391,6 +419,7 @@ fn clear_unknown_files_matrix() {
     symlinks_kept();
     known_tool_files_removed();
     empty_dirs_removed_nonempty_report_incomplete();
+    clear_preserved_and_incomplete_paths_are_scrubbed();
     snapshot_row_loading_resolves_rows();
     #[cfg(unix)]
     unlistable_payload_reports_incomplete();
