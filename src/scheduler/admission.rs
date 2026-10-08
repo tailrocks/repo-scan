@@ -315,6 +315,15 @@ impl Admission {
         }
     }
 
+    /// Currently unheld shared permits: the binding upper bound on how
+    /// many more operations of any class mix can be admitted (every
+    /// class consumes one shared permit). The scheduler caps its claim
+    /// batch at this so claimed tasks are admittable instead of
+    /// claimed-then-released (one sync commit per release).
+    pub fn free_shared(&self) -> usize {
+        self.eff_shared_cap().saturating_sub(self.shared_in_use)
+    }
+
     /// Effective shared-permit cap (halved, minimum 1, while throttled).
     fn eff_shared_cap(&self) -> usize {
         if self.cpu_throttled {
@@ -642,4 +651,22 @@ pub fn stream_stall_suspected(
     idle_grace_ms: u64,
 ) -> bool {
     live_global > last_global && now_ms.saturating_sub(last_callback_ms) > idle_grace_ms
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::effective_limits;
+
+    #[test]
+    fn free_shared_tracks_held_permits() {
+        let mut admission = Admission::new(effective_limits(Some(8)));
+        assert_eq!(admission.free_shared(), 8);
+        let permit = admission
+            .try_acquire(OpClass::Enumerate)
+            .expect("first acquire");
+        assert_eq!(admission.free_shared(), 7);
+        admission.release(&permit);
+        assert_eq!(admission.free_shared(), 8);
+    }
 }
