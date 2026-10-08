@@ -43,8 +43,16 @@ interleaves probes with enumeration).
   2026-10-08 ~04:17 +0700 via `cargo build --release` in a
   shelter checkout (`.git` since removed, `target/` kept);
   embedded `rustc/48a229cea…` string verified. PROVENANCE
-  RECHECK (pending, post-series): pristine rebuild of
-  `13e534b` must reproduce `94bb89c6…`; result recorded here.
+  RECHECK (done post-series, commit `f53af6f`): two pristine
+  `13e534b` rebuilds (separate clones, `cargo build
+  --release`) both give `8cf60f68…`, NOT `94bb89c6…` — but
+  `strings(1)` diff of `94bb89c6` vs `8cf60f68` shows
+  41169/41169 identical lines except ONE turso version
+  string holding a build date (`2026-10-07 07:04:31` vs
+  `2026-10-08 14:20:00`, same length → same 27,519,616
+  bytes). Same source, same rustc; only the embedded
+  dependency build-date differs. Base is a valid
+  pre-optimization baseline; digests are build-date-qualified.
 - new attempt-2 (`new@98ea5fde` r1–r3, `new@d2ef7208` r4–r5
   rebuild): source `44315ee764b808b01c40baede35fdd72ac287e18`
   (Wave8d; shelter reflog-pinned for the rebuild; pre-deletion
