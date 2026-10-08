@@ -1285,17 +1285,24 @@ mod tests {
     /// exceeding the cap), and the count drains once the workers exit.
     #[test]
     fn identity_io_timeout_abandons_wait_not_cap() {
-        let baseline = IDENTITY_IO_LIVE.load(Ordering::Relaxed);
+        // No baseline arithmetic: sibling lib tests run in parallel and
+        // their in-flight identity-I/O workers would pollute a baseline
+        // read here and drain before the assertions below (CI flake).
+        // Instead assert absolute properties of this test's own workers.
         let mut releases = Vec::new();
+        let mut dones = Vec::new();
         let mut callers = Vec::new();
         for _ in 0..IDENTITY_IO_CAP {
             let (started_tx, started_rx) = mpsc::channel();
             let (release_tx, release_rx) = mpsc::channel::<()>();
+            let (done_tx, done_rx) = mpsc::channel::<()>();
             releases.push(release_tx);
+            dones.push(done_rx);
             callers.push(std::thread::spawn(move || {
                 bounded_identity_io(move || {
                     let _ = started_tx.send(());
                     let _ = release_rx.recv();
+                    let _ = done_tx.send(());
                     7u32
                 })
             }));
@@ -1304,21 +1311,36 @@ mod tests {
                 .expect("identity worker starts");
         }
         // Both workers are blocked inside `op()` while their callers sit
-        // in `recv_timeout`: the cap is fully charged.
-        assert!(IDENTITY_IO_LIVE.load(Ordering::Relaxed) >= baseline + IDENTITY_IO_CAP);
+        // in `recv_timeout`: each holds a permit, so the live count is at
+        // least the cap whatever sibling tests do.
+        assert!(IDENTITY_IO_LIVE.load(Ordering::Relaxed) >= IDENTITY_IO_CAP);
         // Every caller abandons its wait at the timeout ...
         for caller in callers {
             assert_eq!(caller.join().expect("caller joins"), None);
         }
         // ... but the stalled workers still hold the cap (pre-fix code
-        // dropped the caller-owned guard here and fell back to baseline).
-        assert!(IDENTITY_IO_LIVE.load(Ordering::Relaxed) >= baseline + IDENTITY_IO_CAP);
-        // Releasing the workers drains the cap back to baseline: no leak.
+        // dropped the caller-owned guard here and the count fell).
+        assert!(IDENTITY_IO_LIVE.load(Ordering::Relaxed) >= IDENTITY_IO_CAP);
+        // Releasing the workers drains their permits: no leak. Wait for
+        // this test's own workers to exit first (done signals), then for
+        // the live count to drop by the two released permits. Sibling
+        // tests only run brief resolves, so a bounded poll observes the
+        // drop even if a sibling flickers the count mid-poll.
+        let held = IDENTITY_IO_LIVE.load(Ordering::Relaxed);
         drop(releases);
+        for done in dones {
+            done.recv_timeout(Duration::from_secs(10))
+                .expect("identity worker exits");
+        }
         let drain_by = Instant::now() + Duration::from_secs(10);
-        while IDENTITY_IO_LIVE.load(Ordering::Relaxed) != baseline && Instant::now() < drain_by {
+        while IDENTITY_IO_LIVE.load(Ordering::Relaxed) > held - IDENTITY_IO_CAP
+            && Instant::now() < drain_by
+        {
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(IDENTITY_IO_LIVE.load(Ordering::Relaxed), baseline);
+        assert!(
+            IDENTITY_IO_LIVE.load(Ordering::Relaxed) <= held - IDENTITY_IO_CAP,
+            "released permits drain from the live count"
+        );
     }
 }
