@@ -84,6 +84,7 @@ LIMITATION (M6): single APFS volume, no latency/fault injection
 | r7-base | base@94bb89c6 | `scan https://github.com/bench-special/family --root /tmp/corpus16/ws --status summary` | 1 | fresh-catalog | 9.33→13.27 | 3 | 3751 | 3716 | 35 | 104127 | 1160577 | 324489 | 217872 | 222/221 | 4 known |
 | r7-new | new@962b2824 | `scan --all --root /tmp/corpus16/ws --status summary --workers 8 --format jsonl` | 8 | fresh-catalog | 13.27→10.56 | 0 | 864 | 785 | 79 | 104132 | 1160577 | 27292 | 27068 | 222/221 | 0 |
 | r8-base | base@94bb89c6 | `scan https://github.com/bench-special/family --root /tmp/corpus16/ws --status summary` | 1 | fresh-catalog | 10.56→57.40 | 3 | 3756 | 3706 | 50 | 104128 | 1160577 | 324329 | 217713 | 222/221 | 4 known |
+| r8-new | new@962b2824 | `scan --all --root /tmp/corpus16/ws --status summary --workers 8 --format jsonl` | 8 | fresh-catalog | 57.40→19.80 | 0 | 1145 | 1084 | 61 | 104132 | 1160577 | 27420 | 27198 | 222/221 | 0 |
 
 Raw logs per rep (git-ignored): `benches/results/w4a/<rep>.{stdout,stderr,time,meta,report.json}`,
 `.meta.json` carries cmd/exit/wall/digest. Claim microbench artifact:
