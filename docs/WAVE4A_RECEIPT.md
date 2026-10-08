@@ -177,6 +177,20 @@ pass serves any target count (dirs/entries identical to --all).
 |-----|---------|------|--------|-------------|------|---------|------|-------|------|
 | t1 | 1 | 3 | 771 | 721 | 104132 | 1160577 | 27060 | 5 | 4 unresolvable_identity cands |
 | t10 | 10 | 3 | 998 | 868 | 104132 | 1160577 | 27237 | 14 | same single pass; wall variance ambient |
+| t100 | 100 | 3 | 952 | 860 | 104132 | 1160577 | 27377 | 103 | dirs/entries identical: +99 targets add zero passes |
+
+Conclusion: 1/10/100-target discovery times (721/868/860s)
+vary within ambient noise; the filesystem pass is constant
+(104132 dirs, 1160577 entries every run) — target count
+changes only report filtering, never traversal.
+
+Format overhead (fixed small scope `special/`, 315 dirs, 19
+repos, n=1 each, all exit 0): human 5s / 14.6 KiB stdout,
+json 8s / 156 KiB, jsonl 4s / 67.5 KiB. Wall deltas are
+noise-scale next to scan cost; byte sizes rank snapshot >
+stream > summary as designed. Full-corpus format scaling
+not measured (each point ~10 min for identical code paths);
+recorded as a limit.
 
 Semantic note (tested behavior, not a bug): targeted runs park
 the 4 identity-less candidates as `unresolvable_identity`
