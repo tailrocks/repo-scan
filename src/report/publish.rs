@@ -83,10 +83,10 @@ pub const MAX_STAGED_REPORT_BYTES: u64 = 128 * 1024 * 1024;
 /// byte vector plus its typed expansion. Covers the staged bytes, the
 /// deserialized typed report (every typed `String` originates from these
 /// bytes, plus struct/`Vec` overhead), and one re-read during snapshot
-/// reconcile/publication. The aggregate estimate
-/// `staged_len * STAGED_PARSE_MEMORY_FACTOR + records *
-/// STAGED_REPORT_RECORD_OVERHEAD_BYTES` must fit the caller's
-/// `rss_target_bytes` before any typed build begins, so a near-cap
+/// reconcile/publication. The aggregate estimate `staged_len *
+/// STAGED_PARSE_MEMORY_FACTOR + array_items *
+/// STAGED_REPORT_RECORD_OVERHEAD_BYTES + 2 * max_debug_string_bytes` must fit
+/// the caller's `rss_target_bytes` before any typed build begins, so a near-cap
 /// staged file cannot multiply memory past the RSS target.
 pub const STAGED_PARSE_MEMORY_FACTOR: u64 = 4;
 
@@ -98,24 +98,100 @@ pub const STAGED_REPORT_RECORD_OVERHEAD_BYTES: u64 = 512;
 
 /// Refuse a staged report whose aggregate verification footprint exceeds
 /// `rss_target_bytes` (R3). `staged_len` is the bound byte count and
-/// `record_count` the low-memory probe count across every report section.
+/// `array_item_count` the measured upper bound across all report arrays, and
+/// `max_debug_string_bytes` the largest serde invalid-type string diagnostic.
 /// Exhaustion reports incomplete instead of exceeding memory: the error
 /// states the coverage is incomplete due to resource exhaustion and no
 /// typed report is built. Never pass the staged envelope's self-declared
 /// target here; the budget must come from the caller's configuration.
 pub fn check_staged_memory_budget(
     staged_len: u64,
-    record_count: u64,
+    array_item_count: u64,
+    max_debug_string_bytes: u64,
     rss_target_bytes: u64,
 ) -> crate::Result<()> {
     let estimate = staged_len
         .saturating_mul(STAGED_PARSE_MEMORY_FACTOR)
-        .saturating_add(record_count.saturating_mul(STAGED_REPORT_RECORD_OVERHEAD_BYTES));
+        .saturating_add(array_item_count.saturating_mul(STAGED_REPORT_RECORD_OVERHEAD_BYTES))
+        .saturating_add(max_debug_string_bytes.saturating_mul(3));
     if estimate > rss_target_bytes {
         return Err(Error::Report(format!(
-            "staged report of {staged_len} bytes in {record_count} records needs an estimated \
+            "staged report of {staged_len} bytes in {array_item_count} array items needs an estimated \
              {estimate} bytes, over the rss_target_bytes {rss_target_bytes} aggregate gate; \
              coverage is incomplete (resource exhaustion), refusing the typed build"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse staged JSON whose measurement pass could exceed the caller's RSS
+/// target before the detailed streaming estimate is available. The source
+/// bytes stay resident while serde_json may retain scratch capacity for the
+/// largest escaped token; the measurement visitor inspects map keys without
+/// keeping owned key strings. Scratch growth is conservatively bounded by
+/// two source lengths, so this preflight reserves three source lengths plus
+/// fixed parser overhead. The detailed gate still accounts for the ID index
+/// and report structure before validation begins.
+pub fn check_streaming_measurement_memory_budget(
+    staged_len: u64,
+    rss_target_bytes: u64,
+) -> crate::Result<()> {
+    const STREAM_MEASURE_FIXED_OVERHEAD_BYTES: u64 = 64 * 1024;
+    let estimate = staged_len
+        .checked_mul(3)
+        .and_then(|bytes| bytes.checked_add(STREAM_MEASURE_FIXED_OVERHEAD_BYTES))
+        .ok_or_else(|| {
+            Error::Report(
+                "staged report measurement memory estimate overflows; refusing staged validation"
+                    .to_string(),
+            )
+        })?;
+    if estimate > rss_target_bytes {
+        return Err(Error::Report(format!(
+            "staged report of {staged_len} bytes needs an estimated {estimate} bytes, over the \
+             rss_target_bytes {rss_target_bytes} streaming preflight gate; coverage is incomplete \
+             (resource exhaustion), refusing staged validation"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a staged report whose streaming validation footprint exceeds
+/// `rss_target_bytes`. The validator keeps the bounded source bytes, a
+/// compact ID index, and at most one decoded record at a time; unlike the
+/// typed validator it never builds the whole report. Two source lengths
+/// cover the input plus the largest decoded field/record, `owned_id_bytes`
+/// accounts for escaped IDs that cannot borrow their source text, and twice
+/// the largest decoded string bounds serde_json's retained escape scratch.
+/// Three times `max_debug_string_bytes` covers serde_json's invalid-type
+/// diagnostic and a possible shrink-copy when its formatting String becomes
+/// a boxed string. The validator drops that detailed message before returning
+/// bounded parser context. Sixty-four bytes per JSON array item conservatively covers
+/// compact indexes and nested vectors. A fixed scratch allowance covers
+/// parser, row, and bounded error headers. The staged-size and caller RSS caps
+/// remain unchanged.
+pub fn check_streaming_staged_memory_budget(
+    staged_len: u64,
+    array_item_count: u64,
+    owned_id_bytes: u64,
+    max_string_bytes: u64,
+    max_debug_string_bytes: u64,
+    rss_target_bytes: u64,
+) -> crate::Result<()> {
+    const STREAM_ARRAY_ITEM_OVERHEAD_BYTES: u64 = 64;
+    const STREAM_FIXED_OVERHEAD_BYTES: u64 = 64 * 1024;
+    let estimate = staged_len
+        .saturating_mul(2)
+        .saturating_add(owned_id_bytes.saturating_mul(2))
+        .saturating_add(max_string_bytes.saturating_mul(2))
+        .saturating_add(max_debug_string_bytes.saturating_mul(3))
+        .saturating_add(array_item_count.saturating_mul(STREAM_ARRAY_ITEM_OVERHEAD_BYTES))
+        .saturating_add(STREAM_FIXED_OVERHEAD_BYTES);
+    if estimate > rss_target_bytes {
+        return Err(Error::Report(format!(
+            "staged report of {staged_len} bytes and {array_item_count} array items needs an estimated \
+             {estimate} bytes, over the rss_target_bytes {rss_target_bytes} streaming gate; \
+             coverage is incomplete (resource exhaustion), refusing staged validation"
         )));
     }
     Ok(())
@@ -1866,9 +1942,9 @@ pub(crate) fn check_report_id(report_id: &str) -> crate::Result<()> {
         || report_id == "."
         || report_id == ".."
     {
-        return Err(Error::Report(format!(
-            "report_id {report_id:?} is not a safe snapshot name"
-        )));
+        return Err(Error::Report(
+            "report_id is not a safe snapshot name".to_string(),
+        ));
     }
     Ok(())
 }

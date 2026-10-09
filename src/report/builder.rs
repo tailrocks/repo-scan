@@ -29,13 +29,10 @@ use crate::report::model::{
     Volume,
 };
 use crate::report::publish::{
-    check_report_id, check_staged_memory_budget, publish_bound, retain_bound, BoundStaged,
-    PublishReceipt,
+    check_report_id, check_staged_memory_budget, check_streaming_measurement_memory_budget,
+    check_streaming_staged_memory_budget, publish_bound, retain_bound, BoundStaged, PublishReceipt,
 };
 use crate::report::stream::StreamingWriter;
-use crate::report::validate::validate_report;
-use serde::de::IgnoredAny;
-use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 #[cfg(unix)]
@@ -1099,7 +1096,12 @@ async fn stream_with_pre_pass<W: Write>(
     let tool = Tool {
         name: crate::report::model::TOOL_NAME.to_string(),
         version: crate::version().to_string(),
-        source_commit: inputs.source_commit.clone(),
+        source_commit: build_source_commit().or_else(|| {
+            inputs
+                .source_commit
+                .as_deref()
+                .and_then(parse_source_commit)
+        }),
     };
     let resources = Resources {
         profile: inputs.profile.clone(),
@@ -1578,64 +1580,25 @@ async fn error_path_id(
 /// target is never trusted for the budget.
 pub const DEFAULT_STAGED_VERIFY_RSS_TARGET_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Low-memory budget probe over staged bytes (R3): counts the records in
-/// every report section without retaining any record content (`IgnoredAny`
-/// elements occupy no heap), so the aggregate budget check runs while the
-/// only live allocation is the staged byte vector itself. Section names
-/// must match [`Report`]'s exactly; a missing section defaults to empty
-/// (the full parse still rejects a malformed envelope afterwards).
-#[derive(Debug, Deserialize)]
-struct StagedBudgetProbe {
-    #[serde(default)]
-    volumes: Vec<IgnoredAny>,
-    #[serde(default)]
-    paths: Vec<IgnoredAny>,
-    #[serde(default)]
-    roots: Vec<IgnoredAny>,
-    #[serde(default)]
-    repositories: Vec<IgnoredAny>,
-    #[serde(default)]
-    checkouts: Vec<IgnoredAny>,
-    #[serde(default)]
-    branches: Vec<IgnoredAny>,
-    #[serde(default)]
-    remotes: Vec<IgnoredAny>,
-    #[serde(default)]
-    storage_links: Vec<IgnoredAny>,
-    #[serde(default)]
-    aliases: Vec<IgnoredAny>,
-    #[serde(default)]
-    candidates: Vec<IgnoredAny>,
-    #[serde(default)]
-    errors: Vec<IgnoredAny>,
-    #[serde(default)]
-    generated_artifacts: Vec<IgnoredAny>,
+/// Exact source commit embedded by the build script, when supplied by a
+/// trusted build input or available from a clean Git checkout. Dirty or
+/// source-archive builds without an explicit commit retain the schema's
+/// nullable fallback.
+pub fn build_source_commit() -> Option<String> {
+    option_env!("REPO_SCAN_SOURCE_COMMIT").and_then(parse_source_commit)
 }
 
-impl StagedBudgetProbe {
-    fn total_records(&self) -> u64 {
-        (self.volumes.len()
-            + self.paths.len()
-            + self.roots.len()
-            + self.repositories.len()
-            + self.checkouts.len()
-            + self.branches.len()
-            + self.remotes.len()
-            + self.storage_links.len()
-            + self.aliases.len()
-            + self.candidates.len()
-            + self.errors.len()
-            + self.generated_artifacts.len()) as u64
+/// Validate a full SHA-1 or SHA-256 Git object ID and normalize its hex
+/// spelling. Abbreviated and non-hex values are treated as unknown.
+pub fn parse_source_commit(value: &str) -> Option<String> {
+    let value = value.trim();
+    if (value.len() == 40 || value.len() == 64)
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        Some(value.to_ascii_lowercase())
+    } else {
+        None
     }
-}
-
-/// Count staged-report records with the low-memory probe (R3). Malformed
-/// JSON fails here with the same wording the full parse uses, so error
-/// precedence is unchanged.
-fn probe_staged_records(bytes: &[u8]) -> crate::Result<u64> {
-    let probe: StagedBudgetProbe = serde_json::from_slice(bytes)
-        .map_err(|e| Error::Report(format!("staged report bytes are not valid JSON: {e}")))?;
-    Ok(probe.total_records())
 }
 
 /// Parse staged bytes back into a validated [`Report`]. Used by the
@@ -1647,11 +1610,67 @@ pub fn verify_staged_report(staged: &Path) -> crate::Result<Report> {
     verify_staged_report_capped(staged, DEFAULT_STAGED_VERIFY_RSS_TARGET_BYTES)
 }
 
+/// Validate staged bytes under the caller's memory target without building
+/// a complete typed [`Report`]. This is the path for publication gates that
+/// only need proof that the report is valid.
+pub fn validate_staged_report(staged: &Path) -> crate::Result<()> {
+    validate_staged_report_capped(staged, DEFAULT_STAGED_VERIFY_RSS_TARGET_BYTES)
+}
+
+/// Streaming counterpart to [`verify_staged_report_capped`]. The staged
+/// file cap and caller-supplied RSS target are unchanged; the streaming
+/// estimate accounts for the source bytes, compact ID index, and one
+/// decoded record at a time.
+pub fn validate_staged_report_capped(staged: &Path, rss_target_bytes: u64) -> crate::Result<()> {
+    let bound = BoundStaged::open(staged)?;
+    validate_bound_staged_report_capped(&bound, rss_target_bytes).map_err(|e| {
+        Error::Report(format!(
+            "staged report {} is not valid: {e}",
+            staged.display()
+        ))
+    })
+}
+
+/// Validate an already-bound staged report. Keeping this handle alive lets
+/// callers validate, retain, and publish the exact same bytes.
+pub fn validate_bound_staged_report(bound: &BoundStaged) -> crate::Result<()> {
+    validate_bound_staged_report_capped(bound, DEFAULT_STAGED_VERIFY_RSS_TARGET_BYTES)
+}
+
+/// Capped counterpart to [`validate_bound_staged_report`].
+pub fn validate_bound_staged_report_capped(
+    bound: &BoundStaged,
+    rss_target_bytes: u64,
+) -> crate::Result<()> {
+    validate_bound_staged_report_id_capped(bound, rss_target_bytes).map(|_| ())
+}
+
+/// Validate an already-bound report under the streaming memory budget and
+/// return its validated report ID for snapshot-reference checks.
+pub fn validate_bound_staged_report_id_capped(
+    bound: &BoundStaged,
+    rss_target_bytes: u64,
+) -> crate::Result<String> {
+    check_streaming_measurement_memory_budget(bound.len(), rss_target_bytes)?;
+    let (array_items, owned_id_bytes, max_string_bytes, max_debug_string_bytes) =
+        super::validate_stream::measure_report_streamed(bound.bytes())?;
+    check_streaming_staged_memory_budget(
+        bound.len(),
+        array_items,
+        owned_id_bytes,
+        max_string_bytes,
+        max_debug_string_bytes,
+        rss_target_bytes,
+    )?;
+    super::validate_stream::validate_report_streamed(bound.bytes())
+}
+
 /// Parse staged bytes back into a validated [`Report`] under an explicit
 /// aggregate budget (R3). The bound handle is consumed and its byte vector
-/// moved out as the single copy; a low-memory probe counts records, the
-/// aggregate budget is enforced against `rss_target_bytes`, and only then
-/// is the typed report built. The byte buffer is dropped before the
+/// moved out as the single copy; a bounded measurement pass counts array
+/// items and string sizes, the aggregate budget is enforced against
+/// `rss_target_bytes`, and only then is the typed report built. The byte
+/// buffer is dropped before the
 /// typed-only validation phase, so bytes and the typed report never
 /// coexist past the parse call. Budget exhaustion refuses with an
 /// incomplete-worded resource error instead of exceeding memory.
@@ -1667,16 +1686,30 @@ pub fn verify_staged_report_capped(staged: &Path, rss_target_bytes: u64) -> crat
 
 /// Owned-bound verification (R3): see [`verify_staged_report_capped`].
 /// Consumes the bound handle, enforces the aggregate budget from the
-/// probe count, builds the typed report, then drops the staging bytes
+/// measured array-item upper bound, builds the typed report, then drops the staging bytes
 /// before validation.
 fn verify_owned_bound_report(bound: BoundStaged, rss_target_bytes: u64) -> crate::Result<Report> {
     let bytes = bound.into_bytes();
-    let records = probe_staged_records(&bytes)?;
-    check_staged_memory_budget(bytes.len() as u64, records, rss_target_bytes)?;
+    let (array_items, owned_id_bytes, max_string_bytes, max_debug_string_bytes) =
+        measure_staged_report(&bytes, rss_target_bytes)?;
+    check_streaming_staged_memory_budget(
+        bytes.len() as u64,
+        array_items,
+        owned_id_bytes,
+        max_string_bytes,
+        max_debug_string_bytes,
+        rss_target_bytes,
+    )?;
+    check_staged_memory_budget(
+        bytes.len() as u64,
+        array_items,
+        max_debug_string_bytes,
+        rss_target_bytes,
+    )?;
+    super::validate_stream::validate_report_streamed(&bytes)?;
     let report: Report = serde_json::from_slice(&bytes)
-        .map_err(|e| Error::Report(format!("staged report bytes are not valid JSON: {e}")))?;
+        .map_err(|error| super::validate_stream::staged_json_error(&error))?;
     drop(bytes);
-    validate_report(&report)?;
     Ok(report)
 }
 
@@ -1686,8 +1719,8 @@ pub fn verify_bound_report(bound: &BoundStaged) -> crate::Result<Report> {
 }
 
 /// Parse already-bound staged bytes into a validated [`Report`] under an
-/// explicit aggregate budget (R3). A low-memory probe counts records and
-/// the `rss_target_bytes` gate is enforced before the typed build, so the
+/// explicit aggregate budget (R3). A bounded measurement pass counts array
+/// items and the `rss_target_bytes` gate is enforced before the typed build, so the
 /// transient bytes-plus-typed peak stays within budget; the bound bytes
 /// stay borrowed for the caller's later retain/publish stages (same
 /// binding, no re-read). Callers that neither retain nor publish
@@ -1697,12 +1730,34 @@ pub fn verify_bound_report_capped(
     bound: &BoundStaged,
     rss_target_bytes: u64,
 ) -> crate::Result<Report> {
-    let records = probe_staged_records(bound.bytes())?;
-    check_staged_memory_budget(bound.len(), records, rss_target_bytes)?;
+    let (array_items, owned_id_bytes, max_string_bytes, max_debug_string_bytes) =
+        measure_staged_report(bound.bytes(), rss_target_bytes)?;
+    check_streaming_staged_memory_budget(
+        bound.len(),
+        array_items,
+        owned_id_bytes,
+        max_string_bytes,
+        max_debug_string_bytes,
+        rss_target_bytes,
+    )?;
+    check_staged_memory_budget(
+        bound.len(),
+        array_items,
+        max_debug_string_bytes,
+        rss_target_bytes,
+    )?;
+    super::validate_stream::validate_report_streamed(bound.bytes())?;
     let report: Report = serde_json::from_slice(bound.bytes())
-        .map_err(|e| Error::Report(format!("staged report bytes are not valid JSON: {e}")))?;
-    validate_report(&report)?;
+        .map_err(|error| super::validate_stream::staged_json_error(&error))?;
     Ok(report)
+}
+
+fn measure_staged_report(
+    bytes: &[u8],
+    rss_target_bytes: u64,
+) -> crate::Result<(u64, u64, u64, u64)> {
+    check_streaming_measurement_memory_budget(bytes.len() as u64, rss_target_bytes)?;
+    super::validate_stream::measure_report_streamed(bytes)
 }
 
 /// Emission pipeline: stage, retain the immutable snapshot, then publish
@@ -1746,13 +1801,23 @@ impl ReportPipeline {
                 staged.display()
             ))
         })?;
-        verify_bound_report_capped(&bound, inputs.rss_target_bytes).map_err(|e| {
+        let staged_report_id =
+            validate_bound_staged_report_id_capped(&bound, inputs.rss_target_bytes).map_err(
+                |e| {
+                    quarantine_staging(&staged);
+                    crate::error::Error::Report(format!(
+                        "refusing invalid staged report {}: {e}",
+                        staged.display()
+                    ))
+                },
+            )?;
+        if staged_report_id != inputs.report_id {
             quarantine_staging(&staged);
-            crate::error::Error::Report(format!(
-                "refusing invalid staged report {}: {e}",
+            return Err(Error::Report(format!(
+                "staged report {} has a report_id that does not match the expected snapshot id",
                 staged.display()
-            ))
-        })?;
+            )));
+        }
         let receipt = retain_bound(
             store,
             &bound,
@@ -1819,6 +1884,13 @@ impl ReportPipeline {
                 staged.display()
             ))
         })?;
+        if report.report_id != inputs.report_id {
+            quarantine_staging(&staged);
+            return Err(Error::Report(format!(
+                "staged report {} has a report_id that does not match the expected snapshot id",
+                staged.display()
+            )));
+        }
         let receipt = retain_bound(
             store,
             &bound,
@@ -1829,14 +1901,23 @@ impl ReportPipeline {
             now_ms,
         )
         .await?;
-        // R3: the bound bytes are no longer needed once retained; drop them
-        // before rendering so the typed report is the only live allocation.
-        drop(bound);
-        crate::report::render::render_terminal(&report, terminal)?;
+        if receipt.sha256 != bound.sha256() {
+            store
+                .set_snapshot_publication(&inputs.report_id, "failed")
+                .await?;
+            return Err(Error::Report(format!(
+                "snapshot {} digest does not match staged bytes",
+                receipt.path.display()
+            )));
+        }
         store
             .set_snapshot_publication(&inputs.report_id, "retained")
             .await?;
+        // R3: the bound bytes are no longer needed once retained; drop them
+        // before rendering so the typed report is the only live allocation.
+        drop(bound);
         let _ = std::fs::remove_file(&staged);
+        crate::report::render::render_terminal(&report, terminal)?;
         Ok(crate::report::Publication {
             report_id: inputs.report_id.clone(),
             published: false,
@@ -1854,17 +1935,30 @@ impl ReportPipeline {
         state_dir: &Path,
     ) -> crate::Result<crate::report::Publication> {
         let bound = BoundStaged::open(snapshot_path)?;
-        {
-            let report =
-                verify_bound_report_capped(&bound, DEFAULT_STAGED_VERIFY_RSS_TARGET_BYTES)?;
-            if report.report_id != report_id {
-                return Err(Error::Report(format!(
-                    "snapshot {} holds report {}, not {report_id}",
-                    snapshot_path.display(),
-                    report.report_id
-                )));
-            }
-        } // R3: typed report dropped before publication; publish ships bytes only.
+        let snapshot_report_id =
+            validate_bound_staged_report_id_capped(&bound, DEFAULT_STAGED_VERIFY_RSS_TARGET_BYTES)?;
+        if snapshot_report_id != report_id {
+            return Err(Error::Report(format!(
+                "snapshot {} report_id does not match the requested report",
+                snapshot_path.display(),
+            )));
+        }
+        let snapshot = store.get_report_snapshot(report_id).await?.ok_or_else(|| {
+            Error::Report(format!(
+                "snapshot {} has no catalog row; refusing publication",
+                snapshot_path.display()
+            ))
+        })?;
+        let expected_sha256 = snapshot
+            .checksum
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+        if expected_sha256.as_deref() != Some(bound.sha256()) {
+            store.set_snapshot_publication(report_id, "failed").await?;
+            return Err(Error::Report(format!(
+                "snapshot {} does not match its catalog checksum; refusing publication",
+                snapshot_path.display()
+            )));
+        }
         match publish_bound(&bound, dest, state_dir) {
             Ok(file) => {
                 store
@@ -1881,6 +1975,53 @@ impl ReportPipeline {
                 Err(error)
             }
         }
+    }
+
+    /// Retry terminal rendering from a retained snapshot without repeating
+    /// discovery. The snapshot is revalidated and matched to its catalog
+    /// checksum before it is rendered again.
+    pub async fn retry_terminal(
+        store: &crate::store::TursoStore,
+        snapshot_path: &Path,
+        report_id: &str,
+        terminal: &mut dyn std::io::Write,
+    ) -> crate::Result<crate::report::Publication> {
+        check_report_id(report_id)?;
+        let bound = BoundStaged::open(snapshot_path)?;
+        let report = verify_bound_report_capped(&bound, DEFAULT_STAGED_VERIFY_RSS_TARGET_BYTES)?;
+        if report.report_id != report_id {
+            return Err(Error::Report(format!(
+                "snapshot {} report_id does not match the requested report",
+                snapshot_path.display()
+            )));
+        }
+        let snapshot = store.get_report_snapshot(report_id).await?.ok_or_else(|| {
+            Error::Report(format!(
+                "snapshot {} has no catalog row; refusing terminal retry",
+                snapshot_path.display()
+            ))
+        })?;
+        let expected_sha256 = snapshot
+            .checksum
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+        if expected_sha256.as_deref() != Some(bound.sha256()) {
+            store.set_snapshot_publication(report_id, "failed").await?;
+            return Err(Error::Report(format!(
+                "snapshot {} does not match its catalog checksum; refusing terminal retry",
+                snapshot_path.display()
+            )));
+        }
+        let checksum = bound.sha256().to_string();
+        store
+            .set_snapshot_publication(report_id, "retained")
+            .await?;
+        drop(bound);
+        crate::report::render::render_terminal(&report, terminal)?;
+        Ok(crate::report::Publication {
+            report_id: report_id.to_string(),
+            published: false,
+            checksum,
+        })
     }
 }
 

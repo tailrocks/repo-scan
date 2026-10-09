@@ -1239,6 +1239,7 @@ fn rsp004_binary_staging_shape_fd_relative() {
         "has space".to_string(),
         "x\0y".to_string(),
         "q".repeat(129),
+        "q".repeat(1024 * 1024),
     ];
     for bad_id in &bad_ids {
         let inputs = test_inputs(bad_id);
@@ -1261,6 +1262,12 @@ fn rsp004_binary_staging_shape_fd_relative() {
                 || err.to_string().contains("must be nonempty"),
             "{bad_id:?}: {err}"
         );
+        if bad_id.len() > 1024 {
+            assert!(
+                !err.to_string().contains(&"q".repeat(1024)),
+                "rejected IDs are not echoed in diagnostics"
+            );
+        }
         let row =
             runtime().block_on(async { store.get_report_snapshot(bad_id).await.expect("lookup") });
         assert!(row.is_none(), "no snapshot row for {bad_id:?}");
@@ -1390,7 +1397,7 @@ fn pub01a_untrusted_parent_replacement_refused() {
 }
 
 /// R3 (RESOURCE-RECHECK item 3): staged-report verification cannot multiply
-/// memory past the RSS target. A low-memory probe counts records, the
+/// memory past the RSS target. A bounded measurement pass counts array items, the
 /// aggregate bytes-plus-typed budget is enforced before the typed build,
 /// exhaustion refuses with incomplete-worded resource wording, and the
 /// owned path releases the staging bytes as a single moved copy.
@@ -1419,11 +1426,11 @@ fn r3_staged_aggregate_budget_and_byte_release() {
 
     // Budget unit shape: byte-driven and count-driven exhaustion each
     // refuse, while a fitting footprint passes.
-    check_staged_memory_budget(200 * 1024 * 1024, 0, 256 * 1024 * 1024)
+    check_staged_memory_budget(200 * 1024 * 1024, 0, 0, 256 * 1024 * 1024)
         .expect_err("byte-driven exhaustion refuses");
-    check_staged_memory_budget(1024, 1_048_576, 256 * 1024 * 1024)
+    check_staged_memory_budget(1024, 1_048_576, 0, 256 * 1024 * 1024)
         .expect_err("count-driven exhaustion refuses");
-    check_staged_memory_budget(1024 * 1024, 1000, 256 * 1024 * 1024)
+    check_staged_memory_budget(1024 * 1024, 1000, 0, 256 * 1024 * 1024)
         .expect("fitting budget passes");
 
     // Explicit release: the bound bytes move out as the single copy.

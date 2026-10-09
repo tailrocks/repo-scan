@@ -160,11 +160,16 @@ fn rsf751_publish_refuses_invalid_staged() {
         let out = scan(&estate, URL_A, &[&root], &rep, &["--status", "metadata"]);
         assert_eq!(out.status.code(), Some(0), "emitting scan: {out:?}");
         let emitted = std::fs::read(&rep).expect("emitted report");
+        let emitted_value: serde_json::Value =
+            serde_json::from_slice(&emitted).expect("parse emitted report");
+        let emitted_report_id = emitted_value["report_id"]
+            .as_str()
+            .expect("emitted report ID");
         let dest2 = tmp.path().join("replay.json");
         let snapshot = main_under_test::test_verified_publish_bytes(
             &store,
             &state,
-            "report-replay",
+            emitted_report_id,
             &emitted,
             &dest2,
             now,

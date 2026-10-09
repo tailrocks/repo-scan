@@ -5,12 +5,19 @@
 
 use repo_scan::model::StatusMode;
 use repo_scan::report::builder::{
-    artifact_for_report, stream_report_from_store, verify_staged_report, AliasInput, ArtifactInput,
-    CandidateInput, ReportInputs, ReportPipeline, RootInput, StorageLinkInput,
+    artifact_for_report, build_source_commit, parse_source_commit, stream_report_from_store,
+    validate_staged_report, verify_staged_report, AliasInput, ArtifactInput, CandidateInput,
+    ReportInputs, ReportPipeline, RootInput, StorageLinkInput,
 };
-use repo_scan::report::encode::{base64_decode, base64_encode, encode_bytes, ms_to_rfc3339};
+use repo_scan::report::encode::{
+    base64_decode, base64_encode, base64_is_valid, encode_bytes, ms_to_rfc3339,
+};
 use repo_scan::report::model::{Report, Status};
-use repo_scan::report::publish::{check_destination, publish_staged, DestinationKind};
+use repo_scan::report::publish::{
+    check_destination, check_staged_memory_budget, check_streaming_measurement_memory_budget,
+    check_streaming_staged_memory_budget, publish_staged, DestinationKind,
+    STAGED_REPORT_RECORD_OVERHEAD_BYTES,
+};
 use repo_scan::report::stream::write_report_value;
 use repo_scan::report::validate::{validate_report, validate_status};
 use repo_scan::store::{
@@ -25,9 +32,293 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("runtime")
 }
 
+struct BrokenPipeWriter;
+
+impl std::io::Write for BrokenPipeWriter {
+    fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn example_report() -> Report {
     let bytes = include_bytes!("data/example-report.json");
     serde_json::from_slice(bytes).expect("example parses")
+}
+
+#[test]
+fn streamed_staged_validation_matches_report_invariants() {
+    let mut valid = example_report();
+    valid.report_id = "external/report id".to_string();
+    let mut cases = vec![("valid", serde_json::to_value(valid).expect("value"), true)];
+
+    let mut dangling = serde_json::to_value(example_report()).expect("value");
+    dangling["repositories"][0]["git_path_id"] = serde_json::Value::String("path-missing".into());
+    cases.push(("dangling reference", dangling, false));
+
+    let mut duplicate = serde_json::to_value(example_report()).expect("value");
+    let first_volume = duplicate["volumes"][0].clone();
+    duplicate["volumes"]
+        .as_array_mut()
+        .expect("volumes")
+        .push(first_volume);
+    cases.push(("duplicate id", duplicate, false));
+
+    let mut count = serde_json::to_value(example_report()).expect("value");
+    count["coverage"]["gaps"] = serde_json::Value::from(99);
+    cases.push(("count mismatch", count, false));
+
+    let mut coverage = serde_json::to_value(example_report()).expect("value");
+    coverage["coverage"]["filesystem"] = serde_json::Value::String("complete".into());
+    coverage["coverage"]["tasks_pending"] = serde_json::Value::from(1);
+    cases.push(("coverage contradiction", coverage, false));
+
+    let mut encoding = serde_json::to_value(example_report()).expect("value");
+    encoding["paths"][0]["encoding"] = serde_json::Value::String("base64".into());
+    encoding["paths"][0]["value"] = serde_json::Value::String("!!!".into());
+    cases.push(("encoding contradiction", encoding, false));
+
+    let mut long_alias_timestamp = serde_json::to_value(example_report()).expect("value");
+    let path_id = long_alias_timestamp["paths"][0]["id"]
+        .as_str()
+        .expect("path id")
+        .to_string();
+    long_alias_timestamp["aliases"]
+        .as_array_mut()
+        .expect("aliases")
+        .push(serde_json::json!({
+            "path_id": path_id.clone(),
+            "target_path_id": path_id,
+            "kind": "symlink",
+            "verified_at": "x".repeat(1024 * 1024)
+        }));
+    cases.push(("long alias timestamp", long_alias_timestamp, false));
+
+    let mut wrong_type_string = serde_json::to_value(example_report()).expect("value");
+    wrong_type_string["resources"]["cpu_target_cores"] =
+        serde_json::Value::String("\u{202e}".repeat(8 * 1024));
+    cases.push(("wrong type string", wrong_type_string, false));
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (name, value, expected_valid) in cases {
+        let bytes = serde_json::to_vec(&value).expect("serialize case");
+        let typed = serde_json::from_slice::<Report>(&bytes)
+            .map(|report| validate_report(&report).is_ok())
+            .unwrap_or(false);
+        let path = dir.path().join(format!("{name}.json"));
+        repo_scan::privacy::private_write_0600(&path, &bytes).expect("write staged report");
+        let streamed = validate_staged_report(&path).is_ok();
+        let verified = verify_staged_report(&path).is_ok();
+        assert_eq!(typed, expected_valid, "typed result for {name}");
+        assert_eq!(streamed, expected_valid, "streamed result for {name}");
+        assert_eq!(
+            verified, expected_valid,
+            "typed report API result for {name}"
+        );
+        if name == "long alias timestamp" || name == "wrong type string" {
+            let error = validate_staged_report(&path).expect_err("invalid staged report rejected");
+            assert!(error.to_string().len() < 1024, "diagnostic must be bounded");
+        }
+        if name == "wrong type string" {
+            let error = verify_staged_report(&path).expect_err("typed parser rejects wrong type");
+            let diagnostic = error.to_string();
+            assert!(diagnostic.len() < 1024, "typed diagnostic must be bounded");
+            assert!(diagnostic.contains("line "), "{diagnostic}");
+            assert!(diagnostic.contains("column "), "{diagnostic}");
+            assert!(
+                !diagnostic.contains(&"\u{202e}".repeat(64)),
+                "typed diagnostic must not echo the offending value"
+            );
+        }
+    }
+}
+
+#[test]
+fn streamed_and_typed_validation_enforce_report_schema_shape() {
+    let mut missing_source_commit = serde_json::to_value(example_report()).expect("value");
+    missing_source_commit["tool"]
+        .as_object_mut()
+        .expect("tool object")
+        .remove("source_commit");
+
+    let mut missing_canonical_url = serde_json::to_value(example_report()).expect("value");
+    missing_canonical_url["scan"]
+        .as_object_mut()
+        .expect("scan object")
+        .remove("canonical_url");
+
+    let mut unknown_record_field = serde_json::to_value(example_report()).expect("value");
+    unknown_record_field["resources"]["unexpected"] = serde_json::Value::Bool(true);
+
+    let mut unknown_root_field = serde_json::to_value(example_report()).expect("value");
+    unknown_root_field["unexpected"] = serde_json::Value::Bool(true);
+
+    let cases = [
+        ("missing tool.source_commit", missing_source_commit),
+        ("missing scan.canonical_url", missing_canonical_url),
+        ("unknown record field", unknown_record_field),
+        ("unknown root field", unknown_root_field),
+    ];
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (name, value) in cases {
+        let bytes = serde_json::to_vec(&value).expect("serialize case");
+        assert!(
+            serde_json::from_slice::<Report>(&bytes).is_err(),
+            "typed deserialization accepts {name}"
+        );
+        let path = dir.path().join(format!("{}.json", name.replace(' ', "-")));
+        repo_scan::privacy::private_write_0600(&path, &bytes).expect("write staged report");
+        assert!(
+            validate_staged_report(&path).is_err(),
+            "streamed validation accepts {name}"
+        );
+        assert!(
+            verify_staged_report(&path).is_err(),
+            "typed staged verification accepts {name}"
+        );
+    }
+}
+
+#[test]
+fn streamed_semantic_errors_do_not_echo_large_report_ids() {
+    let mut invalid = serde_json::to_value(example_report()).expect("value");
+    let report_id = "large-report-id-".to_string() + &"r".repeat(1024 * 1024);
+    invalid["report_id"] = serde_json::Value::String(report_id.clone());
+    invalid["coverage"]["gaps"] = serde_json::Value::from(99);
+    let bytes = serde_json::to_vec(&invalid).expect("serialize invalid report");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let staged = dir.path().join("large-report-id.json");
+    repo_scan::privacy::private_write_0600(&staged, &bytes).expect("write staged report");
+
+    let error = validate_staged_report(&staged).expect_err("count mismatch is rejected");
+    let diagnostic = error.to_string();
+    assert!(diagnostic.len() < 1024, "diagnostic is bounded");
+    assert!(!diagnostic.contains(&report_id), "report ID is not echoed");
+
+    let typed: Report = serde_json::from_slice(&bytes).expect("typed report deserializes");
+    let error = validate_report(&typed).expect_err("typed semantic validation rejects count");
+    let diagnostic = error.to_string();
+    assert!(diagnostic.len() < 1024, "typed diagnostic is bounded");
+    assert!(
+        !diagnostic.contains(&report_id),
+        "typed report ID is not echoed"
+    );
+}
+
+#[test]
+fn streamed_staged_parser_diagnostics_include_bounded_location() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let staged = dir.path().join("malformed.json");
+    repo_scan::privacy::private_write_0600(&staged, b"{\n  \"schema_version\": @\n}")
+        .expect("write malformed report");
+    let error = validate_staged_report(&staged).expect_err("malformed report rejected");
+    let diagnostic = error.to_string();
+    assert!(diagnostic.len() < 256, "{diagnostic}");
+    assert!(diagnostic.contains("line 2"), "{diagnostic}");
+    assert!(diagnostic.contains("column "), "{diagnostic}");
+}
+
+#[test]
+fn typed_staged_verification_bounds_repeated_long_id_diagnostics() {
+    let mut report = example_report();
+    report.volumes[0].id = "v".repeat(2 * 1024 * 1024);
+    report.volumes[0].error_ids = (0..1_000)
+        .map(|index| format!("missing-error-{index}"))
+        .collect();
+    let bytes = serde_json::to_vec(&report).expect("serialize report");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let staged = dir.path().join("long-id-errors.json");
+    repo_scan::privacy::private_write_0600(&staged, &bytes).expect("write staged report");
+
+    let error = verify_staged_report(&staged).expect_err("dangling error references rejected");
+    assert!(error.to_string().len() < 64 * 1024, "diagnostic is bounded");
+    assert!(
+        !error.to_string().contains(&"v".repeat(1024)),
+        "full ID is not echoed"
+    );
+}
+
+#[test]
+fn streamed_memory_budget_fits_the_machine_scan_candidate() {
+    let staged_len = 83 * 1024 * 1024;
+    let records = 396_000;
+    let rss_target = 256 * 1024 * 1024;
+    check_streaming_measurement_memory_budget(staged_len as u64, rss_target)
+        .expect("streaming preflight fits the machine scan candidate");
+    check_streaming_measurement_memory_budget(128 * 1024 * 1024, rss_target)
+        .expect_err("maximum staged input cannot enter measurement above its RSS target");
+    check_streaming_measurement_memory_budget(8 * 1024 * 1024, 16 * 1024 * 1024)
+        .expect_err("small caller target is checked before measurement");
+    let preflight_fixed = 64 * 1024;
+    let boundary_len = (rss_target - preflight_fixed) / 3;
+    check_streaming_measurement_memory_budget(boundary_len, rss_target)
+        .expect("preflight accepts its exact representable boundary");
+    check_streaming_measurement_memory_budget(boundary_len + 1, rss_target)
+        .expect_err("preflight rejects one byte beyond its memory boundary");
+    check_streaming_measurement_memory_budget(u64::MAX, u64::MAX)
+        .expect_err("overflow cannot pass even at the largest caller target");
+    let typed_estimate =
+        staged_len as u64 * 4 + records as u64 * STAGED_REPORT_RECORD_OVERHEAD_BYTES;
+    assert!(typed_estimate > rss_target);
+    check_staged_memory_budget(staged_len as u64, records as u64, 0, rss_target)
+        .expect_err("typed validation remains under the original conservative gate");
+    check_staged_memory_budget(1, 0, 1024, 3075)
+        .expect_err("typed serde diagnostics are charged before parsing");
+    check_staged_memory_budget(1, 0, 1024, 3076)
+        .expect("typed diagnostic budget accepts its exact boundary");
+    check_streaming_staged_memory_budget(staged_len as u64, records as u64, 0, 32, 32, rss_target)
+        .expect("streaming validation fits without relaxing the RSS target");
+    check_streaming_staged_memory_budget(
+        staged_len as u64,
+        records as u64,
+        0,
+        staged_len as u64,
+        staged_len as u64,
+        rss_target,
+    )
+    .expect_err("large decoded strings reserve parser scratch before validation");
+    check_streaming_staged_memory_budget(
+        staged_len as u64,
+        records as u64,
+        staged_len as u64,
+        staged_len as u64,
+        staged_len as u64,
+        rss_target,
+    )
+    .expect_err("escaped IDs and parser scratch are included in the memory budget");
+    let debug_bytes = 1024;
+    let estimate = 2 + debug_bytes * 3 + 64 * 1024;
+    check_streaming_staged_memory_budget(1, 0, 0, 0, debug_bytes, estimate - 1)
+        .expect_err("serde invalid-type diagnostics are charged before parsing");
+    check_streaming_staged_memory_budget(1, 0, 0, 0, debug_bytes, estimate)
+        .expect("diagnostic budget accepts its exact boundary");
+}
+
+#[test]
+fn source_commit_provenance_accepts_only_full_git_object_ids() {
+    let sha1 = "ABCDEF0123456789ABCDEF0123456789ABCDEF01";
+    assert_eq!(
+        parse_source_commit(sha1).as_deref(),
+        Some("abcdef0123456789abcdef0123456789abcdef01")
+    );
+    let sha256 = "a".repeat(64);
+    assert_eq!(
+        parse_source_commit(&sha256).as_deref(),
+        Some(sha256.as_str())
+    );
+    assert!(parse_source_commit("abcdef0").is_none());
+    assert!(parse_source_commit(&format!("{}g", "0".repeat(39))).is_none());
+    assert!(parse_source_commit("").is_none());
+}
+
+#[test]
+fn source_commit_build_fallback_is_null_when_unavailable() {
+    if option_env!("REPO_SCAN_SOURCE_COMMIT").is_none_or(str::is_empty) {
+        assert_eq!(build_source_commit(), None);
+    }
 }
 
 fn test_inputs(report_id: &str) -> ReportInputs {
@@ -404,7 +695,17 @@ fn encoding_round_trip_and_display_escaping() {
     let (encoding, value, display) = encode_bytes(raw);
     assert_eq!(encoding, "base64");
     assert_eq!(base64_decode(&value).expect("decodes"), raw);
+    assert!(base64_is_valid(&value));
     assert_eq!(value, base64_encode(raw));
+    for candidate in ["", "Zg==", "Zm8=", "Zm9v", "Zg", "=m9v", "Zm$v"] {
+        assert_eq!(
+            base64_is_valid(candidate),
+            base64_decode(candidate).is_some(),
+            "validation and decoding agree for {candidate:?}"
+        );
+    }
+    assert!(!base64_is_valid("Zg==AAAA"));
+    assert!(base64_decode("Zg==AAAA").is_none());
     assert!(!display.chars().any(|c| c.is_control()));
 
     // Control characters are escaped in display, never raw.
@@ -434,6 +735,8 @@ fn stream_from_catalog_resolves_and_agrees() {
     let (root_id, _child) = seed_catalog(&store, now);
 
     let mut inputs = test_inputs("report-stream-1");
+    let caller_source_commit = "a".repeat(40);
+    inputs.source_commit = Some(caller_source_commit.clone());
     inputs.roots.push(RootInput {
         id: "root-1".to_string(),
         dir_id: Some(root_id),
@@ -461,6 +764,10 @@ fn stream_from_catalog_resolves_and_agrees() {
     let staged = dir.path().join("staged.json");
     repo_scan::privacy::private_write_0600(&staged, &bytes).expect("write");
     let report = verify_staged_report(&staged).expect("validates");
+    assert_eq!(
+        report.tool.source_commit,
+        build_source_commit().or(Some(caller_source_commit))
+    );
     assert_eq!(report.coverage.gaps, 1);
     assert_eq!(report.coverage.filesystem, "incomplete"); // Open gap.
     assert_eq!(report.coverage.identity, "complete_under_policy");
@@ -475,6 +782,17 @@ fn stream_from_catalog_resolves_and_agrees() {
         .expect("child path");
     assert_eq!(child_path.value, "/repo");
     assert_eq!(child_path.encoding, "utf8");
+
+    // The streamed path also preserves checkout status cross-field rules.
+    let mut invalid_status = report;
+    invalid_status.checkouts[0].status.mode = "metadata".to_string();
+    let typed_error = validate_report(&invalid_status).expect_err("typed status rejects");
+    let invalid_path = dir.path().join("invalid-status.json");
+    let invalid_bytes = serde_json::to_vec(&invalid_status).expect("serialize invalid status");
+    repo_scan::privacy::private_write_0600(&invalid_path, &invalid_bytes).expect("write invalid");
+    let streamed_error = validate_staged_report(&invalid_path).expect_err("stream status rejects");
+    assert!(typed_error.to_string().contains("metadata mode"));
+    assert!(streamed_error.to_string().contains("metadata mode"));
 }
 
 #[test]
@@ -510,6 +828,63 @@ fn terminal_render_goes_to_caller_writer() {
     assert!(text.contains("https://github.com/OWNER/REPO"), "{text}");
     assert!(text.contains("repositories: 1"), "{text}");
     assert!(!text.chars().any(|c| c.is_control() && c != '\n'), "{text}");
+}
+
+#[test]
+fn terminal_write_failure_keeps_a_verified_snapshot_for_replay() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = open_store(&dir);
+    let now = 1_759_154_400_000;
+    seed_catalog(&store, now);
+    let inputs = test_inputs("report-terminal-retry");
+    let staging = dir.path().join("report_staging");
+    let snapshots = dir.path().join("report_snapshots");
+
+    let mut broken = BrokenPipeWriter;
+    runtime()
+        .block_on(async {
+            ReportPipeline::emit_to_terminal(
+                &store,
+                &inputs,
+                &staging,
+                &snapshots,
+                now,
+                &mut broken,
+            )
+            .await
+        })
+        .expect_err("broken terminal output must fail the scan");
+
+    let snapshot = snapshots.join("report-terminal-retry.json");
+    assert!(
+        snapshot.is_file(),
+        "verified snapshot survives output failure"
+    );
+    assert!(
+        staging
+            .read_dir()
+            .expect("staging directory")
+            .next()
+            .is_none(),
+        "staging file is removed after snapshot retention"
+    );
+    let retained = runtime()
+        .block_on(async { store.get_report_snapshot(&inputs.report_id).await })
+        .expect("snapshot lookup")
+        .expect("snapshot row");
+    assert_eq!(retained.publication_state, "retained");
+
+    let mut terminal = Vec::new();
+    let retry = runtime()
+        .block_on(async {
+            ReportPipeline::retry_terminal(&store, &snapshot, &inputs.report_id, &mut terminal)
+                .await
+        })
+        .expect("verified snapshot re-renders");
+    assert!(!retry.published);
+    assert!(String::from_utf8(terminal)
+        .expect("terminal output")
+        .contains(&inputs.report_id));
 }
 
 #[test]
@@ -632,6 +1007,7 @@ fn emit_to_file_with_inside_tree_artifact() {
     assert_eq!(publication.report_id, "report-inside-tree-1");
 
     let report = verify_staged_report(&dest).expect("dest validates");
+    validate_staged_report(&dest).expect("streamed destination validates");
     assert_eq!(report.generated_artifacts.len(), 1);
     assert!(report.generated_artifacts[0].created_after_status);
     assert_eq!(report.generated_artifacts[0].kind, "report");
@@ -730,9 +1106,94 @@ fn snapshot_immutability_and_retry() {
         })
         .expect("terminal emit");
     assert!(!publication.published);
-    assert!(snapshots.join("report-terminal-1.json").is_file());
+    let retained_path = snapshots.join("report-terminal-1.json");
+    assert!(retained_path.is_file());
+    let retained: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&retained_path).expect("read retained terminal report"),
+    )
+    .expect("parse retained terminal report");
+    assert_eq!(
+        retained["report_id"].as_str(),
+        Some(term_inputs.report_id.as_str())
+    );
     let text = String::from_utf8(terminal).expect("utf8");
     assert!(text.contains("report-terminal-1"), "{text}");
+}
+
+#[test]
+fn validation_and_retention_share_the_same_bound_bytes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = open_store(&dir);
+    let staged = dir.path().join("staged-bound.json");
+    let snapshots = dir.path().join("snapshots");
+    let original = include_bytes!("data/example-report.json").to_vec();
+    repo_scan::privacy::private_write_0600(&staged, &original).expect("write staged");
+
+    let bound = repo_scan::report::publish::BoundStaged::open(&staged).expect("bind staged");
+    repo_scan::report::builder::validate_bound_staged_report(&bound).expect("validate bound");
+    assert_eq!(
+        repo_scan::report::builder::validate_bound_staged_report_id_capped(
+            &bound,
+            256 * 1024 * 1024,
+        )
+        .expect("validate and return report id"),
+        "report-example-1"
+    );
+
+    // A path replacement after validation must not change what gets retained.
+    repo_scan::privacy::private_write_0600(&staged, b"not a valid report").expect("replace path");
+    let receipt = runtime()
+        .block_on(async {
+            repo_scan::report::publish::retain_bound(
+                &store,
+                &bound,
+                &snapshots,
+                "report-example-1",
+                1,
+                1,
+                1_759_154_400_000,
+            )
+            .await
+        })
+        .expect("retain validated bytes");
+    assert_eq!(
+        std::fs::read(&receipt.path).expect("read snapshot"),
+        original
+    );
+
+    // A replaced retained pathname must not substitute different bytes for
+    // the validated source when publication uses the still-bound handle.
+    let dest = dir.path().join("published-report.json");
+    let state_dir = dir.path().join("state");
+    repo_scan::store::owner::ensure_private_dir_all(&state_dir).expect("create state dir");
+    repo_scan::report::publish::publish_bound(&bound, &dest, &state_dir)
+        .expect("publish validated bytes");
+    assert_eq!(std::fs::read(dest).expect("read published bytes"), original);
+
+    // A different but valid same-ID report at the snapshot path must not be
+    // accepted for retry when its bytes no longer match the catalog digest.
+    let mut tampered: serde_json::Value = serde_json::from_slice(&original).expect("parse report");
+    tampered["tool"]["version"] = serde_json::Value::String("tampered".to_string());
+    let tampered_bytes = serde_json::to_vec(&tampered).expect("serialize tampered report");
+    repo_scan::privacy::private_write_0600(&receipt.path, &tampered_bytes)
+        .expect("replace retained path");
+    let retry_dest = dir.path().join("retry-report.json");
+    let retry_error = runtime()
+        .block_on(
+            repo_scan::report::builder::ReportPipeline::retry_publication(
+                &store,
+                &receipt.path,
+                "report-example-1",
+                &retry_dest,
+                &state_dir,
+            ),
+        )
+        .expect_err("changed snapshot checksum must refuse retry");
+    assert!(
+        retry_error.to_string().contains("catalog checksum"),
+        "{retry_error}"
+    );
+    assert!(!retry_dest.exists(), "refused retry does not publish bytes");
 }
 
 #[test]
@@ -773,6 +1234,7 @@ fn caller_owned_sections_stream() {
     let staged = dir.path().join("staged.json");
     repo_scan::privacy::private_write_0600(&staged, &bytes).expect("write");
     let report = verify_staged_report(&staged).expect("validates");
+    validate_staged_report(&staged).expect("streamed validation");
     assert_eq!(report.coverage.unresolvable_candidates, 1);
     assert_eq!(report.coverage.identity, "unproven");
 

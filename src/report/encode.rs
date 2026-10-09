@@ -35,7 +35,7 @@ pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(text.len() / 4 * 3);
-    for chunk in text.as_bytes().chunks(4) {
+    for (chunk_index, chunk) in text.as_bytes().chunks(4).enumerate() {
         let mut n: u32 = 0;
         let mut pad = 0usize;
         for (i, byte) in chunk.iter().enumerate() {
@@ -65,6 +65,9 @@ pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
         if pad > 2 {
             return None;
         }
+        if pad > 0 && chunk_index + 1 != text.len() / 4 {
+            return None;
+        }
         out.push((n >> 16) as u8);
         if pad < 2 {
             out.push((n >> 8) as u8);
@@ -74,6 +77,41 @@ pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// Check standard Base64 syntax without allocating a decoded copy. This
+/// mirrors [`base64_decode`] so staged-report validation can verify a large
+/// encoded path while retaining only the current record.
+pub fn base64_is_valid(text: &str) -> bool {
+    if !text.len().is_multiple_of(4) {
+        return false;
+    }
+    for (chunk_index, chunk) in text.as_bytes().chunks(4).enumerate() {
+        let mut pad = 0usize;
+        for (index, byte) in chunk.iter().enumerate() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' => {
+                    if pad > 0 {
+                        return false;
+                    }
+                }
+                b'=' => {
+                    pad += 1;
+                    if index < 2 {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        if pad > 2 {
+            return false;
+        }
+        if pad > 0 && chunk_index + 1 != text.len() / 4 {
+            return false;
+        }
+    }
+    true
 }
 
 /// Escape terminal control characters for safe `display` text. Printable

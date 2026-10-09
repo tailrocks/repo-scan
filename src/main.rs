@@ -19,7 +19,7 @@ use repo_scan::identity;
 use repo_scan::model::{ExitCode, Scope, StatusMode, TaskState};
 use repo_scan::platform::MountTable;
 use repo_scan::report::builder::{
-    verify_staged_report, AliasInput, ArtifactInput, CandidateInput,
+    validate_bound_staged_report_id_capped, AliasInput, ArtifactInput, CandidateInput,
     ReportInputs as LibReportInputs, ReportPipeline, RootInput, StorageLinkInput,
 };
 use repo_scan::scheduler::{backoff_for_attempt, Admission, CircuitBreaker, OpClass};
@@ -7288,7 +7288,7 @@ async fn build_lib_inputs(
         enumerated_entries: inputs.counters.entries,
         db_transactions: inputs.counters.db_transactions,
         db_sync_calls: Some(inputs.counters.db_sync_calls),
-        source_commit: None,
+        source_commit: repo_scan::report::builder::build_source_commit(),
         include_nonmatching: false,
         coverage_filesystem: None,
         coverage_identity: None,
@@ -7497,9 +7497,9 @@ fn check_binary_report_id(report_id: &str) -> repo_scan::Result<()> {
             "report_id must be nonempty".to_string(),
         ))
     } else {
-        Err(repo_scan::Error::Report(format!(
-            "report_id {report_id:?} is not a safe snapshot name"
-        )))
+        Err(repo_scan::Error::Report(
+            "report_id is not a safe snapshot name".to_string(),
+        ))
     }
 }
 
@@ -7624,7 +7624,7 @@ async fn emit_file_report(
 
 /// Verify staged bytes, retain the immutable snapshot, then publish
 /// (RSF-7511725D-DC03-471A-9635-4F8173986489): production publication
-/// calls [`verify_staged_report`] (schema + cross-field rules) and
+/// calls [`validate_bound_staged_report`] (schema + cross-field rules) and
 /// refuses invalid output before it can be retained or shipped. Returns
 /// the snapshot path.
 #[allow(clippy::too_many_arguments)]
@@ -7640,15 +7640,26 @@ async fn verified_retain_and_publish(
 ) -> repo_scan::Result<PathBuf> {
     use repo_scan::report::publish;
 
-    verify_staged_report(staged).map_err(|e| {
+    let bound = publish::BoundStaged::open(staged)?;
+    let staged_report_id = validate_bound_staged_report_id_capped(
+        &bound,
+        repo_scan::report::builder::DEFAULT_STAGED_VERIFY_RSS_TARGET_BYTES,
+    )
+    .map_err(|e| {
         repo_scan::Error::Report(format!(
             "refusing invalid staged report {}: {e}",
             staged.display()
         ))
     })?;
-    let receipt = publish::retain_snapshot(
+    if staged_report_id != report_id {
+        return Err(repo_scan::Error::Report(format!(
+            "staged report {} has a report_id that does not match the expected snapshot id",
+            staged.display()
+        )));
+    }
+    let receipt = publish::retain_bound(
         store,
-        staged,
+        &bound,
         &snapshots_dir(state_dir),
         report_id,
         catalog_rev,
@@ -7666,7 +7677,7 @@ async fn verified_retain_and_publish(
         store.set_snapshot_publication(report_id, "failed").await?;
         return Err(e);
     }
-    match publish::publish_staged(&snapshot, dest, state_dir) {
+    match publish::publish_bound(&bound, dest, state_dir) {
         Ok(_) => {
             store
                 .set_snapshot_publication(report_id, "published")
@@ -8036,11 +8047,28 @@ async fn retry_publication(
                 }
             }
         }
-        None => true,
+        None => {
+            let stdout = std::io::stdout();
+            let mut terminal = stdout.lock();
+            match ReportPipeline::retry_terminal(
+                store,
+                snapshot,
+                &recorded.report_id,
+                &mut terminal,
+            )
+            .await
+            {
+                Ok(_) => true,
+                Err(e) => {
+                    eprintln!(
+                        "repo-scan: terminal report retry failed: {}",
+                        identity::scrub_text(&e.to_string())
+                    );
+                    return Ok(ExitCode::OperationalFailure);
+                }
+            }
+        }
     };
-    store
-        .set_snapshot_publication(&recorded.report_id, "published")
-        .await?;
     let (state, exit) = if discovery == 0 {
         ("complete", ExitCode::Success)
     } else {
@@ -8062,10 +8090,16 @@ async fn retry_publication(
         )
         .await?;
     println!("scan_id: {}", row.id);
-    println!("state: {state} (publication retried from saved snapshot; no new scan)");
+    if dest.is_some() {
+        println!("state: {state} (publication retried from saved snapshot; no new scan)");
+    } else {
+        println!("state: {state} (report retried from saved snapshot; no new scan)");
+    }
     println!("report_id: {}", recorded.report_id);
     if let Some(dest) = &dest {
         println!("report: {}", dest.display());
+    } else {
+        println!("snapshot: {}", snapshot.display());
     }
     Ok(exit)
 }
