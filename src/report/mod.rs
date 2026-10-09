@@ -14,6 +14,7 @@ pub mod publish;
 pub mod render;
 pub mod stream;
 pub mod validate;
+mod validate_stream;
 
 pub use builder::{ReportInputs, ReportPipeline, StreamStats};
 pub use model::Report;

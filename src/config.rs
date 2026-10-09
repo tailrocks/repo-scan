@@ -364,9 +364,9 @@ pub fn snapshot_path(state_dir: &Path, report_id: &str) -> crate::Result<PathBuf
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':'))
     {
-        return Err(crate::Error::Config(format!(
-            "unsafe report ID for snapshot storage: {report_id:?}"
-        )));
+        return Err(crate::Error::Config(
+            "unsafe report ID for snapshot storage".to_string(),
+        ));
     }
     Ok(crate::store::owner::payload_dir(state_dir)
         .join(SNAPSHOTS_DIR_NAME)
@@ -384,7 +384,7 @@ pub struct DecodedOutcome {
     pub discovery_code: Option<i32>,
     /// Immutable snapshot/report ID retained in state.
     pub report_id: String,
-    /// Whether the external destination holds the report.
+    /// Whether report delivery to its destination or the terminal completed.
     pub published: bool,
     /// Traversal generation the run covered, when known.
     pub generation: Option<u64>,

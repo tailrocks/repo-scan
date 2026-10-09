@@ -9,7 +9,7 @@
 //! nonmatching scope and are therefore exempt from agreement.
 
 use crate::error::Error;
-use crate::report::encode::{base64_decode, is_rfc3339_shape, object_id_error};
+use crate::report::encode::{base64_is_valid, is_rfc3339_shape, object_id_error};
 use crate::report::model::{EncodedName, Report, Status};
 use std::collections::{HashMap, HashSet};
 
@@ -27,8 +27,7 @@ pub fn validate_report(report: &Report) -> crate::Result<()> {
         Ok(())
     } else {
         Err(Error::Report(format!(
-            "report {} invalid: {}",
-            report.report_id,
+            "report invalid: {}",
             problems.join("; ")
         )))
     }
@@ -328,18 +327,33 @@ fn check_envelope(report: &Report, problems: &mut Vec<String>) {
     }
 }
 
-fn check_enum(context: &str, value: &str, allowed: &[&str], problems: &mut Vec<String>) {
+pub(crate) fn check_enum(context: &str, value: &str, allowed: &[&str], problems: &mut Vec<String>) {
     if !allowed.contains(&value) {
-        problems.push(format!("{context} is {value:?}, want one of {allowed:?}"));
+        problems.push(format!(
+            "{context} is {}, want one of {allowed:?}",
+            bounded_debug(value)
+        ));
     }
 }
 
-fn check_opt_time(context: &str, value: &Option<String>, problems: &mut Vec<String>) {
+pub(crate) fn check_opt_time(context: &str, value: &Option<String>, problems: &mut Vec<String>) {
     if let Some(time) = value {
         if !is_rfc3339_shape(time) {
-            problems.push(format!("{context} {time:?} is not RFC 3339"));
+            problems.push(format!("{context} {} is not RFC 3339", bounded_debug(time)));
         }
     }
+}
+
+fn bounded_debug(value: &str) -> String {
+    const MAX_BYTES: usize = 256;
+    if value.len() <= MAX_BYTES {
+        return format!("{value:?}");
+    }
+    let mut end = MAX_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{:?}…", &value[..end])
 }
 
 fn collect_id<'a>(
@@ -816,7 +830,7 @@ fn check_name(context: &str, name: &EncodedName, problems: &mut Vec<String>) {
     );
 }
 
-fn check_encoding(
+pub(crate) fn check_encoding(
     context: &str,
     encoding: &str,
     value: &str,
@@ -824,10 +838,13 @@ fn check_encoding(
     problems: &mut Vec<String>,
 ) {
     if encoding != "utf8" && encoding != "base64" {
-        problems.push(format!("{context} is {encoding:?}, want utf8 or base64"));
+        problems.push(format!(
+            "{context} is {}, want utf8 or base64",
+            bounded_debug(encoding)
+        ));
         return;
     }
-    if encoding == "base64" && base64_decode(value).is_none() {
+    if encoding == "base64" && !base64_is_valid(value) {
         problems.push(format!("{context}: base64 value is malformed"));
     }
     if display.chars().any(|c| c.is_control()) {

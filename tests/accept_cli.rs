@@ -530,6 +530,99 @@ fn cli03_failed_publication_retries_to_absolute_dest() {
     assert_eq!(report["scan"]["state"].as_str(), Some("complete"));
 }
 
+/// A failed terminal write replays the retained snapshot on resume without
+/// starting another scan, then completed resume does not render it twice.
+#[test]
+fn cli03_failed_terminal_delivery_retries_saved_snapshot() {
+    use repo_scan::store::{Store, TursoStore};
+
+    let env = Env::new();
+    let initial = env.scan(&[], &env.cwd_a);
+    assert_eq!(
+        initial.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&initial)
+    );
+    let scan_id = stdout_line(&initial, "scan_id");
+    let report_id = stdout_line(&initial, "report_id");
+    let initial_stdout = stdout_text(&initial);
+    assert!(initial_stdout.contains("repo-scan 0.1.0 report"));
+
+    let db = env.state.join("payload").join("catalog.db");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let store = TursoStore::open(&db).await.expect("open catalog");
+        let row = store
+            .get_scan(&scan_id)
+            .await
+            .expect("get scan")
+            .expect("scan row");
+        let outcome = repo_scan::config::parse_outcome(row.outcome.as_deref().expect("outcome"))
+            .expect("decode outcome");
+        let failed =
+            repo_scan::config::encode_outcome(1, Some(0), &report_id, false, outcome.generation);
+        store
+            .update_scan_state(
+                &scan_id,
+                "failed",
+                Some(&failed),
+                None,
+                repo_scan::store::now_ms(),
+            )
+            .await
+            .expect("mark terminal delivery failed");
+        store
+            .set_snapshot_publication(&report_id, "failed")
+            .await
+            .expect("mark snapshot delivery failed");
+        assert!(
+            store
+                .get_report_snapshot(&report_id)
+                .await
+                .expect("get retained snapshot")
+                .is_some(),
+            "retained snapshot remains available for resume"
+        );
+        store.close().await.expect("close catalog");
+    });
+
+    let resumed = run(&["resume", scan_id.as_str()], &env.cwd_b, &env.state);
+    assert_eq!(
+        resumed.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&resumed)
+    );
+    let resumed_stdout = stdout_text(&resumed);
+    assert!(
+        resumed_stdout.contains("repo-scan 0.1.0 report"),
+        "{resumed_stdout}"
+    );
+    assert!(
+        resumed_stdout.contains("report retried from saved snapshot; no new scan"),
+        "{resumed_stdout}"
+    );
+    assert_eq!(stdout_line(&resumed, "scan_id"), scan_id);
+    assert_eq!(stdout_line(&resumed, "report_id"), report_id);
+
+    let replay = run(&["resume", scan_id.as_str()], &env.cwd_b, &env.state);
+    assert_eq!(
+        replay.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&replay)
+    );
+    let replay_stdout = stdout_text(&replay);
+    assert!(replay_stdout.contains("replayed"), "{replay_stdout}");
+    assert!(replay_stdout.contains("no new scan"), "{replay_stdout}");
+    assert!(!replay_stdout.contains("repo-scan 0.1.0 report"));
+    assert_eq!(stdout_line(&replay, "scan_id"), scan_id);
+    assert_eq!(stdout_line(&replay, "report_id"), report_id);
+}
+
 /// An unfinished scan keeps its absolute destination and options: resume
 /// from another cwd continues there with the saved status mode.
 #[cfg(unix)]
