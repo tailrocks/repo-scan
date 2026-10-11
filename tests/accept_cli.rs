@@ -894,34 +894,98 @@ fn step6_format_lanes_refuse_loudly_until_wired() {
     );
 }
 
-/// `--fetch` is pre-staged for the fetch-phase slice: refuse loudly (exit
-/// 1, "not yet implemented") before any state mutation instead of
-/// completing with stale remote state presented as current. Scans without
-/// `--fetch` are unaffected.
+/// `--fetch` is wired (Step 11): the fetch phase runs after discovery,
+/// refreshing tracking refs from a local-path remote (never network) and
+/// surfacing per-ref freshness in the 1.2.0 report. A scan without
+/// `--fetch` runs no fetch phase.
 #[test]
-fn step6_fetch_refuses_loudly_until_wired() {
-    let env = Env::new();
-    let out = env.scan(&["--fetch"], &env.cwd_a);
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "--fetch refuses loudly: {}",
+fn step6_fetch_runs_fetch_phase_against_local_remote() {
+    let tmp = fixture::scratch_root("step6-fetch");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    // Local-path upstream + clone: a real `git fetch`, never networked.
+    let upstream = root.join("upstream");
+    repo_scan::privacy::private_dir_0700(&upstream).expect("mkdir");
+    fixture::git(&upstream, &["init", "-q"]);
+    let c1 = fixture::commit_file(&upstream, "README.md", "# seed\n", "initial");
+    fixture::git(&upstream, &["branch", "-M", "main"]);
+    let clone = root.join("clone");
+    fixture::git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            upstream.to_str().expect("utf8"),
+            clone.to_str().expect("utf8"),
+        ],
+    );
+    // Upstream advances after the clone: the fetch must pick this up.
+    let c2 = fixture::commit_file(&upstream, "advance.txt", "v2\n", "advance main");
+    assert_ne!(c1, c2);
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "wired --fetch completes: {}",
+        stderr_text(&out)
+    );
+    let stderr = stderr_text(&out);
+    assert!(
+        !stderr.contains("not yet implemented"),
+        "the pre-staged refusal is gone: {stderr}"
+    );
+    assert!(
+        stderr.contains("repo-scan: fetch: 1 refreshed, 0 failed"),
+        "fetch phase ran: {stderr}"
+    );
+    let report = read_report(&report_path);
+    assert_eq!(report["schema_version"], "1.2.0");
+    let tracking = report["branches"]
+        .as_array()
+        .expect("branches array")
+        .iter()
+        .find(|b| {
+            b["kind"].as_str() == Some("remote_tracking")
+                && b["name"]["value"].as_str() == Some("refs/remotes/origin/main")
+        })
+        .expect("tracking branch row");
+    assert_eq!(tracking["oid"]["hex"].as_str(), Some(c2.as_str()));
+    assert_eq!(tracking["freshness"].as_str(), Some("current"));
+
+    // Without `--fetch` no fetch phase runs.
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--force-rescan",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "scan without --fetch: {}",
         stderr_text(&out)
     );
     assert!(
-        stderr_text(&out).contains("not yet implemented"),
-        "--fetch stderr: {}",
-        stderr_text(&out)
-    );
-    assert!(
-        !env.state.join("payload").join("catalog.db").exists(),
-        "refusal happens before any state mutation"
-    );
-    let out = env.scan(&["--report", "rep.json"], &env.cwd_a);
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "scan without --fetch unaffected: {}",
+        !stderr_text(&out).contains("repo-scan: fetch:"),
+        "no fetch phase without --fetch: {}",
         stderr_text(&out)
     );
 }

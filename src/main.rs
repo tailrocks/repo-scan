@@ -1164,16 +1164,6 @@ async fn run_scan_inner(
             return Ok(refuse_unwired_format("scan", format));
         }
     }
-    // --fetch is pre-staged for the fetch-phase slice: today no fetch
-    // phase runs, so accepting it would report stale remote state as
-    // current. Refuse loudly instead (same contract as the format lanes).
-    if args.fetch {
-        eprintln!(
-            "repo-scan: not yet implemented: scan --fetch executes in the fetch-phase \
-             slice; omit --fetch for now"
-        );
-        return Ok(ExitCode::OperationalFailure);
-    }
     // CLI boundary (RSF-SEC-TARGET-URL, EXACT-2): credential-bearing
     // targets (userinfo, any query/fragment tail) are rejected before any
     // persistence or reporting; the error echoes only the display-safe
