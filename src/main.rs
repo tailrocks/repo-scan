@@ -3418,6 +3418,16 @@ struct Runner {
     /// entry per distinct identity; eviction would duplicate instances, so
     /// the map lives for the run.
     probed_git_ids: HashMap<(u64, u64), Vec<u8>>,
+    /// Highest scope revision fully persisted this run per probed store
+    /// (keyed like [`Self::probed_git_ids`]). A repeat probe of the SAME
+    /// spelling at an already-persisted revision — enumeration discovers
+    /// both the worktree root (`.git` child) and the `.git` dir itself
+    /// (HEAD+objects+refs markers) — returns early instead of
+    /// re-persisting the store and re-journaling its `branch_batch` /
+    /// `coverage_updated` events. Entries land only on successful persist,
+    /// so a retry after a mid-persist failure re-runs, and a reconcile
+    /// re-probe (invalidation raised the scope rev) still re-persists.
+    persisted_git_revs: HashMap<(u64, u64), u64>,
     /// Working-directory identities already persisted this run (R7):
     /// `(dev, ino)` of `instance.work_dir` to deduplicate checkouts
     /// across pathname aliases while preserving distinct working trees.
@@ -3482,6 +3492,7 @@ impl Runner {
             alias_seen: HashSet::new(),
             alias_overflow: false,
             probed_git_ids: HashMap::new(),
+            persisted_git_revs: HashMap::new(),
             probed_work_ids: HashSet::new(),
             probed_overflow: false,
             watchdog: Watchdog::new(Duration::from_secs(WATCHDOG_GRACE_SECS)),
@@ -6133,7 +6144,16 @@ async fn exec_probe(
         .await;
     }
     match persist_probe(
-        runner, store, generation, run_rev, canonical, &path, &validated, *reads, now,
+        runner,
+        store,
+        generation,
+        run_rev,
+        canonical,
+        &path,
+        &validated,
+        *reads,
+        claimed.task.expected_rev,
+        now,
     )
     .await
     {
@@ -6738,6 +6758,7 @@ async fn persist_probe(
     path: &Path,
     validated: &git::ValidatedCandidate,
     reads: ProbeReads,
+    expected_rev: u64,
     now_ms: i64,
 ) -> repo_scan::Result<()> {
     let instance = &validated.instance;
@@ -6911,7 +6932,23 @@ async fn persist_probe(
                 }
                 return Ok(());
             }
-            Some(_) => {}
+            Some(_) => {
+                // Repeat probe of the SAME spelling. Enumeration discovers
+                // every store twice — once via the worktree root (`.git`
+                // child) and once via the `.git` dir itself (HEAD+objects+
+                // refs markers) — so this arm is the norm, not an
+                // exception. Once this revision is fully persisted there is
+                // nothing new to do: re-persisting would re-journal
+                // `branch_batch`/`coverage_updated` for unchanged rows.
+                // A retry whose first attempt failed mid-persist has no
+                // recorded revision yet and falls through, as does a
+                // reconcile re-probe after an invalidation raised the
+                // scope revision.
+                let persisted = runner.persisted_git_revs.get(&key).copied();
+                if persisted.is_some_and(|rev| rev >= expected_rev) {
+                    return Ok(());
+                }
+            }
             None => {
                 let due = note_probed_git_id(runner, key, common_bytes.clone(), now_ms)?;
                 flush_if_due(runner, store, due).await?;
@@ -7262,6 +7299,11 @@ async fn persist_probe(
         for checkout_id in &checkout_ids {
             enqueue_status_task(store, runner, generation, run_rev, checkout_id, now_ms).await?;
         }
+    }
+    // Mark the fully-persisted revision only now, on success: a mid-persist
+    // failure leaves no record, so the retried probe re-runs the persist.
+    if let Some(key) = reads.common_identity {
+        runner.persisted_git_revs.insert(key, expected_rev);
     }
     Ok(())
 }

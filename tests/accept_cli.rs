@@ -1705,12 +1705,33 @@ fn error_events_journal_completion_gaps() {
 /// per store (chunked at 500), carrying every ref the installed `git`
 /// reports with matching oids, ordered after the store's
 /// `repository_found`.
+///
+/// Regression (double discovery): enumeration schedules two probes per
+/// store — the worktree root (its `.git` child) and the `.git` dir itself
+/// (HEAD+objects+refs markers). With a symlink-free scan root both probes
+/// resolve to the same spelling; the second must not re-persist the store
+/// or re-journal its events. CI (Linux, real `/tmp`) caught the
+/// re-persist; this test canonicalizes the root so the same-spelling path
+/// is exercised everywhere.
 #[test]
 fn branch_batch_journals_persisted_refs() {
     use repo_scan::store::{Store, TursoStore};
     use std::collections::{HashMap, HashSet};
 
     let env = Env::new();
+    let canonical_fixture = std::fs::canonicalize(&env.fixture)
+        .expect("canonical fixture")
+        .to_str()
+        .expect("utf8")
+        .to_string();
+    assert_eq!(
+        std::fs::canonicalize(&canonical_fixture)
+            .expect("canonical")
+            .to_str()
+            .expect("utf8"),
+        canonical_fixture,
+        "root is symlink-free"
+    );
     let repo = env.fixture.join("repo");
     // Three local branches on distinct commits plus a tag; `git` is the
     // independent reference for the expected ref set.
@@ -1738,7 +1759,18 @@ fn branch_batch_journals_persisted_refs() {
     }
     assert_eq!(expected.len(), 4, "main + side-a + side-b + v1");
 
-    let out = env.scan(&["--report", "rep.json"], &env.cwd_a);
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            canonical_fixture.as_str(),
+            "--report",
+            "rep.json",
+        ],
+        &env.cwd_a,
+        &env.state,
+    );
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
     let scan_id = stdout_line(&out, "scan_id");
 
@@ -1824,6 +1856,10 @@ fn hex_of(bytes: &[u8]) -> String {
 /// opens exactly once (re-records are not transitions), unconditional
 /// closes of never-open rows stay silent, and a remote-less clone joins
 /// as an unresolvable candidate.
+///
+/// The scan root is canonicalized (see branch_batch_journals_persisted_refs):
+/// with a symlink-free root the store's double discovery resolves to one
+/// spelling, exercising the same-spelling re-probe dedupe on every platform.
 #[test]
 fn coverage_updated_reports_gap_deltas() {
     use repo_scan::store::{Store, TursoStore};
@@ -1857,7 +1893,21 @@ fn coverage_updated_reports_gap_deltas() {
         return;
     }
 
-    let out = env.scan(&["--report", "rep.json"], &env.cwd_a);
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            std::fs::canonicalize(&env.fixture)
+                .expect("canonical fixture")
+                .to_str()
+                .expect("utf8"),
+            "--report",
+            "rep.json",
+        ],
+        &env.cwd_a,
+        &env.state,
+    );
     assert_eq!(
         out.status.code(),
         Some(3),
