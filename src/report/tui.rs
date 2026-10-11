@@ -1337,7 +1337,7 @@ impl TuiSnapshot {
                     self.header.target = safe_tui_target(&target);
                 }
             }
-            EventType::DiscoveryProgress => {
+            EventType::DiscoveryProgress | EventType::DiscoveryProgressUpdated => {
                 if let Some(phase) = json_str(&env.records, "phase") {
                     self.header.phase = phase;
                 }
@@ -2202,6 +2202,46 @@ pub fn parse_key(buf: &[u8]) -> Option<(Key, usize)> {
     }
 }
 
+/// Delay interpreting a lone ESC so a CSI or SS3 key sequence can
+/// finish arriving in the next read.
+const ESC_DISAMBIGUATION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(35);
+
+/// Input bytes retained between reads, including an incomplete arrow
+/// sequence or an ESC waiting for its disambiguation timeout.
+#[derive(Default)]
+struct PendingInput {
+    bytes: Vec<u8>,
+    lone_escape_since: Option<Instant>,
+}
+
+impl PendingInput {
+    fn extend(&mut self, bytes: &[u8], now: Instant) {
+        self.bytes.extend_from_slice(bytes);
+        if self.bytes.as_slice() == [0x1b] {
+            self.lone_escape_since.get_or_insert(now);
+        } else {
+            self.lone_escape_since = None;
+        }
+    }
+
+    fn next_key(&mut self, now: Instant) -> Option<Key> {
+        if self.bytes.as_slice() == [0x1b] {
+            let since = *self.lone_escape_since.get_or_insert(now);
+            if now.saturating_duration_since(since) < ESC_DISAMBIGUATION_TIMEOUT {
+                return None;
+            }
+        }
+        let (key, used) = parse_key(&self.bytes)?;
+        self.bytes.drain(..used);
+        self.lone_escape_since = if self.bytes.as_slice() == [0x1b] {
+            Some(now)
+        } else {
+            None
+        };
+        Some(key)
+    }
+}
+
 /// What [`apply_key`] decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KeyAction {
@@ -2297,16 +2337,25 @@ impl ViewState {
             .visible_rows()
             .get(self.scroll_top)
             .map(|r| r.id.clone());
+        let mut previously_live = HashSet::new();
+        for group in &self.snapshot.groups {
+            previously_live.insert(group.id.clone());
+            previously_live.extend(group.stores.iter().map(|store| store.id.clone()));
+        }
         self.snapshot = snapshot;
         // New groups/stores default to expanded; checkouts expand on
         // demand. Removal of stale ids keeps the set bounded.
         let mut live = HashSet::new();
         for group in &self.snapshot.groups {
             live.insert(group.id.clone());
-            self.expanded.insert(group.id.clone());
+            if !previously_live.contains(&group.id) {
+                self.expanded.insert(group.id.clone());
+            }
             for store in &group.stores {
                 live.insert(store.id.clone());
-                self.expanded.insert(store.id.clone());
+                if !previously_live.contains(&store.id) {
+                    self.expanded.insert(store.id.clone());
+                }
                 for checkout in &store.checkouts {
                     live.insert(checkout.id.clone());
                     for branch in checkout.branches.iter().chain(store.branches.iter()) {
@@ -3772,7 +3821,7 @@ pub struct Session {
     guard: Option<TermGuard>,
     throttle: RedrawThrottle,
     color: bool,
-    pending_input: Vec<u8>,
+    pending_input: PendingInput,
     started: Instant,
 }
 
@@ -3785,7 +3834,7 @@ impl Session {
             guard: Some(TermGuard::open()),
             throttle: RedrawThrottle::ten_fps(),
             color,
-            pending_input: Vec::new(),
+            pending_input: PendingInput::default(),
             started: Instant::now(),
         }
     }
@@ -3842,30 +3891,12 @@ impl Session {
     pub fn poll(&mut self) -> SessionAction {
         if stdin_ready(0) {
             match read_stdin_bytes() {
-                Some(bytes) => self.pending_input.extend(bytes),
+                Some(bytes) => self.pending_input.extend(&bytes, Instant::now()),
                 None => return SessionAction::Quit, // pty EOF/hangup
             }
         }
-        while self.pending_input.len() > 1 || !self.pending_input.is_empty() && !stdin_ready(0) {
-            let Some((key, used)) = parse_key(&self.pending_input) else {
-                break;
-            };
-            self.pending_input.drain(..used);
+        while let Some(key) = self.pending_input.next_key(Instant::now()) {
             match apply_key(&mut self.state, key) {
-                KeyAction::Redraw => {}
-                KeyAction::Quit => return SessionAction::Quit,
-                KeyAction::Interrupt => return SessionAction::Interrupt,
-            }
-            if self.pending_input.is_empty() {
-                break;
-            }
-        }
-        // A lone ESC byte might start an arrow sequence: when stdin
-        // has no more bytes ready, treat it as a quit key now rather
-        // than stalling the poll.
-        if self.pending_input == [0x1b] {
-            self.pending_input.clear();
-            match apply_key(&mut self.state, Key::Esc) {
                 KeyAction::Redraw => {}
                 KeyAction::Quit => return SessionAction::Quit,
                 KeyAction::Interrupt => return SessionAction::Interrupt,
@@ -3885,31 +3916,15 @@ impl Session {
         loop {
             if stdin_ready(30) {
                 match read_stdin_bytes() {
-                    Some(bytes) => self.pending_input.extend(bytes),
+                    Some(bytes) => self.pending_input.extend(&bytes, Instant::now()),
                     None => {
                         self.detach();
                         return SessionAction::Quit; // pty EOF/hangup
                     }
                 }
             }
-            while let Some((key, used)) = parse_key(&self.pending_input) {
-                self.pending_input.drain(..used);
+            while let Some(key) = self.pending_input.next_key(Instant::now()) {
                 match apply_key(&mut self.state, key) {
-                    KeyAction::Redraw => {}
-                    KeyAction::Quit => {
-                        self.detach();
-                        return SessionAction::Quit;
-                    }
-                    KeyAction::Interrupt => {
-                        self.detach();
-                        return SessionAction::Interrupt;
-                    }
-                }
-            }
-            // Lone ESC with no further bytes: quit key, not a prefix.
-            if self.pending_input == [0x1b] && !stdin_ready(0) {
-                self.pending_input.clear();
-                match apply_key(&mut self.state, Key::Esc) {
                     KeyAction::Redraw => {}
                     KeyAction::Quit => {
                         self.detach();
@@ -3931,5 +3946,47 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.detach();
+    }
+}
+
+#[cfg(test)]
+mod pending_input_tests {
+    use super::{Key, PendingInput, ESC_DISAMBIGUATION_TIMEOUT};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn arrow_sequence_survives_split_reads() {
+        let start = Instant::now();
+        let mut input = PendingInput::default();
+
+        input.extend(b"\x1b", start);
+        assert_eq!(input.next_key(start), None);
+        input.extend(b"[", start + Duration::from_millis(10));
+        assert_eq!(input.next_key(start + Duration::from_millis(10)), None);
+        assert_eq!(input.bytes, b"\x1b[");
+        input.extend(b"A", start + Duration::from_millis(20));
+        assert_eq!(
+            input.next_key(start + Duration::from_millis(20)),
+            Some(Key::Up)
+        );
+        assert!(input.bytes.is_empty());
+    }
+
+    #[test]
+    fn standalone_escape_is_emitted_after_timeout() {
+        let start = Instant::now();
+        let mut input = PendingInput::default();
+
+        input.extend(b"\x1b", start);
+        assert_eq!(input.next_key(start), None);
+        assert_eq!(
+            input.next_key(start + ESC_DISAMBIGUATION_TIMEOUT - Duration::from_millis(1)),
+            None
+        );
+        assert_eq!(
+            input.next_key(start + ESC_DISAMBIGUATION_TIMEOUT),
+            Some(Key::Esc)
+        );
+        assert!(input.bytes.is_empty());
     }
 }

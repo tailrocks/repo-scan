@@ -868,12 +868,11 @@ struct ScanJournal {
     emitted_stores: HashSet<String>,
     emitted_checkouts: HashSet<String>,
     emitted_branch_stores: HashSet<String>,
-    /// Seq of the coalesced `discovery_progress` gauge row, if journaled
-    /// (Step 12: progress coalesces by seq reuse — the first tick takes a
-    /// fresh seq, later ticks update that row's payload in place at its
-    /// immutable `(rev, off)` position, so exactly one progress row (the
-    /// newest) survives per scan and replay order always matches seq
-    /// order).
+    /// Seq of the coalesced `discovery_progress` gauge row, if journaled.
+    /// Later ticks update its payload in place and append a
+    /// `discovery_progress_updated` notification with a new cursor, so
+    /// replay retains one latest gauge while live readers observe each
+    /// committed update.
     progress_seq: Option<u64>,
     /// Seq of the journaled `inventory_ready` row, if any (replay-once:
     /// a resumed run never re-emits the boundary event; a run killed
@@ -944,6 +943,103 @@ fn has_canonical_event_hash(value: &str, prefix: &str) -> bool {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     })
+}
+
+/// Persist an event-identity marker in the same writer transaction as its
+/// event row. The marker table is not subject to journal prefix retention.
+fn buffer_scan_event_dedupe(batch: &mut WriterBatch, scan_id: &str, kind: &str, id: &str) -> bool {
+    batch.push(
+        "INSERT OR IGNORE INTO scan_event_dedupe (scan_id, dedupe_kind, event_id) \
+            VALUES (?1, ?2, ?3)",
+        vec![
+            turso::Value::Text(scan_id.to_string()),
+            turso::Value::Text(kind.to_string()),
+            turso::Value::Text(event_id_from_journal(id)),
+        ],
+    )
+}
+
+/// Read persistent dedupe keys and backfill keys still present in retained
+/// legacy rows before a later prune can remove those rows.
+async fn load_scan_event_dedupe(
+    store: &TursoStore,
+    scan_id: &str,
+    full_prefix_available: bool,
+    sets: &mut [(&str, &mut HashSet<String>)],
+) -> repo_scan::Result<()> {
+    let mut persisted = HashSet::new();
+    let mut ready = false;
+    let mut rows = store
+        .connection()
+        .query(
+            "SELECT dedupe_kind, event_id FROM scan_event_dedupe WHERE scan_id = ?1",
+            vec![turso::Value::Text(scan_id.to_string())],
+        )
+        .await
+        .map_err(|e| repo_scan::Error::Store(e.to_string()))?;
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| repo_scan::Error::Store(e.to_string()))?
+    {
+        let kind = cell_text(&row, 0)?;
+        let raw_id = cell_text(&row, 1)?;
+        if kind == "state" && raw_id == "v8" {
+            ready = true;
+            continue;
+        }
+        let id = event_id_from_journal(&raw_id);
+        persisted.insert((kind.clone(), id.clone()));
+        if let Some((_, set)) = sets.iter_mut().find(|(known, _)| *known == kind.as_str()) {
+            set.insert(id);
+        }
+    }
+    drop(rows);
+
+    // A catalog upgraded after its prefix was already pruned has no way to
+    // recover the lost found IDs. Do not resume that scan and risk emitting
+    // duplicate `add` events. New v8 journals and legacy journals with an
+    // intact prefix are safe to mark ready after backfill.
+    if !ready && !full_prefix_available {
+        return Err(repo_scan::Error::Report(format!(
+            "scan {scan_id} predates durable event dedupe and already has a pruned prefix; resume is unsafe"
+        )));
+    }
+
+    // Rows from catalogs upgraded to v8 may have no side markers yet. Seed
+    // the retained keys before the next prefix prune can erase their source.
+    for (kind, set) in sets {
+        for id in set.iter() {
+            if persisted.contains(&((*kind).to_string(), id.clone())) {
+                continue;
+            }
+            store
+                .connection()
+                .execute(
+                    "INSERT OR IGNORE INTO scan_event_dedupe \
+                        (scan_id, dedupe_kind, event_id) VALUES (?1, ?2, ?3)",
+                    vec![
+                        turso::Value::Text(scan_id.to_string()),
+                        turso::Value::Text((*kind).to_string()),
+                        turso::Value::Text(id.clone()),
+                    ],
+                )
+                .await
+                .map_err(|e| repo_scan::Error::Store(e.to_string()))?;
+        }
+    }
+    if !ready {
+        store
+            .connection()
+            .execute(
+                "INSERT OR IGNORE INTO scan_event_dedupe \
+                    (scan_id, dedupe_kind, event_id) VALUES (?1, 'state', 'v8')",
+                vec![turso::Value::Text(scan_id.to_string())],
+            )
+            .await
+            .map_err(|e| repo_scan::Error::Store(e.to_string()))?;
+    }
+    Ok(())
 }
 
 const EVENT_REDACTED_LOCAL_TARGET: &str = "repo-scan:redacted-local-target";
@@ -1248,6 +1344,25 @@ impl ScanJournal {
                 break;
             }
         }
+        // A retained terminal event closes the stream permanently. It is
+        // safe to skip dedupe hydration for that scan, including an older
+        // pruned-prefix journal whose side markers were cleaned atomically
+        // with its terminal event.
+        if terminal_seq.is_none() {
+            load_scan_event_dedupe(
+                store,
+                scan_id,
+                min_seq.is_none_or(|seq| seq <= 1),
+                &mut [
+                    ("repository_found", &mut emitted_stores),
+                    ("location_found", &mut emitted_checkouts),
+                    ("branch_batch", &mut emitted_branch_stores),
+                    ("error", &mut error_ids),
+                    ("coverage_updated", &mut emitted_unresolvable),
+                ],
+            )
+            .await?;
+        }
         // The ready row can age out with the pruned prefix. Its sequence
         // is also stored on the scan request before retention runs, so a
         // resumed scan keeps the lifecycle boundary authoritative. A
@@ -1299,11 +1414,9 @@ impl ScanJournal {
     /// `scan_failed` payloads (`None` when nothing is journaled yet).
     fn cursor(&self) -> Option<Cursor> {
         match (self.last_seq, self.last_rev) {
-            (Some(seq), Some(rev)) => Some(Cursor {
-                seq,
-                catalog_rev: rev,
-                event_offset: self.last_off,
-            }),
+            (Some(seq), Some(rev)) => {
+                Some(Cursor::for_scan(&self.scan_id, seq, rev, self.last_off))
+            }
             _ => None,
         }
     }
@@ -1373,7 +1486,12 @@ impl ScanJournal {
             reset: false,
             records: &bytes,
         };
-        if !store.append_scan_event(&event).await? {
+        let appended = if is_terminal_event(event_type) {
+            store.append_terminal_scan_event(&event).await?
+        } else {
+            store.append_scan_event(&event).await?
+        };
+        if !appended {
             return Ok(0);
         }
         if event_type == EventType::InventoryReady {
@@ -1414,7 +1532,13 @@ impl ScanJournal {
             reset: false,
             records,
         };
-        Ok(Some(TursoStore::buffer_scan_event(batch, &event)?))
+        TursoStore::buffer_scan_event(batch, &event)?;
+        Ok(Some(buffer_scan_event_dedupe(
+            batch,
+            &self.scan_id,
+            EventType::RepositoryFound.name(),
+            store_id,
+        )))
     }
 
     /// Buffer one `location_found` into the writer batch (same atomicity
@@ -1442,7 +1566,13 @@ impl ScanJournal {
             reset: false,
             records,
         };
-        Ok(Some(TursoStore::buffer_scan_event(batch, &event)?))
+        TursoStore::buffer_scan_event(batch, &event)?;
+        Ok(Some(buffer_scan_event_dedupe(
+            batch,
+            &self.scan_id,
+            EventType::LocationFound.name(),
+            checkout_id,
+        )))
     }
 
     /// Buffer one `location_updated` into the writer batch: it commits
@@ -1473,9 +1603,10 @@ impl ScanJournal {
     }
 
     /// Buffer one `error` into the writer batch: it commits atomically
-    /// with the error row that caused it. No dedupe — errors are
-    /// point-in-time observations (`add`), bounded by the same retry caps
-    /// that bound the rows. Always `Some(should_flush)`.
+    /// with the error row that caused it. Error events are not suppressed:
+    /// they are point-in-time observations (`add`). Their IDs persist as
+    /// resume-reconciliation evidence so a pruned row is not re-journaled.
+    /// Always `Some(should_flush)`.
     fn buffer_error(
         &mut self,
         batch: &mut WriterBatch,
@@ -1495,13 +1626,20 @@ impl ScanJournal {
             reset: false,
             records,
         };
-        Ok(Some(TursoStore::buffer_scan_event(batch, &event)?))
+        let mut due = TursoStore::buffer_scan_event(batch, &event)?;
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(records) {
+            if let Some(id) = value.get("id").and_then(serde_json::Value::as_str) {
+                due |= buffer_scan_event_dedupe(batch, &self.scan_id, EventType::Error.name(), id);
+            }
+        }
+        Ok(Some(due))
     }
 
     /// Buffer one `coverage_updated` into the writer batch: it commits
-    /// atomically with the gap rows it describes. No dedupe — each call
-    /// carries a genuine transition (callers gate on `Runner::open_gaps`),
-    /// and `replace` replays in seq order. Always `Some(should_flush)`.
+    /// atomically with the gap rows it describes. Calls record genuine
+    /// transitions (callers gate on `Runner::open_gaps`); unresolvable
+    /// candidate IDs also persist for resume-time dedupe. `replace`
+    /// replays in seq order. Always `Some(should_flush)`.
     fn buffer_coverage_updated(
         &mut self,
         batch: &mut WriterBatch,
@@ -1521,7 +1659,23 @@ impl ScanJournal {
             reset: false,
             records,
         };
-        Ok(Some(TursoStore::buffer_scan_event(batch, &event)?))
+        let mut due = TursoStore::buffer_scan_event(batch, &event)?;
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(records) {
+            if let Some(ids) = value
+                .get("unresolvable_added")
+                .and_then(serde_json::Value::as_array)
+            {
+                for id in ids.iter().filter_map(serde_json::Value::as_str) {
+                    due |= buffer_scan_event_dedupe(
+                        batch,
+                        &self.scan_id,
+                        EventType::CoverageUpdated.name(),
+                        id,
+                    );
+                }
+            }
+        }
+        Ok(Some(due))
     }
 
     /// Buffer one `branch_batch` into the writer batch: it commits
@@ -1551,19 +1705,24 @@ impl ScanJournal {
             reset: false,
             records,
         };
-        Ok(Some(TursoStore::buffer_scan_event(batch, &event)?))
+        TursoStore::buffer_scan_event(batch, &event)?;
+        Ok(Some(buffer_scan_event_dedupe(
+            batch,
+            &self.scan_id,
+            EventType::BranchBatch.name(),
+            store_id,
+        )))
     }
 
     /// Buffer one `discovery_progress` tick: it commits with the writer
     /// batch (visible while later discovery is still active, never held
-    /// to phase end). Coalescing is by seq reuse
-    /// ([`is_progress_coalescible`]): the first tick takes a fresh seq;
-    /// every later tick updates that same row's payload in place, so
-    /// exactly one progress row (the newest) survives per scan. The
-    /// row's `(seq, rev, off)` position is immutable after the first
-    /// tick, so `(rev, off)` replay order always matches seq order; when
-    /// retention pruned the row, the next tick re-inserts at a fresh
-    /// seq. Always `Some(should_flush)`.
+    /// to phase end). The first tick inserts the coalesced gauge row;
+    /// later ticks update it in place and append a
+    /// `discovery_progress_updated` notification with a fresh cursor.
+    /// This keeps one latest gauge for replay while strict-after live
+    /// readers see subsequent progress. When retention pruned the gauge,
+    /// the next tick re-inserts it at a fresh seq. Always
+    /// `Some(should_flush)`.
     fn buffer_discovery_progress(
         &mut self,
         batch: &mut WriterBatch,
@@ -1586,7 +1745,7 @@ impl ScanJournal {
                 let seq_i64 = i64::try_from(seq).map_err(|_| {
                     repo_scan::Error::Store(format!("event seq {seq} exceeds i64 range"))
                 })?;
-                Ok(Some(batch.push(
+                let update_due = batch.push(
                     "UPDATE scan_events SET records = ?1 \
                         WHERE scan_id = ?2 AND seq = ?3",
                     vec![
@@ -1594,7 +1753,9 @@ impl ScanJournal {
                         turso::Value::Text(self.scan_id.clone()),
                         turso::Value::Integer(seq_i64),
                     ],
-                )))
+                );
+                let notification_due = self.buffer_discovery_progress_updated(batch, records)?;
+                Ok(Some(update_due || notification_due))
             }
             None => {
                 let event_type = EventType::DiscoveryProgress;
@@ -1629,6 +1790,41 @@ impl ScanJournal {
                 )))
             }
         }
+    }
+
+    /// Append the cursor-advancing notification for a coalesced progress
+    /// update. Its records carry the current gauge so a strict-after live
+    /// reader can apply the change without re-reading an earlier row.
+    fn buffer_discovery_progress_updated(
+        &mut self,
+        batch: &mut WriterBatch,
+        records: &[u8],
+    ) -> repo_scan::Result<bool> {
+        let event_type = EventType::DiscoveryProgressUpdated;
+        let (seq, off) = self.assign();
+        let seq_i64 = i64::try_from(seq)
+            .map_err(|_| repo_scan::Error::Store(format!("event seq {seq} exceeds i64 range")))?;
+        let rev_i64 = i64::try_from(self.rev).map_err(|_| {
+            repo_scan::Error::Store(format!("event catalog_rev {} exceeds i64 range", self.rev))
+        })?;
+        let off_i64 = i64::try_from(off).map_err(|_| {
+            repo_scan::Error::Store(format!("event offset {off} exceeds i64 range"))
+        })?;
+        Ok(batch.push(
+            "INSERT OR IGNORE INTO scan_events (scan_id, seq, catalog_rev, event_offset, \
+                event_type, op, reset, records) \
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            vec![
+                turso::Value::Text(self.scan_id.clone()),
+                turso::Value::Integer(seq_i64),
+                turso::Value::Integer(rev_i64),
+                turso::Value::Integer(off_i64),
+                turso::Value::Text(event_type.name().to_string()),
+                turso::Value::Text(event_type.op().name().to_string()),
+                turso::Value::Integer(0),
+                turso::Value::Blob(records.to_vec()),
+            ],
+        ))
     }
 }
 
@@ -1850,8 +2046,9 @@ async fn scan_failure_tail(
 ) -> repo_scan::Result<ExitCode> {
     use repo_scan::cli::OutputFormat;
     if resolved == OutputFormat::Jsonl {
-        // Replay errors here are catalog corruption: loud, but the
-        // scan already failed — report the failure either way.
+        // Replay errors here include catalog corruption and pruned
+        // history: loud, but the scan already failed — report the failure
+        // either way.
         match scan_jsonl_tail(cfg, scan_id).await {
             Ok(_) => {}
             Err(e) => {
@@ -1891,7 +2088,7 @@ async fn scan_failure_tail(
     }
     println!("scan_id: {scan_id}");
     println!("report_id: {report_id}");
-    println!("snapshot: {}", safe_path_display(&snapshot_path));
+    println!("snapshot: {}", safe_path_display(snapshot_path));
     Ok(ExitCode::OperationalFailure)
 }
 
@@ -2026,9 +2223,11 @@ async fn maybe_publish_live_report(
 /// Prune completed snapshots beyond the retention bound (Wave2b case
 /// 17): the newest [`repo_scan::report::output::MAX_RETAINED_SNAPSHOTS`]
 /// files survive, along with the latest prior running-scan recovery
-/// snapshot and this scan's current report. Old completed outcomes do not
-/// pin their snapshots forever. Pruned files lose their catalog rows too.
-/// Best-effort: never fails the scan.
+/// snapshot, every failed unpublished report that resume can retry, and
+/// this scan's current report. Published completed outcomes do not pin
+/// their snapshots forever. Pruned files lose their catalog rows too. If
+/// outcome references cannot be read, skip pruning. Best-effort: never fails
+/// the scan.
 async fn prune_old_snapshots(
     store: &TursoStore,
     state_dir: &Path,
@@ -2036,39 +2235,76 @@ async fn prune_old_snapshots(
     current_report_id: Option<&str>,
 ) {
     use repo_scan::report::output::{prune_snapshot_files, MAX_RETAINED_SNAPSHOTS};
-    let outcome_rows: Vec<String> = async {
+    let outcome_rows: repo_scan::Result<Vec<(String, String)>> = async {
         let mut rows = store
             .connection()
             .query(
-                "SELECT outcome FROM scan_requests \
-                    WHERE outcome IS NOT NULL AND state LIKE 'running%' \
+                "SELECT state, outcome FROM scan_requests \
+                    WHERE outcome IS NOT NULL \
+                        AND (state LIKE 'running%' OR state = 'failed') \
                         AND id <> ?1 \
-                    ORDER BY updated_at_ms DESC, id DESC LIMIT 2",
+                    ORDER BY updated_at_ms DESC, id DESC",
                 vec![turso::Value::Text(current_scan_id.to_string())],
             )
             .await
             .map_err(store_err)?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await.map_err(store_err)? {
-            if let turso::Value::Text(text) = row.get_value(0).map_err(store_err)? {
-                out.push(text);
-            }
+            let state = match row.get_value(0).map_err(store_err)? {
+                turso::Value::Text(text) => text,
+                _ => {
+                    return Err(repo_scan::Error::Store(
+                        "snapshot prune: invalid scan outcome state".to_string(),
+                    ));
+                }
+            };
+            let outcome = match row.get_value(1).map_err(store_err)? {
+                turso::Value::Text(text) => text,
+                _ => {
+                    return Err(repo_scan::Error::Store(
+                        "snapshot prune: invalid scan outcome payload".to_string(),
+                    ));
+                }
+            };
+            out.push((state, outcome));
         }
         repo_scan::Result::Ok(out)
     }
-    .await
-    .unwrap_or_default();
+    .await;
+    let outcome_rows = match outcome_rows {
+        Ok(rows) => rows,
+        Err(error) => {
+            eprintln!(
+                "repo-scan: snapshot prune: cannot read retryable outcome references: {}",
+                identity::scrub_text(&error.to_string())
+            );
+            return;
+        }
+    };
     // The current running row is excluded from the query and its actual
     // report ID is pinned explicitly below. Keep the newest other running
-    // outcome as its recovery snapshot; completed rows are intentionally
-    // not scanned.
-    let prior_recovery = outcome_rows
-        .iter()
-        .filter_map(|o| config::parse_outcome(o).map(|d| d.report_id))
-        .find(|report_id| Some(report_id.as_str()) != current_report_id);
+    // outcome as its recovery snapshot. A failed, unpublished outcome is
+    // also retryable: resume must be able to retry from those saved bytes,
+    // so every such report remains referenced until publication resolves it.
+    let mut prior_recovery = None;
     let mut referenced = HashSet::new();
+    for (state, outcome) in outcome_rows {
+        let Some(decoded) = config::parse_outcome(&outcome) else {
+            eprintln!(
+                "repo-scan: snapshot prune: cannot decode {state} outcome reference; skipping"
+            );
+            return;
+        };
+        if state.starts_with("running") && prior_recovery.is_none() {
+            prior_recovery = Some(decoded.report_id.clone());
+        } else if state == "failed" && !decoded.published {
+            referenced.insert(decoded.report_id);
+        }
+    }
     if let Some(report_id) = prior_recovery {
-        referenced.insert(report_id);
+        if Some(report_id.as_str()) != current_report_id {
+            referenced.insert(report_id);
+        }
     }
     if let Some(report_id) = current_report_id {
         referenced.insert(report_id.to_string());
@@ -3784,21 +4020,39 @@ async fn supersede_stale_scans(
     now_ms: i64,
     counters: &mut RunCounters,
 ) -> repo_scan::Result<()> {
+    let scope = policy.to_string();
+    let canonical = canonical.as_bytes().to_vec();
+    let successor = successor.to_string();
     store
-        .connection()
-        .execute(
-            "UPDATE scan_requests SET state = 'superseded', successor_id = ?1, \
-             updated_at_ms = ?2 WHERE state = 'running' AND scope = ?3 AND \
-             url_canonical = ?4 AND id != ?1",
-            vec![
-                turso::Value::Text(successor.to_string()),
-                turso::Value::Integer(now_ms),
-                turso::Value::Text(policy.to_string()),
-                turso::Value::Blob(canonical.as_bytes().to_vec()),
-            ],
-        )
-        .await
-        .map_err(|e| repo_scan::Error::Store(e.to_string()))?;
+        .with_tx(move |conn| async move {
+            conn.execute(
+                "DELETE FROM scan_event_dedupe WHERE scan_id IN (\
+                    SELECT id FROM scan_requests WHERE state = 'running' AND scope = ?1 AND \
+                    url_canonical = ?2 AND id != ?3)",
+                vec![
+                    turso::Value::Text(scope.clone()),
+                    turso::Value::Blob(canonical.clone()),
+                    turso::Value::Text(successor.clone()),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+            conn.execute(
+                "UPDATE scan_requests SET state = 'superseded', successor_id = ?1, \
+                 updated_at_ms = ?2 WHERE state = 'running' AND scope = ?3 AND \
+                 url_canonical = ?4 AND id != ?1",
+                vec![
+                    turso::Value::Text(successor),
+                    turso::Value::Integer(now_ms),
+                    turso::Value::Text(scope),
+                    turso::Value::Blob(canonical),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+            Ok(())
+        })
+        .await?;
     counters.db_transactions += 1;
     Ok(())
 }
@@ -10735,16 +10989,16 @@ async fn persist_probe(
 /// targets yield no upstream, exactly like git's `rev-parse
 /// --symbolic-full-name '@{u}'` failing there).
 ///
-/// Fail-closed throughout: unparseable lines stop that file with earlier
-/// values kept (matching git's "earlier ones keep working"), missing
-/// remotes/refspecs/targets yield no entry, and divergent per-checkout
-/// overlays drop the branch rather than guess. Read-only and offline:
-/// bounded regular-file reads only, no spawns.
+/// Fail-closed throughout: unparseable or unreadable effective config is
+/// reported as incomplete, missing remotes/refspecs/targets yield no entry
+/// only after a complete read, and divergent per-checkout overlays drop the
+/// branch rather than guess. Read-only and offline: bounded regular-file
+/// reads only, no spawns.
 fn load_branch_upstreams(
     instance: &git::GitInstance,
     checkouts: &[store::CheckoutRow],
     refs: &[git::RefObservation],
-) -> HashMap<Vec<u8>, Vec<u8>> {
+) -> BranchUpstreams {
     let known: HashSet<&[u8]> = refs.iter().map(|r| r.name.as_slice()).collect();
     // Checkout git dirs in row order, deduplicated; the store instance
     // dir covers the degenerate no-checkout case.
@@ -10758,57 +11012,61 @@ fn load_branch_upstreams(
     if git_dirs.is_empty() {
         git_dirs.push(instance.git_dir.clone());
     }
-    // Base effective config from the common dir (+ includes). `gitdir:`
-    // conditions match against any checkout git dir (documented at
-    // `include_condition_matches`).
-    let mut base = UpstreamConfig::default();
-    let mut chain = IncludeChain::default();
-    parse_config_tree(
-        &instance.common_dir.join("config"),
-        &mut base,
-        &mut chain,
-        &git_dirs,
-    );
-    let base_map = resolve_all_upstreams(&base, &known);
-    // Worktree overlays apply only under the effective gate (read from
-    // the common scope — a gate inside a worktree file itself never
-    // counts, probed). Each overlay appends after the base, so last-wins
-    // keys resolve to the worktree value while multi-value keys keep
-    // file order (common first, probed).
-    let gate = base
-        .last(b"extensions", b"", b"worktreeconfig")
-        .is_some_and(git::refspec::config_bool_is_true);
-    if !gate {
-        return base_map;
-    }
-    // Per-checkout effective maps. Checkouts without an overlay file
-    // observe the base map; poisoned checkouts (present-but-unreadable
-    // worktree file, where git itself fails) observe nothing.
+    // Config includes are evaluated from each checkout's perspective:
+    // Git's `includeIf.gitdir` can make the shared config effective for
+    // one linked worktree but not another. The effective worktree-config
+    // gate can also vary by checkout when an include sets it.
     let mut participants: Vec<HashMap<Vec<u8>, Vec<u8>>> = Vec::new();
     let mut overlay_seen: HashSet<std::path::PathBuf> = HashSet::new();
     for dir in &git_dirs {
+        let mut base = UpstreamConfig::default();
+        let mut chain = IncludeChain::default();
+        if parse_config_tree(
+            &instance.common_dir.join("config"),
+            &mut base,
+            &mut chain,
+            dir,
+            false,
+        )
+        .is_err()
+        {
+            return BranchUpstreams::Incomplete;
+        }
+        let base_map = resolve_all_upstreams(&base, &known);
+        // Worktree overlays apply only under this checkout's effective
+        // common-config gate; a gate inside config.worktree itself never
+        // counts (probed). Overlay values follow common-config values.
+        let gate = base
+            .last(b"extensions", b"", b"worktreeconfig")
+            .is_some_and(git::refspec::config_bool_is_true);
+        if !gate {
+            participants.push(base_map);
+            continue;
+        }
+        // An absent overlay leaves this checkout at its common config; a
+        // present but unreadable overlay makes its upstreams unknown.
         let overlay = dir.join("config.worktree");
         if !overlay_seen.insert(overlay.clone()) {
             continue;
         }
-        if std::fs::symlink_metadata(&overlay).is_err() {
-            // Absent overlay: the checkout observes the base map.
-            // (Duplicates across checkouts are harmless: merging below
-            // is idempotent.)
-            participants.push(base_map.clone());
-        } else if git::read_bounded_bytes(&overlay, git::MAX_GIT_CONTROL_BYTES).is_none() {
-            // Poisoned: directory, link, over-cap, or raced away. git
-            // fails here too, so this checkout contributes nothing.
-        } else {
-            let mut effective = base.clone();
-            let mut overlay_chain = IncludeChain::default();
-            parse_config_tree(
-                &overlay,
-                &mut effective,
-                &mut overlay_chain,
-                std::slice::from_ref(dir),
-            );
-            participants.push(resolve_all_upstreams(&effective, &known));
+        match std::fs::symlink_metadata(&overlay) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Absent overlay: the checkout observes the base map.
+                // (Duplicates across checkouts are harmless: merging below
+                // is idempotent.)
+                participants.push(base_map.clone());
+            }
+            Err(_) => return BranchUpstreams::Incomplete,
+            Ok(_) => {
+                let mut effective = base.clone();
+                let mut overlay_chain = IncludeChain::default();
+                if parse_config_tree(&overlay, &mut effective, &mut overlay_chain, dir, true)
+                    .is_err()
+                {
+                    return BranchUpstreams::Incomplete;
+                }
+                participants.push(resolve_all_upstreams(&effective, &known));
+            }
         }
     }
     // Merge: present wins over absent (union), any divergent present
@@ -10833,7 +11091,17 @@ fn load_branch_upstreams(
             }
         }
     }
-    merged
+    BranchUpstreams::Complete(merged)
+}
+
+/// Effective branch-config resolution is either complete, including a
+/// genuinely empty upstream map, or incomplete because some config input
+/// could not be read or parsed. Keeping these outcomes distinct prevents
+/// an unknown upstream from becoming `no_upstream`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BranchUpstreams {
+    Complete(HashMap<Vec<u8>, Vec<u8>>),
+    Incomplete,
 }
 
 /// Upstream bytes for one ref, if it is a local branch with config tracking.
@@ -10861,6 +11129,9 @@ struct IncludeChain {
     seen: HashSet<std::path::PathBuf>,
     files: usize,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IncompleteUpstreamConfig;
 
 /// Ordered config values: `(section, subsection, key)` (section/key
 /// ASCII-lowercased, subsection raw bytes) to values in file order.
@@ -10918,42 +11189,50 @@ impl UpstreamConfig {
     }
 }
 
-/// Parse one config tree root (common `config` or a worktree overlay):
-/// a missing or unreadable root contributes nothing (fail closed).
+/// Parse one config tree root (common `config` or a worktree overlay).
+/// A missing common config is a valid empty config; unreadable roots and
+/// incomplete config trees stay distinct from that complete empty result.
 fn parse_config_tree(
     path: &std::path::Path,
     cfg: &mut UpstreamConfig,
     chain: &mut IncludeChain,
-    git_dirs: &[std::path::PathBuf],
-) {
+    git_dir: &std::path::Path,
+    required: bool,
+) -> Result<(), IncompleteUpstreamConfig> {
     if chain.files >= UPSTREAM_INCLUDE_MAX_FILES {
-        return;
+        return Err(IncompleteUpstreamConfig);
     }
     if !chain.seen.insert(path.to_path_buf()) {
-        return;
+        return Ok(());
     }
     chain.files += 1;
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => return Ok(()),
+        Err(_) => return Err(IncompleteUpstreamConfig),
+        Ok(_) => {}
+    }
     let Some(bytes) = git::read_bounded_bytes(path, git::MAX_GIT_CONTROL_BYTES) else {
-        return;
+        return Err(IncompleteUpstreamConfig);
     };
     let base = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    parse_config_bytes(&bytes, cfg, chain, base, git_dirs, 0);
+    parse_config_bytes(&bytes, cfg, chain, base, git_dir, 0)
 }
 
 /// Parse one config file's bytes, following includes inline in file
 /// order. Any construct git fatals on (bad header, bad key, bad escape,
-/// content outside a section, NUL bytes, present-but-unreadable include
-/// target) stops the file with earlier values kept — matching git's
-/// "earlier ones keep working". CRLF, trailing comments/junk after `]`,
-/// and valueless keys (empty value) are accepted, all probed.
+/// content outside a section, NUL bytes, unreadable include target) stops
+/// the file with earlier values kept, but also marks the effective config
+/// incomplete so that the partial map cannot prove `no_upstream`. CRLF,
+/// trailing comments/junk after `]`, and valueless keys (empty value) are
+/// accepted, all probed.
 fn parse_config_bytes(
     bytes: &[u8],
     cfg: &mut UpstreamConfig,
     chain: &mut IncludeChain,
     base: &std::path::Path,
-    git_dirs: &[std::path::PathBuf],
+    git_dir: &std::path::Path,
     depth: u8,
-) {
+) -> Result<(), IncompleteUpstreamConfig> {
     // git skips a BOM at file start.
     let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
     let joined = join_config_continuations(bytes);
@@ -10964,47 +11243,47 @@ fn parse_config_bytes(
             continue;
         }
         if line.contains(&b'\0') {
-            return;
+            return Err(IncompleteUpstreamConfig);
         }
         if line.first() == Some(&b'[') {
             let Some(header) = parse_config_header(line) else {
-                return;
+                return Err(IncompleteUpstreamConfig);
             };
             section = Some(header);
             continue;
         }
         let Some((name, subsection)) = section.as_ref() else {
-            return;
+            return Err(IncompleteUpstreamConfig);
         };
         let is_include = name == b"include" && subsection.is_empty();
-        let is_include_if = name == b"includeif" && !subsection.is_empty();
+        let is_include_if = name == b"includeif";
         let (key, value): (&[u8], Vec<u8>) = match line.iter().position(|b| *b == b'=') {
             None => (strip_config_comment(line).trim_ascii(), Vec::new()),
             Some(eq) => {
                 let raw = strip_config_comment(line[eq + 1..].trim_ascii()).trim_ascii();
                 let Some(value) = unescape_config_value(raw) else {
-                    return;
+                    return Err(IncompleteUpstreamConfig);
                 };
                 (line[..eq].trim_ascii(), value)
             }
         };
         if key.is_empty() || !key.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'-') {
-            return;
+            return Err(IncompleteUpstreamConfig);
         }
         if is_include && key.eq_ignore_ascii_case(b"path") {
-            if follow_config_include(&value, base, cfg, chain, git_dirs, depth) {
-                return;
+            follow_config_include(&value, base, cfg, chain, git_dir, depth)?;
+        } else if is_include_if && key.eq_ignore_ascii_case(b"path") {
+            if subsection.is_empty() {
+                return Err(IncompleteUpstreamConfig);
             }
-        } else if is_include_if
-            && key.eq_ignore_ascii_case(b"path")
-            && include_condition_matches(subsection, git_dirs)
-            && follow_config_include(&value, base, cfg, chain, git_dirs, depth)
-        {
-            return;
+            if include_condition_matches(subsection, git_dir)? {
+                follow_config_include(&value, base, cfg, chain, git_dir, depth)?;
+            }
         } else {
             cfg.push(name, subsection, key, value);
         }
     }
+    Ok(())
 }
 
 /// Parse a section header line (already trimmed, starts with `[`):
@@ -11183,39 +11462,42 @@ fn unescape_config_value(value: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Follow one `include.path` value inline (file order). Returns true when
-/// the including file must stop (present-but-unreadable target — git
-/// fatals there). Missing targets are silently skipped (probed), as are
-/// revisits (cycles), depth/file cap overflows, and empty/unresolvable
-/// spellings.
+/// Follow one `include.path` value inline (file order). Missing targets
+/// and revisits (cycles) are skipped as Git does. A present target that
+/// cannot be read or parsed makes the effective config incomplete.
 fn follow_config_include(
     value: &[u8],
     base: &std::path::Path,
     cfg: &mut UpstreamConfig,
     chain: &mut IncludeChain,
-    git_dirs: &[std::path::PathBuf],
+    git_dir: &std::path::Path,
     depth: u8,
-) -> bool {
-    if value.is_empty() || depth >= UPSTREAM_INCLUDE_MAX_DEPTH {
-        return false;
+) -> Result<(), IncompleteUpstreamConfig> {
+    if value.is_empty() {
+        return Ok(());
     }
-    let Some(target) = resolve_include_target(value, base) else {
-        return false;
-    };
-    if chain.seen.contains(&target) || chain.files >= UPSTREAM_INCLUDE_MAX_FILES {
-        return false;
+    if depth >= UPSTREAM_INCLUDE_MAX_DEPTH {
+        return Err(IncompleteUpstreamConfig);
     }
-    if std::fs::symlink_metadata(&target).is_err() {
-        return false;
+    let target = resolve_include_target(value, base).ok_or(IncompleteUpstreamConfig)?;
+    if chain.seen.contains(&target) {
+        return Ok(());
+    }
+    if chain.files >= UPSTREAM_INCLUDE_MAX_FILES {
+        return Err(IncompleteUpstreamConfig);
+    }
+    match std::fs::symlink_metadata(&target) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(IncompleteUpstreamConfig),
+        Ok(_) => {}
     }
     let Some(bytes) = git::read_bounded_bytes(&target, git::MAX_GIT_CONTROL_BYTES) else {
-        return true;
+        return Err(IncompleteUpstreamConfig);
     };
     chain.seen.insert(target.clone());
     chain.files += 1;
     let child_base = target.parent().unwrap_or_else(|| std::path::Path::new("."));
-    parse_config_bytes(&bytes, cfg, chain, child_base, git_dirs, depth + 1);
-    false
+    parse_config_bytes(&bytes, cfg, chain, child_base, git_dir, depth + 1)
 }
 
 /// Resolve an include target the way git does: `~`/`~/` against HOME
@@ -11239,34 +11521,30 @@ fn resolve_include_target(value: &[u8], base: &std::path::Path) -> Option<std::p
     }
 }
 
-/// True when an `includeIf` subsection condition positively matches one of
-/// the candidate git dirs. Only absolute `gitdir:`/`gitdir/i:` patterns
-/// are evaluated (probed git 2.56.0, condition keywords case-sensitive:
-/// `*` never crosses `/`, `?` matches one non-`/` byte, `**` crosses, a
-/// trailing `/` appends `**`, matching runs against both the spelled and
-/// canonicalized dir). Every other condition (`onbranch:`, `hasconfig:`,
-/// unknown keywords, bare sections, relative patterns, over-long
-/// patterns, exhausted match budgets) fails closed to false — its
-/// include is skipped, never misapplied.
-///
-/// Multi-checkout approximation: conditions match when ANY checkout git
-/// dir matches. Single-checkout stores are exact; a `gitdir:` include
-/// that git would apply to only one checkout of a divergent store
-/// over-applies here (its values are still real config bytes, attributed
-/// store-wide like every other shared upstream input).
-fn include_condition_matches(condition: &[u8], git_dirs: &[std::path::PathBuf]) -> bool {
+/// Whether an `includeIf` subsection condition matches a checkout git dir.
+/// Only absolute `gitdir:`/`gitdir/i:` patterns are evaluated
+/// (probed git 2.56.0, condition keywords case-sensitive: `*` never crosses
+/// `/`, `?` matches one non-`/` byte, `**` crosses, a trailing `/` appends
+/// `**`, matching runs against both the spelled and canonicalized dir).
+/// Unsupported or unevaluable conditions return incomplete instead of
+/// claiming that their include cannot affect upstream resolution.
+fn include_condition_matches(
+    condition: &[u8],
+    git_dir: &std::path::Path,
+) -> Result<bool, IncompleteUpstreamConfig> {
     let (pattern, ignore_case) = if let Some(pattern) = condition.strip_prefix(b"gitdir:") {
         (pattern, false)
     } else if let Some(pattern) = condition.strip_prefix(b"gitdir/i:") {
         (pattern, true)
     } else {
-        return false;
+        return Err(IncompleteUpstreamConfig);
     };
     if pattern.is_empty()
         || !pattern.starts_with(b"/")
         || pattern.len() > UPSTREAM_GITDIR_PATTERN_MAX
+        || pattern.contains(&b'[')
     {
-        return false;
+        return Err(IncompleteUpstreamConfig);
     }
     let mut expanded;
     let mut pattern = pattern;
@@ -11275,13 +11553,20 @@ fn include_condition_matches(condition: &[u8], git_dirs: &[std::path::PathBuf]) 
         expanded.extend_from_slice(b"**");
         pattern = &expanded;
     }
-    git_dirs.iter().any(|dir| {
-        gitdir_match_forms(dir).iter().any(|form| {
-            let mut memo = HashSet::new();
-            let mut budget = UPSTREAM_GLOB_STEP_BUDGET;
-            glob_match(pattern, form, ignore_case, &mut memo, &mut budget)
-        })
-    })
+    let mut budget_exhausted = false;
+    for form in gitdir_match_forms(git_dir) {
+        let mut memo = HashSet::new();
+        let mut budget = UPSTREAM_GLOB_STEP_BUDGET;
+        if glob_match(pattern, &form, ignore_case, &mut memo, &mut budget) {
+            return Ok(true);
+        }
+        budget_exhausted |= budget == 0;
+    }
+    if budget_exhausted {
+        Err(IncompleteUpstreamConfig)
+    } else {
+        Ok(false)
+    }
 }
 
 /// Candidate spellings of one git dir for `gitdir:` matching: the spelled
@@ -11691,7 +11976,7 @@ struct AnalysisReads {
     refs: Vec<git::RefObservation>,
     refs_notes: Vec<String>,
     ref_errors: Vec<String>,
-    branch_upstreams: HashMap<Vec<u8>, Vec<u8>>,
+    branch_upstreams: BranchUpstreams,
     /// `(checkout_id, HEAD)` per checkout of the store.
     heads: Vec<(String, git::HeadState)>,
     /// Branch-vs-upstream comparisons keyed by full local ref name
@@ -11746,33 +12031,9 @@ fn collect_analysis_reads(
         return Ok(AnalysisOutcome::TimedOut);
     }
     let branch_upstreams = load_branch_upstreams(instance, checkouts, &refs);
-    // Branch comparisons (Step 10): local branches against their
-    // resolved full upstream refs, sharing one per-store result
-    // cache (equal OID pairs reuse saved walks). Runs before the
-    // checkout loop so identity-poll abandonment drops comparisons
-    // together with the reads they derive from.
-    let graph_cache = git::graph::ComparisonCache::new();
-    let Some(comparisons) = compute_branch_comparisons(
-        ctx,
-        instance,
-        &refs,
-        &branch_upstreams,
-        &graph_cache,
-        &cancel,
-    ) else {
-        return Ok(if deadline.expired() {
-            AnalysisOutcome::TimedOut
-        } else {
-            AnalysisOutcome::IdentityChanged
-        });
-    };
-    if !poll.ok_throttled() {
-        return Ok(AnalysisOutcome::IdentityChanged);
-    }
-    // HEAD separately per checkout (Step 10): each checkout's own git
-    // dir observes its own HEAD. A checkout that went unreadable since
-    // discovery keeps `unknown` (its row is simply not merged); the
-    // store analysis still completes for the rest.
+    // HEAD and graph context are checkout-specific: observe HEAD first
+    // so each local branch comparison can use the checkout that owns
+    // that branch, including its worktree config and fallback worktree.
     let mut heads = Vec::with_capacity(checkouts.len());
     for checkout in checkouts {
         if deadline.expired() {
@@ -11797,6 +12058,31 @@ fn collect_analysis_reads(
             return Ok(AnalysisOutcome::IdentityChanged);
         }
     }
+    // Branch comparisons (Step 10): local branches against their
+    // resolved full upstream refs, sharing one per-store cache. The
+    // cache key also includes each owning checkout's effective replace
+    // context, so worktrees with different `core.useReplaceRefs` values
+    // cannot reuse one another's counts.
+    let graph_contexts = branch_graph_contexts(instance, checkouts, &heads);
+    let graph_cache = git::graph::ComparisonCache::new();
+    let Some(comparisons) = compute_branch_comparisons(
+        ctx,
+        instance,
+        &refs,
+        &branch_upstreams,
+        &graph_contexts,
+        &graph_cache,
+        &cancel,
+    ) else {
+        return Ok(if deadline.expired() {
+            AnalysisOutcome::TimedOut
+        } else {
+            AnalysisOutcome::IdentityChanged
+        });
+    };
+    if !poll.ok_throttled() {
+        return Ok(AnalysisOutcome::IdentityChanged);
+    }
     Ok(AnalysisOutcome::Reads(AnalysisReads {
         refs,
         refs_notes,
@@ -11820,10 +12106,22 @@ fn compute_branch_comparisons(
     ctx: &ReadContext,
     instance: &git::GitInstance,
     refs: &[git::RefObservation],
-    upstreams: &HashMap<Vec<u8>, Vec<u8>>,
+    upstreams: &BranchUpstreams,
+    graph_contexts: &[Option<BranchGraphContext>],
     cache: &git::graph::ComparisonCache,
     cancel: &git::fallback::WaitCancel,
 ) -> Option<HashMap<Vec<u8>, git::graph::Comparison>> {
+    // An incomplete config has no trustworthy negative upstream result.
+    // Explicitly persist `pending` for each local branch so an older
+    // comparison cannot remain visible as if it used the current config.
+    let BranchUpstreams::Complete(upstreams) = upstreams else {
+        return Some(
+            refs.iter()
+                .filter(|reference| reference.name.starts_with(b"refs/heads/"))
+                .map(|reference| (reference.name.clone(), git::graph::Comparison::pending()))
+                .collect(),
+        );
+    };
     audit_analysis_read_start("compare_branch");
     let mut oids: HashMap<&[u8], (&str, &str)> = HashMap::new();
     // Presence set: EVERY iterated ref name, including OID-less ones
@@ -11853,15 +12151,6 @@ fn compute_branch_comparisons(
     // Cache store key: the common dir identifies this object
     // database for the cache's lifetime (one analysis pass).
     let store_key = instance.common_dir.to_string_lossy().into_owned();
-    let graph_ctx = git::graph::CompareContext {
-        git_dir: &instance.git_dir,
-        common_dir: &instance.common_dir,
-        store_id: &store_key,
-        work_tree: instance.work_dir.as_deref(),
-        cache: Some(cache),
-        fallback: ctx.fallback(),
-        cancel: Some(cancel),
-    };
     let mut out = HashMap::new();
     for reference in refs {
         if cancel.cancelled() {
@@ -11887,7 +12176,26 @@ fn compute_branch_comparisons(
             upstream_algo,
             upstream_known,
         };
-        let comparison = git::graph::compare_branch(&graph_ctx, &tips);
+        let comparison = match graph_context_for_branch(&reference.name, graph_contexts) {
+            Some(owner) => {
+                let graph_ctx = git::graph::CompareContext {
+                    git_dir: &owner.git_dir,
+                    common_dir: &instance.common_dir,
+                    store_id: &store_key,
+                    use_replace_refs: Some(owner.use_replace_refs),
+                    replace_ref_base: Some(&owner.replace_ref_base),
+                    work_tree: owner.work_tree.as_deref(),
+                    cache: Some(cache),
+                    fallback: ctx.fallback(),
+                    cancel: Some(cancel),
+                };
+                git::graph::compare_branch(&graph_ctx, &tips)
+            }
+            // A conflicting or unreadable checkout context cannot prove
+            // which ancestry semantics apply. Keep this branch pending
+            // rather than publishing counts from an arbitrary worktree.
+            None => git::graph::Comparison::pending(),
+        };
         if cancel.cancelled() {
             // The graph layer returns an error-shaped placeholder when a
             // cancellation interrupts a walk. Drop the whole observation
@@ -11900,6 +12208,397 @@ fn compute_branch_comparisons(
         None
     } else {
         Some(out)
+    }
+}
+
+/// Graph inputs that belong to one checkout. `head_ref` records which
+/// local branch this checkout owns; the replacement context is absent
+/// when its effective repository config could not be resolved safely.
+#[derive(Debug, Clone)]
+struct BranchGraphContext {
+    git_dir: PathBuf,
+    work_tree: Option<PathBuf>,
+    head_ref: Option<Vec<u8>>,
+    use_replace_refs: bool,
+    replace_ref_base: String,
+}
+
+/// Build one graph context per checkout from the current HEAD reads.
+/// The no-checkout case retains the store instance context.
+fn branch_graph_contexts(
+    instance: &git::GitInstance,
+    checkouts: &[store::CheckoutRow],
+    heads: &[(String, git::HeadState)],
+) -> Vec<Option<BranchGraphContext>> {
+    let heads: HashMap<&str, &git::HeadState> = heads
+        .iter()
+        .map(|(checkout_id, head)| (checkout_id.as_str(), head))
+        .collect();
+    if checkouts.is_empty() {
+        return vec![
+            effective_replace_ref_settings(&instance.git_dir, &instance.common_dir).map(
+                |(use_replace_refs, replace_ref_base)| BranchGraphContext {
+                    git_dir: instance.git_dir.clone(),
+                    work_tree: instance.work_dir.clone(),
+                    head_ref: None,
+                    use_replace_refs,
+                    replace_ref_base,
+                },
+            ),
+        ];
+    }
+    checkouts
+        .iter()
+        .map(|checkout| {
+            let git_dir = config::path_from_bytes(checkout.git_path.clone());
+            let work_tree = checkout
+                .root_path
+                .as_ref()
+                .map(|bytes| config::path_from_bytes(bytes.clone()));
+            let head_ref = match heads.get(checkout.id.as_str()).copied() {
+                Some(git::HeadState::Branch { ref_name, .. }) => Some(ref_name.clone()),
+                _ => None,
+            };
+            effective_replace_ref_settings(&git_dir, &instance.common_dir).map(
+                |(use_replace_refs, replace_ref_base)| BranchGraphContext {
+                    git_dir,
+                    work_tree,
+                    head_ref,
+                    use_replace_refs,
+                    replace_ref_base,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Resolve the local effective replace-ref settings for one checkout.
+/// Gix opens with isolated permissions, so repository config (including
+/// `config.worktree`) is the relevant scope. Any unreadable or invalid
+/// input is unknown and causes affected branch results to stay pending.
+fn effective_replace_ref_settings(git_dir: &Path, common_dir: &Path) -> Option<(bool, String)> {
+    let mut effective = UpstreamConfig::default();
+    let mut chain = IncludeChain::default();
+    parse_config_tree(
+        &common_dir.join("config"),
+        &mut effective,
+        &mut chain,
+        git_dir,
+        false,
+    )
+    .ok()?;
+
+    let worktree_config = match effective.last(b"extensions", b"", b"worktreeconfig") {
+        None => false,
+        Some(value) => parse_repo_config_bool(value)?,
+    };
+    if worktree_config {
+        let overlay = git_dir.join("config.worktree");
+        let mut overlay_chain = IncludeChain::default();
+        parse_config_tree(&overlay, &mut effective, &mut overlay_chain, git_dir, false).ok()?;
+    }
+
+    // Git defaults to using replacement refs. A valueless config key is
+    // also true under Git's boolean rules.
+    let use_replace_refs = match effective.last(b"core", b"", b"usereplacerefs") {
+        None => true,
+        Some(value) => parse_repo_config_bool(value)?,
+    };
+    let replace_ref_base = effective
+        .last(b"gitoxide", b"objects", b"replacerefbase")
+        .unwrap_or(b"refs/replace/");
+    let replace_ref_base = std::str::from_utf8(replace_ref_base).ok()?;
+    if !replace_ref_base.starts_with("refs/")
+        || !replace_ref_base.ends_with('/')
+        || replace_ref_base.bytes().any(|byte| {
+            byte.is_ascii_control()
+                || byte.is_ascii_whitespace()
+                || matches!(byte, b'=' | b'"' | b'\\')
+        })
+        || replace_ref_base
+            .split('/')
+            .any(|part| part == "." || part == "..")
+    {
+        return None;
+    }
+    Some((use_replace_refs, replace_ref_base.to_owned()))
+}
+
+/// Strict subset of Git's config boolean grammar. Unknown spellings stay
+/// unknown instead of being treated as false, which would make ancestry
+/// comparison depend on a guessed config value.
+fn parse_repo_config_bool(value: &[u8]) -> Option<bool> {
+    if value.is_empty() {
+        return Some(true);
+    }
+    if value.eq_ignore_ascii_case(b"true")
+        || value.eq_ignore_ascii_case(b"yes")
+        || value.eq_ignore_ascii_case(b"on")
+        || git::refspec::config_bool_is_true(value)
+    {
+        return Some(true);
+    }
+    if value.eq_ignore_ascii_case(b"false")
+        || value.eq_ignore_ascii_case(b"no")
+        || value.eq_ignore_ascii_case(b"off")
+        || value == b"0"
+        || std::str::from_utf8(value)
+            .ok()?
+            .parse::<i128>()
+            .is_ok_and(|number| number == 0)
+    {
+        return Some(false);
+    }
+    None
+}
+
+/// Select the graph context owned by `branch`. An exactly one checkout
+/// with that HEAD wins. An unowned branch can use a shared context only
+/// when every checkout has the same known replace-ref settings.
+fn graph_context_for_branch<'a>(
+    branch: &[u8],
+    contexts: &'a [Option<BranchGraphContext>],
+) -> Option<&'a BranchGraphContext> {
+    let mut owners = contexts
+        .iter()
+        .filter_map(Option::as_ref)
+        .filter(|context| context.head_ref.as_deref() == Some(branch));
+    let owner = owners.next();
+    if owners.next().is_some() {
+        return None;
+    }
+    if let Some(owner) = owner {
+        return Some(owner);
+    }
+
+    let mut contexts = contexts.iter();
+    let first = contexts.next()?.as_ref()?;
+    if contexts.any(|candidate| {
+        candidate.as_ref().is_none_or(|context| {
+            context.use_replace_refs != first.use_replace_refs
+                || context.replace_ref_base != first.replace_ref_base
+        })
+    }) {
+        return None;
+    }
+    Some(first)
+}
+
+#[cfg(test)]
+mod branch_upstream_tests {
+    use super::*;
+
+    fn assert_config_failure_keeps_local_branch_pending(common_dir: &Path) {
+        let instance = git::GitInstance {
+            git_dir: common_dir.to_path_buf(),
+            common_dir: common_dir.to_path_buf(),
+            work_dir: None,
+            is_bare: false,
+            object_format: String::from("sha1"),
+        };
+        let refs = [git::RefObservation {
+            name: b"refs/heads/main".to_vec(),
+            target: git::RefTarget::Symbolic(b"refs/heads/main".to_vec()),
+            peeled: None,
+        }];
+        let upstreams = load_branch_upstreams(&instance, &[], &refs);
+        assert_eq!(upstreams, BranchUpstreams::Incomplete);
+
+        let ctx = ReadContext {
+            fence: None,
+            inspector: git::GixInspector::new(),
+            ssh_aliases: Arc::new(HashMap::new()),
+            fallback: Arc::new(OnceLock::new()),
+            watchdog_grace: Duration::ZERO,
+            pressure: Arc::new(AtomicBool::new(false)),
+        };
+        let comparisons = compute_branch_comparisons(
+            &ctx,
+            &instance,
+            &refs,
+            &upstreams,
+            &[],
+            &git::graph::ComparisonCache::new(),
+            &git::fallback::WaitCancel::never(),
+        )
+        .expect("incomplete config is not a cancelled analysis");
+        assert_eq!(
+            comparisons.get(b"refs/heads/main".as_slice()),
+            Some(&git::graph::Comparison::pending()),
+            "incomplete config persists `pending`, not `no_upstream`"
+        );
+    }
+
+    #[test]
+    fn malformed_effective_config_keeps_local_branch_comparison_pending() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("config"),
+            b"[malformed\n[branch \"main\"]\nremote = origin\nmerge = refs/heads/main\n",
+        )
+        .expect("write malformed config");
+        assert_config_failure_keeps_local_branch_pending(tmp.path());
+    }
+
+    #[test]
+    fn unreadable_effective_config_keeps_local_branch_comparison_pending() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(tmp.path().join("config")).expect("create unreadable config path");
+        assert_config_failure_keeps_local_branch_pending(tmp.path());
+    }
+
+    #[test]
+    fn unevaluable_include_condition_keeps_local_branch_comparison_pending() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("config"),
+            b"[includeIf \"onbranch:main\"]\npath = conditional-config\n",
+        )
+        .expect("write conditional include");
+        assert_config_failure_keeps_local_branch_pending(tmp.path());
+    }
+
+    #[test]
+    fn gitdir_include_is_evaluated_for_each_checkout() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let common_dir = tmp.path().join(".git");
+        let linked_git_dir = common_dir.join("worktrees/linked");
+        std::fs::create_dir_all(&linked_git_dir).expect("linked git dir");
+        let gitdir_condition = format!("gitdir:{}", linked_git_dir.display());
+        assert_eq!(
+            include_condition_matches(gitdir_condition.as_bytes(), &common_dir),
+            Ok(false)
+        );
+        assert_eq!(
+            include_condition_matches(gitdir_condition.as_bytes(), &linked_git_dir),
+            Ok(true)
+        );
+        let common_config = format!(
+            "[remote \"origin\"]\n\
+             \tfetch = +refs/heads/*:refs/remotes/origin/*\n\
+             [remote \"other\"]\n\
+             \tfetch = +refs/heads/*:refs/remotes/other/*\n\
+             [branch \"main\"]\n\
+             \tremote = origin\n\
+             \tmerge = refs/heads/main\n\
+             [includeIf \"gitdir:{}\"]\n\
+             \tpath = linked.inc\n",
+            linked_git_dir.display()
+        );
+        std::fs::write(common_dir.join("config"), common_config).expect("common config");
+        std::fs::write(
+            common_dir.join("linked.inc"),
+            b"[branch \"main\"]\n\tremote = other\n",
+        )
+        .expect("conditional include");
+
+        let instance = git::GitInstance {
+            git_dir: common_dir.clone(),
+            common_dir: common_dir.clone(),
+            work_dir: None,
+            is_bare: false,
+            object_format: String::from("sha1"),
+        };
+        let checkout = |id: &str, git_dir: &Path| store::CheckoutRow {
+            id: id.to_owned(),
+            instance_id: String::from("instance"),
+            root_path: None,
+            git_path: config::path_as_bytes(git_dir),
+            relationship: String::from("main"),
+            availability: String::from("present"),
+            head_state: String::from("branch"),
+            head_ref: None,
+            head_oid: None,
+            head_algo: None,
+            observed_at_ms: 0,
+        };
+        let checkouts = [
+            checkout("main", &common_dir),
+            checkout("linked", &linked_git_dir),
+        ];
+        let refs = [
+            git::RefObservation {
+                name: b"refs/heads/main".to_vec(),
+                target: git::RefTarget::Symbolic(b"refs/heads/main".to_vec()),
+                peeled: None,
+            },
+            git::RefObservation {
+                name: b"refs/remotes/origin/main".to_vec(),
+                target: git::RefTarget::Symbolic(b"refs/remotes/origin/main".to_vec()),
+                peeled: None,
+            },
+            git::RefObservation {
+                name: b"refs/remotes/other/main".to_vec(),
+                target: git::RefTarget::Symbolic(b"refs/remotes/other/main".to_vec()),
+                peeled: None,
+            },
+        ];
+
+        assert_eq!(
+            load_branch_upstreams(&instance, &checkouts, &refs),
+            BranchUpstreams::Complete(HashMap::new()),
+            "the checkout-specific include makes main's upstream divergent; do not broadcast it"
+        );
+    }
+
+    #[test]
+    fn graph_context_uses_branch_owner_and_pending_for_unowned_conflict() {
+        let main = BranchGraphContext {
+            git_dir: PathBuf::from("/repo/.git"),
+            work_tree: Some(PathBuf::from("/repo")),
+            head_ref: Some(b"refs/heads/main".to_vec()),
+            use_replace_refs: true,
+            replace_ref_base: String::from("refs/replace/"),
+        };
+        let linked = BranchGraphContext {
+            git_dir: PathBuf::from("/repo/.git/worktrees/linked"),
+            work_tree: Some(PathBuf::from("/linked")),
+            head_ref: Some(b"refs/heads/linked".to_vec()),
+            use_replace_refs: false,
+            replace_ref_base: String::from("refs/replace/"),
+        };
+        let contexts = [Some(main), Some(linked)];
+        assert_eq!(
+            graph_context_for_branch(b"refs/heads/main", &contexts)
+                .map(|context| context.git_dir.as_path()),
+            Some(Path::new("/repo/.git"))
+        );
+        assert_eq!(
+            graph_context_for_branch(b"refs/heads/linked", &contexts)
+                .map(|context| context.git_dir.as_path()),
+            Some(Path::new("/repo/.git/worktrees/linked"))
+        );
+        assert!(
+            graph_context_for_branch(b"refs/heads/unowned", &contexts).is_none(),
+            "an unowned branch cannot pick between different replacement settings"
+        );
+    }
+
+    #[test]
+    fn effective_replace_ref_settings_read_worktree_override() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let common = tmp.path().join(".git");
+        let main_git_dir = common.clone();
+        let linked_git_dir = common.join("worktrees/linked");
+        std::fs::create_dir_all(&linked_git_dir).expect("linked git dir");
+        std::fs::write(
+            common.join("config"),
+            b"[extensions]\nworktreeConfig = true\n[core]\nuseReplaceRefs = true\n",
+        )
+        .expect("common config");
+        std::fs::write(
+            linked_git_dir.join("config.worktree"),
+            b"[core]\nuseReplaceRefs = false\n",
+        )
+        .expect("linked worktree config");
+        assert_eq!(
+            effective_replace_ref_settings(&main_git_dir, &common),
+            Some((true, String::from("refs/replace/")))
+        );
+        assert_eq!(
+            effective_replace_ref_settings(&linked_git_dir, &common),
+            Some((false, String::from("refs/replace/")))
+        );
     }
 }
 
@@ -12256,6 +12955,24 @@ async fn persist_analysis(
     // v6 comparison columns, once per store: pre-v6 catalogs skip
     // comparison writes (branches read `pending`/null there).
     let persist_comparison = store.supports_ref_comparison().await?;
+    // Preserve the last known upstream field when config is incomplete.
+    // New refs remain unknown (and their comparison stays pending), while
+    // an unreadable config cannot erase an upstream established earlier.
+    let retained_upstreams: HashMap<Vec<u8>, Vec<u8>> =
+        if matches!(&reads.branch_upstreams, BranchUpstreams::Incomplete) {
+            store
+                .list_refs(instance_id)
+                .await?
+                .into_iter()
+                .filter_map(|reference| {
+                    reference
+                        .upstream
+                        .map(|upstream| (reference.name, upstream))
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
     let mut branch_values = Vec::with_capacity(reads.refs.len());
     for reference in &reads.refs {
         let name_text = String::from_utf8_lossy(&reference.name);
@@ -12282,7 +12999,10 @@ async fn persist_analysis(
                 (peeled_oid, peeled_algo, Some(target.as_slice()))
             }
         };
-        let upstream = upstream_for_ref(&reads.branch_upstreams, &reference.name);
+        let upstream = match &reads.branch_upstreams {
+            BranchUpstreams::Complete(upstreams) => upstream_for_ref(upstreams, &reference.name),
+            BranchUpstreams::Incomplete => retained_upstreams.get(&reference.name).cloned(),
+        };
         let state = ref_state_for(reference, &known);
         let new_ref = NewRef {
             id: &ref_id,
@@ -13969,9 +14689,11 @@ enum FetchPlan {
 /// applies `insteadOf` exactly as a fetch would; `ext::` and
 /// remote-helper transports refuse — they execute repo-chosen local
 /// commands), and executable config origins (repo-scope
-/// `credential.helper`, `core.sshCommand`, `remote.*.uploadpack` /
-/// `receivepack`, or `include.*` chains refuse — operator
-/// system/global definers keep working).
+/// `credential.helper` including URL-qualified helpers,
+/// `core.sshCommand`, `core.gitProxy`, `core.alternateRefsCommand`,
+/// configured `hook.*.command`, `remote.*.uploadpack` / `receivepack`,
+/// or `include.*` chains refuse — operator system/global definers keep
+/// working).
 fn plan_remote_fetch(
     git: &git::fallback::FallbackGit,
     dir: &Path,
@@ -14065,8 +14787,10 @@ fn plan_fetch_transport(
     Ok(())
 }
 
-/// Executable-config gate: refuse repo-scope `credential.helper`,
-/// `core.sshCommand`, `remote.*.uploadpack` / `receivepack`, and
+/// Executable-config gate: refuse repo-scope `credential.helper` and
+/// URL-qualified `credential.<url>.helper`, `core.sshCommand`,
+/// `core.gitProxy`, `core.alternateRefsCommand`, configured
+/// `hook.*.command`, `remote.*.uploadpack` / `receivepack`, and
 /// `include.*`/`includeif.*` chains (a repo-scope include would hide
 /// the true definer of the others, so any repo-scope include refuses
 /// too). Operator system/global definers are outside the repo and keep
@@ -14086,6 +14810,13 @@ fn plan_fetch_transport(
 fn is_remote_exec_override(key: &str) -> bool {
     key.starts_with("remote.")
         && (key.ends_with(".uploadpack") || key.ends_with(".receivepack") || key.ends_with(".vcs"))
+}
+
+/// True for a named config hook's command. Git can execute these
+/// independently of the traditional hooks directory.
+fn is_configured_hook_command(key: &str) -> bool {
+    key.strip_prefix("hook.")
+        .is_some_and(|name| name.len() > ".command".len() && name.ends_with(".command"))
 }
 
 fn plan_fetch_exec_config(git: &git::fallback::FallbackGit, dir: &Path) -> Result<(), FetchGate> {
@@ -14110,7 +14841,11 @@ fn plan_fetch_exec_config(git: &git::fallback::FallbackGit, dir: &Path) -> Resul
         };
         let key = origin.key.as_str();
         let gated = key == "credential.helper"
+            || (key.starts_with("credential.") && key.ends_with(".helper"))
             || key == "core.sshcommand"
+            || key == "core.gitproxy"
+            || key == "core.alternaterefscommand"
+            || is_configured_hook_command(key)
             || key.starts_with("include.")
             || key.starts_with("includeif.")
             || is_remote_exec_override(key);
@@ -14121,10 +14856,16 @@ fn plan_fetch_exec_config(git: &git::fallback::FallbackGit, dir: &Path) -> Resul
             if git::fallback::config_origin_within_repo(file, dir) {
                 let setting = if is_remote_exec_override(key) {
                     "remote executable setting"
-                } else if key == "credential.helper" {
+                } else if key.starts_with("credential.") && key.ends_with(".helper") {
                     "credential.helper"
                 } else if key == "core.sshcommand" {
                     "core.sshcommand"
+                } else if key == "core.gitproxy" {
+                    "core.gitproxy"
+                } else if key == "core.alternaterefscommand" {
+                    "core.alternaterefscommand"
+                } else if is_configured_hook_command(key) {
+                    "configured hook command"
                 } else if key.starts_with("includeif.") {
                     "includeIf setting"
                 } else {
@@ -14193,7 +14934,7 @@ fn fetch_ref_storage_path_safety(
                 Ok(true) => {
                     return Err(
                         "fetch destination namespace uses a filesystem symlink; refusing fetch",
-                    )
+                    );
                 }
                 Err(_) => return Err("cannot verify fetch destination paths; refusing fetch"),
             }
@@ -14206,7 +14947,7 @@ fn fetch_ref_storage_path_safety(
     match fetch_ref_namespace_has_symlink(&namespace) {
         Ok(false) => {}
         Ok(true) => {
-            return Err("fetch destination storage contains a filesystem symlink; refusing fetch")
+            return Err("fetch destination storage contains a filesystem symlink; refusing fetch");
         }
         Err(()) => return Err("cannot verify fetch destination storage; refusing fetch"),
     }
@@ -14366,12 +15107,73 @@ fn fetch_ref_namespace_has_symlink(namespace: &Path) -> Result<bool, ()> {
 /// (`git::refspec::covered_by_positive` — never a
 /// `refs/remotes/<name>/` prefix, which misses custom destinations
 /// and trips on `origin`/`origin2` boundaries) and classify it.
-/// Only covered refs
+/// Covered refs and excluded refs in this remote's default namespace
 /// produce applies; another remote's refs are not our statement.
 /// All fresh state returns owned; the caller persists. A failed
 /// upstream audit after a successful fetch still re-observes oids
 /// but labels nothing `current` (`label == false`, status `failed`
 /// so resume retries the audit).
+/// Re-read tracking refs after a failed/timeout fetch and persist their
+/// actual state without labeling any ref fresh. The fetch argv is atomic,
+/// but this also keeps the catalog aligned with any state observable after
+/// the failed operation.
+fn failed_fetch_attempt(
+    git: &git::fallback::FallbackGit,
+    dir: &Path,
+    name: &str,
+    refspecs: &[git::refspec::FetchRefspec],
+    pre: &[git::fallback::TrackingRef],
+    detail: String,
+    duration_ms: i64,
+) -> GitAttempt {
+    let mut attempt = GitAttempt::failed(detail, duration_ms);
+    let post = match git.git_remote_tracking_refs(dir, FETCH_TIMEOUT) {
+        Ok(refs) => refs,
+        Err(e) => {
+            let read_detail = format!(
+                "could not re-read tracking refs after failed fetch: {}",
+                identity::scrub_text(&e)
+            );
+            if let Some(detail) = attempt.detail.take() {
+                attempt.detail = Some(format!("{detail}; {read_detail}"));
+            } else {
+                attempt.detail = Some(read_detail);
+            }
+            return attempt;
+        }
+    };
+    let pre_map: HashMap<&[u8], &[u8]> = pre
+        .iter()
+        .map(|reference| (reference.name.as_slice(), reference.oid.as_slice()))
+        .collect();
+    let known: HashSet<&[u8]> = post
+        .iter()
+        .map(|reference| reference.name.as_slice())
+        .collect();
+    let own_exact = format!("refs/remotes/{name}");
+    let own_prefix = format!("refs/remotes/{name}/");
+    for observed in &post {
+        let covered = git::refspec::covered_by_positive(refspecs, &observed.name);
+        if !covered {
+            let in_own = observed.name.as_slice() == own_exact.as_bytes()
+                || observed.name.starts_with(own_prefix.as_bytes());
+            if !in_own {
+                continue;
+            }
+        } else if pre_map.get(observed.name.as_slice()) != Some(&observed.oid.as_slice()) {
+            attempt.refs_updated += 1;
+        }
+        attempt.applies.push(FetchApply {
+            name: observed.name.clone(),
+            oid: observed.oid.clone(),
+            symref: observed.symref.clone(),
+            state: git::fallback::tracking_ref_state(observed, &known),
+            freshness: "stale",
+        });
+    }
+    attempt
+}
+
 fn execute_remote_fetch(
     git: &git::fallback::FallbackGit,
     dir: &Path,
@@ -14400,7 +15202,7 @@ fn execute_remote_fetch(
             return GitAttempt::unsupported(
                 "cannot read effective ref storage backend; refusing fetch".to_string(),
                 Some(elapsed_ms()),
-            )
+            );
         }
     };
     let storage = match storage_values.as_slice() {
@@ -14411,7 +15213,7 @@ fn execute_remote_fetch(
             return GitAttempt::unsupported(
                 "unknown or multiple ref storage backend values; refusing fetch".to_string(),
                 Some(elapsed_ms()),
-            )
+            );
         }
     };
     if let Err(reason) = fetch_ref_storage_path_safety(dir, name, &parsed, storage) {
@@ -14442,7 +15244,15 @@ fn execute_remote_fetch(
         FETCH_TIMEOUT,
         FETCH_CAPTURE_CAP,
     ) {
-        return GitAttempt::failed(identity::scrub_text(&e), elapsed_ms());
+        return failed_fetch_attempt(
+            git,
+            dir,
+            name,
+            &parsed,
+            &pre,
+            identity::scrub_text(&e),
+            elapsed_ms(),
+        );
     }
     let post = match git.git_remote_tracking_refs(dir, FETCH_TIMEOUT) {
         Ok(refs) => refs,
@@ -14934,21 +15744,39 @@ async fn recompute_fetch_comparisons(
     }
     let git_dir = config::path_from_bytes(inst.git_path.clone());
     let common_dir = config::path_from_bytes(inst.common_path.clone());
+    let checkouts = load_instance_checkouts(store, &inst.id).await?;
+    let graph_instance = git::GitInstance {
+        git_dir: git_dir.clone(),
+        common_dir: common_dir.clone(),
+        work_dir: None,
+        is_bare: false,
+        object_format: inst.object_format.clone(),
+    };
+    let heads: Vec<(String, git::HeadState)> = checkouts
+        .iter()
+        .map(|checkout| {
+            let head = if checkout.head_state == "branch" {
+                checkout
+                    .head_ref
+                    .clone()
+                    .map(|ref_name| git::HeadState::Branch {
+                        ref_name,
+                        oid: None,
+                    })
+                    .unwrap_or(git::HeadState::Unknown)
+            } else {
+                git::HeadState::Unknown
+            };
+            (checkout.id.clone(), head)
+        })
+        .collect();
+    let graph_contexts = branch_graph_contexts(&graph_instance, &checkouts, &heads);
     let cache = git::graph::ComparisonCache::new();
     // The fallback borrow ends before any `&mut runner` buffering
     // below: compare first (immutable), persist after (mutable).
     let comparisons: Vec<(String, &'static str, Option<u64>, Option<u64>)> = {
         let Some(fallback) = runner.fallback() else {
             return Ok(());
-        };
-        let ctx = git::graph::CompareContext {
-            git_dir: &git_dir,
-            common_dir: &common_dir,
-            store_id: &inst.id,
-            work_tree: None,
-            cache: Some(&cache),
-            fallback: Some(fallback),
-            cancel: Some(cancel),
         };
         let mut out = Vec::new();
         for row in &refs {
@@ -14975,7 +15803,23 @@ async fn recompute_fetch_comparisons(
                 upstream_algo,
                 upstream_known,
             };
-            let comparison = git::graph::compare_branch(&ctx, &branch_tips);
+            let comparison = match graph_context_for_branch(&row.name, &graph_contexts) {
+                Some(owner) => {
+                    let ctx = git::graph::CompareContext {
+                        git_dir: &owner.git_dir,
+                        common_dir: &common_dir,
+                        store_id: &inst.id,
+                        use_replace_refs: Some(owner.use_replace_refs),
+                        replace_ref_base: Some(&owner.replace_ref_base),
+                        work_tree: owner.work_tree.as_deref(),
+                        cache: Some(&cache),
+                        fallback: Some(fallback),
+                        cancel: Some(cancel),
+                    };
+                    git::graph::compare_branch(&ctx, &branch_tips)
+                }
+                None => git::graph::Comparison::pending(),
+            };
             if cancel.cancelled() {
                 // Discard this pass rather than persisting placeholders
                 // produced by cancellation inside an object walk.
@@ -15005,6 +15849,43 @@ async fn recompute_fetch_comparisons(
     }
     flush_runner_batch(runner, store).await?;
     Ok(())
+}
+
+/// Load checkout ownership for post-fetch branch recomputation. The
+/// analysis phase wrote these HEAD observations immediately before
+/// fetching; preserving their git/worktree paths keeps replacement-ref
+/// semantics identical when refreshed tips are compared.
+async fn load_instance_checkouts(
+    store: &TursoStore,
+    instance_id: &str,
+) -> repo_scan::Result<Vec<store::CheckoutRow>> {
+    let mut rows = store
+        .connection()
+        .query(
+            "SELECT id, instance_id, root_path, git_path, relationship, availability, \
+                head_state, head_ref, head_oid, head_algo, observed_at_ms \
+             FROM checkouts WHERE instance_id = ?1 ORDER BY id ASC",
+            vec![turso::Value::Text(instance_id.to_string())],
+        )
+        .await
+        .map_err(store_err)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(store_err)? {
+        out.push(store::CheckoutRow {
+            id: cell_text(&row, 0)?,
+            instance_id: cell_text(&row, 1)?,
+            root_path: cell_opt_blob(&row, 2)?,
+            git_path: cell_blob(&row, 3)?,
+            relationship: cell_text(&row, 4)?,
+            availability: cell_text(&row, 5)?,
+            head_state: cell_text(&row, 6)?,
+            head_ref: cell_opt_blob(&row, 7)?,
+            head_oid: cell_opt_blob(&row, 8)?,
+            head_algo: cell_opt_text(&row, 9)?,
+            observed_at_ms: cell_int(&row, 10)?,
+        });
+    }
+    Ok(out)
 }
 
 /// Optional `--fetch` phase (goal Step 11): runs after the
@@ -15421,14 +16302,14 @@ async fn build_lib_inputs(
         &root_scopes,
         Some(&root_scope_aliases),
         &DerivationCaps::default_caps(),
-        scope_roots.as_deref(),
+        scope_roots,
         scope_identity_roots,
     )
     .await?;
     let instances = scan_instance_derivations_scoped(
         store,
         &DerivationCaps::default_caps(),
-        scope_roots.as_deref(),
+        scope_roots,
         scope_identity_roots,
     )
     .await?;
@@ -16013,8 +16894,19 @@ async fn replay_scan_pages(
     terminal_seen: &mut bool,
 ) -> repo_scan::Result<bool> {
     loop {
-        let rows =
-            read_scan_events_after_position(store, scan_id, *after, REPLAY_PAGE_ROWS).await?;
+        // Pin the prefix check and page read to one read-only catalog
+        // snapshot. Roll back before serializing or writing the page so a
+        // follower never holds a database transaction across stdout I/O.
+        let rows = match read_guarded_scan_event_page(store, scan_id, *after, REPLAY_PAGE_ROWS)
+            .await?
+        {
+            GuardedScanEventPage::Pruned => {
+                return Err(repo_scan::Error::Report(format!(
+                    "scan {scan_id} has a pruned event prefix; refusing partial JSONL replay, use the retained JSON snapshot when available"
+                )));
+            }
+            GuardedScanEventPage::Rows(rows) => rows,
+        };
         let short_page = rows.len() < REPLAY_PAGE_ROWS as usize;
         for row in &rows {
             let mut env = envelope_for_row(row)?;
@@ -16038,6 +16930,123 @@ async fn replay_scan_pages(
         }
     }
     Ok(true)
+}
+
+/// Whether a scan's retained event window starts after the first sequence.
+async fn scan_event_prefix_pruned_before(
+    store: &TursoStore,
+    scan_id: &str,
+    after: Option<(u64, u64)>,
+) -> repo_scan::Result<bool> {
+    let rows = store.read_scan_events(scan_id, 0, 1).await?;
+    let Some(first) = rows.first() else {
+        return Ok(false);
+    };
+    if first.seq <= 1 {
+        return Ok(false);
+    }
+    Ok(after.is_none_or(|position| position < (first.catalog_rev, first.event_offset)))
+}
+
+enum GuardedScanEventPage {
+    Pruned,
+    Rows(Vec<ScanEventRow>),
+}
+
+/// Read one event page with its retention check in a single read-only
+/// transaction. The transaction is rolled back before returning, including
+/// when either query fails; callers can then render, write, or wait without
+/// retaining a database snapshot.
+async fn read_guarded_scan_event_page(
+    store: &TursoStore,
+    scan_id: &str,
+    after: Option<(u64, u64)>,
+    limit: u64,
+) -> repo_scan::Result<GuardedScanEventPage> {
+    read_guarded_scan_event_page_with_hook(store, scan_id, after, limit, || async { Ok(()) }).await
+}
+
+async fn read_guarded_scan_event_page_with_hook<F, Fut>(
+    store: &TursoStore,
+    scan_id: &str,
+    after: Option<(u64, u64)>,
+    limit: u64,
+    after_guard: F,
+) -> repo_scan::Result<GuardedScanEventPage>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = repo_scan::Result<()>>,
+{
+    let connection = store.connection();
+    connection
+        .execute("BEGIN", ())
+        .await
+        .map_err(|error| repo_scan::Error::Store(error.to_string()))?;
+
+    let result = async {
+        if scan_event_prefix_pruned_before(store, scan_id, after).await? {
+            return Ok(GuardedScanEventPage::Pruned);
+        }
+        after_guard().await?;
+        let rows = read_scan_events_after_position(store, scan_id, after, limit).await?;
+        Ok(GuardedScanEventPage::Rows(rows))
+    }
+    .await;
+
+    let rollback = connection.execute("ROLLBACK", ()).await;
+    match (result, rollback) {
+        (Ok(page), Ok(_)) => {
+            if !connection
+                .is_autocommit()
+                .map_err(|error| repo_scan::Error::Store(error.to_string()))?
+            {
+                return Err(repo_scan::Error::Store(
+                    "read-only event page left its connection inside a transaction".to_string(),
+                ));
+            }
+            Ok(page)
+        }
+        (Err(error), Ok(_)) => {
+            if !connection
+                .is_autocommit()
+                .map_err(|rollback_error| repo_scan::Error::Store(rollback_error.to_string()))?
+            {
+                return Err(repo_scan::Error::Store(format!(
+                    "{error}; read-only event page rollback left its connection inside a transaction"
+                )));
+            }
+            Err(error)
+        }
+        (result, Err(rollback_error)) => {
+            let rollback_error = rollback_error.to_string();
+            match result {
+                Ok(_) => Err(repo_scan::Error::Store(format!(
+                    "cannot roll back read-only event page transaction: {rollback_error}"
+                ))),
+                Err(error) => Err(repo_scan::Error::Store(format!(
+                    "{error}; cannot roll back read-only event page transaction: {rollback_error}"
+                ))),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub async fn test_read_guarded_scan_event_page_with_hook<F, Fut>(
+    store: &TursoStore,
+    scan_id: &str,
+    after: Option<(u64, u64)>,
+    limit: u64,
+    after_guard: F,
+) -> repo_scan::Result<Option<Vec<ScanEventRow>>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = repo_scan::Result<()>>,
+{
+    match read_guarded_scan_event_page_with_hook(store, scan_id, after, limit, after_guard).await? {
+        GuardedScanEventPage::Pruned => Ok(None),
+        GuardedScanEventPage::Rows(rows) => Ok(Some(rows)),
+    }
 }
 
 /// Flush a JSONL replay writer. `Ok(false)` is a broken pipe (quiet
@@ -16110,15 +17119,76 @@ struct ReplayPosition {
     terminal_seen: bool,
 }
 
+/// Result of rebuilding the TUI state through an `--after` cursor.
+enum TuiBaselineReplay {
+    Complete,
+    Pruned,
+    Terminal,
+}
+
+/// Fold the retained event history up to (and including) `through` into a
+/// fresh TUI snapshot. The caller resumes the live stream strictly after
+/// that position. This gives a cursor-based TUI the state it had at the
+/// cursor instead of starting with an empty view.
+async fn replay_tui_cursor_baseline(
+    store: &TursoStore,
+    scan_id: &str,
+    through: (u64, u64),
+    snapshot: &mut repo_scan::report::tui::TuiSnapshot,
+) -> repo_scan::Result<TuiBaselineReplay> {
+    let mut after = None;
+    loop {
+        let rows =
+            match read_guarded_scan_event_page(store, scan_id, after, REPLAY_PAGE_ROWS).await? {
+                GuardedScanEventPage::Rows(rows) => rows,
+                GuardedScanEventPage::Pruned => return Ok(TuiBaselineReplay::Pruned),
+            };
+        let short_page = rows.len() < REPLAY_PAGE_ROWS as usize;
+        for row in &rows {
+            let position = (row.catalog_rev, row.event_offset);
+            if position > through {
+                return Ok(TuiBaselineReplay::Complete);
+            }
+            let env = envelope_for_row(row)?;
+            if env.reset {
+                *snapshot = repo_scan::report::tui::TuiSnapshot::empty();
+            }
+            snapshot.apply_envelope(&env);
+            after = Some(position);
+            if is_terminal_event(env.event_type) {
+                return Ok(TuiBaselineReplay::Terminal);
+            }
+        }
+        if short_page {
+            return Ok(TuiBaselineReplay::Complete);
+        }
+    }
+}
+
+#[cfg(test)]
+pub async fn test_replay_tui_cursor_baseline(
+    store: &TursoStore,
+    scan_id: &str,
+    through: (u64, u64),
+) -> repo_scan::Result<repo_scan::report::tui::TuiSnapshot> {
+    let mut snapshot = repo_scan::report::tui::TuiSnapshot::empty();
+    match replay_tui_cursor_baseline(store, scan_id, through, &mut snapshot).await? {
+        TuiBaselineReplay::Complete => Ok(snapshot),
+        TuiBaselineReplay::Pruned => Err(repo_scan::Error::Report(format!(
+            "scan {scan_id} has a pruned event prefix; refusing an incomplete live view"
+        ))),
+        TuiBaselineReplay::Terminal => Ok(snapshot),
+    }
+}
+
 /// Resolve an `--after` cursor to its replay position (Step 12): seq 0
 /// replays from the start; otherwise the row at the cursor's seq
-/// classifies via [`classify_cursor`] — covered cursors resume strictly
-/// after the cursor's `(rev, off)` position (revision + event-offset
-/// replay position, so reconnecting between two events of one
-/// transaction loses nothing), while expired or diverged cursors replay
-/// the retained window from its start with `reset:true` first
-/// (explicit-reset snapshot, never a silent gap). Corrupt (undecodable)
-/// cursors stay a usage error.
+/// classifies via [`classify_cursor`] — same-scan covered cursors resume
+/// strictly after the cursor's `(rev, off)` position. Foreign and unbound
+/// legacy cursors request a reset from the beginning;
+/// [`replay_scan_pages`] then fails closed if retention removed any prefix,
+/// since the retained rows cannot restore a full inventory. Corrupt
+/// (undecodable) cursors stay a usage error.
 async fn resolve_after_cursor(
     store: &TursoStore,
     scan_id: &str,
@@ -16129,6 +17199,13 @@ async fn resolve_after_cursor(
             "corrupt --after cursor for scan {scan_id}; replay from the start instead"
         )));
     };
+    if cursor.scan_id.as_deref() != Some(scan_id) {
+        return Ok(ReplayPosition {
+            after: None,
+            reset_first: true,
+            terminal_seen: false,
+        });
+    }
     if cursor.seq == 0 {
         return Ok(ReplayPosition {
             after: None,
@@ -16188,7 +17265,7 @@ async fn resolve_after_cursor(
             ))
         }
     };
-    match classify_cursor(&cursor, found) {
+    match classify_cursor(&cursor, scan_id, found) {
         ResumeAction::ResumeAfterCursor => Ok(ReplayPosition {
             after: Some((cursor.catalog_rev, cursor.event_offset)),
             reset_first: false,
@@ -16243,14 +17320,22 @@ async fn read_scan_events_after_position(
     after: Option<(u64, u64)>,
     limit: u64,
 ) -> repo_scan::Result<Vec<ScanEventRow>> {
-    const COLUMNS: &str = "scan_id, seq, catalog_rev, event_offset, event_type, op, reset, records";
+    // The coalesced gauge sits at its first cursor while its stored payload
+    // advances in place. Project that current payload onto every later
+    // notification during replay so a full replay cannot show the newest
+    // gauge followed by older tick snapshots.
+    const COLUMNS: &str = "e.scan_id, e.seq, e.catalog_rev, e.event_offset, e.event_type, \
+        e.op, e.reset, CASE WHEN e.event_type = 'discovery_progress_updated' THEN \
+        COALESCE((SELECT g.records FROM scan_events AS g WHERE g.scan_id = e.scan_id \
+            AND g.event_type = 'discovery_progress' ORDER BY g.seq DESC LIMIT 1), e.records) \
+        ELSE e.records END AS records";
     let limit_i64 = i64::try_from(limit.clamp(1, 10_000))
         .map_err(|_| repo_scan::Error::Store(format!("event limit {limit} exceeds i64 range")))?;
     let (sql, params) = match after {
         None => (
             format!(
-                "SELECT {COLUMNS} FROM scan_events WHERE scan_id = ?1 \
-                ORDER BY catalog_rev ASC, event_offset ASC LIMIT ?2"
+                "SELECT {COLUMNS} FROM scan_events AS e WHERE e.scan_id = ?1 \
+                ORDER BY e.catalog_rev ASC, e.event_offset ASC LIMIT ?2"
             ),
             vec![
                 turso::Value::Text(scan_id.to_string()),
@@ -16266,9 +17351,9 @@ async fn read_scan_events_after_position(
             })?;
             (
                 format!(
-                    "SELECT {COLUMNS} FROM scan_events WHERE scan_id = ?1 \
-                    AND (catalog_rev > ?2 OR (catalog_rev = ?2 AND event_offset > ?3)) \
-                    ORDER BY catalog_rev ASC, event_offset ASC LIMIT ?4"
+                    "SELECT {COLUMNS} FROM scan_events AS e WHERE e.scan_id = ?1 \
+                    AND (e.catalog_rev > ?2 OR (e.catalog_rev = ?2 AND e.event_offset > ?3)) \
+                    ORDER BY e.catalog_rev ASC, e.event_offset ASC LIMIT ?4"
                 ),
                 vec![
                     turso::Value::Text(scan_id.to_string()),
@@ -16301,15 +17386,18 @@ async fn read_scan_events_after_position(
 /// - `--format jsonl` (default when redirected): replay the journaled
 ///   event stream as JSONL envelopes, oldest first, in `(catalog_rev,
 ///   event_offset)` order. `--after CURSOR` resumes strictly after the
-///   cursor's position; a cursor the retained window no longer covers
-///   (or that diverges from the journaled row) replays the retained
-///   window from its start with `reset:true` on the first envelope.
+///   cursor's position. A prefix already pruned before the first page
+///   fails before rows are written; pruning of unseen rows between pages
+///   fails the next page after any earlier pages have been delivered. A
+///   complete retained journal can still replay from its start with
+///   `reset:true` after divergence.
 ///   `--follow` keeps polling a running scan until the terminal event,
 ///   Ctrl-C (exit 130), or a broken pipe (quiet exit 0).
 /// - `--format json` (no `--follow`; `--follow --format json` is
 ///   rejected by `selection()`): the scan's verified retained snapshot
-///   as one JSON document — the same bytes the human lane renders and
-///   the JSONL lane folds into.
+///   as one JSON document — the same inventory the human lane renders
+///   and the complete JSONL event stream reconstructs while its prefix
+///   is retained.
 /// - `--format human` without `--follow`: the retained snapshot
 ///   as stable plain text. With `--follow`: the Step 13 live TUI on
 ///   a TTY, the plain live lane when redirected (both read-only).
@@ -16332,7 +17420,7 @@ async fn run_follow_human(
     if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
         run_follow_human_tui(cfg, scan_id, after).await
     } else {
-        run_follow_human_plain(cfg, scan_id).await
+        run_follow_human_plain(cfg, scan_id, after).await
     }
 }
 
@@ -16403,14 +17491,70 @@ async fn run_follow_human_tui(
     let mut reset_first = start.reset_first;
     let mut snapshot = TuiSnapshot::empty();
     snapshot.header.scan_state = "running".to_string();
-    // Initial replay: fold committed rows oldest-first (bounded
-    // pages); a reset position drops buffered state first.
     let mut terminal_seen = start.terminal_seen;
+    let mut final_loaded = false;
+    // A covered cursor identifies the point to continue from, but it does
+    // not contain the inventory already discovered before that point.
+    // Rebuild that baseline from the retained prefix before following new
+    // events. If retention removed the prefix, only a finished scan can
+    // recover through its verified snapshot.
+    if let Some(through) = start.after.filter(|_| !start.reset_first) {
+        match replay_tui_cursor_baseline(&store, scan_id, through, &mut snapshot).await {
+            Ok(TuiBaselineReplay::Complete) => {}
+            Ok(TuiBaselineReplay::Terminal) => terminal_seen = true,
+            Ok(TuiBaselineReplay::Pruned) => {
+                match recover_follow_tui_pruned_prefix(&store, cfg, scan_id, &mut snapshot).await {
+                    Ok(true) => {
+                        terminal_seen = true;
+                        final_loaded = true;
+                    }
+                    Ok(false) => unreachable!("pruned prefix must recover or fail closed"),
+                    Err(error) => {
+                        let _ = store.close().await;
+                        return Err(error);
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = store.close().await;
+                return Err(error);
+            }
+        }
+    }
+    // Initial replay: fold committed rows oldest-first (bounded
+    // pages); each page pins its prefix guard and rows to one catalog
+    // snapshot, then releases that snapshot before folding the page.
     if !terminal_seen {
         loop {
-            let rows =
-                read_scan_events_after_position(&store, scan_id, after_pos, REPLAY_PAGE_ROWS)
-                    .await?;
+            let page =
+                match read_guarded_scan_event_page(&store, scan_id, after_pos, REPLAY_PAGE_ROWS)
+                    .await
+                {
+                    Ok(page) => page,
+                    Err(error) => {
+                        let _ = store.close().await;
+                        return Err(error);
+                    }
+                };
+            let rows = match page {
+                GuardedScanEventPage::Rows(rows) => rows,
+                GuardedScanEventPage::Pruned => {
+                    match recover_follow_tui_pruned_prefix(&store, cfg, scan_id, &mut snapshot)
+                        .await
+                    {
+                        Ok(true) => {
+                            terminal_seen = true;
+                            final_loaded = true;
+                            break;
+                        }
+                        Ok(false) => unreachable!("pruned prefix must recover or fail closed"),
+                        Err(error) => {
+                            let _ = store.close().await;
+                            return Err(error);
+                        }
+                    }
+                }
+            };
             let short_page = rows.len() < REPLAY_PAGE_ROWS as usize;
             for row in &rows {
                 let env = envelope_for_row(row)?;
@@ -16432,8 +17576,7 @@ async fn run_follow_human_tui(
     }
     // A terminal scan browses its exact retained bytes (selection
     // preserved by id when the snapshot stages).
-    let mut final_loaded = false;
-    if terminal_seen {
+    if terminal_seen && !final_loaded {
         final_loaded = follow_load_final(&store, cfg, scan_id, &mut snapshot).await;
     }
     // Query has no `--color` flag: auto from the TTY + environment.
@@ -16492,8 +17635,35 @@ async fn run_follow_human_tui(
             );
             return Ok(ExitCode::Incomplete);
         }
-        let rows =
-            read_scan_events_after_position(&store, scan_id, after_pos, REPLAY_PAGE_ROWS).await?;
+        let mut fresh = repo_scan::report::tui::TuiSnapshot::empty();
+        let page = match read_guarded_scan_event_page(&store, scan_id, after_pos, REPLAY_PAGE_ROWS)
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => {
+                session.detach();
+                let _ = store.close().await;
+                return Err(error);
+            }
+        };
+        let rows = match page {
+            GuardedScanEventPage::Rows(rows) => rows,
+            GuardedScanEventPage::Pruned => {
+                match recover_follow_tui_pruned_prefix(&store, cfg, scan_id, &mut fresh).await {
+                    Ok(true) => {
+                        terminal = true;
+                        session.update(fresh);
+                        continue;
+                    }
+                    Ok(false) => unreachable!("pruned prefix must recover or fail closed"),
+                    Err(error) => {
+                        session.detach();
+                        let _ = store.close().await;
+                        return Err(error);
+                    }
+                }
+            }
+        };
         for row in &rows {
             let env = envelope_for_row(row)?;
             if env.reset {
@@ -16603,6 +17773,43 @@ async fn follow_load_final(
     true
 }
 
+/// Recover after a per-page transaction found that unseen event history was
+/// pruned. A finished scan can switch to its verified retained snapshot; a
+/// running scan has no complete event state to recover and must fail closed.
+async fn recover_follow_tui_pruned_prefix(
+    store: &TursoStore,
+    cfg: &config::Config,
+    scan_id: &str,
+    snapshot: &mut repo_scan::report::tui::TuiSnapshot,
+) -> repo_scan::Result<bool> {
+    let finished = store
+        .get_scan(scan_id)
+        .await?
+        .is_some_and(|scan| !scan_still_running(&scan.state));
+    if finished && follow_load_final(store, cfg, scan_id, snapshot).await {
+        return Ok(true);
+    }
+    Err(repo_scan::Error::Report(format!(
+        "scan {scan_id} has a pruned event prefix; refusing an incomplete live view, use the retained JSON snapshot when available"
+    )))
+}
+
+#[cfg(test)]
+pub async fn test_guard_follow_tui_pruned_prefix(
+    store: &TursoStore,
+    cfg: &config::Config,
+    scan_id: &str,
+    after: Option<(u64, u64)>,
+) -> repo_scan::Result<bool> {
+    let mut snapshot = repo_scan::report::tui::TuiSnapshot::empty();
+    match read_guarded_scan_event_page(store, scan_id, after, 1).await? {
+        GuardedScanEventPage::Rows(_) => Ok(false),
+        GuardedScanEventPage::Pruned => {
+            recover_follow_tui_pruned_prefix(store, cfg, scan_id, &mut snapshot).await
+        }
+    }
+}
+
 /// Plain-text live lane for `query --scan --follow --format human`
 /// when redirected (Step 13): re-renders the retained snapshot (or
 /// the live `--report` file mid-scan) whenever its bytes change, at
@@ -16612,19 +17819,60 @@ async fn follow_load_final(
 async fn run_follow_human_plain(
     cfg: &config::Config,
     scan_id: &str,
+    after: Option<&str>,
 ) -> repo_scan::Result<ExitCode> {
     let Some((mut store, scan)) = open_follow_store(cfg, scan_id).await? else {
         return Ok(ExitCode::Incomplete);
     };
+    let start = match after {
+        None => ReplayPosition {
+            after: None,
+            reset_first: false,
+            terminal_seen: false,
+        },
+        Some(cursor) => match resolve_after_cursor(&store, scan_id, cursor).await {
+            Ok(position) => position,
+            Err(error) => {
+                let _ = store.close().await;
+                return Err(error);
+            }
+        },
+    };
+    let mut after_pos = start.after;
+    let mut terminal_seen = start.terminal_seen;
+    let terminal_at_cursor = start.terminal_seen;
+    // A reset reconstructs the full human snapshot only when the original
+    // journal prefix is intact. This applies to completed scans too:
+    // --after cannot make a retained tail look like a full replay.
+    if start.reset_first {
+        let page = match read_guarded_scan_event_page(&store, scan_id, None, 1).await {
+            Ok(page) => page,
+            Err(error) => {
+                let _ = store.close().await;
+                return Err(error);
+            }
+        };
+        let prefix_unavailable = match page {
+            GuardedScanEventPage::Pruned => true,
+            GuardedScanEventPage::Rows(rows) => rows.is_empty(),
+        };
+        if prefix_unavailable {
+            let _ = store.close().await;
+            return Err(repo_scan::Error::Report(format!(
+                "scan {scan_id} has a pruned event prefix; refusing an incomplete live view"
+            )));
+        }
+    }
+    let mut render_eligible = after.is_none() || start.reset_first;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    let mut after_pos: Option<(u64, u64)> = None;
-    let mut terminal_seen = false;
     let mut last_hash: Option<String> = None;
     let mut last_render: Option<Instant> = None;
     // Render the current snapshot (if any) before the first poll so
-    // short follows still print exactly one document.
-    if follow_plain_maybe_render(cfg, &scan, &mut out, &mut last_hash, &mut last_render)?
+    // cursorless short follows still print exactly one document. A
+    // supplied cursor waits for an event strictly after its position.
+    if render_eligible
+        && follow_plain_maybe_render(cfg, &scan, &mut out, &mut last_hash, &mut last_render)?
         && !flush_replay(&mut out)?
     {
         let _ = store.close().await;
@@ -16643,6 +17891,9 @@ async fn run_follow_human_plain(
             let rows =
                 read_scan_events_after_position(&store, scan_id, after_pos, REPLAY_PAGE_ROWS)
                     .await?;
+            if !rows.is_empty() {
+                render_eligible = true;
+            }
             let short_page = rows.len() < REPLAY_PAGE_ROWS as usize;
             for row in &rows {
                 let env = envelope_for_row(row)?;
@@ -16663,10 +17914,11 @@ async fn run_follow_human_plain(
         if let Some(row) = current.as_ref() {
             // A terminal event forces the final render even inside
             // the 1 s throttle (the last revision must print).
-            if terminal_seen {
+            if terminal_seen && !terminal_at_cursor {
                 last_render = None;
             }
-            if follow_plain_maybe_render(cfg, row, &mut out, &mut last_hash, &mut last_render)?
+            if (render_eligible || (terminal_seen && !terminal_at_cursor))
+                && follow_plain_maybe_render(cfg, row, &mut out, &mut last_hash, &mut last_render)?
                 && !flush_replay(&mut out)?
             {
                 let _ = store.close().await;
@@ -17557,7 +18809,7 @@ async fn retry_publication(
         if !dest.is_absolute() {
             return Err(repo_scan::Error::Config(format!(
                 "saved report destination is not absolute: {}",
-                safe_path_display(&dest)
+                safe_path_display(dest)
             )));
         }
     }
@@ -20914,6 +22166,17 @@ pub async fn test_prune_scan_events(
     })
 }
 
+/// Snapshot-retention regression hook through the production pruning path.
+#[cfg(test)]
+pub async fn test_prune_old_snapshots(
+    store: &TursoStore,
+    state_dir: &Path,
+    current_scan_id: &str,
+    current_report_id: Option<&str>,
+) {
+    prune_old_snapshots(store, state_dir, current_scan_id, current_report_id).await;
+}
+
 /// Direct-emission regression hook: journal one event through the same
 /// append-plus-retention path used by scan lifecycle and remote events.
 #[cfg(test)]
@@ -20939,6 +22202,72 @@ pub async fn test_scan_journal_has_ready(
 ) -> repo_scan::Result<bool> {
     let rev = store.next_revision().await?;
     Ok(ScanJournal::open(store, scan_id, rev).await?.has_ready())
+}
+
+/// Reopen a production journal and attempt one found event. Returns the
+/// appended operation (`add` or `replace`), or `None` when durable dedupe
+/// state suppresses a repeated found event.
+#[cfg(test)]
+pub async fn test_emit_deduped_event_after_reopen(
+    store: &TursoStore,
+    scan_id: &str,
+    kind: &str,
+    id: &str,
+) -> repo_scan::Result<Option<String>> {
+    let rev = store.next_revision().await?;
+    let mut journal = ScanJournal::open(store, scan_id, rev).await?;
+    let after_seq = journal.tip_seq();
+    let mut batch = WriterBatch::new();
+    let records = match kind {
+        "repository_found" => serde_json::json!({"store_id": event_opaque_id(id)}),
+        "location_found" => serde_json::json!({
+            "checkout_id": event_opaque_id(id),
+            "store_id": event_opaque_id("test-store"),
+        }),
+        "branch_batch" => serde_json::json!({
+            "store_id": event_opaque_id(id),
+            "branches": [],
+        }),
+        _ => {
+            return Err(repo_scan::Error::InvalidArgs(format!(
+                "unsupported dedupe test event type: {kind}"
+            )));
+        }
+    };
+    let bytes =
+        serde_json::to_vec(&records).map_err(|e| repo_scan::Error::Report(e.to_string()))?;
+    let emitted = match kind {
+        "repository_found" => journal.buffer_repository_found(&mut batch, id, &bytes)?,
+        "location_found" => journal.buffer_location_found(&mut batch, id, &bytes)?,
+        "branch_batch" => journal.buffer_branch_batch(&mut batch, id, &bytes)?,
+        _ => unreachable!(),
+    };
+    if emitted.is_none() {
+        return Ok(None);
+    }
+    store.flush(&mut batch).await?;
+    let rows = store.read_scan_events(scan_id, after_seq, 10).await?;
+    Ok(rows.last().map(|row| row.op.clone()))
+}
+
+/// Exercise the production stale-scan supersession transaction.
+#[cfg(test)]
+pub async fn test_supersede_stale_scans(
+    store: &TursoStore,
+    canonical: &str,
+    policy: &str,
+    successor: &str,
+) -> repo_scan::Result<()> {
+    let mut counters = RunCounters::default();
+    supersede_stale_scans(
+        store,
+        canonical,
+        policy,
+        successor,
+        store::now_ms(),
+        &mut counters,
+    )
+    .await
 }
 
 /// Terminal guard regression hook: attempt to buffer one location update

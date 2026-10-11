@@ -42,7 +42,7 @@ fn test_inputs(report_id: &str) -> ReportInputs {
         canonical_url: Some("https://github.com/owner/repo".to_string()),
         event_volume_ids: Vec::new(),
         targets: vec![],
-        scope: "roots".to_string(),
+        scope: "machine".to_string(),
         scan_state: "complete".to_string(),
         started_at_ms: 1_759_154_398_000,
         finished_at_ms: Some(1_759_154_400_000),
@@ -51,7 +51,7 @@ fn test_inputs(report_id: &str) -> ReportInputs {
         status_mode: StatusMode::Summary,
         directories_complete: 2,
         tasks_pending: 0,
-        scope_boundaries: vec!["Only the explicit fixture root was requested.".to_string()],
+        scope_boundaries: Vec::new(),
         profile: "conservative".to_string(),
         cpu_target_cores: 1.0,
         rss_target_bytes: 268_435_456,
@@ -617,6 +617,8 @@ fn roots_report_excludes_catalog_and_stub_volumes_outside_roots() {
     });
 
     let mut inputs = test_inputs("report-roots-volumes-1");
+    inputs.scope = "roots".to_string();
+    inputs.scope_boundaries = vec!["Only the explicit fixture root was requested.".to_string()];
     inputs.roots.push(RootInput {
         id: "root-in-scope".to_string(),
         dir_id: Some(repo_root),
@@ -714,6 +716,8 @@ fn roots_report_scopes_volume_event_errors_to_referenced_volumes() {
     });
 
     let mut inputs = test_inputs("report-roots-volume-errors-1");
+    inputs.scope = "roots".to_string();
+    inputs.scope_boundaries = vec!["Only the explicit fixture root was requested.".to_string()];
     inputs.roots.push(RootInput {
         id: "root-in-scope".to_string(),
         dir_id: Some(repo_root),
@@ -797,6 +801,8 @@ fn roots_report_includes_catalog_paths_saved_through_symlink_alias() {
     });
 
     let mut inputs = test_inputs("report-roots-symlink-alias-1");
+    inputs.scope = "roots".to_string();
+    inputs.scope_boundaries = vec!["Only the explicit fixture root was requested.".to_string()];
     inputs.roots.push(RootInput {
         id: "root-alias".to_string(),
         dir_id: None,
@@ -921,6 +927,8 @@ fn roots_report_includes_catalog_paths_saved_through_another_symlink_alias() {
     });
 
     let mut inputs = test_inputs("report-roots-symlink-alias-c-1");
+    inputs.scope = "roots".to_string();
+    inputs.scope_boundaries = vec!["Only the explicit fixture root was requested.".to_string()];
     inputs.roots.push(RootInput {
         id: "root-alias-c".to_string(),
         dir_id: None,

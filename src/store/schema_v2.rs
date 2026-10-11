@@ -22,14 +22,10 @@
 //! OUT of the key: `scan_requests.targets_json` records the multi-target
 //! request served by one filesystem pass.
 //!
-//! v1 storage rules (see `schema.rs`) apply unchanged: plain rowid tables
-//! (no `WITHOUT ROWID`), no recursive CTEs, no FTS, every raw
-//! path/component/ref-name/URL in a `BLOB` column, and no index key
-//! contains a `BLOB` column. One noted tension: the `group_members`
-//! composite `PRIMARY KEY` includes `remote_name BLOB` (required D1 edge
-//! identity), which SQLite materializes as a unique autoindex; every
-//! explicit `CREATE INDEX` key below is `TEXT`/`INTEGER`-only, enforced
-//! by unit test (`no_index_key_contains_blob`).
+//! Historical v2 catalogs keyed `group_members` by raw `remote_name BLOB`.
+//! Migration v9 rebuilds the table with a lossless hexadecimal `TEXT` key,
+//! while preserving the raw name bytes in an unindexed BLOB column. V2's
+//! explicit lookup index remains `TEXT`/`INTEGER`-only.
 //!
 //! Wiring (a `Migration` chain entry plus the `CURRENT_SCHEMA_VERSION`
 //! bump) belongs to the coordinator: [`V2Marker::VERSION`] and
@@ -40,9 +36,9 @@
 /// * `github_groups.id` is writer-computed
 ///   `lower(host)/lower(account)/lower(repo)` (D1); the `UNIQUE (host,
 ///   account, repo)` index is the normalized-identity lookup.
-/// * `group_members` is keyed `(group_id, instance_id, remote_name,
-///   role)` (D1: keep name + role per store); `remote_name` is `BLOB`
-///   like `remotes.name` because remote names are raw bytes.
+/// * `group_members` originally keyed `(group_id, instance_id,
+///   remote_name, role)`; v9 replaces the BLOB component with its
+///   lossless hexadecimal `remote_name_key` while retaining raw bytes.
 /// * `scan_events.seq` is the scan-scoped sequence assigned by the writer
 ///   (D4), so the key is `(scan_id, seq)`: a bare `seq` primary key would
 ///   collide across scans. `records` holds JSON bytes stored byte-exact.

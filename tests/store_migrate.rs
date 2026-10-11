@@ -7,7 +7,7 @@
 //! applied — then reopened through [`TursoStore::open`].
 
 use repo_scan::store::{
-    now_ms, NewRef, NewRemoteRefresh, NewScan, NewScanEvent, Store, TursoStore,
+    now_ms, NewRef, NewRemoteRefresh, NewScan, NewScanEvent, Store, TursoStore, WriterBatch,
     CURRENT_SCHEMA_VERSION,
 };
 
@@ -28,7 +28,7 @@ async fn build_v1_catalog(db: &std::path::Path) {
         .connect()
         .expect("turso connect");
     let chain = repo_scan::store::migrations();
-    assert!(chain.len() >= 7, "v7 chain wired");
+    assert!(chain.len() >= 9, "v9 chain wired");
     assert_eq!(chain[0].version, 1);
     conn.execute_batch(chain[0].sql).await.expect("v1 sql");
     conn.execute(
@@ -67,15 +67,59 @@ async fn build_v1_catalog(db: &std::path::Path) {
     .expect("v1 status row");
 }
 
+/// Build a genuine v8 catalog with non-UTF-8 remote names so v9's table
+/// rebuild proves byte preservation, not only UTF-8 compatibility.
+async fn build_v8_catalog(db: &std::path::Path) {
+    let path_str = db.to_str().expect("utf8 db path");
+    let conn = turso::Builder::new_local(path_str)
+        .build()
+        .await
+        .expect("turso build")
+        .connect()
+        .expect("turso connect");
+    let group_remote = vec![b'o', 0x80, 0];
+    let refresh_remote = vec![0xff, b'u', 0x00];
+    let chain = repo_scan::store::migrations();
+    for migration in chain.iter().take(8) {
+        conn.execute_batch(migration.sql)
+            .await
+            .expect("apply historical migration");
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (name, value) VALUES ('schema_version', ?1)",
+            vec![turso::Value::Text(migration.version.to_string())],
+        )
+        .await
+        .expect("schema marker");
+        if migration.version == 3 {
+            conn.execute(
+                "INSERT INTO group_members (group_id, instance_id, remote_name, role, observed_at_ms) \
+                    VALUES ('github.com/legacy/repo', 'git:legacy', ?1, 'fetch', 100)",
+                vec![turso::Value::Blob(group_remote.clone())],
+            )
+            .await
+            .expect("legacy group member");
+            conn.execute(
+                "INSERT INTO remote_refreshes (store_id, remote_name, status, observed_at_ms, \
+                    duration_ms, refs_updated, refs_current_json, refs_deleted_json, detail) \
+                    VALUES ('git:legacy', ?1, 'success', 200, 25, 2, '[]', NULL, NULL)",
+                vec![turso::Value::Blob(refresh_remote.clone())],
+            )
+            .await
+            .expect("legacy remote refresh");
+        }
+    }
+    assert_eq!(chain[7].version, 8);
+}
+
 #[test]
-fn fresh_open_is_v7_with_working_tables() {
+fn fresh_open_is_v9_with_working_tables() {
     let rt = runtime();
     rt.block_on(async {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("catalog.db");
         let store = TursoStore::open(&db).await.expect("open");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 7);
-        assert_eq!(store.schema_version().expect("version"), 7);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 9);
+        assert_eq!(store.schema_version().expect("version"), 9);
 
         // v2 request columns persist through the extended insert.
         let now = now_ms();
@@ -124,6 +168,19 @@ fn fresh_open_is_v7_with_working_tables() {
             .await
             .expect("append");
         assert!(appended);
+        store
+            .connection()
+            .execute(
+                "INSERT INTO scan_event_dedupe (scan_id, dedupe_kind, event_id) \
+                    VALUES (?1, ?2, ?3)",
+                vec![
+                    turso::Value::Text("scan-v2".to_string()),
+                    turso::Value::Text("repository_found".to_string()),
+                    turso::Value::Text("evt:marker".to_string()),
+                ],
+            )
+            .await
+            .expect("v8 dedupe marker table");
         store.close().await.expect("close");
     });
 }
@@ -137,7 +194,7 @@ fn v1_catalog_upgrades_preserving_v1_rows() {
         build_v1_catalog(&db).await;
 
         let store = TursoStore::open(&db).await.expect("open upgrades");
-        assert_eq!(store.schema_version().expect("version"), 7);
+        assert_eq!(store.schema_version().expect("version"), 9);
 
         // v1 rows survive byte-identical; v2..v7 columns read NULL (legacy).
         let scan = store.get_scan("scan-v1").await.expect("get").expect("row");
@@ -179,11 +236,124 @@ fn v1_catalog_upgrades_preserving_v1_rows() {
             .expect("append"));
         store.close().await.expect("close");
 
-        // Reopen is idempotent: still v7, rows intact.
+        // Reopen is idempotent: still v9, rows intact.
         let store = TursoStore::open(&db).await.expect("reopen");
-        assert_eq!(store.schema_version().expect("version"), 7);
+        assert_eq!(store.schema_version().expect("version"), 9);
         assert!(store.get_scan("scan-v1").await.expect("get").is_some());
         assert_eq!(store.last_event_seq("scan-v1").await.expect("seq"), Some(1));
+        store.close().await.expect("close");
+    });
+}
+
+#[test]
+fn v8_remote_name_keys_migrate_losslessly_to_text() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("catalog.db");
+        let group_remote = vec![b'o', 0x80, 0];
+        let refresh_remote = vec![0xff, b'u', 0x00];
+        build_v8_catalog(&db).await;
+
+        let store = TursoStore::open(&db).await.expect("upgrade to v9");
+        assert_eq!(store.schema_version().expect("version"), 9);
+
+        let members = store
+            .list_group_members("github.com/legacy/repo")
+            .await
+            .expect("members");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].remote_name, group_remote);
+        assert!(!store
+            .add_group_member(
+                "github.com/legacy/repo",
+                "git:legacy",
+                &members[0].remote_name,
+                "fetch",
+                300,
+            )
+            .await
+            .expect("existing edge remains unique"));
+
+        let new_group_remote = b"origin\0\xff";
+        let mut batch = WriterBatch::new();
+        TursoStore::buffer_add_group_member(
+            &mut batch,
+            "github.com/legacy/repo",
+            "git:legacy",
+            new_group_remote,
+            "fetch",
+            400,
+        );
+        TursoStore::buffer_record_remote_refresh(
+            &mut batch,
+            &NewRemoteRefresh {
+                store_id: "git:legacy",
+                remote_name: &refresh_remote,
+                status: "failed",
+                observed_at_ms: 500,
+                duration_ms: Some(10),
+                refs_updated: 0,
+                refs_current_json: None,
+                refs_deleted_json: None,
+                detail: Some("resume"),
+            },
+        );
+        store.flush(&mut batch).await.expect("flush v9 key writes");
+
+        let members = store
+            .list_group_members("github.com/legacy/repo")
+            .await
+            .expect("members after buffered insert");
+        assert_eq!(members.len(), 2);
+        assert!(members
+            .iter()
+            .any(|member| member.remote_name == new_group_remote));
+
+        let refresh = store
+            .get_remote_refresh("git:legacy", &refresh_remote)
+            .await
+            .expect("get migrated refresh")
+            .expect("refresh row");
+        assert_eq!(refresh.remote_name, refresh_remote);
+        assert_eq!(refresh.status, "failed");
+        assert_eq!(refresh.refs_updated, 0);
+        assert_eq!(refresh.detail.as_deref(), Some("resume"));
+
+        // The derived keys are TEXT encodings; raw bytes remain available
+        // from the unindexed BLOB fields and are never decoded as UTF-8.
+        let mut rows = store
+            .connection()
+            .query(
+                "SELECT remote_name_key FROM group_members WHERE group_id = ?1 AND remote_name = ?2",
+                vec![
+                    turso::Value::Text("github.com/legacy/repo".to_string()),
+                    turso::Value::Blob(group_remote.clone()),
+                ],
+            )
+            .await
+            .expect("group key query");
+        let row = rows.next().await.expect("next").expect("key row");
+        assert_eq!(
+            row.get_value(0).expect("key"),
+            turso::Value::Text("6F8000".into())
+        );
+        drop(rows);
+
+        let mut rows = store
+            .connection()
+            .query(
+                "SELECT remote_name_key FROM remote_refreshes WHERE store_id = ?1",
+                vec![turso::Value::Text("git:legacy".to_string())],
+            )
+            .await
+            .expect("refresh key query");
+        let row = rows.next().await.expect("next").expect("key row");
+        assert_eq!(
+            row.get_value(0).expect("key"),
+            turso::Value::Text("FF7500".into())
+        );
+        drop(rows);
         store.close().await.expect("close");
     });
 }

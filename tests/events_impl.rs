@@ -32,6 +32,7 @@ use repo_scan::events::{
     MAX_BATCH_EVENTS,
 };
 use repo_scan::platform::{EventBatchIter, EventSource, VolumeId};
+use repo_scan::scan_events::Cursor;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
@@ -1138,6 +1139,21 @@ async fn wave1d_scan_ids_once(db: &Path) -> Result<Vec<String>, ()> {
     Ok(out)
 }
 
+async fn wave1d_event_rows(
+    db: &Path,
+    scan_id: &str,
+) -> Result<Vec<repo_scan::store::ScanEventRow>, ()> {
+    let store = repo_scan::store::TursoStore::open_read_only(db)
+        .await
+        .map_err(|_| ())?;
+    let rows = store
+        .read_scan_events(scan_id, 0, 10_000)
+        .await
+        .map_err(|_| ())?;
+    let _ = store.close().await;
+    Ok(rows)
+}
+
 /// Committed event-type histogram (`None` when no catalog is readable
 /// yet). Each call reopens read-only: a read-only handle pins its
 /// opening snapshot, so mid-scan polling must reopen per poll.
@@ -1328,6 +1344,123 @@ fn wave1d_live_reader_sees_progress_and_found_while_discovery_active() {
     );
 }
 
+/// A cursor taken from the first coalesced gauge must still observe a later
+/// progress update through a fresh journal position while the scan is live.
+#[test]
+fn wave1d_live_follow_after_progress_cursor_observes_updated_gauge() {
+    if !wave1d_git_available() {
+        eprintln!("wave1d progress cursor: git unavailable; skipping");
+        return;
+    }
+    let env = Wave1dEnv::new("wave1d-progress-cursor-");
+    fixture::many_repos(&env.root, "repo", 30);
+    let mut scan = env.spawn_scan();
+    let rt = wave1d_runtime();
+    let db = wave1d_db(&env.state);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let (scan_id, first_cursor, first_done) = loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "first progress gauge never committed"
+        );
+        assert!(
+            scan.try_wait().expect("try_wait").is_none(),
+            "scan finished before first progress gauge was observed"
+        );
+        let ids = rt.block_on(wave1d_scan_ids(&db));
+        let Some(scan_id) = ids.into_iter().next() else {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+        };
+        let Ok(rows) = rt.block_on(wave1d_event_rows(&db, &scan_id)) else {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            continue;
+        };
+        let Some(gauge) = rows
+            .iter()
+            .find(|row| row.event_type == "discovery_progress")
+        else {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+        };
+        let payload: serde_json::Value =
+            serde_json::from_slice(&gauge.records).expect("progress gauge payload");
+        let done = payload["discovered"]["tasks_done"]
+            .as_u64()
+            .expect("progress task count");
+        break (
+            scan_id.clone(),
+            Cursor::for_scan(
+                scan_id.clone(),
+                gauge.seq,
+                gauge.catalog_rev,
+                gauge.event_offset,
+            )
+            .encode(),
+            done,
+        );
+    };
+    assert!(
+        scan.try_wait().expect("try_wait").is_none(),
+        "scan remains active when the strict-after follower starts"
+    );
+
+    // Match the bounded retry used by the live-reader regression below:
+    // Turso can briefly observe a short WAL frame while the active scan
+    // appends to it. Retry only that exact transient and only while the
+    // writer is still running; other query failures remain visible.
+    let mut followed = None;
+    for _ in 0..40 {
+        let attempt = env.run_query(&[
+            "query",
+            "--scan",
+            &scan_id,
+            "--follow",
+            "--format",
+            "jsonl",
+            "--after",
+            &first_cursor,
+        ]);
+        let torn = !attempt.status.success()
+            && String::from_utf8_lossy(&attempt.stderr).contains("short read on WAL frame")
+            && scan.try_wait().expect("try_wait").is_none();
+        followed = Some(attempt);
+        if !torn {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let followed = followed.expect("query attempts exhausted");
+    assert_eq!(
+        followed.status.code(),
+        Some(0),
+        "strict-after follow stderr: {}",
+        String::from_utf8_lossy(&followed.stderr)
+    );
+    let lines = wave1d_parse_jsonl(&followed);
+    let updates: Vec<_> = lines
+        .iter()
+        .filter(|event| event["type"] == "discovery_progress_updated")
+        .collect();
+    assert!(
+        !updates.is_empty(),
+        "strict-after follower receives a cursor-advancing progress notification"
+    );
+    let latest_done = updates
+        .iter()
+        .filter_map(|event| event["records"]["discovered"]["tasks_done"].as_u64())
+        .max()
+        .expect("notification progress count");
+    assert!(
+        latest_done > first_done,
+        "progress advanced from {first_done} to {latest_done}"
+    );
+    assert!(
+        scan.wait().expect("wait scan").success(),
+        "scan exits cleanly"
+    );
+}
+
 /// Reconnect with a mid-transaction cursor loses nothing: the first
 /// probe's `repository_found` + `location_found` share one flush (one
 /// revision, consecutive offsets); resuming between them delivers the
@@ -1375,11 +1508,12 @@ fn wave1d_mid_transaction_cursor_resume_loses_nothing() {
                 .collect::<Vec<_>>()
         )
     });
-    let cursor = Cursor {
-        seq: pair[0].seq,
-        catalog_rev: pair[0].catalog_rev,
-        event_offset: pair[0].event_offset,
-    }
+    let cursor = Cursor::for_scan(
+        &scan_id,
+        pair[0].seq,
+        pair[0].catalog_rev,
+        pair[0].event_offset,
+    )
     .encode();
 
     let resumed = env.run_query(&[
@@ -1411,13 +1545,11 @@ fn wave1d_mid_transaction_cursor_resume_loses_nothing() {
     assert_eq!(tail.last().expect("tail last")["type"], "scan_completed");
 }
 
-/// Expired and diverged cursors yield an explicit-reset snapshot — not a
-/// silent resume, not an error. The prefix is deleted through the
-/// catalog (simulating retention); the production query path must flag
-/// the resync with `reset:true` on the first envelope and replay the
-/// retained window.
+/// Diverged cursors reset when the full prefix remains. Expired and
+/// cursorless replays fail closed after prefix pruning, because a reset flag
+/// cannot reconstruct the full inventory from retained tail rows.
 #[test]
-fn wave1d_expired_cursor_yields_explicit_reset_snapshot() {
+fn wave1d_pruned_prefix_replay_fails_closed() {
     use repo_scan::scan_events::Cursor;
     use repo_scan::store::Store;
 
@@ -1443,6 +1575,24 @@ fn wave1d_expired_cursor_yields_explicit_reset_snapshot() {
         rows
     });
     assert!(rows.len() >= 5, "journal to prune: {}", rows.len());
+
+    // A diverged cursor still requests a complete replay while its prefix
+    // is intact, with reset on the first envelope.
+    let diverged = Cursor::for_scan(&scan_id, rows[2].seq, 999_999, 0).encode();
+    let resync = env.run_query(&[
+        "query", "--scan", &scan_id, "--follow", "--format", "jsonl", "--after", &diverged,
+    ]);
+    assert_eq!(
+        resync.status.code(),
+        Some(0),
+        "intact-prefix divergence resets: {}",
+        String::from_utf8_lossy(&resync.stderr)
+    );
+    let tail = wave1d_parse_jsonl(&resync);
+    assert_eq!(tail[0]["seq"], 1);
+    assert_eq!(tail[0]["reset"], true);
+    assert_eq!(tail.last().expect("terminal")["type"], "scan_completed");
+
     // Expire the prefix through seq 2 (scan_started + the gauge row).
     let expired = rows[1].clone();
     rt.block_on(async {
@@ -1466,52 +1616,384 @@ fn wave1d_expired_cursor_yields_explicit_reset_snapshot() {
         store.close().await.expect("close");
     });
 
-    // Expired cursor: the row is gone, so this is a resync, not a resume.
-    let after = Cursor {
-        seq: expired.seq,
-        catalog_rev: expired.catalog_rev,
-        event_offset: expired.event_offset,
-    }
+    // An expired cursor cannot reconstruct the deleted inventory prefix.
+    let after = Cursor::for_scan(
+        &scan_id,
+        expired.seq,
+        expired.catalog_rev,
+        expired.event_offset,
+    )
     .encode();
-    let resumed = env.run_query(&[
+    let expired_replay = env.run_query(&[
         "query", "--scan", &scan_id, "--follow", "--format", "jsonl", "--after", &after,
     ]);
     assert_eq!(
-        resumed.status.code(),
-        Some(0),
-        "expired cursor is a snapshot, not an error: {}",
-        String::from_utf8_lossy(&resumed.stderr)
+        expired_replay.status.code(),
+        Some(1),
+        "expired cursor fails closed: {}",
+        String::from_utf8_lossy(&expired_replay.stderr)
     );
-    let tail = wave1d_parse_jsonl(&resumed);
-    assert_eq!(tail[0]["seq"], 3, "snapshot replays the retained window");
-    assert_eq!(tail[0]["reset"], true, "explicit reset, never silent");
-    assert_eq!(tail.len(), rows.len() - 2, "whole retained window");
-    assert_eq!(tail.last().expect("tail last")["type"], "scan_completed");
-    // Snapshot cursor = exact end of included changes.
-    let last = tail.last().expect("tail last");
-    assert_eq!(last["seq"], rows.len() as u64);
+    assert!(expired_replay.stdout.is_empty(), "no partial rows escape");
 
-    // Diverged cursor: a retained seq with a foreign position also
-    // resyncs (the position check is revision + event-offset, not seq).
-    let diverged = Cursor {
-        seq: 3,
-        catalog_rev: 999_999,
-        event_offset: 0,
-    }
-    .encode();
-    let resync = env.run_query(&[
-        "query", "--scan", &scan_id, "--follow", "--format", "jsonl", "--after", &diverged,
-    ]);
+    let cursorless = env.run_query(&["query", "--scan", &scan_id, "--format", "jsonl"]);
     assert_eq!(
-        resync.status.code(),
-        Some(0),
-        "diverged cursor is a snapshot, not an error: {}",
-        String::from_utf8_lossy(&resync.stderr)
+        cursorless.status.code(),
+        Some(1),
+        "cursorless replay fails closed: {}",
+        String::from_utf8_lossy(&cursorless.stderr)
     );
-    let tail = wave1d_parse_jsonl(&resync);
-    assert_eq!(tail[0]["seq"], 3);
-    assert_eq!(tail[0]["reset"], true);
-    assert_eq!(tail.last().expect("tail last")["type"], "scan_completed");
+    assert!(
+        cursorless.stdout.is_empty(),
+        "no retained tail claims full state"
+    );
+}
+
+/// The human TUI uses the same fail-closed prefix rule as JSONL. Finished
+/// scans can recover from their verified snapshot; a running scan cannot
+/// present its retained event tail as a complete live inventory.
+#[test]
+fn wave1d_tui_pruned_prefix_uses_snapshot_or_fails_closed() {
+    use repo_scan::store::{NewScan, NewScanEvent, Store, TursoStore};
+
+    if !wave1d_git_available() {
+        eprintln!("wave1d TUI prefix: git unavailable; skipping");
+        return;
+    }
+    let env = Wave1dEnv::new("wave1d-tui-pruned-");
+    fixture::many_repos(&env.root, "repo", 2);
+    let (status, stdout, stderr) = env.run_scan();
+    assert_eq!(status.code(), Some(0), "scan: {stderr}");
+    let completed_id = wave1d_stdout_line(&stdout, "scan_id");
+
+    let rt = wave1d_runtime();
+    let db = wave1d_db(&env.state);
+    rt.block_on(async {
+        let store = TursoStore::open(&db).await.expect("open completed catalog");
+        let rows = store
+            .read_scan_events(&completed_id, 0, 10_000)
+            .await
+            .expect("read completed journal");
+        let terminal = rows.last().expect("terminal event");
+        store
+            .connection()
+            .execute(
+                "DELETE FROM scan_events WHERE scan_id = ?1 AND seq < ?2",
+                vec![
+                    turso::Value::Text(completed_id.clone()),
+                    turso::Value::Integer(i64::try_from(terminal.seq).expect("terminal seq")),
+                ],
+            )
+            .await
+            .expect("prune completed prefix");
+        store.close().await.expect("close completed catalog");
+    });
+
+    let cfg = repo_scan::config::Config::load(Some(env.state.clone())).expect("config");
+    let store = rt
+        .block_on(TursoStore::open_read_only(&db))
+        .expect("open completed catalog read-only");
+    let used_snapshot = rt
+        .block_on(main_under_test::test_guard_follow_tui_pruned_prefix(
+            &store,
+            &cfg,
+            &completed_id,
+            None,
+        ))
+        .expect("completed TUI fallback");
+    assert!(used_snapshot);
+    rt.block_on(store.close()).expect("close completed reader");
+
+    let running_id = "scan-tui-pruned-running";
+    let canonical = b"https://example.invalid/repo.git";
+    rt.block_on(async {
+        let store = TursoStore::open(&db).await.expect("open running catalog");
+        store
+            .create_scan_request(
+                &NewScan {
+                    id: running_id,
+                    url_raw: canonical,
+                    url_canonical: Some(canonical),
+                    scope: "roots",
+                    status_mode: "metadata",
+                    report_dest: None,
+                    targets_json: None,
+                    format: Some("human"),
+                    all_targets: Some(false),
+                    fetch: Some(false),
+                    workers: None,
+                },
+                1,
+            )
+            .await
+            .expect("create running scan");
+        for (seq, event_offset, event_type) in
+            [(1, 0, "scan_started"), (2, 1, "discovery_progress")]
+        {
+            store
+                .append_scan_event(&NewScanEvent {
+                    scan_id: running_id,
+                    seq,
+                    catalog_rev: 1,
+                    event_offset,
+                    event_type,
+                    op: "add",
+                    reset: false,
+                    records: b"{}",
+                })
+                .await
+                .expect("append running event");
+        }
+        store
+            .connection()
+            .execute(
+                "DELETE FROM scan_events WHERE scan_id = ?1 AND seq = 1",
+                vec![turso::Value::Text(running_id.to_string())],
+            )
+            .await
+            .expect("prune running prefix");
+        store.close().await.expect("close running catalog");
+    });
+
+    let store = rt
+        .block_on(TursoStore::open_read_only(&db))
+        .expect("open running catalog read-only");
+    let initial = rt.block_on(main_under_test::test_guard_follow_tui_pruned_prefix(
+        &store, &cfg, running_id, None,
+    ));
+    assert!(initial
+        .expect_err("initial running replay must fail closed")
+        .to_string()
+        .contains("pruned event prefix"));
+    let poll = rt.block_on(main_under_test::test_guard_follow_tui_pruned_prefix(
+        &store,
+        &cfg,
+        running_id,
+        Some((1, 0)),
+    ));
+    assert!(poll
+        .expect_err("poll behind the retained prefix must fail closed")
+        .to_string()
+        .contains("pruned event prefix"));
+    rt.block_on(store.close()).expect("close running reader");
+}
+
+/// A covered TUI cursor rebuilds the snapshot through its position before
+/// the follower applies any later events.
+#[test]
+fn wave1d_tui_after_cursor_reconstructs_baseline() {
+    use repo_scan::store::NewScanEvent;
+
+    let hook = Wave1dHookStore::new();
+    let scan_id = "scan-tui-cursor-baseline";
+    hook.rt.block_on(async {
+        for (seq, event_type, records) in [
+            (
+                1,
+                "repository_found",
+                br#"{"store_id":"store-baseline","github_groups":["github.com/acme/widgets"],"analysis":"pending"}"#.as_slice(),
+            ),
+            (
+                2,
+                "location_found",
+                br#"{"checkout_id":"checkout-before","store_id":"store-baseline","path":"/work/widgets","git_path":"/srv/git/widgets","analysis":"pending"}"#.as_slice(),
+            ),
+            (
+                3,
+                "branch_batch",
+                br#"{"store_id":"store-baseline","branches":[{"id":"branch-after","kind":"local","name":"main"}]}"#.as_slice(),
+            ),
+            (4, "scan_completed", br#"{}"#.as_slice()),
+        ] {
+            hook.store
+                .append_scan_event(&NewScanEvent {
+                    scan_id,
+                    seq,
+                    catalog_rev: 7,
+                    event_offset: seq - 1,
+                    event_type,
+                    op: "add",
+                    reset: false,
+                    records,
+                })
+                .await
+                .expect("append event");
+        }
+    });
+
+    let snapshot = hook
+        .rt
+        .block_on(main_under_test::test_replay_tui_cursor_baseline(
+            &hook.store,
+            scan_id,
+            (7, 1),
+        ))
+        .expect("replay baseline through cursor");
+    let store = snapshot
+        .groups
+        .iter()
+        .find(|group| group.id == "group:github.com/acme/widgets")
+        .and_then(|group| group.stores.first())
+        .expect("repository before cursor");
+    assert_eq!(store.checkouts.len(), 1, "location before cursor is folded");
+    assert!(
+        store.branches.is_empty(),
+        "events after the cursor stay unapplied: {:?}",
+        store.branches
+    );
+
+    let terminal_snapshot = hook
+        .rt
+        .block_on(main_under_test::test_replay_tui_cursor_baseline(
+            &hook.store,
+            scan_id,
+            (7, 3),
+        ))
+        .expect("replay baseline through terminal cursor");
+    let terminal_store = terminal_snapshot
+        .groups
+        .iter()
+        .flat_map(|group| &group.stores)
+        .find(|store| !store.branches.is_empty())
+        .expect("branch before terminal cursor");
+    assert_eq!(terminal_store.branches.len(), 1);
+    assert_eq!(terminal_snapshot.header.scan_state, "complete");
+}
+
+/// Each replay page keeps its prefix guard and rows on one read snapshot.
+/// A concurrent prune after the guard cannot make that page skip unseen
+/// rows, while a later page fails closed if the writer pruned past its cursor.
+#[test]
+fn wave1d_replay_page_pins_prefix_guard_across_prune() {
+    use repo_scan::store::{NewScanEvent, TursoStore};
+
+    let hook = Wave1dHookStore::new();
+    let scan_id = "scan-page-snapshot-prune";
+    hook.rt.block_on(async {
+        for seq in 1..=8u64 {
+            hook.store
+                .append_scan_event(&NewScanEvent {
+                    scan_id,
+                    seq,
+                    catalog_rev: 1,
+                    event_offset: seq - 1,
+                    event_type: if seq == 1 {
+                        "scan_started"
+                    } else {
+                        "location_updated"
+                    },
+                    op: if seq == 1 { "add" } else { "replace" },
+                    reset: false,
+                    records: b"{}",
+                })
+                .await
+                .expect("append event");
+        }
+    });
+
+    let db = hook._dir.path().join("payload").join("catalog.db");
+    let reader = hook
+        .rt
+        .block_on(TursoStore::open_read_only(&db))
+        .expect("open read-only reader");
+
+    // The writer commits a prefix prune after the guard's first SELECT.
+    // The page SELECT must still see the reader transaction's earlier view.
+    let first = hook
+        .rt
+        .block_on(
+            main_under_test::test_read_guarded_scan_event_page_with_hook(
+                &reader,
+                scan_id,
+                None,
+                2,
+                || async {
+                    hook.store
+                        .connection()
+                        .execute(
+                            "DELETE FROM scan_events WHERE scan_id = ?1 AND seq = 1",
+                            vec![turso::Value::Text(scan_id.to_string())],
+                        )
+                        .await
+                        .map_err(|error| repo_scan::Error::Store(error.to_string()))?;
+                    Ok(())
+                },
+            ),
+        )
+        .expect("first guarded page");
+    let first = first.expect("prefix remains readable in pinned snapshot");
+    assert_eq!(
+        first.iter().map(|row| row.seq).collect::<Vec<_>>(),
+        vec![1, 2],
+        "the first page includes rows deleted by the concurrent writer"
+    );
+    let after_first = first
+        .last()
+        .map(|row| (row.catalog_rev, row.event_offset))
+        .expect("first page cursor");
+
+    // On the next page, delete the remaining rows through seq 5 after its
+    // guard. The page sees seq 3–4 from its pinned view; the following page
+    // must reject because seq 5 was pruned before it could be read.
+    let second = hook
+        .rt
+        .block_on(
+            main_under_test::test_read_guarded_scan_event_page_with_hook(
+                &reader,
+                scan_id,
+                Some(after_first),
+                2,
+                || async {
+                    hook.store
+                        .connection()
+                        .execute(
+                            "DELETE FROM scan_events WHERE scan_id = ?1 AND seq <= 5",
+                            vec![turso::Value::Text(scan_id.to_string())],
+                        )
+                        .await
+                        .map_err(|error| repo_scan::Error::Store(error.to_string()))?;
+                    Ok(())
+                },
+            ),
+        )
+        .expect("second guarded page");
+    let second = second.expect("second page remains readable in pinned snapshot");
+    assert_eq!(
+        second.iter().map(|row| row.seq).collect::<Vec<_>>(),
+        vec![3, 4],
+        "the second page includes rows deleted by the concurrent writer"
+    );
+    let after_second = second
+        .last()
+        .map(|row| (row.catalog_rev, row.event_offset))
+        .expect("second page cursor");
+
+    // A read-only store pins its opening database snapshot. Reopen it after
+    // the concurrent prune before asserting that a later page sees the
+    // missing prefix.
+    hook.rt
+        .block_on(reader.close())
+        .expect("close pinned reader");
+    let reader = hook
+        .rt
+        .block_on(TursoStore::open_read_only(&db))
+        .expect("reopen reader after prune");
+    let later = hook
+        .rt
+        .block_on(
+            main_under_test::test_read_guarded_scan_event_page_with_hook(
+                &reader,
+                scan_id,
+                Some(after_second),
+                2,
+                || async { Ok(()) },
+            ),
+        )
+        .expect("later page guard");
+    assert!(later.is_none(), "unseen pruned history fails closed");
+
+    hook.rt
+        .block_on(reader.close())
+        .expect("close reopened reader");
 }
 
 /// Interrupted batch completion resumes without lost children or
@@ -1632,6 +2114,20 @@ fn wave1d_progress_coalesces_to_newest_per_scan() {
         .collect();
     assert_eq!(progress.len(), 1, "many ticks coalesce to one gauge row");
     assert_eq!(progress[0].op, "replace", "D4 op for progress");
+    let progress_updates: Vec<_> = rows
+        .iter()
+        .filter(|r| r.event_type == "discovery_progress_updated")
+        .collect();
+    assert!(
+        !progress_updates.is_empty(),
+        "later ticks append cursor-advancing progress notifications"
+    );
+    assert!(
+        progress_updates
+            .iter()
+            .all(|row| row.op == "add" && row.seq > progress[0].seq),
+        "notification rows advance beyond the retained gauge row"
+    );
     let payload: serde_json::Value =
         serde_json::from_slice(&progress[0].records).expect("progress json");
     // Newest, not first: the first tick fires on the first completion
@@ -1639,6 +2135,19 @@ fn wave1d_progress_coalesces_to_newest_per_scan() {
     assert!(
         payload["discovered"]["tasks_done"].as_u64().unwrap_or(0) > 50,
         "survivor is the newest tick: {payload}"
+    );
+    let notification_done = progress_updates
+        .iter()
+        .filter_map(|row| {
+            let value: serde_json::Value = serde_json::from_slice(&row.records).ok()?;
+            value["discovered"]["tasks_done"].as_u64()
+        })
+        .max()
+        .expect("notification task count");
+    assert_eq!(
+        notification_done,
+        payload["discovered"]["tasks_done"].as_u64().unwrap(),
+        "newest notification and coalesced gauge agree"
     );
     assert!(
         payload.get("pending").is_some() && payload.get("gaps").is_some(),
@@ -1665,6 +2174,14 @@ fn wave1d_progress_coalesces_to_newest_per_scan() {
             .count(),
         1,
         "replay carries one progress envelope"
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|e| e["type"] == "discovery_progress_updated")
+            .count(),
+        progress_updates.len(),
+        "replay retains the cursor-advancing update notifications"
     );
     for (i, env) in lines.iter().enumerate() {
         assert_eq!(env["seq"], serde_json::Value::from((i + 1) as u64));
@@ -1734,6 +2251,29 @@ impl Wave1dHookStore {
                 .expect("claimed")
         })
     }
+}
+
+fn wave1d_dedupe_count(hook: &Wave1dHookStore, scan_id: &str) -> i64 {
+    hook.rt.block_on(async {
+        let mut rows = hook
+            .store
+            .connection()
+            .query(
+                "SELECT COUNT(*) FROM scan_event_dedupe WHERE scan_id = ?1",
+                vec![turso::Value::Text(scan_id.to_string())],
+            )
+            .await
+            .expect("count dedupe markers");
+        let row = rows
+            .next()
+            .await
+            .expect("read marker count")
+            .expect("count row");
+        match row.get_value(0).expect("marker count value") {
+            turso::Value::Integer(count) => count,
+            other => panic!("unexpected dedupe count: {other:?}"),
+        }
+    })
 }
 
 fn wave1d_item(
@@ -2560,6 +3100,310 @@ fn wave1d_direct_emit_enforces_journal_retention() {
     });
 }
 
+/// Found-event `add` dedupe survives process resume even after retention
+/// removes the original event row. Branch batches still resume as `replace`.
+#[test]
+fn wave1d_resume_found_dedupe_survives_pruned_prefix() {
+    use repo_scan::scan_events::EventType;
+
+    let hook = Wave1dHookStore::new();
+    for (kind, id, scan_id) in [
+        ("repository_found", "store-1", "scan-dedupe-repository"),
+        ("location_found", "checkout-1", "scan-dedupe-checkout"),
+        ("branch_batch", "store-2", "scan-dedupe-branch"),
+    ] {
+        let first = hook
+            .rt
+            .block_on(main_under_test::test_emit_deduped_event_after_reopen(
+                &hook.store,
+                scan_id,
+                kind,
+                id,
+            ))
+            .expect("initial found event");
+        assert_eq!(first.as_deref(), Some("add"), "first {kind} is add");
+
+        for _ in 0..2 {
+            hook.rt
+                .block_on(main_under_test::test_emit_scan_event_with_retention(
+                    &hook.store,
+                    scan_id,
+                    EventType::LocationUpdated,
+                    2,
+                ))
+                .expect("emit through retention");
+        }
+        let retained = hook
+            .rt
+            .block_on(async { hook.store.read_scan_events(scan_id, 0, 10).await })
+            .expect("read retained tail");
+        assert!(retained.iter().all(|row| row.event_type != kind));
+
+        let resumed = hook
+            .rt
+            .block_on(main_under_test::test_emit_deduped_event_after_reopen(
+                &hook.store,
+                scan_id,
+                kind,
+                id,
+            ))
+            .expect("resume found event");
+        if kind == "branch_batch" {
+            assert_eq!(resumed.as_deref(), Some("replace"));
+        } else {
+            assert_eq!(resumed, None, "pruned {kind} stays deduped");
+        }
+    }
+}
+
+/// Terminal commits release scan-scoped dedupe rows in the same transaction.
+/// A failed cleanup rolls back the terminal insert, and reopening a terminal
+/// journal succeeds even though its prefix has been pruned and markers are gone.
+#[test]
+fn wave1d_terminal_event_cleans_dedupe_markers_atomically() {
+    use repo_scan::scan_events::EventType;
+
+    let hook = Wave1dHookStore::new();
+    let scan_id = "scan-dedupe-terminal-cleanup";
+    let first = hook
+        .rt
+        .block_on(main_under_test::test_emit_deduped_event_after_reopen(
+            &hook.store,
+            scan_id,
+            "repository_found",
+            "store-terminal-1",
+        ))
+        .expect("initial found event");
+    assert_eq!(first.as_deref(), Some("add"));
+    for _ in 0..2 {
+        hook.rt
+            .block_on(main_under_test::test_emit_scan_event_with_retention(
+                &hook.store,
+                scan_id,
+                EventType::LocationUpdated,
+                2,
+            ))
+            .expect("prune found-event prefix");
+    }
+    assert!(wave1d_dedupe_count(&hook, scan_id) > 0);
+
+    hook.rt.block_on(async {
+        hook.store
+            .connection()
+            .execute(
+                "CREATE TRIGGER fail_scan_dedupe_delete BEFORE DELETE ON scan_event_dedupe \
+                 BEGIN SELECT RAISE(ABORT, 'injected cleanup failure'); END",
+                (),
+            )
+            .await
+            .expect("install cleanup failure trigger");
+    });
+    assert!(hook
+        .rt
+        .block_on(main_under_test::test_emit_scan_event_with_retention(
+            &hook.store,
+            scan_id,
+            EventType::ScanCompleted,
+            2,
+        ))
+        .is_err());
+    assert!(wave1d_dedupe_count(&hook, scan_id) > 0);
+    hook.rt.block_on(async {
+        hook.store
+            .connection()
+            .execute("DROP TRIGGER fail_scan_dedupe_delete", ())
+            .await
+            .expect("drop cleanup failure trigger");
+        let rows = hook
+            .store
+            .read_scan_events(scan_id, 0, 10)
+            .await
+            .expect("read after failed terminal transaction");
+        assert!(rows.iter().all(|row| row.event_type != "scan_completed"));
+    });
+
+    hook.rt
+        .block_on(main_under_test::test_emit_scan_event_with_retention(
+            &hook.store,
+            scan_id,
+            EventType::ScanCompleted,
+            2,
+        ))
+        .expect("commit terminal and cleanup");
+    assert_eq!(wave1d_dedupe_count(&hook, scan_id), 0);
+    let resumed = hook
+        .rt
+        .block_on(main_under_test::test_emit_deduped_event_after_reopen(
+            &hook.store,
+            scan_id,
+            "repository_found",
+            "store-terminal-1",
+        ))
+        .expect("reopen terminal journal with pruned prefix");
+    assert_eq!(resumed, None, "terminal journal rejects later found rows");
+    hook.rt.block_on(async {
+        let rows = hook
+            .store
+            .read_scan_events(scan_id, 0, 10)
+            .await
+            .expect("read final tail");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.last().expect("terminal tip").event_type,
+            "scan_completed"
+        );
+    });
+}
+
+/// A superseded scan cannot resume, so its durable markers are released in
+/// the same transaction as the state change. A failed delete leaves both
+/// the running state and markers intact.
+#[test]
+fn wave1d_superseded_scan_cleans_dedupe_markers_atomically() {
+    use repo_scan::store::NewScan;
+
+    let hook = Wave1dHookStore::new();
+    let scan_id = "scan-dedupe-superseded";
+    let canonical = b"https://example.invalid/repo.git";
+    hook.rt.block_on(async {
+        hook.store
+            .create_scan_request(
+                &NewScan {
+                    id: scan_id,
+                    url_raw: canonical,
+                    url_canonical: Some(canonical),
+                    scope: "roots",
+                    status_mode: "metadata",
+                    report_dest: None,
+                    targets_json: None,
+                    format: Some("jsonl"),
+                    all_targets: Some(false),
+                    fetch: Some(false),
+                    workers: None,
+                },
+                1,
+            )
+            .await
+            .expect("create running scan");
+    });
+    hook.rt
+        .block_on(main_under_test::test_emit_deduped_event_after_reopen(
+            &hook.store,
+            scan_id,
+            "repository_found",
+            "store-superseded-1",
+        ))
+        .expect("append found event");
+    assert!(wave1d_dedupe_count(&hook, scan_id) > 0);
+
+    hook.rt.block_on(async {
+        hook.store
+            .connection()
+            .execute(
+                "CREATE TRIGGER fail_supersede_dedupe_delete BEFORE DELETE ON scan_event_dedupe \
+                 BEGIN SELECT RAISE(ABORT, 'injected cleanup failure'); END",
+                (),
+            )
+            .await
+            .expect("install cleanup failure trigger");
+    });
+    assert!(hook
+        .rt
+        .block_on(main_under_test::test_supersede_stale_scans(
+            &hook.store,
+            std::str::from_utf8(canonical).expect("canonical UTF-8"),
+            "roots",
+            "scan-successor",
+        ))
+        .is_err());
+    hook.rt.block_on(async {
+        let scan = hook
+            .store
+            .get_scan(scan_id)
+            .await
+            .expect("get scan after rollback")
+            .expect("scan row");
+        assert_eq!(scan.state, "running");
+    });
+    assert!(wave1d_dedupe_count(&hook, scan_id) > 0);
+
+    hook.rt.block_on(async {
+        hook.store
+            .connection()
+            .execute("DROP TRIGGER fail_supersede_dedupe_delete", ())
+            .await
+            .expect("drop cleanup failure trigger");
+    });
+    hook.rt
+        .block_on(main_under_test::test_supersede_stale_scans(
+            &hook.store,
+            std::str::from_utf8(canonical).expect("canonical UTF-8"),
+            "roots",
+            "scan-successor",
+        ))
+        .expect("supersede and clean markers");
+    assert_eq!(wave1d_dedupe_count(&hook, scan_id), 0);
+    let scan = hook
+        .rt
+        .block_on(async { hook.store.get_scan(scan_id).await })
+        .expect("get superseded scan")
+        .expect("scan row");
+    assert_eq!(scan.state, "superseded");
+    assert_eq!(scan.successor_id.as_deref(), Some("scan-successor"));
+}
+
+/// If retryable-outcome references cannot be read, snapshot pruning fails
+/// closed and preserves both snapshot files and their catalog rows.
+#[test]
+fn wave2b_snapshot_prune_skips_when_retryable_outcomes_are_unreadable() {
+    let hook = Wave1dHookStore::new();
+    let state_dir = hook._dir.path();
+    let snapshot_dir = state_dir
+        .join("payload")
+        .join(repo_scan::config::SNAPSHOTS_DIR_NAME);
+    std::fs::create_dir_all(&snapshot_dir).expect("create snapshot directory");
+    hook.rt.block_on(async {
+        for index in 0..33 {
+            let id = format!("report-retry-failure-{index:02}");
+            std::fs::write(snapshot_dir.join(format!("{id}.json")), b"{}").expect("write file");
+            hook.store
+                .save_report_snapshot(&id, "v1", 1, 1, "published", None, index)
+                .await
+                .expect("save catalog row");
+        }
+        hook.store
+            .connection()
+            .execute("DROP TABLE scan_requests", ())
+            .await
+            .expect("inject outcome query failure");
+    });
+
+    hook.rt.block_on(main_under_test::test_prune_old_snapshots(
+        &hook.store,
+        state_dir,
+        "current-scan",
+        None,
+    ));
+
+    let file_count = std::fs::read_dir(&snapshot_dir)
+        .expect("read snapshot directory")
+        .count();
+    assert_eq!(file_count, 33, "query failure skips file pruning");
+    hook.rt.block_on(async {
+        let mut rows = hook
+            .store
+            .connection()
+            .query("SELECT COUNT(*) FROM report_snapshots", ())
+            .await
+            .expect("count snapshot rows");
+        let row = rows.next().await.expect("read count").expect("count row");
+        assert_eq!(
+            row.get_value(0).expect("count value"),
+            turso::Value::Integer(33)
+        );
+    });
+}
+
 /// `inventory_ready` is authoritative scan state even after its journal row
 /// falls out of the retained tail, so resume never emits the milestone twice.
 #[test]
@@ -2727,14 +3571,8 @@ fn wave1d_cursor_resolution_matrix() {
             after,
         ))
     };
-    let cursor = |seq: u64, rev: u64, off: u64| {
-        Cursor {
-            seq,
-            catalog_rev: rev,
-            event_offset: off,
-        }
-        .encode()
-    };
+    let cursor =
+        |seq: u64, rev: u64, off: u64| Cursor::for_scan("scan-cursor-1", seq, rev, off).encode();
     // Covered cursors resume after their own (rev, off) position.
     assert_eq!(
         resolve(Some(cursor(3, 5, 2))).expect("match"),
@@ -2748,6 +3586,45 @@ fn wave1d_cursor_resolution_matrix() {
         main_under_test::TestCursorResolution {
             reset_first: false,
             after: Some((5, 1)),
+        }
+    );
+    // A cursor from another scan resets even when all position fields
+    // collide with the target's gauge row.
+    assert_eq!(
+        resolve(Some(
+            Cursor::for_scan("scan-cursor-foreign", 2, 5, 1).encode(),
+        ))
+        .expect("foreign scan cursor"),
+        main_under_test::TestCursorResolution {
+            reset_first: true,
+            after: None,
+        }
+    );
+    // A later offset from another scan must not skip target rows after its
+    // same-seq progress gauge.
+    assert_eq!(
+        resolve(Some(
+            Cursor::for_scan("scan-cursor-foreign", 2, 5, 9).encode(),
+        ))
+        .expect("foreign later offset"),
+        main_under_test::TestCursorResolution {
+            reset_first: true,
+            after: None,
+        }
+    );
+    // Legacy v1 has no scan binding and always requests a complete reset.
+    let legacy = Cursor {
+        scan_id: None,
+        seq: 2,
+        catalog_rev: 5,
+        event_offset: 1,
+    }
+    .encode();
+    assert_eq!(
+        resolve(Some(legacy)).expect("legacy unbound cursor"),
+        main_under_test::TestCursorResolution {
+            reset_first: true,
+            after: None,
         }
     );
     // A drifted gauge position still resumes (never diverges): the
@@ -2807,7 +3684,7 @@ fn wave1d_cursor_resolution_matrix() {
         .block_on(main_under_test::test_resolve_after_cursor(
             &hook.store,
             "scan-no-such-journal",
-            Some(cursor(5, 1, 0)),
+            Some(Cursor::for_scan("scan-no-such-journal", 5, 1, 0).encode()),
         ))
         .expect("empty journal");
     assert_eq!(
@@ -2845,6 +3722,68 @@ fn wave1d_progress_ticks_coalesce_newest_survives_records_kept() {
         "the survivor is the newest tick"
     );
     assert_eq!(outcome.error_rows, 1, "record events are never dropped");
+}
+
+/// A multi-page full replay projects each progress notification to the
+/// coalesced gauge's newest payload, preventing C→B regressions when the
+/// gauge row is returned before its later notifications.
+#[test]
+fn wave1d_progress_replay_notifications_stay_at_latest_gauge_across_pages() {
+    let hook = Wave1dHookStore::new();
+    let scan_id = "scan-progress-page-1";
+    let outcome = hook
+        .rt
+        .block_on(main_under_test::test_journal_progress_ticks(
+            &hook.store,
+            scan_id,
+            510,
+        ))
+        .expect("ticks");
+    assert_eq!(outcome.progress_rows, 1, "one coalesced gauge row");
+    assert_eq!(outcome.survivor_records["tick"], 509);
+
+    let mut after = None;
+    let mut page_sizes = Vec::new();
+    let mut notification_ticks = Vec::new();
+    loop {
+        let page = hook
+            .rt
+            .block_on(
+                main_under_test::test_read_guarded_scan_event_page_with_hook(
+                    &hook.store,
+                    scan_id,
+                    after,
+                    500,
+                    || async { Ok(()) },
+                ),
+            )
+            .expect("read replay page")
+            .expect("intact event prefix");
+        if page.is_empty() {
+            break;
+        }
+        page_sizes.push(page.len());
+        for row in &page {
+            if row.event_type == "discovery_progress_updated" {
+                let records: serde_json::Value =
+                    serde_json::from_slice(&row.records).expect("notification records");
+                notification_ticks.push(records["tick"].as_u64().expect("tick"));
+            }
+        }
+        after = page.last().map(|row| (row.catalog_rev, row.event_offset));
+        if page.len() < 500 {
+            break;
+        }
+    }
+    assert!(
+        page_sizes.len() >= 2,
+        "replay crosses the 500-row production page boundary: {page_sizes:?}"
+    );
+    assert_eq!(notification_ticks.len(), 509);
+    assert!(
+        notification_ticks.iter().all(|tick| *tick == 509),
+        "all notifications project to the newest gauge, never regress: {notification_ticks:?}"
+    );
 }
 
 #[test]

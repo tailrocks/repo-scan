@@ -412,8 +412,11 @@ pub fn remote_tracking_namespaces_overlap(left: &[u8], right: &[u8]) -> bool {
 /// the `remote.<name>.fetch` values in config order, `mirror` is
 /// `remote.<name>.mirror`. Explicit destinations must be under
 /// `refs/remotes/<remote-name>/`, the namespace reserved for that
-/// remote's remote-tracking refs. A remote with no fetch values is safe
-/// (git fetches the remote HEAD into `FETCH_HEAD` only, writing no ref).
+/// remote's remote-tracking refs. Positive refspecs that write refs must
+/// source only `refs/heads/` or `refs/tags/`, the namespaces covered by
+/// the matching `ls-remote --heads --tags` audit. A remote with no fetch
+/// values is safe (git fetches the remote HEAD into `FETCH_HEAD` only,
+/// writing no ref).
 #[must_use]
 pub fn inspect_remote_fetch(remote_name: &str, refspecs: &[&str], mirror: bool) -> FetchVerdict {
     if mirror {
@@ -436,6 +439,16 @@ pub fn inspect_remote_fetch(remote_name: &str, refspecs: &[&str], mirror: bool) 
         if parsed.can_write_tag_refs() {
             return FetchVerdict::Unsupported {
                 reason: "fetch refspec can write to local tag refs; refusing fetch".to_string(),
+            };
+        }
+        if !parsed.negative
+            && parsed.dst.is_some()
+            && !parsed.src.starts_with(HEADS_PREFIX)
+            && !parsed.src.starts_with(TAGS_PREFIX)
+        {
+            return FetchVerdict::Unsupported {
+                reason: "fetch refspec source is outside audited heads and tags; refusing fetch"
+                    .to_string(),
             };
         }
         if parsed
@@ -565,6 +578,26 @@ mod tests {
             false,
         );
         assert_eq!(verdict, FetchVerdict::Safe);
+    }
+
+    #[test]
+    fn tracked_custom_source_namespaces_are_unsupported() {
+        for value in [
+            "+refs/notes/*:refs/remotes/origin/notes/*",
+            "+refs/custom/*:refs/remotes/origin/custom/*",
+        ] {
+            let verdict = inspect_remote_fetch("origin", &[value], false);
+            assert!(
+                matches!(verdict, FetchVerdict::Unsupported { .. }),
+                "{value} must be unsupported because ls-remote does not audit its source"
+            );
+        }
+        // Destination-less mappings write only FETCH_HEAD, so they do
+        // not enter the tracking-ref freshness audit.
+        assert_eq!(
+            inspect_remote_fetch("origin", &["refs/custom/commit"], false),
+            FetchVerdict::Safe
+        );
     }
 
     #[test]
@@ -846,7 +879,7 @@ mod tests {
             ("+refs/*:refs/*", true, true, false),
             ("+*:*", true, true, false),
             ("+refs/heads/*:refs/heads/*", true, false, false),
-            ("refs/*:refs/remotes/origin/*", false, false, true),
+            ("refs/*:refs/remotes/origin/*", false, false, false),
             ("+refs/heads/*:refs/remotes/origin/*", false, false, true),
             ("+refs/tags/*:refs/tags/*", false, true, false),
             // Shares a string prefix with refs/heads/ but lives

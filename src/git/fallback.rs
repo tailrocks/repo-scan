@@ -11,9 +11,10 @@
 //! (hooks, fsmonitor, pager, ssh/askpass, templates, includes via
 //! `-c`/env/flags; clean/smudge/process filter drivers by
 //! detect-and-refuse), `GIT_HTTP_*`/proxy variables unset, no
-//! fetch/clone/pull/push subcommand ever invoked, and no configured
-//! filter/fsmonitor/helper executed (cases needing one stay
-//! `partial`/`unsupported`).
+//! fetch/clone/pull/push subcommand ever invoked, promisor objects are
+//! never lazily fetched (`rev-list --no-lazy-fetch`; unsupported Git fails
+//! closed), and no configured filter/fsmonitor/helper executed (cases
+//! needing one stay `partial`/`unsupported`).
 //!
 //! Every spawn additionally runs inside one envelope
 //! (RSF-SEC-GIT-PROBE): stdin is nulled, config-redirect environment
@@ -24,9 +25,10 @@
 //! and the caller-visible result requires the expected exit status.
 //!
 //! Capabilities are probed once per installed-git identity (binary path +
-//! `git --version` plus the `git status --porcelain=v2 --help` feature
-//! probe per GIT_QUAL §11) and reused; [`FallbackGit`] caches them at
-//! discovery. A version string alone is never feature evidence: wrappers
+//! `git --version` plus the `git status --porcelain=v2 --help` and
+//! `--no-lazy-fetch` feature probes per GIT_QUAL §11) and reused;
+//! [`FallbackGit`] caches them at discovery. A version string alone is
+//! never feature evidence: wrappers
 //! and vendor backports can report a version while lacking an assumed
 //! option, so the probe must succeed or the capability stays false.
 
@@ -197,6 +199,7 @@ pub struct FallbackGit {
     path: PathBuf,
     source: BinarySource,
     capabilities: Capabilities,
+    no_lazy_fetch: bool,
     identity: BinaryIdentity,
 }
 
@@ -465,6 +468,7 @@ impl FallbackGit {
             return None;
         }
         let feature_probe_ok = probe_porcelain_v2(&canonical);
+        let no_lazy_fetch = probe_no_lazy_fetch(&canonical);
         let current_id_after = binary_identity(&canonical);
         if current_id_after != Some(identity) {
             eprintln!(
@@ -485,6 +489,7 @@ impl FallbackGit {
                 worktree_list: at_least(2, 7),
                 feature_probe_ok,
             },
+            no_lazy_fetch,
             identity,
         })
     }
@@ -506,6 +511,13 @@ impl FallbackGit {
     #[must_use]
     pub fn capabilities(&self) -> &Capabilities {
         &self.capabilities
+    }
+
+    /// Whether this Git binary recognizes the global `--no-lazy-fetch`
+    /// option. Graph reads fail closed when it does not.
+    #[must_use]
+    pub fn supports_no_lazy_fetch(&self) -> bool {
+        self.no_lazy_fetch
     }
 
     /// Enumerate refs via `for-each-ref` (covers reftable stores).
@@ -582,7 +594,7 @@ impl FallbackGit {
         a_hex: &str,
         b_hex: &str,
     ) -> crate::Result<(u64, u64)> {
-        self.rev_list_count_inner(git_dir, work_tree, a_hex, b_hex, None)
+        self.rev_list_count_inner(git_dir, work_tree, a_hex, b_hex, None, None)
     }
 
     /// [`Self::rev_list_count`] with an explicit cancellation/deadline token.
@@ -596,7 +608,41 @@ impl FallbackGit {
         b_hex: &str,
         cancel: &WaitCancel,
     ) -> crate::Result<(u64, u64)> {
-        self.rev_list_count_inner(git_dir, work_tree, a_hex, b_hex, Some(cancel))
+        self.rev_list_count_inner(git_dir, work_tree, a_hex, b_hex, Some(cancel), None)
+    }
+
+    /// [`Self::rev_list_count`] with the repository-local replacement
+    /// policy resolved by the isolated graph caller. The explicit `-c`
+    /// value prevents system config from changing that interpretation.
+    pub fn rev_list_count_with_replace_refs(
+        &self,
+        git_dir: &Path,
+        work_tree: Option<&Path>,
+        a_hex: &str,
+        b_hex: &str,
+        enabled: bool,
+    ) -> crate::Result<(u64, u64)> {
+        self.rev_list_count_inner(git_dir, work_tree, a_hex, b_hex, None, Some(enabled))
+    }
+
+    /// [`Self::rev_list_count_with_replace_refs`] with cancellation.
+    pub fn rev_list_count_with_replace_refs_cancel(
+        &self,
+        git_dir: &Path,
+        work_tree: Option<&Path>,
+        a_hex: &str,
+        b_hex: &str,
+        enabled: bool,
+        cancel: &WaitCancel,
+    ) -> crate::Result<(u64, u64)> {
+        self.rev_list_count_inner(
+            git_dir,
+            work_tree,
+            a_hex,
+            b_hex,
+            Some(cancel),
+            Some(enabled),
+        )
     }
 
     fn rev_list_count_inner(
@@ -606,16 +652,37 @@ impl FallbackGit {
         a_hex: &str,
         b_hex: &str,
         cancel: Option<&WaitCancel>,
+        use_replace_refs: Option<bool>,
     ) -> crate::Result<(u64, u64)> {
         if a_hex.is_empty() || b_hex.is_empty() {
             return Err(crate::Error::Git(String::from(
                 "installed git: rev-list refuses empty tip OID",
             )));
         }
+        if !self.no_lazy_fetch {
+            return Err(crate::Error::Git(String::from(
+                "installed git: rev-list fallback refuses unsupported --no-lazy-fetch",
+            )));
+        }
         let spec = format!("{a_hex}...{b_hex}");
         // One argv element, no shell: hostile OID text cannot escape
         // into options or paths (and git re-validates the revision).
-        let args = ["rev-list", "--left-right", "--count", &spec];
+        let replace_override =
+            use_replace_refs.map(|enabled| format!("core.useReplaceRefs={enabled}"));
+        let mut args = Vec::with_capacity(7);
+        if let Some(value) = replace_override.as_deref() {
+            args.extend(["-c", value]);
+        }
+        // This is a global git option and must remain before the subcommand.
+        // Older Git binaries are rejected by the probe above, so this child
+        // cannot silently fall back to a promisor lazy fetch.
+        args.extend([
+            "--no-lazy-fetch",
+            "rev-list",
+            "--left-right",
+            "--count",
+            &spec,
+        ]);
         let out = match cancel {
             Some(cancel) => {
                 self.run_inner_with_cancel(git_dir, work_tree, &args, None, Some(cancel))?
@@ -1965,6 +2032,56 @@ fn probe_porcelain_v2(path: &Path) -> bool {
     }
 }
 
+/// Feature probe for the global `--no-lazy-fetch` option. `--version`
+/// avoids repository reads while requiring Git's option parser to accept
+/// the flag. Unsupported binaries fail closed before graph reads run.
+fn probe_no_lazy_fetch(path: &Path) -> bool {
+    let repo = match tempfile::tempdir() {
+        Ok(dir) => dir,
+        Err(_) => return false,
+    };
+    let empty_template = repo.path().join("probe-template");
+    if std::fs::create_dir(&empty_template).is_err() {
+        return false;
+    }
+
+    // Keep the probe away from the ambient CWD and any configured init
+    // template, matching the porcelain-v2 capability probe.
+    let mut init = Command::new(path);
+    sanitize_git_env(&mut init);
+    apply_repo_neutralization(&mut init);
+    init.arg("init")
+        .arg("-q")
+        .arg(format!("--template={}", empty_template.display()))
+        .current_dir(repo.path())
+        .env("LC_ALL", "C");
+    if let Err(error) = spawn_enveloped(&mut init, false, GIT_SPAWN_TIMEOUT, MAX_CAPTURE_BYTES) {
+        eprintln!("repo-scan: git probe: no-lazy-fetch temp-repo init failed: {error}");
+    }
+
+    let mut command = Command::new(path);
+    sanitize_git_env(&mut command);
+    apply_repo_neutralization(&mut command);
+    command
+        .arg("--no-lazy-fetch")
+        .arg("--version")
+        .current_dir(repo.path())
+        .env("LC_ALL", "C");
+    match spawn_enveloped(&mut command, true, GIT_SPAWN_TIMEOUT, MAX_CAPTURE_BYTES) {
+        Ok(outcome) => {
+            !outcome.truncated
+                && outcome.status.success()
+                && String::from_utf8_lossy(&outcome.stdout)
+                    .trim_ascii()
+                    .starts_with("git version ")
+        }
+        Err(error) => {
+            eprintln!("repo-scan: git probe: --no-lazy-fetch probe failed: {error}");
+            false
+        }
+    }
+}
+
 /// Parse `git version 2.47.1`-style banners into a version tuple.
 fn parse_git_version(banner: &str) -> (u32, u32, u32) {
     let numeric = banner
@@ -2174,13 +2291,15 @@ impl FallbackGit {
     }
 
     /// Fetch-subcommand argv without the remote operand (single source
-    /// for [`FallbackGit::git_fetch_remote`] and its unit test): no
-    /// prune (deleted upstream branches keep their tracking refs), no
-    /// submodule recursion, no tag downloads (branch freshness needs
-    /// no tags; the CLI flag overrides a configured `tagOpt`).
-    fn fetch_argv() -> [&'static str; 4] {
+    /// for [`FallbackGit::git_fetch_remote`] and its unit test): atomic
+    /// ref updates, no prune (deleted upstream branches keep their
+    /// tracking refs), no submodule recursion, and no tag downloads
+    /// (branch freshness needs no tags; the CLI flag overrides a
+    /// configured `tagOpt`).
+    fn fetch_argv() -> [&'static str; 5] {
         [
             "fetch",
+            "--atomic",
             "--no-prune",
             "--no-recurse-submodules",
             "--no-tags",
@@ -2333,24 +2452,52 @@ pub fn parse_config_origin_line(line: &[u8]) -> Result<Option<ConfigOrigin>, Str
     }))
 }
 
-/// True when a `--show-origin` file path resolves inside `git_dir`
-/// (the `--git-dir` the config was read through): repo-scope config,
+/// True when a `--show-origin` file path belongs to `git_dir` (the
+/// `--git-dir` the config was read through): repo-scope config,
 /// including `config`, `config.worktree`, and anything they include
-/// from inside the store. Relative origins resolve against the
-/// current directory (the spawn inherits it). ANY resolution failure
-/// fails closed (`true`): an origin git read but we cannot place is
-/// treated as repo-scope.
+/// from inside the store. Relative origins resolve against the spawn's
+/// working directory, `git_dir`. Check lexical containment before
+/// canonicalization so a repository config symlink to an outside file
+/// remains repo-scope. ANY resolution failure fails closed (`true`):
+/// an origin git read but we cannot place is treated as repo-scope.
 pub fn config_origin_within_repo(origin_file: &str, git_dir: &Path) -> bool {
     let origin_path = Path::new(origin_file);
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(_) => return true,
+    };
+    let dir = if git_dir.is_absolute() {
+        git_dir.to_path_buf()
+    } else {
+        cwd.join(git_dir)
+    };
     let abs = if origin_path.is_absolute() {
         origin_path.to_path_buf()
     } else {
-        match std::env::current_dir() {
-            Ok(cwd) => cwd.join(origin_path),
-            Err(_) => return true,
-        }
+        dir.join(origin_path)
     };
-    match (std::fs::canonicalize(&abs), std::fs::canonicalize(git_dir)) {
+
+    // `git config --show-origin` can name either the symlink path or its
+    // resolved target. Preserve the repository scope in both cases.
+    if abs.starts_with(&dir) {
+        return true;
+    }
+    let config = dir.join("config");
+    match std::fs::symlink_metadata(&config) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            if let (Ok(origin), Ok(target)) =
+                (std::fs::canonicalize(&abs), std::fs::canonicalize(&config))
+            {
+                if origin == target {
+                    return true;
+                }
+            }
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return true,
+        _ => {}
+    }
+
+    match (std::fs::canonicalize(&abs), std::fs::canonicalize(&dir)) {
         (Ok(origin), Ok(dir)) => origin.starts_with(&dir),
         // Unresolvable either side: fail closed.
         _ => true,
@@ -2508,7 +2655,7 @@ mod tests {
     fn git_fixture(dir: &Path, name: &str, banner: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
         let script = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\necho \"{banner}\"\nexit 0\nfi\n{body}\n"
+            "#!/bin/sh\ncase \" $* \" in *\" --no-lazy-fetch --version \"*) echo \"{banner}\"; exit 0;; esac\nif [ \"$1\" = \"--version\" ]; then\necho \"{banner}\"\nexit 0\nfi\n{body}\n"
         );
         std::fs::write(&path, script).expect("write fixture");
         let mut perms = std::fs::metadata(&path).expect("meta").permissions();
@@ -2565,6 +2712,7 @@ mod tests {
         let found = FallbackGit::discover_from(&[], &[], Some(path_var)).expect("discover");
         assert_eq!(found.source(), BinarySource::Path);
         assert_eq!(found.path(), git.as_path());
+        assert!(found.supports_no_lazy_fetch());
     }
 
     #[test]
@@ -2610,6 +2758,36 @@ mod tests {
         let git = git_fixture(dir.path(), "git", "git version 2.47.1", CAPABLE_BODY);
         let found = FallbackGit::probe(&git).expect("probe");
         assert_eq!(found.source(), BinarySource::Explicit);
+        assert!(found.supports_no_lazy_fetch());
+    }
+
+    #[test]
+    fn no_lazy_fetch_probe_rejects_unsupported_option() {
+        let _serial = spawn_serial();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = git_fixture(
+            dir.path(),
+            "git-supported",
+            "git version 2.47.1",
+            CAPABLE_BODY,
+        );
+        assert!(probe_no_lazy_fetch(&git));
+
+        let legacy = git_fixture(dir.path(), "git-legacy", "git version 2.20.0", "exit 129");
+        let script = "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\necho 'git version 2.20.0'\nexit 0\nfi\nexit 129\n";
+        std::fs::write(&legacy, script).expect("write legacy git");
+        assert!(!probe_no_lazy_fetch(&legacy));
+
+        let fallback = FallbackGit::probe(&legacy).expect("legacy git is identifiable");
+        let error = fallback
+            .rev_list_count(
+                Path::new("/missing/git-dir"),
+                None,
+                "1111111111111111111111111111111111111111",
+                "2222222222222222222222222222222222222222",
+            )
+            .expect_err("unsupported lazy-fetch guard fails closed before spawn");
+        assert!(error.to_string().contains("unsupported --no-lazy-fetch"));
     }
 
     #[test]
@@ -3173,14 +3351,15 @@ mod tests {
     }
 
     #[test]
-    fn fetch_argv_disables_prune_submodules_tags() {
-        // Step 11: deleted upstream branches keep their tracking refs,
-        // no submodule recursion, no tag downloads. `git_fetch_remote`
-        // builds from this single source; the assertion pins it.
+    fn fetch_argv_is_atomic_and_disables_prune_submodules_tags() {
+        // Step 11: refs update atomically, deleted upstream branches
+        // keep their tracking refs, with no submodule recursion or tag
+        // downloads. `git_fetch_remote` builds from this single source.
         assert_eq!(
             FallbackGit::fetch_argv().as_slice(),
             &[
                 "fetch",
+                "--atomic",
                 "--no-prune",
                 "--no-recurse-submodules",
                 "--no-tags"
@@ -3315,6 +3494,35 @@ mod tests {
         assert!(config_origin_within_repo(
             config.to_str().expect("utf8"),
             &dir.path().join("no-git-dir")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_repo_config_origin_remains_repo_scope() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git_dir = dir.path().join("r.git");
+        std::fs::create_dir_all(&git_dir).expect("mkdir");
+        let target = dir.path().join("external-config");
+        std::fs::write(
+            &target,
+            b"[remote \"origin\"]\n\tuploadpack = /tmp/canary\n",
+        )
+        .expect("write target");
+        let config = git_dir.join("config");
+        symlink(&target, &config).expect("symlink config");
+
+        // Git may report the lexical path (`.git/config`) or the
+        // canonical target. Both identify repository-selected settings.
+        assert!(config_origin_within_repo(
+            config.to_str().expect("utf8"),
+            &git_dir
+        ));
+        assert!(config_origin_within_repo(
+            target.to_str().expect("utf8"),
+            &git_dir
         ));
     }
 }

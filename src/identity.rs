@@ -1803,7 +1803,17 @@ fn scrub_embedded_scp(text: &str) -> String {
             return;
         }
         // Preserve surrounding punctuation; redact the core shape only.
-        let core = token.trim_start_matches(['\'', '"', '`', '(', '[', '<']);
+        // `<redacted>` is itself our username placeholder, not a wrapper
+        // around another scp-like token. Keeping its opening angle bracket
+        // makes repeated sanitation idempotent.
+        let prefix = token.trim_start_matches(['\'', '"', '`', '(', '[']);
+        let leading = token.len() - prefix.len();
+        let (lead, core) = if prefix.starts_with("<redacted>@") {
+            (leading, prefix)
+        } else {
+            let core = prefix.trim_start_matches('<');
+            (leading + prefix.len() - core.len(), core)
+        };
         let stripped =
             core.trim_end_matches(['\'', '"', '`', '.', ',', ';', ':', '!', '?', ')', ']', '>']);
         if stripped.is_empty() {
@@ -1815,10 +1825,6 @@ fn scrub_embedded_scp(text: &str) -> String {
             .or_else(|| redact_colon_user_host(stripped))
         {
             Some(redacted) => {
-                let lead = token.len()
-                    - token
-                        .trim_start_matches(['\'', '"', '`', '(', '[', '<'])
-                        .len();
                 out.push_str(&token[..lead]);
                 out.push_str(&redacted);
                 // `stripped` borrows from `core`, which starts `lead`

@@ -316,6 +316,22 @@ fn exact2_scan_scp_user_never_persists() {
     assert_no_canary_in_state(&state_t, canary);
 }
 
+#[test]
+fn scp_remote_redaction_is_idempotent() {
+    let once = repo_scan::identity::redact_remote_url("credential-user@github.com:o/r.git");
+    assert_eq!(once, "<redacted>@github.com:o/r.git");
+    assert_eq!(
+        repo_scan::identity::redact_remote_url(&once),
+        once,
+        "a sanitized scp-like URL remains stable"
+    );
+    assert_eq!(
+        repo_scan::identity::scrub_text(&once),
+        once,
+        "free-text sanitation preserves the redaction marker"
+    );
+}
+
 /// Targets that fail shape validation echo the display-safe form: spaced
 /// and JSON secrets never reach stderr verbatim.
 #[test]

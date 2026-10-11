@@ -99,7 +99,7 @@ machine formats.
 | `--format human` redirected | `scan`, `resume` | plain `live_text` lane: header, coverage, totals, `R`/`C`/`B`/`?`/`!` rows (cap 200 + overflow line), then legacy footers |
 | `--format human` | `query --scan`, `query --all` | plain `live_text` lane only (no footers) |
 | `--format human` | `query TARGET --cached` | short human summary |
-| `--format json` | `scan`, `query --scan`, `query --all`, `query TARGET --cached`, `resume` | one JSON document: the retained snapshot (report schema `1.4.0`), plus a trailing newline on stdout |
+| `--format json` | `scan`, `query --scan`, `query --all`, `query TARGET --cached`, `resume` | one JSON document: the retained snapshot (report schema `1.5.0`), plus a trailing newline on stdout |
 | `--format jsonl` | `scan`, `query --scan`, `query --all`, `query TARGET --cached`, `resume` | the scan journal replayed as event envelopes (event schema `1.0.0`) |
 
 `--follow` works with `human` and `jsonl` only: `--follow --format json`
@@ -153,7 +153,7 @@ Row prefixes: `R` repository, `C` checkout, `B` branch, `?` candidate,
 ### JSON document (observed shape)
 
 `--format json` prints the retained snapshot: one object with
-`schema_version: "1.4.0"` and these top-level keys (observed key set;
+`schema_version: "1.5.0"` and these top-level keys (observed key set;
 record vecs in full, elided here):
 
 ```text

@@ -43,6 +43,7 @@ impl Op {
 pub enum EventType {
     ScanStarted,
     DiscoveryProgress,
+    DiscoveryProgressUpdated,
     LocationFound,
     RepositoryFound,
     InventoryReady,
@@ -72,6 +73,7 @@ impl EventType {
             | EventType::CoverageUpdated
             | EventType::RemoteUpdated => Op::Replace,
             EventType::ScanStarted
+            | EventType::DiscoveryProgressUpdated
             | EventType::LocationFound
             | EventType::RepositoryFound
             | EventType::InventoryReady
@@ -90,6 +92,7 @@ impl EventType {
         match self {
             EventType::ScanStarted => "scan_started",
             EventType::DiscoveryProgress => "discovery_progress",
+            EventType::DiscoveryProgressUpdated => "discovery_progress_updated",
             EventType::LocationFound => "location_found",
             EventType::RepositoryFound => "repository_found",
             EventType::InventoryReady => "inventory_ready",
@@ -106,9 +109,9 @@ impl EventType {
     }
 }
 
-/// True only for [`EventType::DiscoveryProgress`] (contract D4: progress
-/// events coalesce to newest per scan; record/error events are never
-/// silently dropped).
+/// True only for the coalesced [`EventType::DiscoveryProgress`] gauge.
+/// [`EventType::DiscoveryProgressUpdated`] notifications are append-only
+/// cursor advances and are not coalesced.
 #[must_use]
 pub fn is_progress_coalescible(t: EventType) -> bool {
     matches!(t, EventType::DiscoveryProgress)
@@ -145,8 +148,8 @@ pub fn is_terminal_name(name: &str) -> bool {
 ///
 /// Wire shape is `{schema_version, scan_id, seq, catalog_rev, type, op,
 /// records}` plus `event_offset` (journal offset inside `catalog_rev`) and
-/// `reset` (true when the consumer must drop buffered state, e.g. cursor
-/// outside retention → fresh snapshot). `event_type` serializes as `type`
+/// `reset` (true when the consumer must drop buffered state before applying
+/// a complete replay). `event_type` serializes as `type`
 /// per D4. Events are sent only after their Catalog transaction commits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
@@ -190,41 +193,90 @@ impl Envelope {
     }
 }
 
-/// Opaque replay cursor (contract D4): scan `seq` + `(catalog_rev,
-/// event offset)`.
+/// Opaque replay cursor (contract D4): scan ID + `seq` +
+/// `(catalog_rev, event offset)`.
 ///
 /// Replay rules (D4): a snapshot cursor is the exact end of the included
-/// changes; a cursor outside retention yields a fresh snapshot with
-/// `reset:true`; duplicate delivery of the same `seq` is idempotent and
-/// consumers dedupe by `seq`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// changes; a cursor outside retention requests a reset, which the CLI can
+/// serve only when the full event prefix remains available; duplicate
+/// delivery of the same `seq` is idempotent and consumers dedupe by `seq`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cursor {
+    /// Scan that issued this cursor. `None` identifies a decoded legacy v1
+    /// cursor, which is never trusted to resume a scan.
+    pub scan_id: Option<String>,
     pub seq: u64,
     pub catalog_rev: u64,
     pub event_offset: u64,
 }
 
 impl Cursor {
-    /// Encode as opaque base64url (no padding) of `v1:{seq}:{rev}:{off}`.
+    /// Create a cursor bound to one scan.
+    #[must_use]
+    pub fn for_scan(
+        scan_id: impl Into<String>,
+        seq: u64,
+        catalog_rev: u64,
+        event_offset: u64,
+    ) -> Self {
+        Self {
+            scan_id: Some(scan_id.into()),
+            seq,
+            catalog_rev,
+            event_offset,
+        }
+    }
+
+    /// Encode a bound cursor as v2, or an unbound legacy cursor as v1.
+    /// Both formats use opaque base64url with no padding.
     #[must_use]
     pub fn encode(&self) -> String {
-        let raw = format!("v1:{}:{}:{}", self.seq, self.catalog_rev, self.event_offset);
+        let raw = match &self.scan_id {
+            Some(scan_id) => format!(
+                "v2:{}:{}:{}:{}",
+                b64url_encode(scan_id.as_bytes()),
+                self.seq,
+                self.catalog_rev,
+                self.event_offset,
+            ),
+            None => format!("v1:{}:{}:{}", self.seq, self.catalog_rev, self.event_offset),
+        };
         b64url_encode(raw.as_bytes())
     }
 
-    /// Decode a cursor produced by [`Cursor::encode`]; corrupt input yields
-    /// `None` (callers then fall back to fresh snapshot + `reset:true`).
+    /// Decode a cursor produced by [`Cursor::encode`]. Legacy v1 cursors
+    /// remain readable but are unbound and must request a full reset.
+    /// Corrupt input yields `None` so callers can report a usage error.
     #[must_use]
     pub fn decode(s: &str) -> Option<Self> {
         let bytes = b64url_decode(s)?;
         let raw = std::str::from_utf8(&bytes).ok()?;
         let mut parts = raw.split(':');
-        match (parts.next()?, parts.next()?, parts.next()?, parts.next()?) {
-            ("v1", seq, rev, off) if parts.next().is_none() => Some(Self {
+        match (
+            parts.next()?,
+            parts.next()?,
+            parts.next()?,
+            parts.next()?,
+            parts.next(),
+        ) {
+            ("v1", seq, rev, off, None) => Some(Self {
+                scan_id: None,
                 seq: seq.parse().ok()?,
                 catalog_rev: rev.parse().ok()?,
                 event_offset: off.parse().ok()?,
             }),
+            ("v2", encoded_scan_id, seq, rev, Some(off)) if parts.next().is_none() => {
+                let scan_id = String::from_utf8(b64url_decode(encoded_scan_id)?).ok()?;
+                if scan_id.is_empty() {
+                    return None;
+                }
+                Some(Self {
+                    scan_id: Some(scan_id),
+                    seq: seq.parse().ok()?,
+                    catalog_rev: rev.parse().ok()?,
+                    event_offset: off.parse().ok()?,
+                })
+            }
             _ => None,
         }
     }
@@ -236,8 +288,9 @@ impl Cursor {
 /// The writer keeps the newest [`MAX_RETAINED_SCAN_EVENTS`] rows per scan
 /// (position-based prefix prune; the tip row always survives, so a
 /// finished scan's terminal event is never pruned). A cursor the retained
-/// window no longer covers yields an explicit-reset snapshot, never a
-/// silent resume ([`classify_cursor`]).
+/// window no longer covers requests a reset. Replay fails closed when prefix
+/// retention removed events needed to rebuild the full state
+/// ([`classify_cursor`]).
 pub const MAX_RETAINED_SCAN_EVENTS: u64 = 50_000;
 
 /// Prune cutoff for [`MAX_RETAINED_SCAN_EVENTS`]: delete retained rows
@@ -259,18 +312,20 @@ pub enum ResumeAction {
     /// The cursor points at a terminal event; the stream must stop there.
     /// A terminal cursor is never a valid point from which to resume rows.
     StopAtTerminal,
-    /// Retained events no longer cover the cursor: replay the retained
-    /// window from its start with `reset:true` on the first envelope, so
-    /// the consumer drops buffered state instead of silently skipping.
+    /// Retained events no longer cover the cursor: the caller must reset
+    /// from a complete state source. The CLI fails closed when prefix
+    /// retention means the remaining event rows cannot rebuild that state.
     ResetSnapshot,
 }
 
-/// Classify one `--after` [`Cursor`] against the journaled row at its
+/// Classify one `--after` [`Cursor`] against its target scan and the journaled row at its
 /// `seq` (`None` when no row carries that seq).
 ///
+/// - An unbound legacy v1 cursor or a cursor bound to another scan →
+///   [`ResumeAction::ResetSnapshot`].
 /// - No row (pruned prefix, beyond-tip cursor, or empty journal) →
-///   [`ResumeAction::ResetSnapshot`]: resync, never silent.
-/// - Row found and [`is_progress_coalescible`] → `ResumeAfterCursor`: a
+///   [`ResumeAction::ResetSnapshot`]: request a resync, never silently skip.
+/// - Row found in the bound scan and [`is_progress_coalescible`] → `ResumeAfterCursor`: a
 ///   coalescible row is a gauge, never divergence — the caller resumes
 ///   after the *cursor's* position, so records journaled around it are
 ///   still delivered. (Production gauge positions are immutable, so the
@@ -278,10 +333,17 @@ pub enum ResumeAction {
 ///   resync followers either way.)
 /// - Row found, record class, `(rev, off)` matches → `ResumeAfterCursor`,
 ///   except an exact terminal row gives [`ResumeAction::StopAtTerminal`].
-/// - Row found, record class, `(rev, off)` differs (foreign scan's cursor
-///   or corruption) → `ResetSnapshot`.
+/// - Row found, record class, `(rev, off)` differs (same-scan corruption) →
+///   `ResetSnapshot`.
 #[must_use]
-pub fn classify_cursor(cursor: &Cursor, found: Option<(EventType, u64, u64)>) -> ResumeAction {
+pub fn classify_cursor(
+    cursor: &Cursor,
+    scan_id: &str,
+    found: Option<(EventType, u64, u64)>,
+) -> ResumeAction {
+    if cursor.scan_id.as_deref() != Some(scan_id) {
+        return ResumeAction::ResetSnapshot;
+    }
     match found {
         None => ResumeAction::ResetSnapshot,
         Some((event_type, _rev, _off)) if is_progress_coalescible(event_type) => {
@@ -365,12 +427,17 @@ fn b64url_decode(s: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    const ALL_TYPES: [(EventType, Op, &str); 14] = [
+    const ALL_TYPES: [(EventType, Op, &str); 15] = [
         (EventType::ScanStarted, Op::Add, "scan_started"),
         (
             EventType::DiscoveryProgress,
             Op::Replace,
             "discovery_progress",
+        ),
+        (
+            EventType::DiscoveryProgressUpdated,
+            Op::Add,
+            "discovery_progress_updated",
         ),
         (EventType::LocationFound, Op::Add, "location_found"),
         (EventType::RepositoryFound, Op::Add, "repository_found"),
@@ -477,25 +544,26 @@ mod tests {
     #[test]
     fn cursor_encode_decode_round_trip() {
         for c in [
-            Cursor {
-                seq: 0,
-                catalog_rev: 0,
-                event_offset: 0,
-            },
-            Cursor {
-                seq: 1,
-                catalog_rev: 2,
-                event_offset: 3,
-            },
-            Cursor {
-                seq: u64::MAX,
-                catalog_rev: u64::MAX,
-                event_offset: u64::MAX,
-            },
+            Cursor::for_scan("scan-1", 0, 0, 0),
+            Cursor::for_scan("scan-1", 1, 2, 3),
+            Cursor::for_scan("scan-1", u64::MAX, u64::MAX, u64::MAX),
         ] {
             let s = c.encode();
             assert_eq!(Cursor::decode(&s), Some(c), "{s}");
         }
+
+        let legacy = Cursor {
+            scan_id: None,
+            seq: 7,
+            catalog_rev: 3,
+            event_offset: 4,
+        };
+        let encoded = legacy.encode();
+        assert_eq!(Cursor::decode(&encoded), Some(legacy));
+        assert!(Cursor::decode(&encoded)
+            .expect("legacy v1 cursor")
+            .scan_id
+            .is_none());
     }
 
     #[test]
@@ -504,21 +572,19 @@ mod tests {
             "",
             "!!!",
             "v1:1:2:3",                                     // raw, not base64url
-            &b64url_encode(b"v2:1:2:3"),                    // wrong version tag
+            &b64url_encode(b"v3:1:2:3"),                    // wrong version tag
             &b64url_encode(b"v1:1:2"),                      // missing field
             &b64url_encode(b"v1:1:2:3:4"),                  // extra field
             &b64url_encode(b"v1:x:2:3"),                    // non-numeric
             &b64url_encode(b"v1:1:2:18446744073709551616"), // u64 overflow
+            &b64url_encode(b"v2::1:2:3"),                   // empty scan ID
+            &b64url_encode(b"v2:!:1:2:3"),                  // bad scan ID encoding
+            &b64url_encode(b"v2:c2Nhbi0x:x:2:3"),           // non-numeric
         ] {
             assert_eq!(Cursor::decode(bad), None, "{bad}");
         }
         // Truncated / bad-length base64url.
-        let mut s = Cursor {
-            seq: 9,
-            catalog_rev: 9,
-            event_offset: 9,
-        }
-        .encode();
+        let mut s = Cursor::for_scan("scan-1", 9, 9, 9).encode();
         s.pop();
         if s.len() % 4 != 1 {
             s.pop();
@@ -543,49 +609,82 @@ mod tests {
 
     #[test]
     fn classify_cursor_matrix() {
-        let cursor = Cursor {
-            seq: 7,
-            catalog_rev: 3,
-            event_offset: 4,
-        };
+        let cursor = Cursor::for_scan("scan-1", 7, 3, 4);
         // Missing row (pruned prefix, beyond tip, empty journal): reset.
-        assert_eq!(classify_cursor(&cursor, None), ResumeAction::ResetSnapshot);
+        assert_eq!(
+            classify_cursor(&cursor, "scan-1", None),
+            ResumeAction::ResetSnapshot
+        );
         // Record row, position matches: resume.
         assert_eq!(
-            classify_cursor(&cursor, Some((EventType::LocationFound, 3, 4))),
+            classify_cursor(&cursor, "scan-1", Some((EventType::LocationFound, 3, 4))),
             ResumeAction::ResumeAfterCursor
         );
         // Record row, position differs (foreign cursor/corruption): reset.
         assert_eq!(
-            classify_cursor(&cursor, Some((EventType::LocationFound, 3, 5))),
+            classify_cursor(&cursor, "scan-1", Some((EventType::LocationFound, 3, 5))),
             ResumeAction::ResetSnapshot
         );
         assert_eq!(
-            classify_cursor(&cursor, Some((EventType::LocationFound, 9, 4))),
+            classify_cursor(&cursor, "scan-1", Some((EventType::LocationFound, 9, 4))),
             ResumeAction::ResetSnapshot
         );
         // Coalescible gauge: resume even when its position drifted
         // (seq-reuse coalescing moves it); the caller resumes after the
         // cursor's own position so nothing between is skipped.
         assert_eq!(
-            classify_cursor(&cursor, Some((EventType::DiscoveryProgress, 3, 4))),
+            classify_cursor(
+                &cursor,
+                "scan-1",
+                Some((EventType::DiscoveryProgress, 3, 4))
+            ),
             ResumeAction::ResumeAfterCursor
         );
         assert_eq!(
-            classify_cursor(&cursor, Some((EventType::DiscoveryProgress, 9, 9))),
+            classify_cursor(
+                &cursor,
+                "scan-1",
+                Some((EventType::DiscoveryProgress, 9, 9))
+            ),
             ResumeAction::ResumeAfterCursor
         );
         assert_eq!(
-            classify_cursor(&cursor, Some((EventType::ScanCompleted, 3, 4))),
+            classify_cursor(&cursor, "scan-1", Some((EventType::ScanCompleted, 3, 4))),
             ResumeAction::StopAtTerminal
         );
         assert_eq!(
-            classify_cursor(&cursor, Some((EventType::ScanCompleted, 3, 5))),
+            classify_cursor(&cursor, "scan-1", Some((EventType::ScanCompleted, 3, 5))),
             ResumeAction::ResetSnapshot
         );
         assert_eq!(
-            classify_cursor(&cursor, Some((EventType::ScanCompleted, 9, 4))),
+            classify_cursor(&cursor, "scan-1", Some((EventType::ScanCompleted, 9, 4))),
             ResumeAction::ResetSnapshot
+        );
+
+        let foreign = Cursor::for_scan("scan-foreign", 7, 3, 4);
+        assert_eq!(
+            classify_cursor(
+                &foreign,
+                "scan-1",
+                Some((EventType::DiscoveryProgress, 3, 4))
+            ),
+            ResumeAction::ResetSnapshot,
+            "scan binding applies even when every position field collides"
+        );
+        let legacy = Cursor {
+            scan_id: None,
+            seq: cursor.seq,
+            catalog_rev: cursor.catalog_rev,
+            event_offset: cursor.event_offset,
+        };
+        assert_eq!(
+            classify_cursor(
+                &legacy,
+                "scan-1",
+                Some((EventType::DiscoveryProgress, 3, 4))
+            ),
+            ResumeAction::ResetSnapshot,
+            "v1 cursors lack a trustworthy scan binding"
         );
     }
 

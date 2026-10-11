@@ -625,6 +625,50 @@ fn selection_survives_row_changes_mid_session() {
 }
 
 #[test]
+fn collapsed_rows_stay_collapsed_across_live_refresh() {
+    let mut state = sample_state();
+    let rows = state.visible_rows();
+    let store_pos = rows
+        .iter()
+        .position(|row| row.kind == "store")
+        .expect("sample store");
+    let group_id = rows[..store_pos]
+        .iter()
+        .rev()
+        .find(|row| row.kind == "group")
+        .expect("sample store group")
+        .id
+        .clone();
+    let store_id = rows[store_pos].id.clone();
+
+    state.selected = Some(store_id.clone());
+    feed(&mut state, &[Key::Enter]);
+    assert!(!state.expanded.contains(&store_id));
+    state.apply_snapshot(state.snapshot.clone());
+    let store_row = state
+        .visible_rows()
+        .into_iter()
+        .find(|row| row.id == store_id)
+        .expect("collapsed store stays visible");
+    assert!(!store_row.expanded);
+
+    state.selected = Some(group_id.clone());
+    feed(&mut state, &[Key::Enter]);
+    assert!(!state.expanded.contains(&group_id));
+
+    state.apply_snapshot(state.snapshot.clone());
+
+    assert!(!state.expanded.contains(&group_id));
+    assert!(!state.expanded.contains(&store_id));
+    let group_row = state
+        .visible_rows()
+        .into_iter()
+        .find(|row| row.id == group_id)
+        .expect("collapsed group stays visible");
+    assert!(!group_row.expanded);
+}
+
+#[test]
 fn scroll_anchor_survives_live_updates() {
     let mut state = sample_state();
     // Scroll down several rows, then update: the anchor row stays put.

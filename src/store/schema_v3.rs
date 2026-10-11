@@ -22,15 +22,10 @@
 //! `scan_requests.fetch` persists the `--fetch` request (`NULL` = legacy
 //! row, no fetch); resume restores it.
 //!
-//! v1 storage rules (see `schema.rs`) apply unchanged: plain rowid tables
-//! (no `WITHOUT ROWID`), no recursive CTEs, no FTS, every raw
-//! path/component/ref-name/URL in a `BLOB` column, and no index key
-//! contains a `BLOB` column. One noted tension: the `remote_refreshes`
-//! composite `PRIMARY KEY` includes `remote_name BLOB` (required edge
-//! identity, same as v2 `group_members`), which SQLite materializes as a
-//! unique autoindex; every explicit `CREATE INDEX` key below is
-//! `TEXT`/`INTEGER`-only, enforced by unit test
-//! (`no_index_key_contains_blob`).
+//! Historical v3 catalogs keyed `remote_refreshes` by raw `remote_name
+//! BLOB`. Migration v9 rebuilds the table with a lossless hexadecimal
+//! `TEXT` key, while preserving the raw name bytes in an unindexed BLOB
+//! column. V3's explicit lookup index remains `TEXT`/`INTEGER`-only.
 //!
 //! Wiring (a `Migration` chain entry plus the `CURRENT_SCHEMA_VERSION`
 //! bump) belongs to the coordinator: [`V3Marker::VERSION`] and
@@ -38,10 +33,9 @@
 
 /// Schema version 3 SQL: additive Step 11 tables and columns.
 ///
-/// * `remote_refreshes` is keyed `(store_id, remote_name)` (Step 11:
-///   one record per store + effective remote configuration);
-///   `remote_name` is `BLOB` like `remotes.name` because remote names
-///   are raw bytes.
+/// * `remote_refreshes` was originally keyed `(store_id, remote_name)`;
+///   v9 replaces the BLOB component with a lossless hexadecimal
+///   `remote_name_key` while retaining raw bytes.
 /// * `refs.freshness` / `refs.freshness_at_ms` are nullable; `NULL` =
 ///   legacy unlabeled row, read as `unknown`.
 /// * `scan_requests.fetch` is nullable; `NULL` = legacy row, no fetch.
