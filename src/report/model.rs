@@ -107,6 +107,7 @@ pub struct ScanTarget {
     /// Target exactly as supplied (credentials redacted, never secret bytes).
     pub raw: String,
     /// Normalized canonical form, when the shape is supported.
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub canonical: Option<String>,
     /// Repositories `confirmed` for this target in this report.
     pub matched_repositories: u64,
