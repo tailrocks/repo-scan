@@ -893,6 +893,38 @@ fn step6_format_lanes_refuse_loudly_until_wired() {
     );
 }
 
+/// `--fetch` is pre-staged for the fetch-phase slice: refuse loudly (exit
+/// 1, "not yet implemented") before any state mutation instead of
+/// completing with stale remote state presented as current. Scans without
+/// `--fetch` are unaffected.
+#[test]
+fn step6_fetch_refuses_loudly_until_wired() {
+    let env = Env::new();
+    let out = env.scan(&["--fetch"], &env.cwd_a);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "--fetch refuses loudly: {}",
+        stderr_text(&out)
+    );
+    assert!(
+        stderr_text(&out).contains("not yet implemented"),
+        "--fetch stderr: {}",
+        stderr_text(&out)
+    );
+    assert!(
+        !env.state.join("payload").join("catalog.db").exists(),
+        "refusal happens before any state mutation"
+    );
+    let out = env.scan(&["--report", "rep.json"], &env.cwd_a);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "scan without --fetch unaffected: {}",
+        stderr_text(&out)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Step 15 case 5: distinct explicit root sets never share a generation.
 // ---------------------------------------------------------------------------
@@ -1199,6 +1231,163 @@ fn query_scan_replays_journaled_lifecycle_as_jsonl() {
         Some(2),
         "stderr: {}",
         stderr_text(&missing)
+    );
+}
+
+/// `--follow` race: the scan writer commits the terminal row state and the
+/// terminal journal event as two transactions (row first). A follower that
+/// polls between them must keep draining for the event instead of exiting
+/// at the tip. Reproduced deterministically by deleting the committed
+/// terminal event (row stays `complete`) and re-inserting it while the
+/// follower polls: the event must still be replayed.
+#[test]
+fn query_scan_follow_drains_terminal_event_committed_after_row_state() {
+    use repo_scan::store::{Store, TursoStore};
+    use std::io::{BufRead, BufReader, Read as _};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let cwd = dir.path().join("cwd");
+    repo_scan::privacy::private_dir_0700(&cwd).expect("mkdir");
+    let root = dir.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    fixture::normal_clone(&root, "repo");
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            "rep.json",
+        ],
+        &cwd,
+        &state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let scan_id = stdout_line(&out, "scan_id");
+
+    // Lift the committed terminal event out of the journal; the scan row
+    // stays `complete`, so the follower observes the terminal state one
+    // commit ahead of the terminal event — the writer's real order.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    let terminal_row: Vec<turso::Value> = rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        let mut rows = store
+            .connection()
+            .query(
+                "SELECT seq, catalog_rev, event_offset, event_type, op, reset, records \
+                 FROM scan_events WHERE scan_id = ?1 ORDER BY seq DESC LIMIT 1",
+                vec![turso::Value::Text(scan_id.clone())],
+            )
+            .await
+            .expect("query");
+        let row = rows.next().await.expect("next").expect("terminal row");
+        let mut values = Vec::new();
+        for i in 0..7 {
+            values.push(row.get_value(i).expect("column"));
+        }
+        let seq = match &values[0] {
+            turso::Value::Integer(n) => *n,
+            other => panic!("seq integer, got {other:?}"),
+        };
+        assert!(
+            matches!(&values[3], turso::Value::Text(t) if t.as_str() == "scan_completed"),
+            "last journaled event is the terminal one: {:?}",
+            values[3]
+        );
+        store
+            .connection()
+            .execute(
+                "DELETE FROM scan_events WHERE scan_id = ?1 AND seq = ?2",
+                vec![
+                    turso::Value::Text(scan_id.clone()),
+                    turso::Value::Integer(seq),
+                ],
+            )
+            .await
+            .expect("delete terminal event");
+        store.close().await.expect("close");
+        values
+    });
+
+    // Follow with piped stdout; read until the follower passes
+    // `inventory_ready`, which proves its initial replay finished and the
+    // follow loop is polling.
+    let mut child = ProcCommand::new(binary())
+        .args([
+            "--state-dir",
+            state.to_str().expect("utf8"),
+            "query",
+            "--scan",
+            scan_id.as_str(),
+            "--follow",
+            "--format",
+            "jsonl",
+        ])
+        .current_dir(&cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn follower");
+    let child_stdout = child.stdout.take().expect("piped stdout");
+    let mut reader = BufReader::new(child_stdout);
+    let mut followed = String::new();
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).expect("read follower line");
+        assert!(n > 0, "follower exited before inventory_ready: {followed}");
+        let envelope: serde_json::Value = serde_json::from_str(&line).expect("jsonl");
+        let is_inventory = envelope["type"] == "inventory_ready";
+        followed.push_str(&line);
+        if is_inventory {
+            break;
+        }
+    }
+
+    // The follower is now polling a terminal scan row with the terminal
+    // event missing. Commit the event mid-window; the bounded grace drain
+    // must pick it up instead of stopping at the tip.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("reopen");
+        let mut params = vec![turso::Value::Text(scan_id.clone())];
+        params.extend(terminal_row);
+        store
+            .connection()
+            .execute(
+                "INSERT INTO scan_events \
+                 (scan_id, seq, catalog_rev, event_offset, event_type, op, reset, records) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params,
+            )
+            .await
+            .expect("re-insert terminal event");
+        store.close().await.expect("close");
+    });
+
+    let mut rest = String::new();
+    reader.read_to_string(&mut rest).expect("read to EOF");
+    followed.push_str(&rest);
+    let status = child.wait().expect("wait");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "follower exits 0 at the terminal event"
+    );
+    let last = followed
+        .lines()
+        .last()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("jsonl"))
+        .expect("follower emitted events");
+    assert_eq!(
+        last["type"],
+        serde_json::Value::String("scan_completed".to_string()),
+        "terminal event committed after the row state is still replayed: {followed}"
     );
 }
 

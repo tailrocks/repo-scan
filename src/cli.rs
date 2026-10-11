@@ -119,7 +119,8 @@ pub struct ScanArgs {
     /// After discovery and local analysis, fetch current remote state.
     /// Updates remote-tracking refs and objects only; checkout files and
     /// local branch tips are never moved (unsafe refspecs report
-    /// `unsupported` instead of writing).
+    /// `unsupported` instead of writing). Pre-staged: the fetch phase is
+    /// not wired yet, so `scan --fetch` currently refuses loudly.
     #[arg(long)]
     pub fetch: bool,
     /// Terminal color control. `NO_COLOR` and `TERM=dumb` also disable color.

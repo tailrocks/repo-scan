@@ -123,6 +123,12 @@ const REPLAY_PAGE_ROWS: u64 = 500;
 /// Poll interval for `query --scan --follow` while the scan is still
 /// running and no terminal event is journaled yet.
 const FOLLOW_POLL: Duration = Duration::from_millis(250);
+/// Polls a `--follow` replay grants a terminal scan row for its terminal
+/// journal event to commit: the writer persists the row state and the
+/// terminal event as two transactions (row first), so a terminal row can
+/// beat its event by a commit. A writer that crashed between the two never
+/// emits it, so the grace is bounded rather than an infinite wait.
+const FOLLOW_TERMINAL_GRACE_POLLS: u32 = 4;
 /// Rows per catalog page for bounded report-derivation scans
 /// (RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1): errors, instances, and
 /// reclassification reads never hold more than one page from the database
@@ -1157,6 +1163,16 @@ async fn run_scan_inner(
         if format != repo_scan::cli::OutputFormat::Human {
             return Ok(refuse_unwired_format("scan", format));
         }
+    }
+    // --fetch is pre-staged for the fetch-phase slice: today no fetch
+    // phase runs, so accepting it would report stale remote state as
+    // current. Refuse loudly instead (same contract as the format lanes).
+    if args.fetch {
+        eprintln!(
+            "repo-scan: not yet implemented: scan --fetch executes in the fetch-phase \
+             slice; omit --fetch for now"
+        );
+        return Ok(ExitCode::OperationalFailure);
     }
     // CLI boundary (RSF-SEC-TARGET-URL, EXACT-2): credential-bearing
     // targets (userinfo, any query/fragment tail) are rejected before any
@@ -9364,13 +9380,17 @@ async fn run_query_scan_replay(
         let _ = store.close().await;
         return Ok(ExitCode::Success);
     }
-    // Follow: a scan row that already left `running` will never journal
-    // more (pre-journal scans included), so stop at the tip; otherwise
-    // poll until the terminal event lands.
-    if !scan_still_running(&scan.state) {
-        let _ = store.close().await;
-        return Ok(ExitCode::Success);
-    }
+    // Follow: poll until the terminal event lands. A scan row that already
+    // left `running` keeps draining for a bounded grace: the writer commits
+    // the row state and the terminal journal event as two transactions (row
+    // first), so a terminal row can beat its event by a commit, and stopping
+    // at the tip here would silently drop the final event. Pre-journal
+    // scans never emit one; the same grace bounds their exit.
+    let mut terminal_row_polls = if scan_still_running(&scan.state) {
+        0
+    } else {
+        1
+    };
     loop {
         if interrupted() {
             let _ = store.close().await;
@@ -9424,10 +9444,18 @@ async fn run_query_scan_replay(
             return Ok(ExitCode::Success);
         }
         match store.get_scan(scan_id).await? {
-            Some(s) if scan_still_running(&s.state) => {}
+            Some(s) if scan_still_running(&s.state) => {
+                terminal_row_polls = 0;
+            }
             Some(_) => {
-                let _ = store.close().await;
-                return Ok(ExitCode::Success);
+                // Terminal row, terminal event not yet drained: keep
+                // draining through the grace window (see the constant)
+                // instead of exiting without the final event.
+                terminal_row_polls += 1;
+                if terminal_row_polls >= FOLLOW_TERMINAL_GRACE_POLLS {
+                    let _ = store.close().await;
+                    return Ok(ExitCode::Success);
+                }
             }
             None => {
                 let _ = store.close().await;
