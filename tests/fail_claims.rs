@@ -52,6 +52,7 @@ fn report_inputs(report_id: &str, generation: u64, scan_state: &str) -> ReportIn
         catalog_revision: 0,
         target_url: "https://github.com/OWNER/REPO".to_string(),
         canonical_url: Some("https://github.com/owner/repo".to_string()),
+        targets: vec![],
         scope: "roots".to_string(),
         scan_state: scan_state.to_string(),
         started_at_ms: 1_759_154_398_000,

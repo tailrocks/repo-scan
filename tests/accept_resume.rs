@@ -549,17 +549,14 @@ fn resume02_incomplete_scan_keeps_old_findings() {
         gapped["coverage"]["filesystem"].as_str(),
         Some("incomplete")
     );
-    #[cfg(target_os = "macos")]
-    assert_eq!(
-        gapped["scan"]["generation"].as_u64(),
-        Some(1),
-        "same catalog"
-    );
-    #[cfg(not(target_os = "macos"))]
+    // D5 (Step 15 case 5): the root set {fixture, gone} differs from the
+    // first scan's {fixture}, so coverage cannot be reused even with live
+    // events — a fresh generation on every platform. The old findings below
+    // still come from the shared catalog, not from generation reuse.
     assert_eq!(
         gapped["scan"]["generation"].as_u64(),
         Some(2),
-        "fresh generation on Linux"
+        "fresh generation for a different root set"
     );
     assert_eq!(
         gapped["repositories"].as_array().map(|a| a.len()),
@@ -571,4 +568,231 @@ fn resume02_incomplete_scan_keeps_old_findings() {
     let out = run(&["query", URL, "--cached"], tmp.path(), &state);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
     assert_eq!(stdout_line(&out, "matches"), "2");
+}
+
+// ---------------------------------------------------------------------------
+// RESUME-03/04/05: resume restores the saved v2 request shape (targets,
+// `--all` marker, output format) instead of collapsing to the primary
+// target with defaults.
+// ---------------------------------------------------------------------------
+
+/// Flip a completed scan back to `interrupted` — keeping its outcome and
+/// explicit roots — so `resume` re-executes the request from the saved row.
+fn mark_interrupted(state: &Path, scan_id: &str, roots: &[PathBuf]) {
+    let rt = runtime();
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        let row = store
+            .get_scan(scan_id)
+            .await
+            .expect("get")
+            .expect("scan row");
+        let interrupted = repo_scan::config::scan_state_name("interrupted", Some(roots));
+        store
+            .update_scan_state(
+                scan_id,
+                &interrupted,
+                row.outcome.as_deref(),
+                None,
+                now_ms(),
+            )
+            .await
+            .expect("mark interrupted");
+        store.close().await.expect("close");
+    });
+}
+
+/// RESUME-03: an interrupted multi-target scan re-serves every target on
+/// resume (exit 0/3), not just the primary one.
+#[test]
+fn resume03_two_target_resume_re_serves_every_target() {
+    const URL_B: &str = "https://github.com/OTHER/REPO2";
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state = tmp.path().join("state");
+    let cwd = tmp.path().join("cwd");
+    repo_scan::privacy::private_dir_0700(&cwd).expect("mkdir");
+    let root = tmp.path().join("fixture");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    fixture::normal_clone(&root, "repo-a");
+    let repo_b = fixture::normal_clone(&root, "repo-b");
+    fixture::git(&repo_b, &["remote", "set-url", "origin", URL_B]);
+    let report = tmp.path().join("rep.json");
+    let report_s = report.to_str().expect("utf8").to_string();
+    let root_s = root.to_str().expect("utf8").to_string();
+
+    let out = run(
+        &[
+            "scan",
+            URL,
+            URL_B,
+            "--root",
+            root_s.as_str(),
+            "--report",
+            report_s.as_str(),
+        ],
+        &cwd,
+        &state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let scan_id = stdout_line(&out, "scan_id");
+    mark_interrupted(&state, &scan_id, std::slice::from_ref(&root));
+
+    // Remove the first report: the assertions below must read the resumed
+    // run's publication, never a stale file.
+    std::fs::remove_file(&report).expect("remove first report");
+    let out = run(&["resume", scan_id.as_str()], &cwd, &state);
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "resume exits 0/3: {}",
+        stderr_text(&out)
+    );
+    let resumed = report_json(&report);
+    let targets = resumed["scan"]["targets"]
+        .as_array()
+        .expect("targets array");
+    assert_eq!(targets.len(), 2, "both targets re-served: {targets:?}");
+    assert_eq!(targets[0]["raw"], URL);
+    assert_eq!(targets[1]["raw"], URL_B);
+    assert!(
+        targets[0]["matched_repositories"].as_u64().unwrap() >= 1,
+        "primary target matched: {targets:?}"
+    );
+    assert!(
+        targets[1]["matched_repositories"].as_u64().unwrap() >= 1,
+        "second target matched: {targets:?}"
+    );
+}
+
+/// RESUME-04: an interrupted `--all` scan resumes as `--all` (exit 0/3)
+/// instead of failing argument validation on the `--all` sentinel.
+#[test]
+fn resume04_all_scan_resume_keeps_all_marker() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state = tmp.path().join("state");
+    let cwd = tmp.path().join("cwd");
+    repo_scan::privacy::private_dir_0700(&cwd).expect("mkdir");
+    let root = tmp.path().join("fixture");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    fixture::normal_clone(&root, "repo-a");
+    fixture::normal_clone(&root, "repo-b");
+    let report = tmp.path().join("rep.json");
+    let report_s = report.to_str().expect("utf8").to_string();
+    let root_s = root.to_str().expect("utf8").to_string();
+
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root_s.as_str(),
+            "--report",
+            report_s.as_str(),
+        ],
+        &cwd,
+        &state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let scan_id = stdout_line(&out, "scan_id");
+    mark_interrupted(&state, &scan_id, std::slice::from_ref(&root));
+
+    // Remove the first report: the assertions below must read the resumed
+    // run's publication, never a stale file.
+    std::fs::remove_file(&report).expect("remove first report");
+    let out = run(&["resume", scan_id.as_str()], &cwd, &state);
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "resume exits 0/3 (never argument refusal on the --all sentinel): {}",
+        stderr_text(&out)
+    );
+    let resumed = report_json(&report);
+    assert_eq!(resumed["scan"]["target_url"], "--all");
+    assert!(resumed["scan"]["canonical_url"].is_null());
+    assert_eq!(
+        resumed["scan"]["targets"]
+            .as_array()
+            .expect("targets array")
+            .len(),
+        0,
+        "--all stays target-free"
+    );
+}
+
+/// RESUME-05: the json/jsonl lanes are refused loudly on resume — both via
+/// an explicit `resume --format` override and via the format saved in the
+/// scan request row.
+#[test]
+fn resume05_format_lanes_refuse_loudly_on_resume() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state = tmp.path().join("state");
+    let cwd = tmp.path().join("cwd");
+    repo_scan::privacy::private_dir_0700(&cwd).expect("mkdir");
+    let root = tmp.path().join("fixture");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    fixture::normal_clone(&root, "repo");
+    let report = tmp.path().join("rep.json");
+    let report_s = report.to_str().expect("utf8").to_string();
+    let root_s = root.to_str().expect("utf8").to_string();
+
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            root_s.as_str(),
+            "--report",
+            report_s.as_str(),
+        ],
+        &cwd,
+        &state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let scan_id = stdout_line(&out, "scan_id");
+
+    // Explicit override on the resume command line.
+    let out = run(
+        &["resume", scan_id.as_str(), "--format", "json"],
+        &cwd,
+        &state,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "loud refusal, not silent human lane: {}",
+        stderr_text(&out)
+    );
+    assert!(
+        stderr_text(&out).contains("not yet implemented"),
+        "stderr: {}",
+        stderr_text(&out)
+    );
+
+    // Saved row format (legacy/foreign row carrying `jsonl`): no CLI flag
+    // needed for the same refusal.
+    let rt = runtime();
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        store
+            .connection()
+            .execute(
+                "UPDATE scan_requests SET format = 'jsonl' WHERE id = ?1",
+                vec![turso::Value::Text(scan_id.clone())],
+            )
+            .await
+            .expect("pin saved format");
+        store.close().await.expect("close");
+    });
+    let out = run(&["resume", scan_id.as_str()], &cwd, &state);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "saved jsonl format refuses loudly: {}",
+        stderr_text(&out)
+    );
+    assert!(
+        stderr_text(&out).contains("not yet implemented"),
+        "stderr: {}",
+        stderr_text(&out)
+    );
 }

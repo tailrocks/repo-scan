@@ -22,11 +22,12 @@ use repo_scan::report::builder::{
     validate_bound_staged_report_id_capped, AliasInput, ArtifactInput, CandidateInput,
     ReportInputs as LibReportInputs, ReportPipeline, RootInput, StorageLinkInput,
 };
+use repo_scan::scan_events::{is_terminal_event, Cursor, Envelope, EventType, Op};
 use repo_scan::scheduler::{backoff_for_attempt, Admission, CircuitBreaker, OpClass};
 use repo_scan::store::{
-    self, CheckpointCoordinator, CheckpointPolicy, ClaimedTask, NewCheckout, NewGitInstance,
-    NewRef, NewRemote, NewScan, NewStatus, NewTask, NewVolume, OwnerGuard, Store, TaskOutcome,
-    TursoStore, WriterBatch,
+    self, CheckpointCoordinator, CheckpointPolicy, ClaimedTask, CompletionDelta, NewCheckout,
+    NewGitInstance, NewRef, NewRemote, NewScan, NewScanEvent, NewStatus, NewTask, NewVolume,
+    OwnerGuard, ScanEventRow, Store, TaskOutcome, TursoStore, WriterBatch,
 };
 use repo_scan::telemetry::{live_helper_rss_bytes, FootprintSampler, SamplerInputs};
 use repo_scan::walk::roots::{plan_machine_roots, PlannedRoot, RootPriority};
@@ -36,6 +37,7 @@ use repo_scan::walk::topology::{
 };
 use repo_scan::walk::{ChildKind, ListOptions, WalkItem};
 use std::collections::{HashMap, HashSet};
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -115,6 +117,18 @@ const QUERY_MAX_GENERATIONS: usize = 1_024;
 const QUERY_MAX_MATCHES: usize = 10_000;
 /// Wall-clock budget for one cached query.
 const QUERY_DEADLINE_SECS: u64 = 60;
+/// Journal rows per replay page for `query --scan` (D4): bounded reads,
+/// oldest first; a short page means the reader caught up to the tip.
+const REPLAY_PAGE_ROWS: u64 = 500;
+/// Poll interval for `query --scan --follow` while the scan is still
+/// running and no terminal event is journaled yet.
+const FOLLOW_POLL: Duration = Duration::from_millis(250);
+/// Polls a `--follow` replay grants a terminal scan row for its terminal
+/// journal event to commit: the writer persists the row state and the
+/// terminal event as two transactions (row first), so a terminal row can
+/// beat its event by a commit. A writer that crashed between the two never
+/// emits it, so the grace is bounded rather than an infinite wait.
+const FOLLOW_TERMINAL_GRACE_POLLS: u32 = 4;
 /// Rows per catalog page for bounded report-derivation scans
 /// (RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1): errors, instances, and
 /// reclassification reads never hold more than one page from the database
@@ -413,6 +427,29 @@ fn status_mode_from_str(text: &str) -> Option<StatusMode> {
     }
 }
 
+/// Inverse of [`repo_scan::cli::OutputFormat::name`] for persisted rows.
+fn output_format_from_str(text: &str) -> Option<repo_scan::cli::OutputFormat> {
+    use repo_scan::cli::OutputFormat;
+    match text {
+        "human" => Some(OutputFormat::Human),
+        "json" => Some(OutputFormat::Json),
+        "jsonl" => Some(OutputFormat::Jsonl),
+        _ => None,
+    }
+}
+
+/// The `json`/`jsonl` lanes are pre-staged in the CLI (goal Step 6) and
+/// wired only for `query --scan`; refuse loudly instead of silently
+/// ignoring the flag (mirrors the `query --scan` stub).
+fn refuse_unwired_format(command: &str, format: repo_scan::cli::OutputFormat) -> ExitCode {
+    eprintln!(
+        "repo-scan: not yet implemented: {command} --format {} executes in the live-outputs \
+         slice; omit --format (or use `--format human`) for now",
+        format.name()
+    );
+    ExitCode::OperationalFailure
+}
+
 fn disposition_str(d: identity::MatchDisposition) -> &'static str {
     match d {
         identity::MatchDisposition::Confirmed => "confirmed",
@@ -423,20 +460,85 @@ fn disposition_str(d: identity::MatchDisposition) -> &'static str {
     }
 }
 
+/// True for evidence lines that carry a match verdict (single-target and
+/// multi-target phrasings). Reclassification strips these before appending
+/// fresh verdicts so repeated runs — including target-set changes between
+/// runs — never accumulate stale lines. Probe-structural lines
+/// (`matching-policy:`, `config files consulted:`, ...) never match.
+fn is_match_verdict_line(line: &str) -> bool {
+    line.starts_with("Effective ")
+        || line.starts_with("No effective remotes")
+        || line.starts_with("reclassified for ")
+        || line.starts_with("for target ")
+}
+
+/// Best disposition across per-target verdicts (goal Step 6 union matching):
+/// any `confirmed` wins, then `related`, then `probable`, then
+/// `unresolvable_identity`, else `nonmatch`. Empty input yields `nonmatch`.
+fn best_disposition(
+    ranks: &[repo_scan::identity::MatchDisposition],
+) -> repo_scan::identity::MatchDisposition {
+    use repo_scan::identity::MatchDisposition as D;
+    let has = |d: D| ranks.contains(&d);
+    if has(D::Confirmed) {
+        D::Confirmed
+    } else if has(D::Related) {
+        D::Related
+    } else if has(D::Probable) {
+        D::Probable
+    } else if has(D::UnresolvableIdentity) {
+        D::UnresolvableIdentity
+    } else {
+        D::Nonmatch
+    }
+}
+
+/// True when stored instance `id` IS the local-target repository named by a
+/// `file://` canonical: same path-identity rule as the single-target
+/// reclassify/probe paths (common dir, git dir, or their parents).
+async fn instance_matches_local_target(
+    store: &TursoStore,
+    id: &str,
+    canonical: &str,
+) -> repo_scan::Result<bool> {
+    let target_path_str = canonical.strip_prefix("file://").unwrap_or(canonical);
+    let t_canon =
+        std::fs::canonicalize(target_path_str).unwrap_or_else(|_| PathBuf::from(target_path_str));
+    let Ok(Some(inst)) = store.get_git_instance(id).await else {
+        return Ok(false);
+    };
+    let gp = config::path_from_bytes(inst.git_path);
+    let cp = config::path_from_bytes(inst.common_path);
+    let gp_canon = std::fs::canonicalize(&gp).ok();
+    let cp_canon = std::fs::canonicalize(&cp).ok();
+    Ok(gp_canon == Some(t_canon.clone())
+        || cp_canon == Some(t_canon.clone())
+        || gp_canon
+            .as_ref()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            == Some(t_canon.clone())
+        || cp_canon
+            .as_ref()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            == Some(t_canon.clone()))
+}
+
 /// Reclassify every stored instance against THIS scan's canonical target
 /// from stored remotes (R1): dispositions are per (instance, target) at
 /// report time, so scanning URL-B after URL-A never leaks URL-A's matches
 /// into URL-B's report (or vice versa). Probe-structural evidence is kept;
 /// stale match verdicts are replaced by fresh ones. Only disposition +
-/// evidence are rewritten — observation times are untouched.
+/// evidence are rewritten — observation times are untouched. Returns the
+/// number of `confirmed` instances (for `scan.targets[].matched_repositories`).
 async fn reclassify_for_target(
     store: &TursoStore,
     canonical: &str,
     counters: &mut RunCounters,
-) -> repo_scan::Result<()> {
+) -> repo_scan::Result<u64> {
     // RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1: chunked pages, one
     // in flight at a time; per-row work is unchanged.
     let mut offset: i64 = 0;
+    let mut confirmed = 0u64;
     loop {
         let sql = format!(
             "SELECT id, evidence FROM git_instances ORDER BY id ASC \
@@ -503,12 +605,11 @@ async fn reclassify_for_target(
             } else {
                 identity::classify_remotes(canonical, borrowed)
             };
+            if disposition == identity::MatchDisposition::Confirmed {
+                confirmed += 1;
+            }
             let mut evidence: Vec<String> = serde_json::from_str(evidence_json).unwrap_or_default();
-            evidence.retain(|line| {
-                !(line.starts_with("Effective ")
-                    || line.starts_with("No effective remotes")
-                    || line.starts_with("reclassified for target "))
-            });
+            evidence.retain(|line| !is_match_verdict_line(line));
             evidence.push(format!(
                 "reclassified for target {canonical} at report time"
             ));
@@ -535,17 +636,514 @@ async fn reclassify_for_target(
             break;
         }
     }
-    Ok(())
+    Ok(confirmed)
+}
+
+/// Reclassify every stored instance against a SET of canonical targets
+/// (goal Step 6 union matching: one filesystem pass serves all targets) or
+/// `--all` (empty `canonicals`: every discovered instance is in scope and
+/// `confirmed`). Same paging shape as [`reclassify_for_target`]; local
+/// `file://` canonicals keep the path-identity rule. Per-target evidence is
+/// prefixed `for target {canonical}: ...` for attribution. Returns
+/// per-target `confirmed` counts aligned with `canonicals` (empty for
+/// `--all`).
+async fn reclassify_for_targets(
+    store: &TursoStore,
+    canonicals: &[String],
+    counters: &mut RunCounters,
+) -> repo_scan::Result<Vec<u64>> {
+    let mut matched = vec![0u64; canonicals.len()];
+    let mut offset: i64 = 0;
+    loop {
+        let sql = format!(
+            "SELECT id, evidence FROM git_instances ORDER BY id ASC \
+             LIMIT {LOAD_CHUNK_ROWS} OFFSET {offset}"
+        );
+        let mut rows = store
+            .connection()
+            .query(sql.as_str(), ())
+            .await
+            .map_err(store_err)?;
+        let mut page: Vec<(String, String)> = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            page.push((cell_text(&row, 0)?, cell_text(&row, 1)?));
+            if page.len() as i64 >= LOAD_CHUNK_ROWS {
+                break;
+            }
+        }
+        if page.is_empty() {
+            break;
+        }
+        let full_page = page.len() as i64 >= LOAD_CHUNK_ROWS;
+        for (id, evidence_json) in &page {
+            let remotes = store.list_remotes(id).await?;
+            let pairs: Vec<(String, String)> = remotes
+                .iter()
+                .map(|r| (String::from_utf8_lossy(&r.url).into_owned(), r.role.clone()))
+                .collect();
+            let borrowed: Vec<(&str, &str)> = pairs
+                .iter()
+                .map(|(url, role)| (url.as_str(), role.as_str()))
+                .collect();
+            let (disposition, mut fresh) = if canonicals.is_empty() {
+                (
+                    identity::MatchDisposition::Confirmed,
+                    vec![String::from(
+                        "matched by --all: no target filter; every discovered instance is in scope",
+                    )],
+                )
+            } else {
+                let mut ranks = Vec::with_capacity(canonicals.len());
+                let mut lines = Vec::new();
+                for (i, canonical) in canonicals.iter().enumerate() {
+                    if identity::is_local_target(canonical)
+                        && instance_matches_local_target(store, id, canonical).await?
+                    {
+                        ranks.push(identity::MatchDisposition::Confirmed);
+                        matched[i] += 1;
+                        lines.push(format!(
+                            "for target {canonical}: repository matches local target repository"
+                        ));
+                        continue;
+                    }
+                    let (verdict, verdict_lines) =
+                        identity::classify_remotes(canonical, borrowed.iter().copied());
+                    if verdict == identity::MatchDisposition::Confirmed {
+                        matched[i] += 1;
+                    }
+                    for line in verdict_lines {
+                        lines.push(format!("for target {canonical}: {line}"));
+                    }
+                    ranks.push(verdict);
+                }
+                (best_disposition(&ranks), lines)
+            };
+            let mut evidence: Vec<String> = serde_json::from_str(evidence_json).unwrap_or_default();
+            evidence.retain(|line| !is_match_verdict_line(line));
+            if canonicals.is_empty() {
+                evidence.push(String::from("reclassified for --all at report time"));
+            } else {
+                for canonical in canonicals {
+                    evidence.push(format!(
+                        "reclassified for target {canonical} at report time"
+                    ));
+                }
+            }
+            evidence.append(&mut fresh);
+            let evidence_json = serde_json::to_string(&evidence)
+                .map_err(|e| repo_scan::Error::Report(e.to_string()))?;
+            store
+                .connection()
+                .execute(
+                    "UPDATE git_instances SET disposition = ?1, evidence = ?2 WHERE id = ?3",
+                    vec![
+                        turso::Value::Text(disposition_str(disposition).to_string()),
+                        turso::Value::Text(evidence_json),
+                        turso::Value::Text(id.clone()),
+                    ],
+                )
+                .await
+                .map_err(store_err)?;
+            counters.db_transactions += 1;
+        }
+        if full_page {
+            offset += page.len() as i64;
+        } else {
+            break;
+        }
+    }
+    Ok(matched)
 }
 
 // ---------------------------------------------------------------------------
 // Scan
 // ---------------------------------------------------------------------------
 
+/// Scan-scoped event journal writer (D4): assigns contiguous 1-based
+/// `seq`s (`seq` 0 is the "before everything" cursor), tracks the
+/// per-revision event offset, and dedupes found events per store/checkout
+/// id so re-probes and resume re-runs never double-emit. `open` replays
+/// the committed prefix to resume numbering AND the emitted sets: a task
+/// whose flush committed but whose completion was lost re-persists its
+/// rows idempotently while its found events stay single.
+struct ScanJournal {
+    scan_id: String,
+    next_seq: u64,
+    /// This run's catalog revision: `next_revision` runs once per scan,
+    /// so every event this writer journals shares one `rev`.
+    rev: u64,
+    last_rev: Option<u64>,
+    last_off: u64,
+    last_seq: Option<u64>,
+    emitted_stores: HashSet<String>,
+    emitted_checkouts: HashSet<String>,
+    emitted_branch_stores: HashSet<String>,
+}
+
+impl ScanJournal {
+    async fn open(store: &TursoStore, scan_id: &str, rev: u64) -> repo_scan::Result<Self> {
+        let mut max_seq = 0u64;
+        let mut last_rev = None;
+        let mut last_off = 0u64;
+        let mut emitted_stores = HashSet::new();
+        let mut emitted_checkouts = HashSet::new();
+        let mut emitted_branch_stores = HashSet::new();
+        loop {
+            let rows = store.read_scan_events(scan_id, max_seq, 500).await?;
+            let short = rows.len() < 500;
+            for row in &rows {
+                max_seq = row.seq;
+                last_rev = Some(row.catalog_rev);
+                last_off = row.event_offset;
+                let id_key = match row.event_type.as_str() {
+                    "repository_found" => Some((&mut emitted_stores, "store_id")),
+                    "location_found" => Some((&mut emitted_checkouts, "checkout_id")),
+                    "branch_batch" => Some((&mut emitted_branch_stores, "store_id")),
+                    _ => None,
+                };
+                if let Some((set, key)) = id_key {
+                    let v: serde_json::Value =
+                        serde_json::from_slice(&row.records).map_err(|e| {
+                            repo_scan::Error::Report(format!(
+                                "scan_events row seq {} carries corrupt records: {e}",
+                                row.seq,
+                            ))
+                        })?;
+                    if let Some(id) = v.get(key).and_then(|v| v.as_str()) {
+                        set.insert(id.to_string());
+                    }
+                }
+            }
+            if short {
+                break;
+            }
+        }
+        Ok(Self {
+            scan_id: scan_id.to_string(),
+            next_seq: max_seq + 1,
+            rev,
+            last_rev,
+            last_off,
+            last_seq: if max_seq == 0 { None } else { Some(max_seq) },
+            emitted_stores,
+            emitted_checkouts,
+            emitted_branch_stores,
+        })
+    }
+
+    /// Cursor of the last committed event, for `scan_interrupted` /
+    /// `scan_failed` payloads (`None` when nothing is journaled yet).
+    fn cursor(&self) -> Option<Cursor> {
+        match (self.last_seq, self.last_rev) {
+            (Some(seq), Some(rev)) => Some(Cursor {
+                seq,
+                catalog_rev: rev,
+                event_offset: self.last_off,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Assign the next `(seq, offset)` pair against this run's rev. The
+    /// offset restarts at 0 when the rev changes (a resumed run journals
+    /// under a fresh revision).
+    fn assign(&mut self) -> (u64, u64) {
+        let off = if self.last_rev == Some(self.rev) {
+            self.last_off + 1
+        } else {
+            0
+        };
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.last_rev = Some(self.rev);
+        self.last_off = off;
+        self.last_seq = Some(seq);
+        (seq, off)
+    }
+
+    /// Journal one lifecycle event. Each call is its own transaction
+    /// (lifecycle events are rare); per-record events buffer into the
+    /// writer batch below instead.
+    async fn emit(
+        &mut self,
+        store: &TursoStore,
+        event_type: EventType,
+        records: &serde_json::Value,
+    ) -> repo_scan::Result<()> {
+        let (seq, off) = self.assign();
+        let bytes =
+            serde_json::to_vec(records).map_err(|e| repo_scan::Error::Report(e.to_string()))?;
+        let event = NewScanEvent {
+            scan_id: &self.scan_id,
+            seq,
+            catalog_rev: self.rev,
+            event_offset: off,
+            event_type: event_type.name(),
+            op: event_type.op().name(),
+            reset: false,
+            records: &bytes,
+        };
+        store.append_scan_event(&event).await?;
+        Ok(())
+    }
+
+    /// Buffer one `repository_found` into the writer batch: it commits
+    /// atomically with the store row that caused it. Returns `None` when
+    /// this store already has a found event in this scan's journal
+    /// (re-probe or resume re-run); otherwise `Some(should_flush)`.
+    fn buffer_repository_found(
+        &mut self,
+        batch: &mut WriterBatch,
+        store_id: &str,
+        records: &[u8],
+    ) -> repo_scan::Result<Option<bool>> {
+        if !self.emitted_stores.insert(store_id.to_string()) {
+            return Ok(None);
+        }
+        let (seq, off) = self.assign();
+        let event = NewScanEvent {
+            scan_id: &self.scan_id,
+            seq,
+            catalog_rev: self.rev,
+            event_offset: off,
+            event_type: EventType::RepositoryFound.name(),
+            op: EventType::RepositoryFound.op().name(),
+            reset: false,
+            records,
+        };
+        Ok(Some(TursoStore::buffer_scan_event(batch, &event)?))
+    }
+
+    /// Buffer one `location_found` into the writer batch (same atomicity
+    /// and dedupe contract as [`Self::buffer_repository_found`]).
+    fn buffer_location_found(
+        &mut self,
+        batch: &mut WriterBatch,
+        checkout_id: &str,
+        records: &[u8],
+    ) -> repo_scan::Result<Option<bool>> {
+        if !self.emitted_checkouts.insert(checkout_id.to_string()) {
+            return Ok(None);
+        }
+        let (seq, off) = self.assign();
+        let event = NewScanEvent {
+            scan_id: &self.scan_id,
+            seq,
+            catalog_rev: self.rev,
+            event_offset: off,
+            event_type: EventType::LocationFound.name(),
+            op: EventType::LocationFound.op().name(),
+            reset: false,
+            records,
+        };
+        Ok(Some(TursoStore::buffer_scan_event(batch, &event)?))
+    }
+
+    /// Buffer one `location_updated` into the writer batch: it commits
+    /// atomically with the status row that caused it. Unlike the found
+    /// events there is no emitted-set dedupe — `replace` replays
+    /// idempotently, so a retried status task re-emitting identical
+    /// content converges to the same end state. Always `Some(should_flush)`.
+    fn buffer_location_updated(
+        &mut self,
+        batch: &mut WriterBatch,
+        records: &[u8],
+    ) -> repo_scan::Result<Option<bool>> {
+        let (seq, off) = self.assign();
+        let event = NewScanEvent {
+            scan_id: &self.scan_id,
+            seq,
+            catalog_rev: self.rev,
+            event_offset: off,
+            event_type: EventType::LocationUpdated.name(),
+            op: EventType::LocationUpdated.op().name(),
+            reset: false,
+            records,
+        };
+        Ok(Some(TursoStore::buffer_scan_event(batch, &event)?))
+    }
+
+    /// Buffer one `error` into the writer batch: it commits atomically
+    /// with the error row that caused it. No dedupe — errors are
+    /// point-in-time observations (`add`), bounded by the same retry caps
+    /// that bound the rows. Always `Some(should_flush)`.
+    fn buffer_error(
+        &mut self,
+        batch: &mut WriterBatch,
+        records: &[u8],
+    ) -> repo_scan::Result<Option<bool>> {
+        let (seq, off) = self.assign();
+        let event = NewScanEvent {
+            scan_id: &self.scan_id,
+            seq,
+            catalog_rev: self.rev,
+            event_offset: off,
+            event_type: EventType::Error.name(),
+            op: EventType::Error.op().name(),
+            reset: false,
+            records,
+        };
+        Ok(Some(TursoStore::buffer_scan_event(batch, &event)?))
+    }
+
+    /// Buffer one `coverage_updated` into the writer batch: it commits
+    /// atomically with the gap rows it describes. No dedupe — each call
+    /// carries a genuine transition (callers gate on `Runner::open_gaps`),
+    /// and `replace` replays in seq order. Always `Some(should_flush)`.
+    fn buffer_coverage_updated(
+        &mut self,
+        batch: &mut WriterBatch,
+        records: &[u8],
+    ) -> repo_scan::Result<Option<bool>> {
+        let (seq, off) = self.assign();
+        let event = NewScanEvent {
+            scan_id: &self.scan_id,
+            seq,
+            catalog_rev: self.rev,
+            event_offset: off,
+            event_type: EventType::CoverageUpdated.name(),
+            op: EventType::CoverageUpdated.op().name(),
+            reset: false,
+            records,
+        };
+        Ok(Some(TursoStore::buffer_scan_event(batch, &event)?))
+    }
+
+    /// Buffer one `branch_batch` into the writer batch: it commits
+    /// atomically with the ref rows it describes. First batch per store is
+    /// `add`; a re-persisted store (retry, resume re-run) resends as
+    /// `replace` (D4 `add/replace` cell), ordered by the payload `rev`.
+    /// Always `Some(should_flush)`.
+    fn buffer_branch_batch(
+        &mut self,
+        batch: &mut WriterBatch,
+        store_id: &str,
+        records: &[u8],
+    ) -> repo_scan::Result<Option<bool>> {
+        let first = self.emitted_branch_stores.insert(store_id.to_string());
+        let op = if first { Op::Add } else { Op::Replace };
+        let (seq, off) = self.assign();
+        let event = NewScanEvent {
+            scan_id: &self.scan_id,
+            seq,
+            catalog_rev: self.rev,
+            event_offset: off,
+            event_type: EventType::BranchBatch.name(),
+            op: op.name(),
+            reset: false,
+            records,
+        };
+        Ok(Some(TursoStore::buffer_scan_event(batch, &event)?))
+    }
+}
+
+/// Resume command recorded in lifecycle payloads (D4): replays the exact
+/// state dir + scan id a follower needs to reconnect.
+fn resume_cmd_for(state_dir: &Path, scan_id: &str) -> String {
+    format!(
+        "repo-scan --state-dir {} resume {scan_id}",
+        state_dir.display()
+    )
+}
+
+/// `scan_failed` payload (Step 12): last committed cursor, scrubbed error,
+/// resume capability + command. The staged snapshot survives a publication
+/// failure, so `resumable` is always true here.
+fn failed_records(
+    journal: &ScanJournal,
+    err: &str,
+    state_dir: &Path,
+    scan_id: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "cursor": journal.cursor().map(|c| serde_json::json!({
+            "after": c.encode(),
+            "seq": c.seq,
+            "catalog_rev": c.catalog_rev,
+            "event_offset": c.event_offset,
+        })).unwrap_or(serde_json::Value::Null),
+        "error": err,
+        "resumable": true,
+        "resume_cmd": resume_cmd_for(state_dir, scan_id),
+    })
+}
+
 async fn run_scan(cfg: &config::Config, args: &repo_scan::cli::ScanArgs) -> ExitCode {
+    // Goal Step 6: explicit targets XOR --all, validated once; execution
+    // resolves the full set and serves it with one filesystem pass.
+    if let Err(msg) = args.target_set() {
+        return fail(&repo_scan::Error::InvalidArgs(msg));
+    }
     match run_scan_inner(cfg, args, None).await {
         Ok(code) => code,
         Err(e) => fail(&e),
+    }
+}
+
+/// Scan target set resolved once per request (goal Step 6): explicit
+/// `(sanitized raw, canonical)` pairs in request order, or `--all` (no
+/// target filter). Kept separate from inventory collection: one filesystem
+/// pass serves the whole set.
+struct ResolvedTargets {
+    targets: Vec<(String, String)>,
+    all: bool,
+}
+
+impl ResolvedTargets {
+    /// Primary target (legacy single-target fields use this); `None` for `--all`.
+    fn primary(&self) -> Option<(&str, &str)> {
+        if self.all {
+            return None;
+        }
+        self.targets
+            .first()
+            .map(|(raw, canonical)| (raw.as_str(), canonical.as_str()))
+    }
+
+    /// Canonical forms in request order (empty for `--all`).
+    fn canonicals(&self) -> Vec<String> {
+        self.targets
+            .iter()
+            .map(|(_, canonical)| canonical.clone())
+            .collect()
+    }
+
+    /// True when union matching applies (multi-target or `--all`).
+    /// Exactly one explicit target keeps the legacy single-target path.
+    fn is_set(&self) -> bool {
+        self.all || self.targets.len() > 1
+    }
+}
+
+/// Validate and normalize the scan target set once per request (goal Step
+/// 6). Credential-bearing inputs are rejected before any persistence; every
+/// target resolves to canonical form; `--all` stays target-free.
+fn resolve_scan_targets(args: &repo_scan::cli::ScanArgs) -> repo_scan::Result<ResolvedTargets> {
+    match args.target_set() {
+        Ok(repo_scan::cli::TargetSet::All) => Ok(ResolvedTargets {
+            targets: Vec::new(),
+            all: true,
+        }),
+        Ok(repo_scan::cli::TargetSet::Targets(list)) => {
+            let mut targets = Vec::with_capacity(list.len());
+            for raw in &list {
+                // CLI boundary (RSF-SEC-TARGET-URL, EXACT-2): per target,
+                // before any persistence or reporting; the error echoes
+                // only the display-safe shape, never secret bytes.
+                if identity::must_reject_target(raw) {
+                    return Err(repo_scan::Error::InvalidArgs(format!(
+                        "target URL must not embed credentials or a query/fragment tail; remove them and retry: {}",
+                        identity::redact_target_for_display(raw),
+                    )));
+                }
+                targets.push(resolve_target_identity(raw)?);
+            }
+            Ok(ResolvedTargets {
+                targets,
+                all: false,
+            })
+        }
+        Err(msg) => Err(repo_scan::Error::InvalidArgs(msg)),
     }
 }
 
@@ -557,17 +1155,40 @@ async fn run_scan_inner(
     args: &repo_scan::cli::ScanArgs,
     resumed: Option<ResumedRequest>,
 ) -> repo_scan::Result<ExitCode> {
+    // The json/jsonl lanes are accepted by the CLI but not wired for
+    // scan/resume yet; refuse before any state mutation rather than
+    // silently running the human lane (the live-outputs slice wires
+    // them). Resume threads the saved request's format into `args` first.
+    if let Some(format) = args.format {
+        if format != repo_scan::cli::OutputFormat::Human {
+            return Ok(refuse_unwired_format("scan", format));
+        }
+    }
+    // --fetch is pre-staged for the fetch-phase slice: today no fetch
+    // phase runs, so accepting it would report stale remote state as
+    // current. Refuse loudly instead (same contract as the format lanes).
+    if args.fetch {
+        eprintln!(
+            "repo-scan: not yet implemented: scan --fetch executes in the fetch-phase \
+             slice; omit --fetch for now"
+        );
+        return Ok(ExitCode::OperationalFailure);
+    }
     // CLI boundary (RSF-SEC-TARGET-URL, EXACT-2): credential-bearing
     // targets (userinfo, any query/fragment tail) are rejected before any
     // persistence or reporting; the error echoes only the display-safe
     // shape, never secret bytes.
-    if identity::must_reject_target(&args.url) {
-        return Err(repo_scan::Error::InvalidArgs(format!(
-            "target URL must not embed credentials or a query/fragment tail; remove them and retry: {}",
-            identity::redact_target_for_display(&args.url),
-        )));
-    }
-    let (target, canonical) = resolve_target_identity(&args.url)?;
+    let resolved = resolve_scan_targets(args)?;
+    // Legacy single-target fields: the primary target, or the `--all`
+    // marker when no target filter applies (report 1.1.0 `scan.targets`
+    // carries the full set; `--all` leaves it empty).
+    let (target, canonical) = match resolved.primary() {
+        Some((raw, canonical)) => (raw.to_string(), Some(canonical.to_string())),
+        None => (String::from("--all"), None),
+    };
+    // Probe-time classification key: primary canonical, or "" for `--all`
+    // (union-only instances are corrected by the post-traversal fix-up).
+    let primary_canonical = canonical.as_deref().unwrap_or("");
     // Absolute report destination at request-creation time (spec §3).
     let report_dest = args
         .report
@@ -621,6 +1242,8 @@ async fn run_scan_inner(
     // fresh one exactly like `--force-rescan`.
     let saved_generation = resumed.as_ref().and_then(|r| r.generation);
     let events_live = events.live && events.degraded.is_empty();
+    // Full scope key (D5): generation reuse requires equal coverage roots.
+    let scope_key = repo_scan::walk::roots::generation_scope_key(&policy, &roots);
     let generation = match saved_generation {
         Some(saved) if store.get_generation(saved).await?.is_some() => {
             store.set_generation_state(saved, "running").await?;
@@ -632,6 +1255,7 @@ async fn run_scan_inner(
             pick_generation(
                 &store,
                 &policy,
+                &scope_key,
                 args.force_rescan,
                 events_live,
                 now,
@@ -650,6 +1274,7 @@ async fn run_scan_inner(
             pick_generation(
                 &store,
                 &policy,
+                &scope_key,
                 force,
                 events_live,
                 now,
@@ -670,10 +1295,13 @@ async fn run_scan_inner(
             mint_scan_id(
                 &store,
                 &target,
-                &canonical,
+                canonical.as_deref(),
                 &policy,
                 args.status,
                 &report_dest,
+                &resolved.targets,
+                args.format,
+                resolved.all,
                 &mut runner.counters,
             )
             .await?
@@ -684,15 +1312,18 @@ async fn run_scan_inner(
         None => now,
     };
     if resumed.is_none() {
-        supersede_stale_scans(
-            &store,
-            &canonical,
-            &policy,
-            &scan_id,
-            now,
-            &mut runner.counters,
-        )
-        .await?;
+        // Per-target supersede (`--all` has no canonical: nothing to match).
+        for supersede_canonical in resolved.canonicals() {
+            supersede_stale_scans(
+                &store,
+                &supersede_canonical,
+                &policy,
+                &scan_id,
+                now,
+                &mut runner.counters,
+            )
+            .await?;
+        }
     }
     // Bind the generation on the running row (R14): the pending outcome
     // carries no terminal verdict (`exit=-1`), only the generation, so an
@@ -714,6 +1345,41 @@ async fn run_scan_inner(
         )
         .await?;
     runner.counters.db_transactions += 1;
+    // Lifecycle journal (D4): opened against this run's revision.
+    // `open` replays the committed prefix, so resumed scans continue
+    // numbering (and found-event dedupe) without repeating `scan_started`.
+    runner.journal = Some(ScanJournal::open(&store, &scan_id, run_rev).await?);
+    // Coverage-delta baseline (also on resume): gaps already open stay
+    // silent until they close; closes of pre-existing rows still report.
+    runner.open_gaps = store.list_open_error_ids().await?.into_iter().collect();
+    if resumed.is_none() {
+        let started = serde_json::json!({
+            "scan_id": &scan_id,
+            "scope": {
+                "policy": &policy,
+                "roots": roots.iter().map(|r| r.path.display().to_string()).collect::<Vec<_>>(),
+                "scope_key": &scope_key,
+            },
+            "targets": resolved.targets.iter().map(|(raw, canonical)| {
+                serde_json::json!({"raw": raw, "canonical": canonical})
+            }).collect::<Vec<_>>(),
+            "options": {
+                "all": resolved.all,
+                "format": args.format.map(repo_scan::cli::OutputFormat::name),
+                "status": format!("{:?}", args.status),
+                "force_rescan": args.force_rescan,
+                "fetch": args.fetch,
+            },
+            "resume_cmd": resume_cmd_for(&cfg.state_dir, &scan_id),
+        });
+        runner
+            .journal
+            .as_mut()
+            .expect("scan journal opened above")
+            .emit(&store, EventType::ScanStarted, &started)
+            .await?;
+        runner.counters.db_transactions += 1;
+    }
     upsert_volumes(&store, &policy, &roots, now, &mut runner.counters).await?;
     // Ingest available event history before traversal (R5).
     let mut drain = ingest_available_events(
@@ -733,7 +1399,11 @@ async fn run_scan_inner(
     seed_root_tasks(&store, &mut runner, generation, &roots, now).await?;
     // Per-target dispositions before traversal and staging (R1): status
     // refresh, probes, and the report all classify this scan's target.
-    reclassify_for_target(&store, &canonical, &mut runner.counters).await?;
+    let mut matched_counts = if resolved.is_set() {
+        reclassify_for_targets(&store, &resolved.canonicals(), &mut runner.counters).await?
+    } else {
+        vec![reclassify_for_target(&store, primary_canonical, &mut runner.counters).await?]
+    };
     enqueue_status_refresh(&store, &mut runner, generation, run_rev, now).await?;
 
     let mut outcome = run_until_boundary(
@@ -742,11 +1412,53 @@ async fn run_scan_inner(
         epoch,
         generation,
         run_rev,
-        &canonical,
+        primary_canonical,
         args.status,
         &scan_id,
     )
     .await?;
+    // Post-traversal recount (goal Step 6): the pre-traversal classify saw an
+    // empty or partial catalog, so per-target `confirmed` counts are
+    // recomputed here against the drained catalog. Set scans reclassify
+    // set-aware — correcting union-only instances — and refresh their status
+    // in this same run and generation (status task IDs are idempotent per
+    // run, so the repeat refresh is safe). Single-target rows are already
+    // primary-classified (pre-traversal reclassify + probe time), so a
+    // count query suffices and no rewrite churn is added.
+    if !outcome.interrupted {
+        if resolved.is_set() {
+            matched_counts =
+                reclassify_for_targets(&store, &resolved.canonicals(), &mut runner.counters)
+                    .await?;
+            enqueue_status_refresh(&store, &mut runner, generation, run_rev, store::now_ms())
+                .await?;
+            let union_next = run_until_boundary(
+                &mut runner,
+                &store,
+                epoch,
+                generation,
+                run_rev,
+                primary_canonical,
+                args.status,
+                &scan_id,
+            )
+            .await?;
+            outcome.interrupted |= union_next.interrupted;
+            outcome.pending = union_next.pending;
+            outcome.open_gaps = union_next.open_gaps;
+            outcome.unresolvable = union_next.unresolvable;
+            outcome.status_pending = union_next.status_pending;
+        } else {
+            matched_counts = vec![
+                count_query(
+                    &store,
+                    "SELECT COUNT(*) FROM git_instances WHERE disposition = 'confirmed'",
+                    Vec::new(),
+                )
+                .await?,
+            ];
+        }
+    }
     if runner.watchdog.tripped > 0 {
         eprintln!(
             "repo-scan: watchdog tripped {} time(s) this run; stalled scopes were contained",
@@ -802,7 +1514,7 @@ async fn run_scan_inner(
             epoch,
             generation,
             run_rev,
-            &canonical,
+            primary_canonical,
             args.status,
             &scan_id,
         )
@@ -843,6 +1555,32 @@ async fn run_scan_inner(
     };
     store.set_generation_state(generation, gen_state).await?;
     runner.counters.db_transactions += 1;
+    // Discovery boundary journal (D3/D4): committed right after the
+    // generation state, before report staging. An interrupted run closes the
+    // boundary as `incomplete` — the inventory is partial, never silent.
+    let ready = serde_json::json!({
+        "verdict": if gen_state == "complete" { "complete" } else { "incomplete" },
+        "generation": generation,
+        "counts": {
+            "matched_per_target": &matched_counts,
+            "pending": outcome.pending,
+            "open_gaps": outcome.open_gaps,
+            "unresolvable": outcome.unresolvable,
+            "status_pending": outcome.status_pending,
+            "event_gaps": event_gaps,
+        },
+        "gaps": {
+            "open": outcome.open_gaps,
+            "event_history": event_gaps,
+        },
+    });
+    runner
+        .journal
+        .as_mut()
+        .expect("scan journal opened above")
+        .emit(&store, EventType::InventoryReady, &ready)
+        .await?;
+    runner.counters.db_transactions += 1;
     let discovery_code = if scan_incomplete { 3 } else { 0 };
     // Stage first, publish second through the tested lib pipeline (R3): a
     // failed publication retains the saved snapshot and can be retried
@@ -864,6 +1602,18 @@ async fn run_scan_inner(
         epoch,
         target_raw: target.clone(),
         canonical: canonical.clone(),
+        targets: resolved
+            .targets
+            .iter()
+            .enumerate()
+            .map(
+                |(i, (raw, canonical))| repo_scan::report::model::ScanTarget {
+                    raw: raw.clone(),
+                    canonical: Some(canonical.clone()),
+                    matched_repositories: matched_counts.get(i).copied().unwrap_or(0),
+                },
+            )
+            .collect(),
         scope_policy: policy.clone(),
         scan_state: gen_state.to_string(),
         status_mode: args.status,
@@ -891,10 +1641,8 @@ async fn run_scan_inner(
             match emit_file_report(&store, &lib_inputs, dest, &cfg.state_dir, finished_ms).await {
                 Ok(_) => true,
                 Err(e) => {
-                    eprintln!(
-                        "repo-scan: report publication failed: {}",
-                        identity::scrub_text(&e.to_string())
-                    );
+                    let err = identity::scrub_text(&e.to_string());
+                    eprintln!("repo-scan: report publication failed: {err}");
                     store
                         .update_scan_state(
                             &scan_id,
@@ -909,6 +1657,18 @@ async fn run_scan_inner(
                             None,
                             store::now_ms(),
                         )
+                        .await?;
+                    let failed = failed_records(
+                        runner.journal.as_ref().expect("scan journal opened above"),
+                        &err,
+                        &cfg.state_dir,
+                        &scan_id,
+                    );
+                    runner
+                        .journal
+                        .as_mut()
+                        .expect("scan journal opened above")
+                        .emit(&store, EventType::ScanFailed, &failed)
                         .await?;
                     let _ = store.close().await;
                     println!("scan_id: {scan_id}");
@@ -933,10 +1693,8 @@ async fn run_scan_inner(
             {
                 Ok(_) => true,
                 Err(e) => {
-                    eprintln!(
-                        "repo-scan: terminal report failed: {}",
-                        identity::scrub_text(&e.to_string())
-                    );
+                    let err = identity::scrub_text(&e.to_string());
+                    eprintln!("repo-scan: terminal report failed: {err}");
                     store
                         .update_scan_state(
                             &scan_id,
@@ -951,6 +1709,18 @@ async fn run_scan_inner(
                             None,
                             store::now_ms(),
                         )
+                        .await?;
+                    let failed = failed_records(
+                        runner.journal.as_ref().expect("scan journal opened above"),
+                        &err,
+                        &cfg.state_dir,
+                        &scan_id,
+                    );
+                    runner
+                        .journal
+                        .as_mut()
+                        .expect("scan journal opened above")
+                        .emit(&store, EventType::ScanFailed, &failed)
                         .await?;
                     let _ = store.close().await;
                     println!("scan_id: {scan_id}");
@@ -1013,6 +1783,66 @@ async fn run_scan_inner(
             .await?;
         ExitCode::Success
     };
+    // Terminal journal (D4): same predicates as the verdict above, so the
+    // journaled class can never disagree with the scan row. Completed and
+    // incomplete scans carry final counts + resume command; interrupted
+    // scans carry the scan id, cursor, and saved scope/options.
+    let (terminal, terminal_records) = if outcome.interrupted {
+        (
+            EventType::ScanInterrupted,
+            serde_json::json!({
+                "scan_id": &scan_id,
+                "cursor": runner
+                    .journal
+                    .as_ref()
+                    .expect("scan journal opened above")
+                    .cursor()
+                    .map(|c| c.encode()),
+                "generation": generation,
+                "scope": {
+                    "policy": &policy,
+                    "roots": roots.iter().map(|r| r.path.display().to_string()).collect::<Vec<_>>(),
+                    "scope_key": &scope_key,
+                },
+                "options": {
+                    "all": resolved.all,
+                    "format": args.format.map(repo_scan::cli::OutputFormat::name),
+                    "status": format!("{:?}", args.status),
+                    "force_rescan": args.force_rescan,
+                    "fetch": args.fetch,
+                },
+                "resume_cmd": resume_cmd_for(&cfg.state_dir, &scan_id),
+            }),
+        )
+    } else {
+        (
+            if scan_incomplete {
+                EventType::ScanIncomplete
+            } else {
+                EventType::ScanCompleted
+            },
+            serde_json::json!({
+                "counts": {
+                    "matched_per_target": &matched_counts,
+                    "pending": outcome.pending,
+                    "open_gaps": outcome.open_gaps,
+                    "unresolvable": outcome.unresolvable,
+                    "status_pending": outcome.status_pending,
+                    "event_gaps": event_gaps,
+                },
+                "generation": generation,
+                "report_id": &report_id,
+                "published": published,
+                "resume_cmd": resume_cmd_for(&cfg.state_dir, &scan_id),
+            }),
+        )
+    };
+    runner
+        .journal
+        .as_mut()
+        .expect("scan journal opened above")
+        .emit(&store, terminal, &terminal_records)
+        .await?;
     let _ = store.close().await;
     println!("scan_id: {scan_id}");
     println!("generation: {generation}");
@@ -1098,11 +1928,11 @@ fn resolve_target_identity(input: &str) -> repo_scan::Result<(String, String)> {
     }
 
     let target = identity::sanitize_target_url(input);
-    let canonical = match identity::normalize_github_url(&target) {
+    let canonical = match identity::normalize_target_input(&target) {
         Some(canonical) => canonical,
         None => {
             return Err(repo_scan::Error::InvalidArgs(format!(
-                "target URL is not a supported GitHub shape: {}",
+                "target is not a supported GitHub shape (owner/name or URL): {}",
                 identity::redact_target_for_display(input),
             )));
         }
@@ -1148,16 +1978,21 @@ fn plan_roots(
     }
 }
 
-/// Pick the traversal generation: a fresh one on `--force-rescan`, else the
-/// newest generation of this scope policy still holding actionable work
-/// (compatible unfinished discovery is resumed and shared), else the newest
-/// generation if live events are active (valid catalog information is reused
-/// and reconciled via events), else a fresh generation (when live events are
-/// unsupported or degraded, minting a new generation ensures directory
-/// enumeration tasks run and newly added repositories are discovered).
+/// Pick the traversal generation, reusing only key-compatible coverage
+/// (goal Step 9, contract D5): a fresh one on `--force-rescan`, else the
+/// newest generation whose scope key matches this request still holding
+/// actionable work (compatible unfinished discovery is resumed and shared),
+/// else the newest key-matching generation if live events are active, else
+/// a fresh generation (when live events are unsupported or degraded,
+/// minting a new generation ensures directory enumeration tasks run and
+/// newly added repositories are discovered). Legacy rows (`NULL` scope key)
+/// carry unknown root sets and never satisfy a keyed request; the lineage
+/// `prior` stays the newest same-policy row. Fresh generations record the
+/// requesting key before any seeding.
 async fn pick_generation(
     store: &TursoStore,
     policy: &str,
+    scope_key: &str,
     force: bool,
     events_live: bool,
     now_ms: i64,
@@ -1166,18 +2001,25 @@ async fn pick_generation(
     let mut rows = store
         .connection()
         .query(
-            "SELECT id, state FROM generations WHERE scope_policy = ?1 ORDER BY id DESC",
+            "SELECT id, state, scope_key FROM generations WHERE scope_policy = ?1 ORDER BY id DESC",
             vec![turso::Value::Text(policy.to_string())],
         )
         .await
         .map_err(|e| repo_scan::Error::Store(e.to_string()))?;
     let mut generations = Vec::new();
+    let mut newest_same_policy = None;
     while let Some(row) = rows
         .next()
         .await
         .map_err(|e| repo_scan::Error::Store(e.to_string()))?
     {
-        generations.push((cell_int(&row, 0)? as u64, cell_text(&row, 1)?));
+        let id = cell_int(&row, 0)? as u64;
+        if newest_same_policy.is_none() {
+            newest_same_policy = Some(id);
+        }
+        if cell_opt_text(&row, 2)?.as_deref() == Some(scope_key) {
+            generations.push((id, cell_text(&row, 1)?));
+        }
     }
     if !force {
         for (id, _) in &generations {
@@ -1195,23 +2037,34 @@ async fn pick_generation(
             }
         }
     }
-    let prior = generations.first().map(|(id, _)| *id);
     let generation = store
-        .create_generation(policy, "running", prior, now_ms)
+        .create_generation(policy, "running", newest_same_policy, now_ms)
+        .await?;
+    counters.db_transactions += 1;
+    store
+        .set_generation_scope_key(generation, scope_key)
         .await?;
     counters.db_transactions += 1;
     Ok(generation)
 }
 
-/// Mint a scan ID and persist the request row (raw + canonical URL, scope,
-/// status mode, absolute report destination). Retries ID collisions.
+/// Mint a scan ID and persist the request row (raw + optional canonical URL,
+/// scope, status mode, absolute report destination, v2 target set / format /
+/// `--all` marker). Retries ID collisions. `--all` scans persist the `--all`
+/// marker with no canonical, an empty target set, and `all_targets`.
+// Parameters mirror the scan-request row 1:1; grouping would churn the
+// single caller for no clarity gain.
+#[allow(clippy::too_many_arguments)]
 async fn mint_scan_id(
     store: &TursoStore,
     raw_url: &str,
-    canonical: &str,
+    canonical: Option<&str>,
     policy: &str,
     status: StatusMode,
     report_dest: &Option<PathBuf>,
+    targets: &[(String, String)],
+    format: Option<repo_scan::cli::OutputFormat>,
+    all: bool,
     counters: &mut RunCounters,
 ) -> repo_scan::Result<String> {
     // Defense-in-depth: the CLI boundary already rejected credential
@@ -1227,6 +2080,17 @@ async fn mint_scan_id(
     let safe_url = identity::sanitize_target_url(raw_url);
     let now = store::now_ms();
     let dest_bytes = report_dest.as_ref().map(|p| config::path_as_bytes(p));
+    // v2 request shape (D5/D6): the full target set served by one
+    // filesystem pass, the output format, and the `--all` marker. The
+    // CLI boundary already rejected credential-bearing targets.
+    let targets_json = serde_json::to_string(
+        &targets
+            .iter()
+            .map(|(raw, canonical)| serde_json::json!({"raw": raw, "canonical": canonical}))
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|e| repo_scan::Error::Report(e.to_string()))?;
+    let format_str = format.map(repo_scan::cli::OutputFormat::name);
     for _ in 0..3 {
         let id = config::new_scan_id();
         let inserted = store
@@ -1234,10 +2098,13 @@ async fn mint_scan_id(
                 &NewScan {
                     id: &id,
                     url_raw: safe_url.as_bytes(),
-                    url_canonical: Some(canonical.as_bytes()),
+                    url_canonical: canonical.map(str::as_bytes),
                     scope: policy,
                     status_mode: status_mode_str(status),
                     report_dest: dest_bytes.as_deref(),
+                    targets_json: Some(targets_json.as_str()),
+                    format: format_str,
+                    all_targets: Some(all),
                 },
                 now,
             )
@@ -2561,10 +3428,22 @@ struct Runner {
     alias_overflow: bool,
     /// Git-directory identities already persisted this run (R7):
     /// `(dev, ino)` of `instance.git_dir` to the first spelling's bytes.
-    /// A second spelling of the same object records an alias instead of a
-    /// duplicate instance. One small entry per distinct identity; eviction
-    /// would duplicate instances, so the map lives for the run.
+    /// Keyed by the probed store's COMMON-dir identity: a second spelling of
+    /// the same store records a path alias, and a linked-worktree admin dir
+    /// attaches its checkout — neither duplicates the instance. One small
+    /// entry per distinct identity; eviction would duplicate instances, so
+    /// the map lives for the run.
     probed_git_ids: HashMap<(u64, u64), Vec<u8>>,
+    /// Highest scope revision fully persisted this run per probed store
+    /// (keyed like [`Self::probed_git_ids`]). A repeat probe of the SAME
+    /// spelling at an already-persisted revision — enumeration discovers
+    /// both the worktree root (`.git` child) and the `.git` dir itself
+    /// (HEAD+objects+refs markers) — returns early instead of
+    /// re-persisting the store and re-journaling its `branch_batch` /
+    /// `coverage_updated` events. Entries land only on successful persist,
+    /// so a retry after a mid-persist failure re-runs, and a reconcile
+    /// re-probe (invalidation raised the scope rev) still re-persists.
+    persisted_git_revs: HashMap<(u64, u64), u64>,
     /// Working-directory identities already persisted this run (R7):
     /// `(dev, ino)` of `instance.work_dir` to deduplicate checkouts
     /// across pathname aliases while preserving distinct working trees.
@@ -2603,6 +3482,15 @@ struct Runner {
     /// pushes a check also pushes a batch op, and the batch flushes
     /// (draining the checks) at the spec §5 limits.
     pending_alias_checks: Vec<PendingAliasCheck>,
+    /// This scan's event journal writer (D4): `Some` on every production
+    /// scan (opened in `run_scan_inner` once the scan id exists); `None`
+    /// only on unit-test runners, which persist without journaling.
+    journal: Option<ScanJournal>,
+    /// Error ids currently open (D4 `coverage_updated` gating): preloaded
+    /// once per scan from the catalog, then tracked across buffered
+    /// records/resolves so deltas fire only on genuine transitions —
+    /// never for re-records or zero-row closes.
+    open_gaps: HashSet<String>,
 }
 
 impl Runner {
@@ -2620,6 +3508,7 @@ impl Runner {
             alias_seen: HashSet::new(),
             alias_overflow: false,
             probed_git_ids: HashMap::new(),
+            persisted_git_revs: HashMap::new(),
             probed_work_ids: HashSet::new(),
             probed_overflow: false,
             watchdog: Watchdog::new(Duration::from_secs(WATCHDOG_GRACE_SECS)),
@@ -2634,6 +3523,8 @@ impl Runner {
             current_volume: String::new(),
             progress_last_total: None,
             pending_alias_checks: Vec::new(),
+            journal: None,
+            open_gaps: HashSet::new(),
         }
     }
 
@@ -2921,15 +3812,15 @@ async fn run_until_boundary(
                     );
                     let stall_now = store::now_ms();
                     buffer_record_error(
-                        &mut runner.batch,
+                        runner,
                         &stall_id,
                         &item.task.scope_key,
                         "watchdog-no-progress",
                         &stall_detail,
                         None,
                         stall_now,
-                    );
-                    buffer_resolve_error(&mut runner.batch, &stall_id, stall_now);
+                    )?;
+                    buffer_resolve_error(runner, &stall_id, stall_now)?;
                     let stall_due = runner.batch.should_flush();
                     flush_if_due(runner, store, stall_due).await?;
                     eprintln!(
@@ -3425,16 +4316,88 @@ async fn flush_if_due(runner: &mut Runner, store: &TursoStore, due: bool) -> rep
 /// the unconditional `UPDATE` plus `INSERT OR IGNORE`, mirroring
 /// `record_error`'s update-then-insert outcome without a read. Returns
 /// `WriterBatch::should_flush`.
+/// `error` records (D4): the gap row's stable id, scope, category,
+/// and detail. Attempts are omitted: the UPDATE+INSERT pair means the
+/// final count is only knowable after commit (the catalog row has it).
+/// `coverage_updated` payload (D4): gap/candidate deltas only — opened
+/// gap ids, closed gap ids, newly unresolvable instance ids. All three
+/// keys are always present (possibly empty); consumers accumulate by id.
+/// Totals live on `inventory_ready` and terminal events, never here, so
+/// this path needs no aggregate queries.
+fn coverage_updated_value(
+    opened: &[String],
+    closed: &[String],
+    unresolvable_added: &[String],
+) -> serde_json::Value {
+    serde_json::json!({
+        "opened": opened,
+        "closed": closed,
+        "unresolvable_added": unresolvable_added,
+    })
+}
+
+fn coverage_updated_records(
+    opened: &[String],
+    closed: &[String],
+    unresolvable_added: &[String],
+) -> repo_scan::Result<Vec<u8>> {
+    let records = coverage_updated_value(opened, closed, unresolvable_added);
+    serde_json::to_vec(&records).map_err(|e| repo_scan::Error::Report(e.to_string()))
+}
+
+/// Buffer one `coverage_updated` delta (same journaling contract as
+/// [`journal_repository_found`]).
+async fn journal_coverage_updated(
+    runner: &mut Runner,
+    store: &TursoStore,
+    opened: &[String],
+    closed: &[String],
+    unresolvable_added: &[String],
+) -> repo_scan::Result<()> {
+    let Some(journal) = runner.journal.as_mut() else {
+        return Ok(());
+    };
+    let records = coverage_updated_records(opened, closed, unresolvable_added)?;
+    if let Some(due) = journal.buffer_coverage_updated(&mut runner.batch, &records)? {
+        flush_if_due(runner, store, due).await?;
+    }
+    Ok(())
+}
+
+fn error_records_value(
+    id: &str,
+    scope_key: &str,
+    category: &str,
+    detail: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "scope_key": scope_key,
+        "category": category,
+        "detail": detail,
+    })
+}
+
+fn error_records(
+    id: &str,
+    scope_key: &str,
+    category: &str,
+    detail: &str,
+) -> repo_scan::Result<Vec<u8>> {
+    let records = error_records_value(id, scope_key, category, detail);
+    serde_json::to_vec(&records).map_err(|e| repo_scan::Error::Report(e.to_string()))
+}
+
 fn buffer_record_error(
-    batch: &mut WriterBatch,
+    runner: &mut Runner,
     id: &str,
     scope_key: &str,
     category: &str,
     detail: &str,
     next_retry_ms: Option<i64>,
     now_ms: i64,
-) -> bool {
-    batch.push(
+) -> repo_scan::Result<bool> {
+    runner.batch.push(
         "UPDATE errors SET attempts = attempts + 1, detail = ?1, last_seen_ms = ?2, \
          next_retry_ms = ?3, open = 1 WHERE id = ?4",
         vec![
@@ -3444,7 +4407,7 @@ fn buffer_record_error(
             turso::Value::Text(id.to_string()),
         ],
     );
-    batch.push(
+    runner.batch.push(
         "INSERT OR IGNORE INTO errors (id, scope_key, category, detail, attempts, \
          first_seen_ms, last_seen_ms, next_retry_ms, open) \
          VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5, ?6, 1)",
@@ -3457,19 +4420,49 @@ fn buffer_record_error(
             next_retry_ms.map_or(turso::Value::Null, turso::Value::Integer),
         ],
     );
-    batch.should_flush()
+    // Coverage delta only on a genuine open transition: re-records
+    // (attempts bump on an already-open row) are not coverage changes.
+    // Computed before the journal borrow below.
+    let fresh_open = runner.open_gaps.insert(id.to_string());
+    // Same batch as the error rows: the event is only readable once its
+    // cause has committed. Unit-test runners (journal: None) persist rows
+    // without journaling.
+    if let Some(journal) = runner.journal.as_mut() {
+        let records = error_records(id, scope_key, category, detail)?;
+        journal.buffer_error(&mut runner.batch, &records)?;
+        if fresh_open {
+            let opened = vec![id.to_string()];
+            let records = coverage_updated_records(&opened, &[], &[])?;
+            journal.buffer_coverage_updated(&mut runner.batch, &records)?;
+        }
+    }
+    Ok(runner.batch.should_flush())
 }
 
 /// Buffer a gap close (RSF-AC461500-609D-4D55-991E-09C60D382D67), mirroring
-/// `resolve_error`. Returns `WriterBatch::should_flush`.
-fn buffer_resolve_error(batch: &mut WriterBatch, id: &str, now_ms: i64) -> bool {
-    batch.push(
+/// `resolve_error`. Takes the runner (not the batch) so the close delta
+/// can gate on `open_gaps`: unconditional closes (e.g. every successful
+/// probe persist) report nothing when no row was open. Returns
+/// `WriterBatch::should_flush`.
+fn buffer_resolve_error(runner: &mut Runner, id: &str, now_ms: i64) -> repo_scan::Result<bool> {
+    runner.batch.push(
         "UPDATE errors SET open = 0, last_seen_ms = ?1 WHERE id = ?2",
         vec![
             turso::Value::Integer(now_ms),
             turso::Value::Text(id.to_string()),
         ],
-    )
+    );
+    // Transition first (see `buffer_record_error`): the batched UPDATE
+    // cannot report its rowcount, so the open set is the authority.
+    let was_open = runner.open_gaps.remove(id);
+    if let Some(journal) = runner.journal.as_mut() {
+        if was_open {
+            let closed = vec![id.to_string()];
+            let records = coverage_updated_records(&[], &closed, &[])?;
+            journal.buffer_coverage_updated(&mut runner.batch, &records)?;
+        }
+    }
+    Ok(runner.batch.should_flush())
 }
 
 impl Runner {
@@ -3493,26 +4486,26 @@ impl Runner {
     /// what the report emits (see `alias_inputs`). Capped at
     /// [`MAX_ALIASES`] (A-F5, mirroring [`note_applied_scopes`]): past
     /// the cap new triples drop and one `alias-overflow` gap row
-    /// documents the loss. Returns `WriterBatch::should_flush`.
+    /// documents the loss. Returns `Ok(WriterBatch::should_flush)`.
     fn note_alias(
         &mut self,
         path: Vec<u8>,
         target: Vec<u8>,
         kind: &'static str,
         at_ms: i64,
-    ) -> bool {
+    ) -> repo_scan::Result<bool> {
         if self.alias_overflow {
-            return false;
+            return Ok(false);
         }
         let key = (path, target, kind);
         if self.alias_seen.contains(&key) {
-            return false;
+            return Ok(false);
         }
         if self.alias_seen.len() >= MAX_ALIASES {
             self.alias_overflow = true;
             eprintln!("repo-scan: alias overflow; further aliases dropped (gap recorded)");
             return buffer_record_error(
-                &mut self.batch,
+                self,
                 "alias-overflow",
                 events::mounts_scope_key(),
                 "alias-overflow",
@@ -3528,7 +4521,7 @@ impl Runner {
             kind: key.2,
             verified_at_ms: at_ms,
         });
-        false
+        Ok(false)
     }
 }
 
@@ -3536,15 +4529,15 @@ impl Runner {
 /// (A-F5, mirroring [`note_applied_scopes`]): past the cap the identity
 /// is not recorded (later spellings persist without dedupe) and one
 /// `probe-index-overflow` gap row documents the loss. Returns
-/// `WriterBatch::should_flush`.
+/// `Ok(WriterBatch::should_flush)`.
 fn note_probed_git_id(
     runner: &mut Runner,
     key: (u64, u64),
     git_bytes: Vec<u8>,
     now_ms: i64,
-) -> bool {
+) -> repo_scan::Result<bool> {
     if runner.probed_overflow {
-        return false;
+        return Ok(false);
     }
     if runner.probed_git_ids.len() >= MAX_PROBED_GIT_IDS {
         runner.probed_overflow = true;
@@ -3553,7 +4546,7 @@ fn note_probed_git_id(
              (gap recorded)"
         );
         return buffer_record_error(
-            &mut runner.batch,
+            runner,
             "probe-index-overflow",
             events::mounts_scope_key(),
             "probe-index-overflow",
@@ -3565,7 +4558,7 @@ fn note_probed_git_id(
         );
     }
     runner.probed_git_ids.insert(key, git_bytes);
-    false
+    Ok(false)
 }
 
 /// Per-volume breaker key for a scope key (paths stat their volume;
@@ -3643,14 +4636,14 @@ async fn execute_task(
         other => {
             let detail = format!("unknown task kind: {other}");
             let due = buffer_record_error(
-                &mut runner.batch,
+                runner,
                 &format!("kind:{}", claimed.task.id),
                 &claimed.task.scope_key,
                 "unsupported-task-kind",
                 &detail,
                 None,
                 store::now_ms(),
-            );
+            )?;
             flush_if_due(runner, store, due).await?;
             TaskOutcome::Parked {
                 state: TaskState::Unsupported,
@@ -3682,6 +4675,9 @@ enum CompletionApplied {
 /// Complete one claimed task, translating the store's scheduler signals:
 /// stale completions (already requeued by the store) are routine; lease
 /// mismatches and unknown tasks become typed errors that abort the run.
+/// A gap delta the completion caused is journaled as `error` /
+/// `coverage_updated` events after the completion transaction commits —
+/// never inside it.
 async fn complete_claimed(
     store: &TursoStore,
     runner: &mut Runner,
@@ -3691,11 +4687,12 @@ async fn complete_claimed(
 ) -> repo_scan::Result<CompletionApplied> {
     let now = store::now_ms();
     match store
-        .complete_task(&claimed.task.id, claimed.token, epoch, outcome, now)
+        .complete_task_report_gap(&claimed.task.id, claimed.token, epoch, outcome, now)
         .await
     {
-        Ok(()) => {
+        Ok(delta) => {
             runner.counters.db_transactions += 1;
+            journal_completion_delta(runner, store, &delta).await?;
             Ok(CompletionApplied::Applied)
         }
         Err(repo_scan::Error::Scheduler(message)) if message.starts_with("stale-completion:") => {
@@ -3710,6 +4707,55 @@ async fn complete_claimed(
         }
         Err(e) => Err(e),
     }
+}
+
+/// Journal one completion gap delta: the opened row (if any) as an
+/// `error` event, then the open/close delta as `coverage_updated` — each
+/// in its own transaction. The gap rows are already durable (the
+/// completion committed before this runs); unit-test runners without a
+/// journal skip silently. The opened row always emits an `error`
+/// (point-in-time); the coverage delta fires only on genuine
+/// transitions against `open_gaps`.
+async fn journal_completion_delta(
+    runner: &mut Runner,
+    store: &TursoStore,
+    delta: &CompletionDelta,
+) -> repo_scan::Result<()> {
+    if runner.journal.is_none() {
+        return Ok(());
+    }
+    // Transition gating before the journal borrow below: opens fire only
+    // for newly opened rows; closes are rowcount-gated by the store, so
+    // the set update just keeps this run's view accurate.
+    let opened: Vec<String> = match delta.opened.as_ref() {
+        Some(gap) if runner.open_gaps.insert(gap.id.clone()) => vec![gap.id.clone()],
+        _ => Vec::new(),
+    };
+    let closed: Vec<String> = match delta.closed.as_ref() {
+        Some(id) => {
+            runner.open_gaps.remove(id.as_str());
+            vec![id.clone()]
+        }
+        None => Vec::new(),
+    };
+    let journal = runner.journal.as_mut().expect("journal checked above");
+    // Counter increments hoisted past the last journal use (NLL): the
+    // journal borrow spans both emits.
+    let mut txns = 0u64;
+    if let Some(gap) = delta.opened.as_ref() {
+        let records = error_records_value(&gap.id, &gap.scope_key, &gap.category, &gap.detail);
+        journal.emit(store, EventType::Error, &records).await?;
+        txns += 1;
+    }
+    if !opened.is_empty() || !closed.is_empty() {
+        let records = coverage_updated_value(&opened, &closed, &[]);
+        journal
+            .emit(store, EventType::CoverageUpdated, &records)
+            .await?;
+        txns += 1;
+    }
+    runner.counters.db_transactions += txns;
+    Ok(())
 }
 
 /// Translate an [`ExecFail`] into a retry (backoff from the attempt count)
@@ -4315,7 +5361,8 @@ async fn note_enum_alias(
         config::path_as_bytes(&first),
         kind,
         now_ms,
-    );
+    )?;
+
     // Boxed: flush_runner_batch -> note_enum_alias -> flush_if_due ->
     // flush_runner_batch is a future-type cycle (E0733).
     Box::pin(flush_if_due(runner, store, due)).await?;
@@ -4347,7 +5394,7 @@ async fn enqueue_symlink_target(
                         config::path_as_bytes(&target.path),
                         "symlink",
                         now_ms,
-                    );
+                    )?;
                     flush_if_due(runner, store, alias_due).await?;
                     return Ok(());
                 }
@@ -4378,7 +5425,7 @@ async fn enqueue_symlink_target(
                 config::path_as_bytes(&target.path),
                 "symlink",
                 now_ms,
-            );
+            )?;
             // The target itself may be scheduled under another spelling:
             // preserve that pair too (deferred; no-ops on same scope).
             runner.pending_alias_checks.push(PendingAliasCheck {
@@ -4393,7 +5440,7 @@ async fn enqueue_symlink_target(
         }
         Err(ResolveError::Cycle(p) | ResolveError::TooDeep(p)) => {
             let due = buffer_record_error(
-                &mut runner.batch,
+                runner,
                 &format!(
                     "symlink:{}",
                     config::encode_hex(&config::path_as_bytes(link_path))
@@ -4403,13 +5450,13 @@ async fn enqueue_symlink_target(
                 &format!("symlink cycle or excessive chain at {}", p.display()),
                 None,
                 now_ms,
-            );
+            )?;
             flush_if_due(runner, store, due).await?;
             Ok(())
         }
         Err(ResolveError::Io(e)) => {
             let due = buffer_record_error(
-                &mut runner.batch,
+                runner,
                 &format!(
                     "symlink:{}",
                     config::encode_hex(&config::path_as_bytes(link_path))
@@ -4419,7 +5466,7 @@ async fn enqueue_symlink_target(
                 &format!("cannot resolve {}: {e}", link_path.display()),
                 None,
                 now_ms,
-            );
+            )?;
             flush_if_due(runner, store, due).await?;
             Ok(())
         }
@@ -5020,14 +6067,14 @@ async fn exec_probe(
                 "probe-failed"
             };
             let due = buffer_record_error(
-                &mut runner.batch,
+                runner,
                 &gap_id,
                 &claimed.task.scope_key,
                 category,
                 &e.to_string(),
                 None,
                 now,
-            );
+            )?;
             flush_if_due(runner, store, due).await?;
             return Ok(TaskOutcome::Complete);
         }
@@ -5113,12 +6160,21 @@ async fn exec_probe(
         .await;
     }
     match persist_probe(
-        runner, store, generation, run_rev, canonical, &path, &validated, *reads, now,
+        runner,
+        store,
+        generation,
+        run_rev,
+        canonical,
+        &path,
+        &validated,
+        *reads,
+        claimed.task.expected_rev,
+        now,
     )
     .await
     {
         Ok(()) => {
-            let due = buffer_resolve_error(&mut runner.batch, &gap_id, store::now_ms());
+            let due = buffer_resolve_error(runner, &gap_id, store::now_ms())?;
             flush_if_due(runner, store, due).await?;
             Ok(TaskOutcome::Complete)
         }
@@ -5269,7 +6325,9 @@ async fn test_probe_outcome_impl(
 /// reach the catalog — not even through an early batch flush.
 struct ProbeReads {
     incarnation: String,
-    git_identity: Option<(u64, u64)>,
+    /// Physical identity of the COMMON dir: all worktree admin dirs of one
+    /// store share it, so repeats attach instead of duplicating the store.
+    common_identity: Option<(u64, u64)>,
     remotes: Vec<git::RemoteObservation>,
     remotes_note: Option<String>,
     head: git::HeadState,
@@ -5324,13 +6382,13 @@ async fn collect_probe_reads(
     if deadline.expired() {
         return Ok(CollectOutcome::TimedOut);
     }
-    let incarnation = std::fs::symlink_metadata(&instance.git_dir)
+    let incarnation = std::fs::symlink_metadata(&instance.common_dir)
         .map(|md| {
             let (dev, ino) = dir_identity(&md);
             format!("d{dev}i{ino}")
         })
         .unwrap_or_default();
-    let git_identity = std::fs::metadata(&instance.git_dir)
+    let common_identity = std::fs::metadata(&instance.common_dir)
         .ok()
         .map(|md| dir_identity(&md))
         .filter(|key| *key != (0, 0));
@@ -5424,7 +6482,7 @@ async fn collect_probe_reads(
     let branch_upstreams = load_branch_upstreams(&instance.common_dir);
     Ok(CollectOutcome::Reads(Box::new(ProbeReads {
         incarnation,
-        git_identity,
+        common_identity,
         remotes,
         remotes_note,
         head,
@@ -5437,6 +6495,267 @@ async fn collect_probe_reads(
         branch_upstreams,
         config_dep_count,
     })))
+}
+
+/// Identity summary for found-event payloads (D4: identity or
+/// `unknown`): the first normalized canonical remote URL, else explicit
+/// unknown. Remote URLs arrive pre-redacted from the probe reads.
+fn found_identity(remotes: &[git::RemoteObservation]) -> (Option<&str>, &'static str) {
+    match remotes.iter().find_map(|r| r.canonical_url.as_deref()) {
+        Some(canonical) => (Some(canonical), "known"),
+        None => (None, "unknown"),
+    }
+}
+
+/// Split a normalized GitHub canonical URL into the D1 group id
+/// `host/account/repo` plus its parts. The normalizer
+/// ([`identity::normalize_github_url`]) always emits lowercase
+/// `https://github.com/owner/repo`, so the group id is the URL tail and
+/// needs no further lowering; `None` only fires on input no normalizer
+/// produced (defensive: probe `canonical_url` values always are).
+fn github_group_parts(canonical: &str) -> Option<(&str, &str, &str, &str)> {
+    let id = canonical.strip_prefix("https://")?;
+    let mut parts = id.split('/');
+    let (host, account, repo) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || host.is_empty() || account.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((id, host, account, repo))
+}
+
+/// `repository_found` records (D4): store id + the remote evidence the
+/// GitHub group association derives from + the derived `github_groups`
+/// ids (sorted, deduped; the matching group/member rows land in the same
+/// batch transaction) + `analysis: "pending"`.
+fn repository_found_records(
+    store_id: &str,
+    remotes: &[git::RemoteObservation],
+) -> repo_scan::Result<Vec<u8>> {
+    let (identity, identity_state) = found_identity(remotes);
+    let mut github_groups: Vec<&str> = remotes
+        .iter()
+        .filter_map(|r| {
+            r.canonical_url
+                .as_deref()
+                .and_then(github_group_parts)
+                .map(|(id, _, _, _)| id)
+        })
+        .collect();
+    github_groups.sort_unstable();
+    github_groups.dedup();
+    let records = serde_json::json!({
+        "store_id": store_id,
+        "identity": identity,
+        "identity_state": identity_state,
+        "remotes": remotes.iter().map(|r| serde_json::json!({
+            "name": String::from_utf8_lossy(&r.name),
+            "role": match r.role {
+                git::RemoteRole::Fetch => "fetch",
+                git::RemoteRole::Push => "push",
+            },
+            "url": r.url,
+            "canonical_url": r.canonical_url,
+        })).collect::<Vec<_>>(),
+        "github_groups": github_groups,
+        "analysis": "pending",
+    });
+    serde_json::to_vec(&records).map_err(|e| repo_scan::Error::Report(e.to_string()))
+}
+
+/// `location_found` records (D4): checkout/store ids, observed path
+/// (lossy display + exact hex), identity or `unknown`, and
+/// `analysis: "pending"`. Alias deltas arrive via `location_updated`.
+fn location_found_records(
+    checkout_id: &str,
+    store_id: &str,
+    path: &[u8],
+    git_path: &[u8],
+    remotes: &[git::RemoteObservation],
+) -> repo_scan::Result<Vec<u8>> {
+    let (identity, identity_state) = found_identity(remotes);
+    let records = serde_json::json!({
+        "checkout_id": checkout_id,
+        "store_id": store_id,
+        "path": String::from_utf8_lossy(path),
+        "path_hex": config::encode_hex(path),
+        "git_path": String::from_utf8_lossy(git_path),
+        "git_path_hex": config::encode_hex(git_path),
+        "identity": identity,
+        "identity_state": identity_state,
+        "analysis": "pending",
+    });
+    serde_json::to_vec(&records).map_err(|e| repo_scan::Error::Report(e.to_string()))
+}
+
+/// Maximum branch records per `branch_batch` event (Step 12: bounded
+/// batches — a store with thousands of refs journals several events).
+const BRANCH_BATCH_CHUNK: usize = 500;
+
+/// One branch record inside a `branch_batch` payload. Byte-exact fields
+/// pair lossy text with hex; oids are hex ASCII already.
+#[allow(clippy::too_many_arguments)]
+fn branch_record_value(
+    id: &str,
+    kind: &str,
+    name: &[u8],
+    oid: Option<&[u8]>,
+    algo: Option<&str>,
+    symbolic_target: Option<&[u8]>,
+    upstream: Option<&[u8]>,
+    state: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "kind": kind,
+        "name": String::from_utf8_lossy(name),
+        "name_hex": config::encode_hex(name),
+        "oid": oid.map(|o| String::from_utf8_lossy(o).into_owned()),
+        "algo": algo,
+        "symbolic_target": symbolic_target.map(|t| String::from_utf8_lossy(t).into_owned()),
+        "symbolic_target_hex": symbolic_target.map(config::encode_hex),
+        "upstream": upstream.map(|u| String::from_utf8_lossy(u).into_owned()),
+        "upstream_hex": upstream.map(config::encode_hex),
+        "state": state,
+    })
+}
+
+/// `branch_batch` records (D4): store id, the observation `rev`
+/// (`observed_at_ms`, orders re-sends), chunk position, and the branch
+/// records.
+fn branch_batch_records(
+    store_id: &str,
+    rev: i64,
+    batch_index: usize,
+    batch_count: usize,
+    branches: &[serde_json::Value],
+) -> repo_scan::Result<Vec<u8>> {
+    let records = serde_json::json!({
+        "store_id": store_id,
+        "rev": rev,
+        "batch_index": batch_index,
+        "batch_count": batch_count,
+        "branches": branches,
+    });
+    serde_json::to_vec(&records).map_err(|e| repo_scan::Error::Report(e.to_string()))
+}
+
+/// Buffer a `branch_batch` chunk (same journaling contract as
+/// [`journal_repository_found`]).
+async fn journal_branch_batch(
+    runner: &mut Runner,
+    store: &TursoStore,
+    store_id: &str,
+    records: &[u8],
+) -> repo_scan::Result<()> {
+    let Some(journal) = runner.journal.as_mut() else {
+        return Ok(());
+    };
+    if let Some(due) = journal.buffer_branch_batch(&mut runner.batch, store_id, records)? {
+        flush_if_due(runner, store, due).await?;
+    }
+    Ok(())
+}
+
+/// Buffer a `repository_found` when this runner journals (production
+/// scans); unit-test runners (`journal: None`) persist without journaling.
+async fn journal_repository_found(
+    runner: &mut Runner,
+    store: &TursoStore,
+    store_id: &str,
+    remotes: &[git::RemoteObservation],
+) -> repo_scan::Result<()> {
+    let Some(journal) = runner.journal.as_mut() else {
+        return Ok(());
+    };
+    let records = repository_found_records(store_id, remotes)?;
+    if let Some(due) = journal.buffer_repository_found(&mut runner.batch, store_id, &records)? {
+        flush_if_due(runner, store, due).await?;
+    }
+    Ok(())
+}
+
+/// Buffer a `location_found` (same journaling contract as
+/// [`journal_repository_found`]).
+async fn journal_location_found(
+    runner: &mut Runner,
+    store: &TursoStore,
+    checkout_id: &str,
+    store_id: &str,
+    path: &[u8],
+    git_path: &[u8],
+    remotes: &[git::RemoteObservation],
+) -> repo_scan::Result<()> {
+    let Some(journal) = runner.journal.as_mut() else {
+        return Ok(());
+    };
+    let records = location_found_records(checkout_id, store_id, path, git_path, remotes)?;
+    if let Some(due) = journal.buffer_location_found(&mut runner.batch, checkout_id, &records)? {
+        flush_if_due(runner, store, due).await?;
+    }
+    Ok(())
+}
+
+/// `location_updated` records (D4): checkout/store ids, the status
+/// observation that caused this update (state + mode + counts, unknown
+/// counts stay null), and the observation `rev` consumers replay against.
+/// No `analysis` claim: branch comparison is not implemented yet, so only
+/// the observed status facts are stated.
+#[allow(clippy::too_many_arguments)]
+fn location_updated_records(
+    checkout_id: &str,
+    store_id: &str,
+    mode: &str,
+    state: &str,
+    staged: Option<i64>,
+    unstaged: Option<i64>,
+    untracked: Option<i64>,
+    observed_rev: u64,
+) -> repo_scan::Result<Vec<u8>> {
+    let records = serde_json::json!({
+        "checkout_id": checkout_id,
+        "store_id": store_id,
+        "rev": observed_rev,
+        "status_state": state,
+        "mode": mode,
+        "staged": staged,
+        "unstaged": unstaged,
+        "untracked": untracked,
+    });
+    serde_json::to_vec(&records).map_err(|e| repo_scan::Error::Report(e.to_string()))
+}
+
+/// Buffer a `location_updated` (same journaling contract as
+/// [`journal_repository_found`]).
+#[allow(clippy::too_many_arguments)]
+async fn journal_location_updated(
+    runner: &mut Runner,
+    store: &TursoStore,
+    checkout_id: &str,
+    store_id: &str,
+    mode: &str,
+    state: &str,
+    staged: Option<i64>,
+    unstaged: Option<i64>,
+    untracked: Option<i64>,
+    observed_rev: u64,
+) -> repo_scan::Result<()> {
+    let Some(journal) = runner.journal.as_mut() else {
+        return Ok(());
+    };
+    let records = location_updated_records(
+        checkout_id,
+        store_id,
+        mode,
+        state,
+        staged,
+        unstaged,
+        untracked,
+        observed_rev,
+    )?;
+    if let Some(due) = journal.buffer_location_updated(&mut runner.batch, &records)? {
+        flush_if_due(runner, store, due).await?;
+    }
+    Ok(())
 }
 
 /// Persist collected observations from a validated probe. Remotes, refs, and
@@ -5455,23 +6774,56 @@ async fn persist_probe(
     path: &Path,
     validated: &git::ValidatedCandidate,
     reads: ProbeReads,
+    expected_rev: u64,
     now_ms: i64,
 ) -> repo_scan::Result<()> {
     let instance = &validated.instance;
     let git_bytes = config::path_as_bytes(&instance.git_dir);
-    let common_bytes = config::path_as_bytes(&instance.common_dir);
-    let instance_id = format!("git:{}", config::encode_hex(&git_bytes));
+    // Local-store identity (goal Step 5): the canonical COMMON dir. Linked
+    // worktree admin dirs resolve to their shared store, and distinct
+    // spellings of one directory merge — instance, remote, and ref IDs all
+    // key on this. The stored PATH columns keep observed spellings (goal
+    // Step 7: every spelling stays visible; second spellings add alias
+    // rows), so only ID derivation uses the canonical form. Non-absolute
+    // paths (should not happen: probe inputs are absolute) skip
+    // canonicalization rather than resolving against the process working
+    // directory.
+    let canonical_common = if instance.common_dir.is_absolute() {
+        std::fs::canonicalize(&instance.common_dir).unwrap_or_else(|_| instance.common_dir.clone())
+    } else {
+        instance.common_dir.clone()
+    };
+    let common_bytes = config::path_as_bytes(&canonical_common);
+    let raw_common_bytes = config::path_as_bytes(&instance.common_dir);
+    let instance_id = format!("git:{}", config::encode_hex(&common_bytes));
     let incarnation = reads.incarnation;
 
-    // A second pathname spelling of an already-persisted object records an
-    // alias instead of a duplicate instance (R7). Identity follows
-    // symlinks; the `(0, 0)` fallback (non-unix) never dedupes.
-    if let Some(key) = reads.git_identity {
+    // A repeat probe of an already-persisted STORE (same common dir: a
+    // second spelling, or a linked-worktree admin dir) attaches its
+    // checkout instead of duplicating the instance (R7 + goal Step 5).
+    // Identity follows symlinks; the `(0, 0)` fallback (non-unix) never
+    // dedupes. Shared refs/remotes persist once, on first sight.
+    if let Some(key) = reads.common_identity {
         match runner.probed_git_ids.get(&key).cloned() {
             Some(first) if first != git_bytes => {
-                let due =
-                    runner.note_alias(git_bytes.clone(), first.clone(), "same_object", now_ms);
-                flush_if_due(runner, store, due).await?;
+                // Same-directory spellings record a path alias; a worktree
+                // admin dir is a DIFFERENT directory sharing the store, so
+                // it attaches without an alias row (its admin path is
+                // preserved on its checkout row).
+                let same_dir = if instance.git_dir.is_absolute() {
+                    std::fs::canonicalize(&instance.git_dir).ok() == Some(canonical_common.clone())
+                } else {
+                    instance.git_dir == instance.common_dir
+                };
+                if same_dir {
+                    let due = runner.note_alias(
+                        git_bytes.clone(),
+                        first.clone(),
+                        "same_object",
+                        now_ms,
+                    )?;
+                    flush_if_due(runner, store, due).await?;
+                }
                 let work_identity = instance
                     .work_dir
                     .as_ref()
@@ -5565,6 +6917,18 @@ async fn persist_probe(
                 } else {
                     identity::classify_remotes(canonical, borrowed)
                 };
+                // The store is already known (first sight journaled it);
+                // this spelling only adds its checkout location.
+                journal_location_found(
+                    runner,
+                    store,
+                    &main_checkout_id,
+                    &first_instance_id,
+                    root_bytes.as_deref().unwrap_or(git_bytes.as_slice()),
+                    &git_bytes,
+                    &reads.remotes,
+                )
+                .await?;
 
                 if matches!(
                     disposition,
@@ -5584,9 +6948,25 @@ async fn persist_probe(
                 }
                 return Ok(());
             }
-            Some(_) => {}
+            Some(_) => {
+                // Repeat probe of the SAME spelling. Enumeration discovers
+                // every store twice — once via the worktree root (`.git`
+                // child) and once via the `.git` dir itself (HEAD+objects+
+                // refs markers) — so this arm is the norm, not an
+                // exception. Once this revision is fully persisted there is
+                // nothing new to do: re-persisting would re-journal
+                // `branch_batch`/`coverage_updated` for unchanged rows.
+                // A retry whose first attempt failed mid-persist has no
+                // recorded revision yet and falls through, as does a
+                // reconcile re-probe after an invalidation raised the
+                // scope revision.
+                let persisted = runner.persisted_git_revs.get(&key).copied();
+                if persisted.is_some_and(|rev| rev >= expected_rev) {
+                    return Ok(());
+                }
+            }
             None => {
-                let due = note_probed_git_id(runner, key, git_bytes.clone(), now_ms);
+                let due = note_probed_git_id(runner, key, common_bytes.clone(), now_ms)?;
                 flush_if_due(runner, store, due).await?;
             }
         }
@@ -5653,7 +7033,7 @@ async fn persist_probe(
     let new_instance = NewGitInstance {
         id: &instance_id,
         git_path: &git_bytes,
-        common_path: &common_bytes,
+        common_path: &raw_common_bytes,
         incarnation: &incarnation,
         format: "git-files",
         bare: Some(instance.is_bare),
@@ -5664,6 +7044,19 @@ async fn persist_probe(
     let due = TursoStore::buffer_upsert_git_instance(&mut runner.batch, &new_instance, now_ms);
     runner.counters.repos_found += 1;
     flush_if_due(runner, store, due).await?;
+    journal_repository_found(runner, store, &instance_id, &remotes).await?;
+    // Unresolvable-identity candidates join the coverage delta stream in
+    // the same batch as the instance row. Repeat probes return early, so
+    // re-persist dupes are rare; consumers dedupe by id. (Report-time
+    // reclassification can flip dispositions later; those flips surface
+    // in the final report, not as live deltas.)
+    if matches!(
+        disposition,
+        identity::MatchDisposition::UnresolvableIdentity
+    ) {
+        journal_coverage_updated(runner, store, &[], &[], std::slice::from_ref(&instance_id))
+            .await?;
+    }
     for remote in &remotes {
         let role = match remote.role {
             git::RemoteRole::Fetch => "fetch",
@@ -5671,7 +7064,7 @@ async fn persist_probe(
         };
         let remote_id = format!(
             "remote:{}:{}:{role}",
-            config::encode_hex(&git_bytes),
+            config::encode_hex(&common_bytes),
             config::encode_hex(&remote.name),
         );
         let canonical_bytes = remote.canonical_url.as_ref().map(|c| c.as_bytes());
@@ -5686,6 +7079,34 @@ async fn persist_probe(
         };
         let due = TursoStore::buffer_upsert_remote(&mut runner.batch, &new_remote, now_ms);
         flush_if_due(runner, store, due).await?;
+        // D1/D5: every normalized remote observation links its store to one
+        // GitHub group (same batch transaction as the remote row, so the
+        // `repository_found.github_groups` ids above always resolve once
+        // committed). Distinct canonicals stay distinct groups — a fork and
+        // its upstream never merge — while URL spellings of one identity
+        // share one group row (`INSERT OR IGNORE` keeps resume replays
+        // idempotent).
+        if let Some((group_id, host, account, repo)) =
+            remote.canonical_url.as_deref().and_then(github_group_parts)
+        {
+            let due_group = TursoStore::buffer_upsert_github_group(
+                &mut runner.batch,
+                group_id,
+                host,
+                account,
+                repo,
+                now_ms,
+            );
+            let due_member = TursoStore::buffer_add_group_member(
+                &mut runner.batch,
+                group_id,
+                &instance_id,
+                &remote.name,
+                role,
+                now_ms,
+            );
+            flush_if_due(runner, store, due_group || due_member).await?;
+        }
     }
 
     let head = reads.head;
@@ -5719,6 +7140,16 @@ async fn persist_probe(
         TursoStore::buffer_upsert_checkout(&mut runner.batch, &main_checkout, now_ms)
     };
     flush_if_due(runner, store, due).await?;
+    journal_location_found(
+        runner,
+        store,
+        &main_checkout_id,
+        &instance_id,
+        root_bytes.as_deref().unwrap_or(git_bytes.as_slice()),
+        &git_bytes,
+        &remotes,
+    )
+    .await?;
     if let Some(wid) = instance
         .work_dir
         .as_ref()
@@ -5776,6 +7207,16 @@ async fn persist_probe(
                 let due =
                     TursoStore::buffer_upsert_checkout(&mut runner.batch, &wt_checkout, now_ms);
                 flush_if_due(runner, store, due).await?;
+                journal_location_found(
+                    runner,
+                    store,
+                    &wt_id,
+                    &instance_id,
+                    &wt_root,
+                    &wt_git,
+                    &remotes,
+                )
+                .await?;
                 checkout_ids.push(wt_id);
             }
             enqueue_probe_task_for_path(store, runner, generation, &wt.base, now_ms).await?;
@@ -5788,6 +7229,7 @@ async fn persist_probe(
     // probe; absent/unreadable config yields no upstreams, never fake ones.
     let branch_upstreams = reads.branch_upstreams;
     let known: HashSet<&[u8]> = refs.iter().map(|r| r.name.as_slice()).collect();
+    let mut branch_values = Vec::with_capacity(refs.len());
     for reference in &refs {
         let name_text = String::from_utf8_lossy(&reference.name);
         let kind = if name_text.starts_with("refs/heads/") {
@@ -5799,7 +7241,7 @@ async fn persist_probe(
         };
         let ref_id = format!(
             "ref:{}:{}",
-            config::encode_hex(&git_bytes),
+            config::encode_hex(&common_bytes),
             config::encode_hex(&reference.name),
         );
         let (oid, algo, symbolic) = match &reference.target {
@@ -5814,6 +7256,7 @@ async fn persist_probe(
             }
         };
         let upstream = upstream_for_ref(&branch_upstreams, &reference.name);
+        let state = ref_state_for(reference, &known);
         let new_ref = NewRef {
             id: &ref_id,
             instance_id: &instance_id,
@@ -5824,21 +7267,41 @@ async fn persist_probe(
             algo,
             symbolic_target: symbolic,
             upstream: upstream.as_deref(),
-            state: ref_state_for(reference, &known),
+            state,
         };
         let due = TursoStore::buffer_upsert_ref(&mut runner.batch, &new_ref, now_ms);
         flush_if_due(runner, store, due).await?;
+        branch_values.push(branch_record_value(
+            &ref_id,
+            kind,
+            &reference.name,
+            oid,
+            algo,
+            symbolic,
+            upstream.as_deref(),
+            state,
+        ));
+    }
+    // The ref rows above commit with these batches: one `branch_batch`
+    // event per 500 refs, all sharing this observation's `rev`.
+    if !branch_values.is_empty() {
+        let chunks: Vec<&[serde_json::Value]> = branch_values.chunks(BRANCH_BATCH_CHUNK).collect();
+        let batch_count = chunks.len();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let records = branch_batch_records(&instance_id, now_ms, index, batch_count, chunk)?;
+            journal_branch_batch(runner, store, &instance_id, &records).await?;
+        }
     }
     for broken in &reads.ref_errors {
         let due = buffer_record_error(
-            &mut runner.batch,
+            runner,
             &format!("ref-err:{instance_id}:{}", fnv1a_hex(broken.as_bytes())),
             &config::scope_key_for_git(path),
             "invalid-ref",
             broken,
             None,
             now_ms,
-        );
+        )?;
         flush_if_due(runner, store, due).await?;
     }
 
@@ -5852,6 +7315,11 @@ async fn persist_probe(
         for checkout_id in &checkout_ids {
             enqueue_status_task(store, runner, generation, run_rev, checkout_id, now_ms).await?;
         }
+    }
+    // Mark the fully-persisted revision only now, on success: a mid-persist
+    // failure leaves no record, so the retried probe re-runs the persist.
+    if let Some(key) = reads.common_identity {
+        runner.persisted_git_revs.insert(key, expected_rev);
     }
     Ok(())
 }
@@ -6167,14 +7635,14 @@ async fn exec_status(
     let now = store::now_ms();
     let Some(checkout) = store.get_checkout(&checkout_id).await? else {
         let due = buffer_record_error(
-            &mut runner.batch,
+            runner,
             &format!("status:{checkout_id}"),
             &claimed.task.scope_key,
             "unknown-checkout",
             &format!("status task names unknown checkout {checkout_id}; dropping"),
             None,
             now,
-        );
+        )?;
         flush_if_due(runner, store, due).await?;
         return Ok(TaskOutcome::Complete);
     };
@@ -6186,6 +7654,7 @@ async fn exec_status(
             runner,
             store,
             &checkout_id,
+            &checkout.instance_id,
             mode,
             "not_requested",
             None,
@@ -6228,6 +7697,7 @@ async fn exec_status(
                 runner,
                 store,
                 &checkout_id,
+                &checkout.instance_id,
                 mode,
                 "unsupported",
                 None,
@@ -6429,6 +7899,7 @@ async fn exec_status(
                 runner,
                 store,
                 &checkout_id,
+                &checkout.instance_id,
                 mode,
                 "unsupported",
                 None,
@@ -6449,6 +7920,7 @@ async fn exec_status(
                 runner,
                 store,
                 &checkout_id,
+                &checkout.instance_id,
                 mode,
                 state,
                 obs.staged.map(|c| c.min(i64::MAX as u64) as i64),
@@ -6534,6 +8006,7 @@ async fn record_status_row(
     runner: &mut Runner,
     store: &TursoStore,
     checkout_id: &str,
+    store_id: &str,
     mode: StatusMode,
     state: &str,
     staged: Option<i64>,
@@ -6567,6 +8040,21 @@ async fn record_status_row(
     };
     let due = TursoStore::buffer_record_status(&mut runner.batch, &status, finished_ms);
     flush_if_due(runner, store, due).await?;
+    // Same batch as the status row: the update is only readable once its
+    // cause has committed.
+    journal_location_updated(
+        runner,
+        store,
+        checkout_id,
+        store_id,
+        status_mode_str(mode),
+        state,
+        staged,
+        unstaged,
+        untracked,
+        observed_rev,
+    )
+    .await?;
     Ok(())
 }
 
@@ -6633,6 +8121,16 @@ fn cell_text(row: &turso::Row, idx: usize) -> repo_scan::Result<String> {
         turso::Value::Text(value) => Ok(value),
         other => Err(repo_scan::Error::Store(format!(
             "column {idx} expected TEXT, got {other:?}"
+        ))),
+    }
+}
+
+fn cell_opt_text(row: &turso::Row, idx: usize) -> repo_scan::Result<Option<String>> {
+    match row.get_value(idx).map_err(store_err)? {
+        turso::Value::Text(value) => Ok(Some(value)),
+        turso::Value::Null => Ok(None),
+        other => Err(repo_scan::Error::Store(format!(
+            "column {idx} expected TEXT or NULL, got {other:?}"
         ))),
     }
 }
@@ -6704,7 +8202,9 @@ struct ScanReportInputs {
     generation: u64,
     epoch: u64,
     target_raw: String,
-    canonical: String,
+    canonical: Option<String>,
+    /// Full requested target set for report 1.1.0 (empty for `--all`).
+    targets: Vec<repo_scan::report::model::ScanTarget>,
     scope_policy: String,
     scan_state: String,
     status_mode: StatusMode,
@@ -7267,7 +8767,8 @@ async fn build_lib_inputs(
         // never carries credentials even if a legacy stored target did.
         // Strict form (RETEST-2): opaque query/fragment tails drop too.
         target_url: identity::redact_remote_url(&inputs.target_raw),
-        canonical_url: Some(inputs.canonical.clone()),
+        canonical_url: inputs.canonical.clone(),
+        targets: inputs.targets.clone(),
         scope: inputs.scope_policy.clone(),
         scan_state: inputs.scan_state.clone(),
         started_at_ms: inputs.started_ms,
@@ -7703,6 +9204,268 @@ fn snapshots_dir(state_dir: &Path) -> PathBuf {
 // Query (cached only)
 // ---------------------------------------------------------------------------
 
+/// Rebuild the wire [`Envelope`] for one journaled row. The journaled
+/// `op` wins over the class default so a resent batch carrying
+/// `replace` stays `replace` (D4 `add/replace` cell); unknown classes or
+/// corrupt payloads fail loudly, never as silent skips.
+fn envelope_for_row(row: &ScanEventRow) -> repo_scan::Result<Envelope> {
+    let event_type: EventType =
+        serde_json::from_value(serde_json::Value::String(row.event_type.clone())).map_err(|e| {
+            repo_scan::Error::Report(format!(
+                "scan_events row seq {} carries unknown class {:?}: {e}",
+                row.seq, row.event_type,
+            ))
+        })?;
+    let op: Op =
+        serde_json::from_value(serde_json::Value::String(row.op.clone())).map_err(|e| {
+            repo_scan::Error::Report(format!(
+                "scan_events row seq {} carries unknown op {:?}: {e}",
+                row.seq, row.op,
+            ))
+        })?;
+    let records: serde_json::Value = serde_json::from_slice(&row.records).map_err(|e| {
+        repo_scan::Error::Report(format!(
+            "scan_events row seq {} carries corrupt records: {e}",
+            row.seq,
+        ))
+    })?;
+    let mut env = Envelope::new(
+        row.scan_id.clone(),
+        row.seq,
+        row.catalog_rev,
+        row.event_offset,
+        event_type,
+        row.reset,
+        records,
+    );
+    env.op = op;
+    Ok(env)
+}
+
+/// Write one JSONL line. `Ok(false)` means the consumer went away
+/// (broken pipe): the follower stops quietly with committed catalog
+/// records untouched (Step 12); any other IO error fails loudly.
+fn write_jsonl_line(out: &mut impl std::io::Write, line: &str) -> repo_scan::Result<bool> {
+    match writeln!(out, "{line}") {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
+        Err(e) => Err(repo_scan::Error::Io(format!(
+            "cannot write replay line: {e}"
+        ))),
+    }
+}
+
+/// True while the scan row can still journal more events: only the
+/// `running` state (with or without the `:roots:` suffix) keeps a
+/// follower waiting. Any other state — complete, incomplete,
+/// interrupted, failed, superseded — ends the follow at the journal tip,
+/// which also covers pre-journal scans that will never emit.
+fn scan_still_running(state: &str) -> bool {
+    state == "running" || state.starts_with("running:")
+}
+
+/// `query --scan SCAN_ID`: replay the scan's journaled event stream as
+/// JSONL envelopes, oldest first. `--after CURSOR` resumes strictly after
+/// the cursor's `seq`; `--follow` keeps polling a running scan until the
+/// terminal event, Ctrl-C (exit 130), or a broken pipe (quiet exit 0).
+/// Read-only: no owner lock, no epoch claim, servable while a scan holds
+/// the write lock. Unknown scan IDs exit 2 like `resume` on a missing ID.
+async fn run_query_scan_replay(
+    cfg: &config::Config,
+    args: &repo_scan::cli::QueryArgs,
+    scan_id: &str,
+) -> repo_scan::Result<ExitCode> {
+    use repo_scan::cli::OutputFormat;
+    // Explicit format wins; the default is JSONL when redirected, the
+    // live human view on a terminal (human replay: TUI slice).
+    let format = match args.format {
+        Some(f) => f,
+        None if !std::io::stdout().is_terminal() => OutputFormat::Jsonl,
+        None => {
+            eprintln!(
+                "repo-scan: not yet implemented: query --scan human replay executes in the TUI \
+                 slice; use --format jsonl for now"
+            );
+            return Ok(ExitCode::OperationalFailure);
+        }
+    };
+    if format != OutputFormat::Jsonl {
+        // `--follow --format json` never reaches here: `selection()`
+        // rejects it. Plain `--format json` folds the journal into one
+        // snapshot in a later slice.
+        eprintln!(
+            "repo-scan: not yet implemented: query --scan --format json executes in a later \
+             slice; use --format jsonl for now"
+        );
+        return Ok(ExitCode::OperationalFailure);
+    }
+    let db_path = store::owner::catalog_db_path(&cfg.state_dir);
+    if !db_path.exists() {
+        // JSONL lane: notices ride stderr so stdout stays a clean event
+        // stream.
+        eprintln!("cached: true");
+        eprintln!("suitable_catalog: false");
+        eprintln!(
+            "note: no catalog at {}; no live verification performed",
+            db_path.display()
+        );
+        return Ok(ExitCode::Incomplete);
+    }
+    let mut store = TursoStore::open_read_only(&db_path).await?;
+    if !catalog_bound_to_marker(&store, &cfg.state_dir).await? {
+        eprintln!("cached: true");
+        eprintln!("suitable_catalog: false");
+        eprintln!(
+            "note: catalog at {} is not bound to this tool's ownership marker; \
+             no live verification performed",
+            db_path.display()
+        );
+        let _ = store.close().await;
+        return Ok(ExitCode::Incomplete);
+    }
+    let Some(scan) = store.get_scan(scan_id).await? else {
+        let _ = store.close().await;
+        return Err(repo_scan::Error::InvalidArgs(format!(
+            "no such scan: {scan_id}"
+        )));
+    };
+    let mut after_seq = 0u64;
+    if let Some(after) = &args.after {
+        let Some(cursor) = Cursor::decode(after) else {
+            let _ = store.close().await;
+            return Err(repo_scan::Error::InvalidArgs(format!(
+                "corrupt --after cursor for scan {scan_id}; replay from the start instead"
+            )));
+        };
+        after_seq = cursor.seq;
+    }
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    // Initial replay: page through committed rows; a short page (or an
+    // empty one) means the reader caught up to the tip.
+    let mut terminal_seen = false;
+    loop {
+        let rows = store
+            .read_scan_events(scan_id, after_seq, REPLAY_PAGE_ROWS)
+            .await?;
+        let short_page = rows.len() < REPLAY_PAGE_ROWS as usize;
+        for row in &rows {
+            let env = envelope_for_row(row)?;
+            let line =
+                serde_json::to_string(&env).map_err(|e| repo_scan::Error::Report(e.to_string()))?;
+            if !write_jsonl_line(&mut out, &line)? {
+                let _ = store.close().await;
+                return Ok(ExitCode::Success);
+            }
+            after_seq = row.seq;
+            terminal_seen |= is_terminal_event(env.event_type);
+        }
+        if short_page {
+            break;
+        }
+    }
+    match out.flush() {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+            let _ = store.close().await;
+            return Ok(ExitCode::Success);
+        }
+        Err(e) => {
+            return Err(repo_scan::Error::Io(format!(
+                "cannot flush replay output: {e}"
+            )));
+        }
+    }
+    if !args.follow || terminal_seen {
+        let _ = store.close().await;
+        return Ok(ExitCode::Success);
+    }
+    // Follow: poll until the terminal event lands. A scan row that already
+    // left `running` keeps draining for a bounded grace: the writer commits
+    // the row state and the terminal journal event as two transactions (row
+    // first), so a terminal row can beat its event by a commit, and stopping
+    // at the tip here would silently drop the final event. Pre-journal
+    // scans never emit one; the same grace bounds their exit.
+    let mut terminal_row_polls = if scan_still_running(&scan.state) {
+        0
+    } else {
+        1
+    };
+    loop {
+        if interrupted() {
+            let _ = store.close().await;
+            return Ok(ExitCode::Interrupted);
+        }
+        std::thread::sleep(FOLLOW_POLL);
+        // A read-only handle pins its opening snapshot: later commits are
+        // invisible until reopen (measured: a 60s poll never saw new rows,
+        // a fresh open did). Reopen per poll and re-verify the ownership
+        // bind, so a swapped or cleared catalog ends the follow loudly
+        // instead of replaying stale or foreign rows.
+        let _ = store.close().await;
+        store = TursoStore::open_read_only(&db_path).await?;
+        if !catalog_bound_to_marker(&store, &cfg.state_dir).await? {
+            let _ = store.close().await;
+            eprintln!(
+                "repo-scan: follow: catalog at {} lost its ownership bind; \
+                 stopping at the journal tip",
+                db_path.display()
+            );
+            return Ok(ExitCode::Incomplete);
+        }
+        let rows = store
+            .read_scan_events(scan_id, after_seq, REPLAY_PAGE_ROWS)
+            .await?;
+        for row in &rows {
+            let env = envelope_for_row(row)?;
+            let line =
+                serde_json::to_string(&env).map_err(|e| repo_scan::Error::Report(e.to_string()))?;
+            if !write_jsonl_line(&mut out, &line)? {
+                let _ = store.close().await;
+                return Ok(ExitCode::Success);
+            }
+            after_seq = row.seq;
+            terminal_seen |= is_terminal_event(env.event_type);
+        }
+        match out.flush() {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                let _ = store.close().await;
+                return Ok(ExitCode::Success);
+            }
+            Err(e) => {
+                return Err(repo_scan::Error::Io(format!(
+                    "cannot flush replay output: {e}"
+                )));
+            }
+        }
+        if terminal_seen {
+            let _ = store.close().await;
+            return Ok(ExitCode::Success);
+        }
+        match store.get_scan(scan_id).await? {
+            Some(s) if scan_still_running(&s.state) => {
+                terminal_row_polls = 0;
+            }
+            Some(_) => {
+                // Terminal row, terminal event not yet drained: keep
+                // draining through the grace window (see the constant)
+                // instead of exiting without the final event.
+                terminal_row_polls += 1;
+                if terminal_row_polls >= FOLLOW_TERMINAL_GRACE_POLLS {
+                    let _ = store.close().await;
+                    return Ok(ExitCode::Success);
+                }
+            }
+            None => {
+                let _ = store.close().await;
+                eprintln!("repo-scan: follow: scan {scan_id} is gone; stopping at the journal tip");
+                return Ok(ExitCode::Incomplete);
+            }
+        }
+    }
+}
+
 async fn run_query(cfg: &config::Config, args: &repo_scan::cli::QueryArgs) -> ExitCode {
     match run_query_inner(cfg, args).await {
         Ok(code) => code,
@@ -7717,6 +9480,26 @@ async fn run_query_inner(
     cfg: &config::Config,
     args: &repo_scan::cli::QueryArgs,
 ) -> repo_scan::Result<ExitCode> {
+    // Goal Step 6: exactly one of TARGET / --all / --scan. The cached
+    // single-target path stays inline; --scan replays the journaled event
+    // stream; --all follows in a later slice.
+    let selection = match args.selection() {
+        Ok(s) => s,
+        Err(msg) => return Err(repo_scan::Error::InvalidArgs(msg)),
+    };
+    let url = match selection {
+        repo_scan::cli::QuerySelection::Target(url) => url,
+        repo_scan::cli::QuerySelection::Scan(id) => {
+            return run_query_scan_replay(cfg, args, &id).await;
+        }
+        repo_scan::cli::QuerySelection::All => {
+            eprintln!(
+                "repo-scan: not yet implemented: query --all executes in a later slice; \
+                 use one TARGET with --cached, or --scan SCAN_ID --format jsonl"
+            );
+            return Ok(ExitCode::OperationalFailure);
+        }
+    };
     if !args.cached {
         return Err(repo_scan::Error::InvalidArgs(
             "--cached is required: live queries are not supported".to_string(),
@@ -7791,9 +9574,9 @@ async fn run_query_inner(
         let _ = store.close().await;
         return Ok(ExitCode::Incomplete);
     }
-    let Some(canonical) = normalize_query_cached(&args.url) else {
+    let Some(canonical) = normalize_query_cached(&url) else {
         println!("cached: true");
-        println!("target: {}", identity::redact_target_for_display(&args.url));
+        println!("target: {}", identity::redact_target_for_display(&url));
         println!("canonical: unresolved (unsupported shape or unresolvable host alias)");
         println!("note: aliases resolve only from cached observations; no live probe performed");
         let _ = store.close().await;
@@ -7841,7 +9624,7 @@ async fn run_query_inner(
     )
     .await?;
     println!("cached: true (no live verification performed)");
-    println!("target: {}", identity::redact_target_for_display(&args.url));
+    println!("target: {}", identity::redact_target_for_display(&url));
     println!("canonical: {canonical}");
     for (id, policy, state, created) in &generations {
         println!(
@@ -7919,6 +9702,23 @@ async fn run_resume_inner(
     };
     let (base, saved_roots) = config::split_scan_state(&row.state);
     let outcome = row.outcome.as_deref().and_then(config::parse_outcome);
+    // Effective output lane: the saved v2 request format, overridden by an
+    // explicit `resume --format`. The json/jsonl lanes are not wired for
+    // scan/resume yet; refuse loudly rather than silently running human.
+    let saved_format = match row.format.as_deref() {
+        Some(value) => Some(output_format_from_str(value).ok_or_else(|| {
+            repo_scan::Error::Config(format!("saved output format is invalid: {value}"))
+        })?),
+        None => None,
+    };
+    let effective_format = args.format.or(saved_format);
+    if let Some(format) = effective_format {
+        if format != repo_scan::cli::OutputFormat::Human {
+            let _ = store.close().await;
+            drop(guard);
+            return Ok(refuse_unwired_format("resume", format));
+        }
+    }
     match base {
         "complete" => {
             let Some(recorded) = outcome else {
@@ -7973,10 +9773,10 @@ async fn run_resume_inner(
                     }
                 }
             }
-            continue_saved_scan(cfg, guard, store, &row, saved_roots).await
+            continue_saved_scan(cfg, guard, store, &row, saved_roots, effective_format).await
         }
         "running" | "interrupted" | "incomplete" => {
-            continue_saved_scan(cfg, guard, store, &row, saved_roots).await
+            continue_saved_scan(cfg, guard, store, &row, saved_roots, effective_format).await
         }
         other => {
             let _ = store.close().await;
@@ -8104,6 +9904,25 @@ async fn retry_publication(
     Ok(exit)
 }
 
+/// One persisted v2 scan target (`{raw, canonical}` in
+/// `scan_requests.targets_json`). The canonical form is re-derived on
+/// resume; only the sanitized raw target is carried forward.
+#[derive(serde::Deserialize)]
+struct SavedTarget {
+    raw: String,
+}
+
+/// Decode the persisted v2 target set of a saved scan request into the
+/// raw target list `scan` would have received.
+fn parse_saved_targets(json: &str, scan_id: &str) -> repo_scan::Result<Vec<String>> {
+    let saved: Vec<SavedTarget> = serde_json::from_str(json).map_err(|e| {
+        repo_scan::Error::Config(format!(
+            "scan {scan_id} has a corrupt saved target set: {e}"
+        ))
+    })?;
+    Ok(saved.into_iter().map(|t| t.raw).collect())
+}
+
 /// Restore a saved non-terminal request and continue its unfinished work.
 /// Releases ownership first: re-entering the scan loop re-acquires it.
 async fn continue_saved_scan(
@@ -8112,6 +9931,7 @@ async fn continue_saved_scan(
     store: TursoStore,
     row: &store::ScanRow,
     saved_roots: Option<Vec<PathBuf>>,
+    format: Option<repo_scan::cli::OutputFormat>,
 ) -> repo_scan::Result<ExitCode> {
     // Redact-on-read (RSF-SEC-TARGET-URL, EXACT-2): rows persisted
     // before the CLI boundary reject may hold credential-bearing targets.
@@ -8169,14 +9989,6 @@ async fn continue_saved_scan(
         "repo-scan: resuming scan {scan_id} (scope {}, saved options restored)",
         row.scope
     );
-    let args = repo_scan::cli::ScanArgs {
-        url,
-        scope,
-        report,
-        force_rescan: false,
-        status,
-        root,
-    };
     // The row's bound generation (R14), if any; `run_scan_inner`
     // honors it instead of re-picking.
     let generation = row
@@ -8184,6 +9996,38 @@ async fn continue_saved_scan(
         .as_deref()
         .and_then(config::parse_outcome)
         .and_then(|d| d.generation);
+    // v2 request shape (D5/D6): resume rebuilds the full target set the
+    // request was minted with — an interrupted `--all` scan resumes as
+    // `--all`, and a multi-target scan re-serves every target, not just
+    // the primary. Legacy rows (NULL v2 columns) fall back to `url_raw`.
+    let all = row.all_targets.unwrap_or(false);
+    let targets = if all {
+        Vec::new()
+    } else {
+        match row.targets_json.as_deref() {
+            Some(json) => {
+                let saved = parse_saved_targets(json, &row.id)?;
+                if saved.is_empty() {
+                    vec![url]
+                } else {
+                    saved
+                }
+            }
+            None => vec![url],
+        }
+    };
+    let args = repo_scan::cli::ScanArgs {
+        targets,
+        all,
+        scope,
+        report,
+        force_rescan: false,
+        status,
+        root,
+        format,
+        fetch: false,
+        color: None,
+    };
     run_scan_inner(
         cfg,
         &args,
@@ -11194,9 +13038,15 @@ pub async fn test_report_cursors(store: &TursoStore) -> repo_scan::Result<TestRe
 #[cfg(test)]
 pub fn test_alias_dedupe() -> (usize, usize) {
     let mut runner = Runner::new(&config::ResourceLimits::default());
-    runner.note_alias(b"/a".to_vec(), b"/b".to_vec(), "same_object", 1);
-    runner.note_alias(b"/a".to_vec(), b"/b".to_vec(), "same_object", 2);
-    runner.note_alias(b"/a".to_vec(), b"/c".to_vec(), "symlink", 3);
+    runner
+        .note_alias(b"/a".to_vec(), b"/b".to_vec(), "same_object", 1)
+        .expect("note");
+    runner
+        .note_alias(b"/a".to_vec(), b"/b".to_vec(), "same_object", 2)
+        .expect("note");
+    runner
+        .note_alias(b"/a".to_vec(), b"/c".to_vec(), "symlink", 3)
+        .expect("note");
     (runner.aliases.len(), runner.alias_seen.len())
 }
 
@@ -11231,9 +13081,11 @@ pub fn test_alias_cap() -> (usize, bool, bool) {
     for n in 0..(MAX_ALIASES + 10) {
         let path = format!("/a/{n}").into_bytes();
         let target = format!("/b/{n}").into_bytes();
-        let _ = runner.note_alias(path, target, "symlink", 1);
+        let _ = runner.note_alias(path, target, "symlink", 1).expect("note");
     }
-    let _ = runner.note_alias(b"/a/0".to_vec(), b"/b/0".to_vec(), "symlink", 2);
+    let _ = runner
+        .note_alias(b"/a/0".to_vec(), b"/b/0".to_vec(), "symlink", 2)
+        .expect("note");
     (
         runner.aliases.len(),
         runner.alias_overflow,
@@ -11252,7 +13104,8 @@ pub fn test_probed_git_ids_cap() -> (usize, bool, bool) {
             (1, n as u64),
             format!("/g/{n}").into_bytes(),
             1,
-        );
+        )
+        .expect("note");
     }
     (
         runner.probed_git_ids.len(),

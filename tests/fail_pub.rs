@@ -10,7 +10,7 @@ use repo_scan::report::publish::{check_destination_at, DestinationKind};
 
 fn prior_bytes(report_id: &str) -> Vec<u8> {
     serde_json::json!({
-        "schema_version": "1.0.0",
+        "schema_version": repo_scan::report::model::SCHEMA_VERSION,
         "report_id": report_id,
         "tool": {"name": "repo-scan", "version": "0.1.0", "source_commit": null},
     })

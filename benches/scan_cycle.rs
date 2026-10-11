@@ -242,6 +242,9 @@ async fn seed_catalog(store: &TursoStore, now: i64) {
                 scope: "roots",
                 status_mode: "summary",
                 report_dest: None,
+                targets_json: None,
+                format: None,
+                all_targets: None,
             },
             now,
         )

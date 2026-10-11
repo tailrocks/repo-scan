@@ -85,6 +85,34 @@ pub fn normalize_github_url(url: &str) -> Option<String> {
     ))
 }
 
+/// Normalize one scan-target input to canonical `https://github.com/owner/repo`
+/// form (goal Step 6). Accepts bare `owner/name` plus every
+/// [`normalize_github_url`] shape; anything else yields `None` (the caller
+/// reports it as invalid arguments).
+///
+/// Bare detection is structural: no `://`, no `@`, no `:` — none of which
+/// can appear in a valid owner or repo name, while every URL/scp shape
+/// contains at least one. Owner/repo charset and case rules are exactly the
+/// URL-path rules, so `Owner/Repo` and its URL spellings normalize
+/// identically. A `?`/`#` tail can never survive: it fails the repo-name
+/// charset (and [`must_reject_target`] refuses it first at the CLI
+/// boundary).
+pub fn normalize_target_input(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !trimmed.contains("://") && !trimmed.contains('@') && !trimmed.contains(':') {
+        let (owner, repo) = split_owner_repo_path(trimmed, false)?;
+        return Some(format!(
+            "https://{GITHUB_HOST}/{}/{}",
+            owner.to_lowercase(),
+            repo.to_lowercase()
+        ));
+    }
+    normalize_github_url(trimmed)
+}
+
 /// True when `target` is a local filesystem repository target (starts with `file://` or `/`).
 pub fn is_local_target(target: &str) -> bool {
     target.starts_with("file://") || target.starts_with('/')

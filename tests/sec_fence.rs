@@ -265,6 +265,7 @@ fn report_remote_urls_cap_huge_fields() {
             catalog_revision: 7,
             target_url: "https://example.com/OWNER/REPO".to_string(),
             canonical_url: Some("https://example.com/owner/repo".to_string()),
+            targets: vec![],
             scope: "roots".to_string(),
             scan_state: "complete".to_string(),
             started_at_ms: now,

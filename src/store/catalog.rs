@@ -561,6 +561,35 @@ pub enum TaskOutcome {
     },
 }
 
+/// Gap row a completion just recorded (`Retry`/`Parked` arms of
+/// [`TursoStore::complete_task`]), returned so the caller can journal the
+/// matching `error` event after the completion transaction commits. The
+/// store is the single source of truth for the id/category/detail — the
+/// caller must not reconstruct them from the outcome.
+#[derive(Debug, Clone)]
+pub struct CompletionGap {
+    /// Stable error id (`gap:<task id>`).
+    pub id: String,
+    /// Scope the error belongs to.
+    pub scope_key: String,
+    /// Stable category.
+    pub category: String,
+    /// Human-readable detail.
+    pub detail: String,
+}
+
+/// Gap delta of one task completion: the gap the outcome opened
+/// (`Retry`/`Parked`), if any, and the gap id a `Complete` outcome
+/// actually closed (rowcount-gated: tasks that never failed close
+/// nothing).
+#[derive(Debug, Clone, Default)]
+pub struct CompletionDelta {
+    /// Newly recorded open gap, when the outcome recorded one.
+    pub opened: Option<CompletionGap>,
+    /// Closed gap id, when the outcome closed a previously open row.
+    pub closed: Option<String>,
+}
+
 /// New task for [`TursoStore::enqueue_task`] (insert is idempotent).
 #[derive(Debug, Clone)]
 pub struct NewTask<'a> {
@@ -1632,6 +1661,10 @@ impl TursoStore {
     /// `stale-completion` scheduler error is returned. A token/epoch
     /// mismatch returns `lease-mismatch`. Stale results never erase
     /// newer invalidations (spec §12).
+    /// Complete one claimed task, discarding any gap delta the outcome
+    /// caused. Production completion goes through
+    /// [`TursoStore::complete_task_report_gap`] so the delta can be
+    /// journaled as `error` / `coverage_updated` events after the commit.
     pub async fn complete_task(
         &self,
         task_id: &str,
@@ -1640,8 +1673,25 @@ impl TursoStore {
         outcome: &TaskOutcome,
         now_ms: i64,
     ) -> crate::Result<()> {
+        self.complete_task_report_gap(task_id, token, epoch, outcome, now_ms)
+            .await
+            .map(|_| ())
+    }
+
+    /// Complete one claimed task. Returns the gap delta the outcome
+    /// caused — opened row (`Retry`/`Parked`) and/or closed id
+    /// (`Complete`) — so the caller can journal the matching `error` /
+    /// `coverage_updated` events after this transaction commits.
+    pub async fn complete_task_report_gap(
+        &self,
+        task_id: &str,
+        token: i64,
+        epoch: u64,
+        outcome: &TaskOutcome,
+        now_ms: i64,
+    ) -> crate::Result<CompletionDelta> {
         self.check_owner_epoch(epoch, "complete_task")?;
-        let stale = self
+        let (stale, delta) = self
             .with_tx(|conn| async move {
                 Self::complete_task_on(conn, task_id, token, epoch, outcome, now_ms).await
             })
@@ -1649,7 +1699,7 @@ impl TursoStore {
         // The stale requeue above committed; report it now. Returning the
         // error from inside the transaction would roll the requeue back.
         match stale {
-            None => Ok(()),
+            None => Ok(delta),
             Some(message) => Err(Error::Scheduler(message)),
         }
     }
@@ -1726,13 +1776,15 @@ impl TursoStore {
 
     /// Revision gate plus outcome application shared by plain and verified
     /// completions. Returns the stale-completion message when the task was
-    /// requeued (committed by the caller), `None` on a clean completion.
+    /// requeued (committed by the caller), `None` on a clean completion —
+    /// plus the gap row the outcome recorded, if any, so the caller can
+    /// journal the matching `error` event after this transaction commits.
     async fn apply_completion_on(
         conn: &turso::Connection,
         task: &FrontierTask,
         outcome: &TaskOutcome,
         now_ms: i64,
-    ) -> crate::Result<Option<String>> {
+    ) -> crate::Result<(Option<String>, CompletionDelta)> {
         let current_rev = Self::scope_rev_on(conn, &task.scope_key).await?;
         if current_rev != task.expected_rev {
             conn.execute(
@@ -1747,13 +1799,16 @@ impl TursoStore {
             )
             .await
             .map_err(store_err)?;
-            return Ok(Some(format!(
-                "stale-completion: task {} expected rev {} but scope {:?} \
+            return Ok((
+                Some(format!(
+                    "stale-completion: task {} expected rev {} but scope {:?} \
                     is at rev {current_rev}; task requeued",
-                task.id, task.expected_rev, task.scope_key
-            )));
+                    task.id, task.expected_rev, task.scope_key
+                )),
+                CompletionDelta::default(),
+            ));
         }
-        match outcome {
+        let gap = match outcome {
             TaskOutcome::Complete => {
                 conn.execute(
                     "UPDATE frontier_tasks SET state = 'complete', lease_token = NULL, \
@@ -1769,12 +1824,21 @@ impl TursoStore {
                 // never poison verdicts permanently. The row stays for
                 // audit (`open = 0`); tasks that never failed match zero
                 // rows (no-op).
-                conn.execute(
-                    "UPDATE errors SET open = 0, last_seen_ms = ?1 WHERE id = ?2",
-                    vec![v_int(now_ms), v_text(format!("gap:{}", task.id))],
-                )
-                .await
-                .map_err(store_err)?;
+                let gap_id = format!("gap:{}", task.id);
+                let closed_rows = conn
+                    .execute(
+                        "UPDATE errors SET open = 0, last_seen_ms = ?1 WHERE id = ?2 AND open = 1",
+                        vec![v_int(now_ms), v_text(gap_id.clone())],
+                    )
+                    .await
+                    .map_err(store_err)?;
+                // Rowcount-gated: only a genuinely open row reports a
+                // close. Close deltas belong to `coverage_updated`, not
+                // `error`.
+                CompletionDelta {
+                    opened: None,
+                    closed: if closed_rows > 0 { Some(gap_id) } else { None },
+                }
             }
             TaskOutcome::Retry {
                 category,
@@ -1804,6 +1868,15 @@ impl TursoStore {
                     now_ms,
                 )
                 .await?;
+                CompletionDelta {
+                    opened: Some(CompletionGap {
+                        id: gap_id,
+                        scope_key: task.scope_key.clone(),
+                        category: (*category).clone(),
+                        detail: (*detail).clone(),
+                    }),
+                    closed: None,
+                }
             }
             TaskOutcome::Parked { state, reason } => {
                 if !matches!(state, TaskState::Unavailable | TaskState::Unsupported) {
@@ -1834,15 +1907,25 @@ impl TursoStore {
                     now_ms,
                 )
                 .await?;
+                CompletionDelta {
+                    opened: Some(CompletionGap {
+                        id: gap_id,
+                        scope_key: task.scope_key.clone(),
+                        category: task_state_as_str(*state).to_string(),
+                        detail: (*reason).clone(),
+                    }),
+                    closed: None,
+                }
             }
-        }
-        Ok(None)
+        };
+        Ok((None, gap))
     }
 
     /// Returns the stale-completion message when the task was requeued
-    /// (committed by the caller), `None` on a clean completion. Lease and
-    /// parked-state errors return before any write, so their rollback is a
-    /// no-op; only the stale path writes-then-reports.
+    /// (committed by the caller), `None` on a clean completion — plus the
+    /// gap row the outcome recorded, if any. Lease and parked-state errors
+    /// return before any write, so their rollback is a no-op; only the
+    /// stale path writes-then-reports.
     async fn complete_task_on(
         conn: &turso::Connection,
         task_id: &str,
@@ -1850,7 +1933,7 @@ impl TursoStore {
         epoch: u64,
         outcome: &TaskOutcome,
         now_ms: i64,
-    ) -> crate::Result<Option<String>> {
+    ) -> crate::Result<(Option<String>, CompletionDelta)> {
         let task = Self::check_lease_on(conn, task_id, token, epoch).await?;
         Self::apply_completion_on(conn, &task, outcome, now_ms).await
     }
@@ -1863,6 +1946,10 @@ impl TursoStore {
     /// non-`Complete` outcomes skip the child check (no children are claimed
     /// durable). Stale completions still requeue and report as before.
     /// Callers using writer batches must flush before calling this.
+    /// Returns the gap row the outcome recorded, if any (see
+    /// [`TursoStore::complete_task`]). Recorded gaps are discarded: no
+    /// production caller completes verified parents yet, so there is no
+    /// journal to report them to.
     pub async fn complete_task_with_children(
         &self,
         task_id: &str,
@@ -1873,7 +1960,7 @@ impl TursoStore {
         now_ms: i64,
     ) -> crate::Result<()> {
         self.check_owner_epoch(epoch, "complete_task_with_children")?;
-        let stale = self
+        let (stale, _gap) = self
             .with_tx(|conn| async move {
                 let task = Self::check_lease_on(conn, task_id, token, epoch).await?;
                 if matches!(outcome, TaskOutcome::Complete) {
@@ -2535,6 +2622,14 @@ pub struct ScanRow {
     pub created_at_ms: i64,
     /// Last update time.
     pub updated_at_ms: i64,
+    /// v2: JSON array of `{raw, canonical}` for the multi-target request
+    /// served by one filesystem pass; `None` = legacy single-target row
+    /// addressed via `url_raw`.
+    pub targets_json: Option<String>,
+    /// v2: output format (`human|json|jsonl`); `None` = legacy/auto.
+    pub format: Option<String>,
+    /// v2: `--all` filesystem-discovery scan; `None` = legacy row.
+    pub all_targets: Option<bool>,
 }
 
 impl ScanRow {
@@ -2551,6 +2646,9 @@ impl ScanRow {
             successor_id: opt_text(row, 8)?,
             created_at_ms: req_i64(row, 9)?,
             updated_at_ms: req_i64(row, 10)?,
+            targets_json: opt_text(row, 11)?,
+            format: opt_text(row, 12)?,
+            all_targets: opt_i64(row, 13)?.map(|v| v != 0),
         })
     }
 }
@@ -2570,6 +2668,12 @@ pub struct NewScan<'a> {
     pub status_mode: &'a str,
     /// Absolute report destination, exact bytes.
     pub report_dest: Option<&'a [u8]>,
+    /// v2: JSON array of `{raw, canonical}` targets; `None` = legacy row.
+    pub targets_json: Option<&'a str>,
+    /// v2: output format (`human|json|jsonl`); `None` = legacy/auto.
+    pub format: Option<&'a str>,
+    /// v2: `--all` scan; `None` = legacy row.
+    pub all_targets: Option<bool>,
 }
 
 /// One immutable report snapshot.
@@ -2755,6 +2859,10 @@ pub struct GenerationRow {
     pub prior_generation: Option<u64>,
     /// Creation time.
     pub created_at_ms: i64,
+    /// v2: full scope key (roots + volume identities + exclusions +
+    /// traversal policy); `None` = legacy policy-name key in
+    /// `scope_policy`.
+    pub scope_key: Option<String>,
 }
 
 impl GenerationRow {
@@ -2767,6 +2875,118 @@ impl GenerationRow {
                 .map(|prior| i64_to_u64(prior, "prior generation"))
                 .transpose()?,
             created_at_ms: req_i64(row, 4)?,
+            scope_key: opt_text(row, 5)?,
+        })
+    }
+}
+
+/// v2: one scan-event journal append (D4).
+#[derive(Debug, Clone)]
+pub struct NewScanEvent<'a> {
+    /// Scan id.
+    pub scan_id: &'a str,
+    /// Scan-scoped sequence, assigned by the writer.
+    pub seq: u64,
+    /// Catalog revision committed with this event.
+    pub catalog_rev: u64,
+    /// Offset of this event within its revision.
+    pub event_offset: u64,
+    /// Event class (`scan_started`, `location_found`, ...).
+    pub event_type: &'a str,
+    /// `add` | `replace` | `remove`.
+    pub op: &'a str,
+    /// Consumer must drop buffered state.
+    pub reset: bool,
+    /// JSON bytes, stored byte-exact.
+    pub records: &'a [u8],
+}
+
+/// v2: one journaled scan event.
+#[derive(Debug, Clone)]
+pub struct ScanEventRow {
+    /// Scan id.
+    pub scan_id: String,
+    /// Scan-scoped sequence.
+    pub seq: u64,
+    /// Catalog revision committed with this event.
+    pub catalog_rev: u64,
+    /// Offset of this event within its revision.
+    pub event_offset: u64,
+    /// Event class.
+    pub event_type: String,
+    /// `add` | `replace` | `remove`.
+    pub op: String,
+    /// Consumer must drop buffered state.
+    pub reset: bool,
+    /// JSON bytes, byte-exact.
+    pub records: Vec<u8>,
+}
+
+impl ScanEventRow {
+    fn from_row(row: &turso::Row) -> crate::Result<Self> {
+        Ok(Self {
+            scan_id: req_text(row, 0)?,
+            seq: i64_to_u64(req_i64(row, 1)?, "event seq")?,
+            catalog_rev: i64_to_u64(req_i64(row, 2)?, "event catalog_rev")?,
+            event_offset: i64_to_u64(req_i64(row, 3)?, "event offset")?,
+            event_type: req_text(row, 4)?,
+            op: req_text(row, 5)?,
+            reset: req_i64(row, 6)? != 0,
+            records: req_blob(row, 7)?,
+        })
+    }
+}
+
+/// v2: one GitHub group (D1): normalized host/account/repo.
+#[derive(Debug, Clone)]
+pub struct GithubGroupRow {
+    /// Writer-computed `lower(host)/lower(account)/lower(repo)`.
+    pub id: String,
+    /// Normalized host.
+    pub host: String,
+    /// Normalized account or organization.
+    pub account: String,
+    /// Normalized repository name.
+    pub repo: String,
+    /// First observation time.
+    pub observed_at_ms: i64,
+}
+
+impl GithubGroupRow {
+    fn from_row(row: &turso::Row) -> crate::Result<Self> {
+        Ok(Self {
+            id: req_text(row, 0)?,
+            host: req_text(row, 1)?,
+            account: req_text(row, 2)?,
+            repo: req_text(row, 3)?,
+            observed_at_ms: req_i64(row, 4)?,
+        })
+    }
+}
+
+/// v2: one store-to-group edge via the observing remote (D1).
+#[derive(Debug, Clone)]
+pub struct GroupMemberRow {
+    /// Group id.
+    pub group_id: String,
+    /// Local store id.
+    pub instance_id: String,
+    /// Observing remote name, exact bytes.
+    pub remote_name: Vec<u8>,
+    /// `fetch` | `push`.
+    pub role: String,
+    /// Observation time.
+    pub observed_at_ms: i64,
+}
+
+impl GroupMemberRow {
+    fn from_row(row: &turso::Row) -> crate::Result<Self> {
+        Ok(Self {
+            group_id: req_text(row, 0)?,
+            instance_id: req_text(row, 1)?,
+            remote_name: req_blob(row, 2)?,
+            role: req_text(row, 3)?,
+            observed_at_ms: req_i64(row, 4)?,
         })
     }
 }
@@ -3250,8 +3470,9 @@ impl TursoStore {
             .conn
             .execute(
                 "INSERT OR IGNORE INTO scan_requests (id, url_raw, url_canonical, scope, \
-                    status_mode, report_dest, state, created_at_ms, updated_at_ms) \
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?7)",
+                    status_mode, report_dest, state, created_at_ms, updated_at_ms, \
+                    targets_json, format, all_targets) \
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?7, ?8, ?9, ?10)",
                 vec![
                     v_text(scan.id),
                     v_blob(url_raw),
@@ -3260,6 +3481,9 @@ impl TursoStore {
                     v_text(scan.status_mode),
                     v_opt_blob(scan.report_dest.map(<[u8]>::to_vec)),
                     v_int(now_ms),
+                    v_opt_text(scan.targets_json.map(str::to_string)),
+                    v_opt_text(scan.format.map(str::to_string)),
+                    v_opt_int(scan.all_targets.map(i64::from)),
                 ],
             )
             .await
@@ -3300,7 +3524,8 @@ impl TursoStore {
             .conn
             .query(
                 "SELECT id, url_raw, url_canonical, scope, status_mode, report_dest, \
-                    state, outcome, successor_id, created_at_ms, updated_at_ms \
+                    state, outcome, successor_id, created_at_ms, updated_at_ms, \
+                    targets_json, format, all_targets \
                     FROM scan_requests WHERE id = ?1",
                 vec![v_text(id)],
             )
@@ -3514,6 +3739,22 @@ impl TursoStore {
             None => Ok(None),
             Some(row) => Ok(Some(ErrorRow::from_row(&row)?)),
         }
+    }
+
+    /// Ids of currently open error rows. The runner preloads this once
+    /// per scan so buffered gap closes report `coverage_updated` deltas
+    /// only for genuine open→closed transitions.
+    pub async fn list_open_error_ids(&self) -> crate::Result<Vec<String>> {
+        let mut rows = self
+            .conn
+            .query("SELECT id FROM errors WHERE open = 1 ORDER BY id ASC", ())
+            .await
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            out.push(req_text(&row, 0)?);
+        }
+        Ok(out)
     }
 
     /// Append an event-journal record idempotently
@@ -3737,7 +3978,7 @@ impl TursoStore {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, scope_policy, state, prior_generation, created_at_ms \
+                "SELECT id, scope_policy, state, prior_generation, created_at_ms, scope_key \
                     FROM generations WHERE id = ?1",
                 vec![v_int(u64_to_i64(id, "generation id")?)],
             )
@@ -3747,6 +3988,257 @@ impl TursoStore {
             None => Ok(None),
             Some(row) => Ok(Some(GenerationRow::from_row(&row)?)),
         }
+    }
+
+    /// v2: record the full scope key for a generation (D5). Never set
+    /// (`NULL`) keeps the legacy policy-name key semantics.
+    pub async fn set_generation_scope_key(&self, id: u64, scope_key: &str) -> crate::Result<()> {
+        self.forbid_write("set_generation_scope_key")?;
+        self.conn
+            .execute(
+                "UPDATE generations SET scope_key = ?1 WHERE id = ?2",
+                vec![v_text(scope_key), v_int(u64_to_i64(id, "generation id")?)],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// v2: append one scan-event journal row (D4). `INSERT OR IGNORE` by
+    /// `(scan_id, seq)`: redelivery of the same `seq` is idempotent.
+    /// Returns true when newly inserted.
+    pub async fn append_scan_event(&self, event: &NewScanEvent<'_>) -> crate::Result<bool> {
+        self.forbid_write("append_scan_event")?;
+        let rows = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO scan_events (scan_id, seq, catalog_rev, event_offset, \
+                    event_type, op, reset, records) \
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                vec![
+                    v_text(event.scan_id),
+                    v_int(u64_to_i64(event.seq, "event seq")?),
+                    v_int(u64_to_i64(event.catalog_rev, "event catalog_rev")?),
+                    v_int(u64_to_i64(event.event_offset, "event offset")?),
+                    v_text(event.event_type),
+                    v_text(event.op),
+                    v_int(i64::from(event.reset)),
+                    v_blob(event.records.to_vec()),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(rows == 1)
+    }
+
+    /// v2: buffer one scan-event journal row into a writer batch (D4),
+    /// committing atomically with the instance/checkout rows that caused
+    /// it. Same `INSERT OR IGNORE` by `(scan_id, seq)` as
+    /// [`Self::append_scan_event`]. Returns `WriterBatch::should_flush`.
+    pub fn buffer_scan_event(
+        batch: &mut WriterBatch,
+        event: &NewScanEvent<'_>,
+    ) -> crate::Result<bool> {
+        Ok(batch.push(
+            "INSERT OR IGNORE INTO scan_events (scan_id, seq, catalog_rev, event_offset, \
+                event_type, op, reset, records) \
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            vec![
+                v_text(event.scan_id),
+                v_int(u64_to_i64(event.seq, "event seq")?),
+                v_int(u64_to_i64(event.catalog_rev, "event catalog_rev")?),
+                v_int(u64_to_i64(event.event_offset, "event offset")?),
+                v_text(event.event_type),
+                v_text(event.op),
+                v_int(i64::from(event.reset)),
+                v_blob(event.records.to_vec()),
+            ],
+        ))
+    }
+
+    /// v2: replay journal rows for a scan after `after_seq` (exclusive),
+    /// oldest first, capped at `limit` rows (clamped to `[1, 10_000]`).
+    pub async fn read_scan_events(
+        &self,
+        scan_id: &str,
+        after_seq: u64,
+        limit: u64,
+    ) -> crate::Result<Vec<ScanEventRow>> {
+        let limit = limit.clamp(1, 10_000);
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT scan_id, seq, catalog_rev, event_offset, event_type, op, reset, records \
+                    FROM scan_events WHERE scan_id = ?1 AND seq > ?2 \
+                    ORDER BY seq ASC LIMIT ?3",
+                vec![
+                    v_text(scan_id),
+                    v_int(u64_to_i64(after_seq, "after seq")?),
+                    v_int(u64_to_i64(limit, "event limit")?),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            out.push(ScanEventRow::from_row(&row)?);
+        }
+        Ok(out)
+    }
+
+    /// v2: highest journaled `seq` for a scan (`None` when empty), so a
+    /// restarted writer resumes numbering without reuse.
+    pub async fn last_event_seq(&self, scan_id: &str) -> crate::Result<Option<u64>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT MAX(seq) FROM scan_events WHERE scan_id = ?1",
+                vec![v_text(scan_id)],
+            )
+            .await
+            .map_err(store_err)?;
+        match rows.next().await.map_err(store_err)? {
+            None => Ok(None),
+            Some(row) => Ok(opt_i64(&row, 0)?
+                .map(|v| i64_to_u64(v, "event seq"))
+                .transpose()?),
+        }
+    }
+
+    /// v2: upsert one GitHub group (D1). The id is writer-computed
+    /// `lower(host)/lower(account)/lower(repo)`; first observation wins
+    /// (`INSERT OR IGNORE`). Returns true when newly inserted.
+    pub async fn upsert_github_group(
+        &self,
+        id: &str,
+        host: &str,
+        account: &str,
+        repo: &str,
+        now_ms: i64,
+    ) -> crate::Result<bool> {
+        self.forbid_write("upsert_github_group")?;
+        let rows = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO github_groups (id, host, account, repo, observed_at_ms) \
+                    VALUES (?1, ?2, ?3, ?4, ?5)",
+                vec![
+                    v_text(id),
+                    v_text(host),
+                    v_text(account),
+                    v_text(repo),
+                    v_int(now_ms),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(rows == 1)
+    }
+
+    /// v2: attach one store to a group via the observing remote's
+    /// `(name, role)` (D1). Idempotent. Returns true when newly inserted.
+    pub async fn add_group_member(
+        &self,
+        group_id: &str,
+        instance_id: &str,
+        remote_name: &[u8],
+        role: &str,
+        now_ms: i64,
+    ) -> crate::Result<bool> {
+        self.forbid_write("add_group_member")?;
+        let rows = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO group_members (group_id, instance_id, remote_name, role, \
+                    observed_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+                vec![
+                    v_text(group_id),
+                    v_text(instance_id),
+                    v_blob(remote_name.to_vec()),
+                    v_text(role),
+                    v_int(now_ms),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(rows == 1)
+    }
+
+    /// v2: one group by id.
+    pub async fn get_github_group(&self, id: &str) -> crate::Result<Option<GithubGroupRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, host, account, repo, observed_at_ms \
+                    FROM github_groups WHERE id = ?1",
+                vec![v_text(id)],
+            )
+            .await
+            .map_err(store_err)?;
+        match rows.next().await.map_err(store_err)? {
+            None => Ok(None),
+            Some(row) => Ok(Some(GithubGroupRow::from_row(&row)?)),
+        }
+    }
+
+    /// v2: member edges of one group.
+    pub async fn list_group_members(&self, group_id: &str) -> crate::Result<Vec<GroupMemberRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT group_id, instance_id, remote_name, role, observed_at_ms \
+                    FROM group_members WHERE group_id = ?1 \
+                    ORDER BY instance_id ASC, role ASC",
+                vec![v_text(group_id)],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            out.push(GroupMemberRow::from_row(&row)?);
+        }
+        Ok(out)
+    }
+
+    /// v2: groups one store belongs to (via any remote).
+    pub async fn groups_for_instance(
+        &self,
+        instance_id: &str,
+    ) -> crate::Result<Vec<GroupMemberRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT group_id, instance_id, remote_name, role, observed_at_ms \
+                    FROM group_members WHERE instance_id = ?1 \
+                    ORDER BY group_id ASC",
+                vec![v_text(instance_id)],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            out.push(GroupMemberRow::from_row(&row)?);
+        }
+        Ok(out)
+    }
+
+    /// v2: all observed groups, ordered by id (unique-group totals read
+    /// this; one row per distinct normalized identity, so no bound needed).
+    pub async fn list_github_groups(&self) -> crate::Result<Vec<GithubGroupRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, host, account, repo, observed_at_ms \
+                    FROM github_groups ORDER BY id ASC",
+                (),
+            )
+            .await
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            out.push(GithubGroupRow::from_row(&row)?);
+        }
+        Ok(out)
     }
 }
 
@@ -4187,6 +4679,54 @@ impl TursoStore {
                 v_text(remote.role),
                 v_blob(redacted_remote_bytes(remote.url)),
                 v_opt_blob(remote.canonical_url.map(redacted_remote_bytes)),
+                v_int(observed_ms),
+            ],
+        )
+    }
+
+    /// Buffer a v2 GitHub group upsert (`INSERT OR IGNORE`, first
+    /// observation wins); same SQL as [`TursoStore::upsert_github_group`].
+    /// The id is the caller-computed `lower(host)/lower(account)/lower(repo)`
+    /// (D1). Returns `WriterBatch::should_flush`.
+    pub fn buffer_upsert_github_group(
+        batch: &mut WriterBatch,
+        id: &str,
+        host: &str,
+        account: &str,
+        repo: &str,
+        observed_ms: i64,
+    ) -> bool {
+        batch.push(
+            "INSERT OR IGNORE INTO github_groups (id, host, account, repo, observed_at_ms) \
+                VALUES (?1, ?2, ?3, ?4, ?5)",
+            vec![
+                v_text(id),
+                v_text(host),
+                v_text(account),
+                v_text(repo),
+                v_int(observed_ms),
+            ],
+        )
+    }
+
+    /// Buffer one v2 store-to-group edge (`INSERT OR IGNORE`); same SQL as
+    /// [`TursoStore::add_group_member`]. Returns `WriterBatch::should_flush`.
+    pub fn buffer_add_group_member(
+        batch: &mut WriterBatch,
+        group_id: &str,
+        instance_id: &str,
+        remote_name: &[u8],
+        role: &str,
+        observed_ms: i64,
+    ) -> bool {
+        batch.push(
+            "INSERT OR IGNORE INTO group_members (group_id, instance_id, remote_name, role, \
+                observed_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+            vec![
+                v_text(group_id),
+                v_text(instance_id),
+                v_blob(remote_name.to_vec()),
+                v_text(role),
                 v_int(observed_ms),
             ],
         )

@@ -9,6 +9,7 @@ pub mod model;
 pub mod platform;
 pub mod privacy;
 pub mod report;
+pub mod scan_events;
 pub mod scheduler;
 pub mod store;
 pub mod telemetry;
