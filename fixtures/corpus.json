@@ -1,0 +1,43 @@
+{
+  "corpus": "repo-scan PERF-02 declared corpus v1",
+  "note": "Sizes are generation parameters, not measurements. Results are recorded on run to benches/results/*.jsonl.",
+  "git_layouts": [
+    "normal clone with main branch + origin remote",
+    "bare store under arbitrary name (store.backup)",
+    "linked worktree (detached)",
+    "detached HEAD checkout",
+    "submodule (registered) and nested repo (unregistered)",
+    "packed-refs with 3 branches",
+    "unborn branch (no commits)",
+    "external git dir (--separate-git-dir)",
+    "shared clone via alternates"
+  ],
+  "scope_layouts": [
+    ".hidden/repo",
+    "tmp/scratch/repo",
+    ".cache/tool/repo",
+    "target/debug/repo",
+    "node_modules/pkg/repo",
+    "outer/inner (nested)",
+    "outer/.git/recovery/salvaged"
+  ],
+  "adversarial": [
+    "symlink cycle a<->b + self-loop",
+    "non-UTF-8 dir and file names (unix)",
+    "control characters in names"
+  ],
+  "sizes": {
+    "huge_flat_ci_files": 2000,
+    "deep_path_ci_depth": 64,
+    "walk_compare_flat_files": 500,
+    "walk_compare_deep_depth": 32,
+    "scan_cycle_flat_files": 500,
+    "scan_cycle_catalog_instances": 200,
+    "scan_cycle_refs_per_instance": 3,
+    "scan_cycle_cached_query_reps": 50,
+    "scan_cycle_resume_tasks": 500
+  },
+  "rss_method": "peak_rss_bytes via getrusage(RUSAGE_SELF): macOS ru_maxrss is bytes, Linux is kilobytes (normalized in benches/support.rs)",
+  "sampling": "1 Hz resource telemetry per spec section 5; per-phase peak RSS recorded in JSONL",
+  "warmup": "cold pass then warm pass over identical scope; sustained 30s PERF-02 runs repeat the controlled fixture"
+}
