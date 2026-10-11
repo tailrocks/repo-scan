@@ -1,7 +1,7 @@
 //! Catalog migration v2: GitHub groups, scan-event journal, multi-target
 //! scans, full scope keys (`docs/GOAL_CONTRACTS.md` D1/D2/D4/D5).
 //!
-//! D1: NEW `github_groups` record (`groups[]` in report `1.1.0`) with ID
+//! D1: NEW `github_groups` record (`groups[]` in report `1.5.0`) with ID
 //! `lower(host)/lower(account)/lower(repo)`; exact match for targets.
 //! `group_members` edges one store to a group via the observing remote's
 //! `(name, role)` — fork/upstream never merged.

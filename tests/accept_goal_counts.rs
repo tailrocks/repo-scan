@@ -236,6 +236,6 @@ fn goal_exact_counts_main_plus_worktrees_plus_clone() {
         assert!(names.insert(n.clone()), "duplicate branch row for {n}");
     }
 
-    // TODO(report 1.1.0, D1): assert groups[] has one entry for goal-owner/goal-repo — not implemented yet.
-    // TODO(report 1.1.0, D1): assert totals { stores: 2, present checkouts: 5, linked worktrees: 3 } — not implemented yet.
+    // TODO(report 1.5.0, D1): assert groups[] has one entry for goal-owner/goal-repo — not implemented yet.
+    // TODO(report 1.5.0, D1): assert totals { stores: 2, present checkouts: 5, linked worktrees: 3 } — not implemented yet.
 }

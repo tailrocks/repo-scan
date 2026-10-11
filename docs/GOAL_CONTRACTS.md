@@ -13,14 +13,14 @@ Reuse existing Catalog tables; add what is missing. No renames.
 |---|---|---|---|
 | Local store | `git_instances` (= existing) | `Repository` | existing `id` (common dir + physical identity); independent clones stay separate |
 | Checkout | `checkouts` | `Checkout` | existing `id`; HEAD/index/config/refs per checkout |
-| Branch | `refs` | `Branch` + comparison fields | `(instance_id, full refname)`; never merge across stores |
+| Branch | `refs` | `Branch` + comparison fields (report `1.3`/`1.4`) | `(instance_id, full refname)`; never merge across stores |
 | Path alias | derived (alias index) | `Alias` | `(path_id, target_path_id, kind)` |
 | Remote assoc | `remotes` | `Remote` | existing `id`; keep name + role + normalized identity; fork/upstream never merged |
-| GitHub group | NEW `github_groups` (migration v2) | NEW `groups[]` | `lower(host) + '/' + lower(account) + '/' + lower(repo)`; exact match for targets |
+| GitHub group | NEW `github_groups` (migration v2) | NEW `groups[]` (report `1.5.0`) | `lower(host) + '/' + lower(account) + '/' + lower(repo)`; exact match for targets |
 | Coverage gap | `errors` | `ErrorRecord` | existing `id` |
 | Candidate | derived | `Candidate` | existing `id`; identity `unknown` when unresolvable |
 
-Totals (NEW `totals` object in report): accounts/orgs, unique groups,
+Totals (NEW `totals` object, report `1.5.0`): accounts/orgs, unique groups,
 stores (+bare), present checkouts (+linked worktrees), observed paths
 (+aliases), local branches, remote-tracking refs, analysis
 completed/pending/failed/unavailable, unresolved candidates, gaps.
@@ -30,8 +30,10 @@ freshness stay separate properties.
 
 ## D2. Schema versions (Step 5)
 
-- Report `1.0.0` → `1.1.0` (additive: `groups[]`, `totals`, branch
-  comparison fields, freshness basis; no field removed/renamed).
+- Report `1.0.0` → `1.1.0` (additive: `scan.targets` only; no field
+  removed/renamed). Later additive bumps: `1.2.0` adds the fetch freshness
+  basis, `1.3`/`1.4` add branch comparison and working-state fields,
+  `1.5.0` adds `groups[]` and `totals`.
 - NEW scan-event stream schema `1.0.0` (JSONL).
 - Catalog migration v2: `github_groups`, `scan_events` journal,
   `scan_requests` multi-target columns, full scope key (D5). v1 data migrates.
