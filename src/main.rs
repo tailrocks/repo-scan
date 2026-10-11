@@ -421,6 +421,29 @@ fn status_mode_from_str(text: &str) -> Option<StatusMode> {
     }
 }
 
+/// Inverse of [`repo_scan::cli::OutputFormat::name`] for persisted rows.
+fn output_format_from_str(text: &str) -> Option<repo_scan::cli::OutputFormat> {
+    use repo_scan::cli::OutputFormat;
+    match text {
+        "human" => Some(OutputFormat::Human),
+        "json" => Some(OutputFormat::Json),
+        "jsonl" => Some(OutputFormat::Jsonl),
+        _ => None,
+    }
+}
+
+/// The `json`/`jsonl` lanes are pre-staged in the CLI (goal Step 6) and
+/// wired only for `query --scan`; refuse loudly instead of silently
+/// ignoring the flag (mirrors the `query --scan` stub).
+fn refuse_unwired_format(command: &str, format: repo_scan::cli::OutputFormat) -> ExitCode {
+    eprintln!(
+        "repo-scan: not yet implemented: {command} --format {} executes in the live-outputs \
+         slice; omit --format (or use `--format human`) for now",
+        format.name()
+    );
+    ExitCode::OperationalFailure
+}
+
 fn disposition_str(d: identity::MatchDisposition) -> &'static str {
     match d {
         identity::MatchDisposition::Confirmed => "confirmed",
@@ -1126,6 +1149,15 @@ async fn run_scan_inner(
     args: &repo_scan::cli::ScanArgs,
     resumed: Option<ResumedRequest>,
 ) -> repo_scan::Result<ExitCode> {
+    // The json/jsonl lanes are accepted by the CLI but not wired for
+    // scan/resume yet; refuse before any state mutation rather than
+    // silently running the human lane (the live-outputs slice wires
+    // them). Resume threads the saved request's format into `args` first.
+    if let Some(format) = args.format {
+        if format != repo_scan::cli::OutputFormat::Human {
+            return Ok(refuse_unwired_format("scan", format));
+        }
+    }
     // CLI boundary (RSF-SEC-TARGET-URL, EXACT-2): credential-bearing
     // targets (userinfo, any query/fragment tail) are rejected before any
     // persistence or reporting; the error echoes only the display-safe
@@ -1317,7 +1349,7 @@ async fn run_scan_inner(
             }).collect::<Vec<_>>(),
             "options": {
                 "all": resolved.all,
-                "format": format!("{:?}", args.format),
+                "format": args.format.map(repo_scan::cli::OutputFormat::name),
                 "status": format!("{:?}", args.status),
                 "force_rescan": args.force_rescan,
                 "fetch": args.fetch,
@@ -1758,7 +1790,7 @@ async fn run_scan_inner(
                 },
                 "options": {
                     "all": resolved.all,
-                    "format": format!("{:?}", args.format),
+                    "format": args.format.map(repo_scan::cli::OutputFormat::name),
                     "status": format!("{:?}", args.status),
                     "force_rescan": args.force_rescan,
                     "fetch": args.fetch,
@@ -2042,11 +2074,7 @@ async fn mint_scan_id(
             .collect::<Vec<_>>(),
     )
     .map_err(|e| repo_scan::Error::Report(e.to_string()))?;
-    let format_str = format.map(|f| match f {
-        repo_scan::cli::OutputFormat::Human => "human",
-        repo_scan::cli::OutputFormat::Json => "json",
-        repo_scan::cli::OutputFormat::Jsonl => "jsonl",
-    });
+    let format_str = format.map(repo_scan::cli::OutputFormat::name);
     for _ in 0..3 {
         let id = config::new_scan_id();
         let inserted = store
@@ -9215,9 +9243,11 @@ async fn run_query_scan_replay(
     }
     let db_path = store::owner::catalog_db_path(&cfg.state_dir);
     if !db_path.exists() {
-        println!("cached: true");
-        println!("suitable_catalog: false");
-        println!(
+        // JSONL lane: notices ride stderr so stdout stays a clean event
+        // stream.
+        eprintln!("cached: true");
+        eprintln!("suitable_catalog: false");
+        eprintln!(
             "note: no catalog at {}; no live verification performed",
             db_path.display()
         );
@@ -9225,9 +9255,9 @@ async fn run_query_scan_replay(
     }
     let mut store = TursoStore::open_read_only(&db_path).await?;
     if !catalog_bound_to_marker(&store, &cfg.state_dir).await? {
-        println!("cached: true");
-        println!("suitable_catalog: false");
-        println!(
+        eprintln!("cached: true");
+        eprintln!("suitable_catalog: false");
+        eprintln!(
             "note: catalog at {} is not bound to this tool's ownership marker; \
              no live verification performed",
             db_path.display()
@@ -9602,6 +9632,23 @@ async fn run_resume_inner(
     };
     let (base, saved_roots) = config::split_scan_state(&row.state);
     let outcome = row.outcome.as_deref().and_then(config::parse_outcome);
+    // Effective output lane: the saved v2 request format, overridden by an
+    // explicit `resume --format`. The json/jsonl lanes are not wired for
+    // scan/resume yet; refuse loudly rather than silently running human.
+    let saved_format = match row.format.as_deref() {
+        Some(value) => Some(output_format_from_str(value).ok_or_else(|| {
+            repo_scan::Error::Config(format!("saved output format is invalid: {value}"))
+        })?),
+        None => None,
+    };
+    let effective_format = args.format.or(saved_format);
+    if let Some(format) = effective_format {
+        if format != repo_scan::cli::OutputFormat::Human {
+            let _ = store.close().await;
+            drop(guard);
+            return Ok(refuse_unwired_format("resume", format));
+        }
+    }
     match base {
         "complete" => {
             let Some(recorded) = outcome else {
@@ -9656,10 +9703,10 @@ async fn run_resume_inner(
                     }
                 }
             }
-            continue_saved_scan(cfg, guard, store, &row, saved_roots).await
+            continue_saved_scan(cfg, guard, store, &row, saved_roots, effective_format).await
         }
         "running" | "interrupted" | "incomplete" => {
-            continue_saved_scan(cfg, guard, store, &row, saved_roots).await
+            continue_saved_scan(cfg, guard, store, &row, saved_roots, effective_format).await
         }
         other => {
             let _ = store.close().await;
@@ -9787,6 +9834,25 @@ async fn retry_publication(
     Ok(exit)
 }
 
+/// One persisted v2 scan target (`{raw, canonical}` in
+/// `scan_requests.targets_json`). The canonical form is re-derived on
+/// resume; only the sanitized raw target is carried forward.
+#[derive(serde::Deserialize)]
+struct SavedTarget {
+    raw: String,
+}
+
+/// Decode the persisted v2 target set of a saved scan request into the
+/// raw target list `scan` would have received.
+fn parse_saved_targets(json: &str, scan_id: &str) -> repo_scan::Result<Vec<String>> {
+    let saved: Vec<SavedTarget> = serde_json::from_str(json).map_err(|e| {
+        repo_scan::Error::Config(format!(
+            "scan {scan_id} has a corrupt saved target set: {e}"
+        ))
+    })?;
+    Ok(saved.into_iter().map(|t| t.raw).collect())
+}
+
 /// Restore a saved non-terminal request and continue its unfinished work.
 /// Releases ownership first: re-entering the scan loop re-acquires it.
 async fn continue_saved_scan(
@@ -9795,6 +9861,7 @@ async fn continue_saved_scan(
     store: TursoStore,
     row: &store::ScanRow,
     saved_roots: Option<Vec<PathBuf>>,
+    format: Option<repo_scan::cli::OutputFormat>,
 ) -> repo_scan::Result<ExitCode> {
     // Redact-on-read (RSF-SEC-TARGET-URL, EXACT-2): rows persisted
     // before the CLI boundary reject may hold credential-bearing targets.
@@ -9852,18 +9919,6 @@ async fn continue_saved_scan(
         "repo-scan: resuming scan {scan_id} (scope {}, saved options restored)",
         row.scope
     );
-    let args = repo_scan::cli::ScanArgs {
-        targets: vec![url],
-        all: false,
-        scope,
-        report,
-        force_rescan: false,
-        status,
-        root,
-        format: None,
-        fetch: false,
-        color: None,
-    };
     // The row's bound generation (R14), if any; `run_scan_inner`
     // honors it instead of re-picking.
     let generation = row
@@ -9871,6 +9926,38 @@ async fn continue_saved_scan(
         .as_deref()
         .and_then(config::parse_outcome)
         .and_then(|d| d.generation);
+    // v2 request shape (D5/D6): resume rebuilds the full target set the
+    // request was minted with — an interrupted `--all` scan resumes as
+    // `--all`, and a multi-target scan re-serves every target, not just
+    // the primary. Legacy rows (NULL v2 columns) fall back to `url_raw`.
+    let all = row.all_targets.unwrap_or(false);
+    let targets = if all {
+        Vec::new()
+    } else {
+        match row.targets_json.as_deref() {
+            Some(json) => {
+                let saved = parse_saved_targets(json, &row.id)?;
+                if saved.is_empty() {
+                    vec![url]
+                } else {
+                    saved
+                }
+            }
+            None => vec![url],
+        }
+    };
+    let args = repo_scan::cli::ScanArgs {
+        targets,
+        all,
+        scope,
+        report,
+        force_rescan: false,
+        status,
+        root,
+        format,
+        fetch: false,
+        color: None,
+    };
     run_scan_inner(
         cfg,
         &args,

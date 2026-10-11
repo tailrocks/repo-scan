@@ -39,6 +39,9 @@ fn sanitize(text: &str) -> String {
 
 /// Render `report` as deterministic plain text (no ANSI, no cursor codes).
 ///
+/// Pre-staged for the live-outputs group: nothing calls this in production
+/// yet; the scan/resume `--format` lanes refuse loudly until it is wired.
+///
 /// Header carries scan id, state, scope, and target; coverage carries
 /// filesystem/identity/status plus gaps and pending tasks (never a
 /// percentage of an unknown total); totals count `repositories`,

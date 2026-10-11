@@ -859,6 +859,40 @@ fn step6_all_finds_without_target_filter() {
     assert_eq!(report["scan"]["state"], "complete");
 }
 
+/// The `json`/`jsonl` lanes are pre-staged in the CLI but not wired for
+/// `scan` yet: refuse loudly (exit 1, "not yet implemented") before any
+/// state mutation instead of silently running the human lane. `human`
+/// stays today's behavior.
+#[test]
+fn step6_format_lanes_refuse_loudly_until_wired() {
+    let env = Env::new();
+    for lane in ["json", "jsonl"] {
+        let out = env.scan(&["--format", lane], &env.cwd_a);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "--format {lane} refuses loudly: {}",
+            stderr_text(&out)
+        );
+        assert!(
+            stderr_text(&out).contains("not yet implemented"),
+            "--format {lane} stderr: {}",
+            stderr_text(&out)
+        );
+    }
+    assert!(
+        !env.state.join("payload").join("catalog.db").exists(),
+        "refusal happens before any state mutation"
+    );
+    let out = env.scan(&["--format", "human", "--report", "rep.json"], &env.cwd_a);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "human lane unchanged: {}",
+        stderr_text(&out)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Step 15 case 5: distinct explicit root sets never share a generation.
 // ---------------------------------------------------------------------------

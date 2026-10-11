@@ -47,6 +47,19 @@ pub enum OutputFormat {
     Jsonl,
 }
 
+impl OutputFormat {
+    /// Stable lowercase name used in persisted scan rows and journal
+    /// payloads (`scan_requests.format`, `scan_started`/`scan_interrupted`
+    /// options).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Json => "json",
+            Self::Jsonl => "jsonl",
+        }
+    }
+}
+
 /// Terminal color control (goal Step 13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ColorChoice {
