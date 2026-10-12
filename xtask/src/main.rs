@@ -8,6 +8,7 @@
 //! cargo run --locked -p xtask -- proof red --requirements proof/requirements.json
 //! cargo run --locked -p xtask -- proof benchmark --policy proof/policy.json \
 //!     --baseline-bin <a> --candidate-bin <b> --scenario <id> --blocks 20
+//! cargo run --locked -p xtask -- proof evaluate --run-dir proof-out/<run-id>
 //! ```
 //!
 //! Exit codes follow goal section 3.2:
@@ -18,6 +19,7 @@
 mod baseline;
 mod benchmark;
 mod canon;
+mod evaluate;
 mod policy;
 mod requirements;
 mod runs;
@@ -125,6 +127,13 @@ enum ProofCommands {
         #[arg(long, default_value = "proof/requirements.json")]
         requirements: PathBuf,
     },
+    /// Validate a run directory's integrity, recompute statistics, compare
+    /// against the frozen policy gates, and emit the verdict JSON.
+    Evaluate {
+        /// Run directory produced by `proof benchmark`.
+        #[arg(long)]
+        run_dir: PathBuf,
+    },
     /// Paired-block benchmark between two binaries with seeded randomized
     /// balanced order; raw samples are written as JSONL to the run dir.
     Benchmark {
@@ -171,6 +180,7 @@ fn main() {
                 args,
             } => baseline::cmd_baseline(&policy, &bin, &dataset, samples, &out_root, &args),
             ProofCommands::Red { requirements } => requirements::cmd_red(&requirements),
+            ProofCommands::Evaluate { run_dir } => evaluate::cmd_evaluate(&run_dir),
             ProofCommands::Benchmark {
                 policy,
                 baseline_bin,
