@@ -320,5 +320,37 @@
       "object_type": "commit"
     }
   ],
-  "seed_mismatches": []
+  "seed_mismatches": [],
+  "frozen_pull_heads": {
+    "1": {
+      "head": "8289a839d26a44f4820441349ac040a62348ef50",
+      "tree": "deed95901effa4f439f75f45633b7dbb91a30ee4"
+    },
+    "2": {
+      "head": "8fc5d1870baa63949e0ccce546b5fc5169ff2bd5",
+      "tree": "f5f382232339c5e14bff035156a992a4e8b409a1"
+    },
+    "3": {
+      "head": "0502919d0013de78b3f10566736c56fc4d5ef39f",
+      "tree": "82dc07b59f4baa74e67488569b9fd409c0d64e15"
+    },
+    "4": {
+      "head": "989305679e7a24dd7b98a6a2abc246c83f2c3348",
+      "tree": "b66d7aca3b1198380bb225819e616b9ae760fcdb"
+    },
+    "5": {
+      "head": "29b4110c3140859edb0f209cc9cbb15f0544b3f9",
+      "tree": "995fe9da3837383b826e8a803132a75138b63e42"
+    },
+    "6": {
+      "head": "2d4cb5471cadf956d7d7c7729bb2166e3054468d",
+      "tree": "c9c35006e674654bde167e7fd4db9bcb8f6bb702"
+    },
+    "7": {
+      "head": "da4e3c20e9bc72c67a1a551d5094a034dafa7544",
+      "tree": "aa5d2eb57d9c2ce88cd591a2dc78f28a1deb4d09"
+    }
+  },
+  "frozen_pull_heads_note": "refs/pull/*/head frozen 2026-10-13; PR6 head tree == main tip tree (provenance-only, verified locally)",
+  "updated_at": "2026-10-12T18:32:02.924814+00:00"
 }
