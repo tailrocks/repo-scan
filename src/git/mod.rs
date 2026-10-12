@@ -17,6 +17,7 @@
 //! [`fallback`] backend; anything else is an operational probe failure.
 
 pub mod fallback;
+pub mod graph;
 pub mod refspec;
 
 use crate::model::StatusMode;
