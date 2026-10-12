@@ -8,6 +8,7 @@
 //! cargo run --locked -p xtask -- proof red --requirements proof/requirements.json
 //! cargo run --locked -p xtask -- proof benchmark --policy proof/policy.json \
 //!     --baseline-bin <a> --candidate-bin <b> --scenario <id> --blocks 20
+//! cargo run --locked -p xtask -- proof integration --matrix proof/platforms.json
 //! cargo run --locked -p xtask -- proof evaluate --run-dir proof-out/<run-id>
 //! ```
 //!
@@ -20,6 +21,7 @@ mod baseline;
 mod benchmark;
 mod canon;
 mod evaluate;
+mod integration;
 mod policy;
 mod requirements;
 mod runs;
@@ -134,6 +136,22 @@ enum ProofCommands {
         #[arg(long)]
         run_dir: PathBuf,
     },
+    /// Run the integration test matrix (default: cargo test --locked
+    /// --test '*'), capture the full log, classify per-file results, and
+    /// fail on failures or skipped/absent mandatory tests.
+    Integration {
+        #[arg(long, default_value = "proof/platforms.json")]
+        matrix: PathBuf,
+        /// Repository to test (default: current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Test command to execute instead of the default cargo invocation.
+        #[arg(long)]
+        cmd: Option<String>,
+        /// Output root for run evidence.
+        #[arg(long, default_value = "proof-out")]
+        out_root: PathBuf,
+    },
     /// Paired-block benchmark between two binaries with seeded randomized
     /// balanced order; raw samples are written as JSONL to the run dir.
     Benchmark {
@@ -181,6 +199,12 @@ fn main() {
             } => baseline::cmd_baseline(&policy, &bin, &dataset, samples, &out_root, &args),
             ProofCommands::Red { requirements } => requirements::cmd_red(&requirements),
             ProofCommands::Evaluate { run_dir } => evaluate::cmd_evaluate(&run_dir),
+            ProofCommands::Integration {
+                matrix,
+                repo,
+                cmd,
+                out_root,
+            } => integration::cmd_integration(&matrix, repo, cmd, &out_root),
             ProofCommands::Benchmark {
                 policy,
                 baseline_bin,
