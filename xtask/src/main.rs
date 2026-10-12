@@ -10,6 +10,7 @@
 //!     --baseline-bin <a> --candidate-bin <b> --scenario <id> --blocks 20
 //! cargo run --locked -p xtask -- proof integration --matrix proof/platforms.json
 //! cargo run --locked -p xtask -- proof evaluate --run-dir proof-out/<run-id>
+//! cargo run --locked -p xtask -- proof verify-final --commit <sha>
 //! ```
 //!
 //! Exit codes follow goal section 3.2:
@@ -27,6 +28,7 @@ mod requirements;
 mod runs;
 mod sources;
 mod stats;
+mod verify;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -152,6 +154,21 @@ enum ProofCommands {
         #[arg(long, default_value = "proof-out")]
         out_root: PathBuf,
     },
+    /// Final reconciliation: every mandatory requirement has green evidence
+    /// with verifier != implementer, evidence hashes match, source coverage
+    /// is complete, and the named commit exists. Prints PASS only then.
+    VerifyFinal {
+        /// Final code commit to reconcile.
+        #[arg(long)]
+        commit: String,
+        #[arg(long, default_value = "proof/requirements.json")]
+        requirements: PathBuf,
+        #[arg(long, default_value = "proof/sources.lock.json")]
+        sources: PathBuf,
+        /// Repository to reconcile against (default: current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
     /// Paired-block benchmark between two binaries with seeded randomized
     /// balanced order; raw samples are written as JSONL to the run dir.
     Benchmark {
@@ -205,6 +222,12 @@ fn main() {
                 cmd,
                 out_root,
             } => integration::cmd_integration(&matrix, repo, cmd, &out_root),
+            ProofCommands::VerifyFinal {
+                commit,
+                requirements,
+                sources,
+                repo,
+            } => verify::cmd_verify_final(&commit, &requirements, &sources, repo),
             ProofCommands::Benchmark {
                 policy,
                 baseline_bin,
