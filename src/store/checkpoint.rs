@@ -41,6 +41,13 @@ pub struct CheckpointStats {
     /// Probes/checkpoints skipped because the WAL was busy (a reader held
     /// it): expected coordination state, retried at the next cadence.
     pub busy_skips: u64,
+    /// Probes/checkpoints skipped because the engine reported an active
+    /// statement on the writer connection
+    /// ([`is_checkpoint_contention`]): transient coordination state,
+    /// retried at the next cadence like a busy WAL. A checkpoint is pure
+    /// maintenance — durability never depends on it — so contention must
+    /// not fail the scan.
+    pub contention_skips: u64,
     /// WAL frames at the most recent probe.
     pub wal_frames_last: u64,
     /// Maximum WAL frames observed at any probe.
@@ -95,7 +102,10 @@ impl CheckpointCoordinator {
     /// the time rate-limit skips the probe (op count is kept); otherwise the
     /// observed [`crate::store::WalStatus`] with counters updated. A busy
     /// WAL is recorded as a skip, never an error: the scan loop keeps
-    /// serving reads and retries at the next cadence.
+    /// serving reads and retries at the next cadence. Statement contention
+    /// ([`is_checkpoint_contention`]) skips the same way: the writer is
+    /// single-owner and sequential, so any extra active statement at probe
+    /// time is transient engine state, gone by the next cadence.
     pub async fn maybe_checkpoint(
         &mut self,
         store: &crate::store::TursoStore,
@@ -107,7 +117,14 @@ impl CheckpointCoordinator {
         }
         self.ops_since_probe = 0;
         self.last_probe = Some(Instant::now());
-        let status = store.wal_status().await?;
+        let status = match store.wal_status().await {
+            Ok(status) => status,
+            Err(error) if is_checkpoint_contention(&error) => {
+                self.stats.contention_skips += 1;
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         self.stats.wal_probes += 1;
         self.stats.wal_frames_last = status.log_frames;
         self.stats.wal_frames_max = self.stats.wal_frames_max.max(status.log_frames);
@@ -116,13 +133,34 @@ impl CheckpointCoordinator {
             return Ok(Some(status));
         }
         if status.log_frames > self.policy.max_wal_frames {
-            let (busy, _log_frames, _checkpointed) = store.checkpoint_truncate().await?;
-            if busy != 0 {
-                self.stats.busy_skips += 1;
-            } else {
-                self.stats.checkpoints += 1;
+            match store.checkpoint_truncate().await {
+                Ok((busy, _log_frames, _checkpointed)) => {
+                    if busy != 0 {
+                        self.stats.busy_skips += 1;
+                    } else {
+                        self.stats.checkpoints += 1;
+                    }
+                }
+                Err(error) if is_checkpoint_contention(&error) => {
+                    self.stats.contention_skips += 1;
+                }
+                Err(error) => return Err(error),
             }
         }
         Ok(Some(status))
+    }
+}
+
+/// True when `error` is the engine refusing a checkpoint because another
+/// statement is active on the writer connection. turso surfaces its
+/// `StatementsInProgress` guard only as a message (Cargo.lock pins
+/// turso 0.8.1; its text is `cannot checkpoint while another statement
+/// is active`), so the classifier keys off that marker. Any other store
+/// failure (IO, corruption, misuse elsewhere) is not contention and
+/// keeps failing loudly.
+pub fn is_checkpoint_contention(error: &crate::Error) -> bool {
+    match error {
+        crate::Error::Store(message) => message.contains("another statement is active"),
+        _ => false,
     }
 }

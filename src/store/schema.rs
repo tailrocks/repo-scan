@@ -3,9 +3,9 @@
 //! Rules: plain rowid tables only (no `WITHOUT ROWID`, experimental in the
 //! pinned engine), no recursive CTEs, no FTS5 (not compiled in), every raw
 //! path/component/ref-name/URL in a `BLOB` column (engine TEXT is UTF-8).
-//! `BLOB` columns are indexed by byte equality only where unavoidable; to
-//! keep the qualified SQL surface minimal, no index key contains a `BLOB`
-//! column — BLOB lookups filter on a TEXT/INTEGER key first.
+//! Raw remote names remain in `BLOB` columns. Their lookup keys use a
+//! lossless hexadecimal `TEXT` companion after migration v9, so no
+//! primary-key or explicit index key contains a `BLOB` column.
 
 use crate::store::Migration;
 
@@ -214,7 +214,7 @@ CREATE TABLE IF NOT EXISTS batches (
 ";
 
 /// Ordered migration chain (append-only; referenced by [`crate::store::migrations`]).
-pub static MIGRATIONS: [Migration; 2] = [
+pub static MIGRATIONS: [Migration; 9] = [
     Migration {
         version: 1,
         description: "v1: spec section 11 entities with required lookup indexes",
@@ -224,5 +224,40 @@ pub static MIGRATIONS: [Migration; 2] = [
         version: crate::store::schema_v2::V2Marker::VERSION,
         description: crate::store::schema_v2::V2Marker::DESCRIPTION,
         sql: crate::store::schema_v2::V2_SQL,
+    },
+    Migration {
+        version: crate::store::schema_v3::V3Marker::VERSION,
+        description: crate::store::schema_v3::V3Marker::DESCRIPTION,
+        sql: crate::store::schema_v3::V3_SQL,
+    },
+    Migration {
+        version: crate::store::schema_v4::V4Marker::VERSION,
+        description: crate::store::schema_v4::V4Marker::DESCRIPTION,
+        sql: crate::store::schema_v4::V4_SQL,
+    },
+    Migration {
+        version: crate::store::schema_v5::V5Marker::VERSION,
+        description: crate::store::schema_v5::V5Marker::DESCRIPTION,
+        sql: crate::store::schema_v5::V5_SQL,
+    },
+    Migration {
+        version: crate::store::schema_v6::V6Marker::VERSION,
+        description: crate::store::schema_v6::V6Marker::DESCRIPTION,
+        sql: crate::store::schema_v6::V6_SQL,
+    },
+    Migration {
+        version: crate::store::schema_v7::V7Marker::VERSION,
+        description: crate::store::schema_v7::V7Marker::DESCRIPTION,
+        sql: crate::store::schema_v7::V7_SQL,
+    },
+    Migration {
+        version: crate::store::schema_v8::V8Marker::VERSION,
+        description: crate::store::schema_v8::V8Marker::DESCRIPTION,
+        sql: crate::store::schema_v8::V8_SQL,
+    },
+    Migration {
+        version: crate::store::schema_v9::V9Marker::VERSION,
+        description: crate::store::schema_v9::V9Marker::DESCRIPTION,
+        sql: crate::store::schema_v9::V9_SQL,
     },
 ];
