@@ -1,0 +1,146 @@
+{
+  "amendment_rule": "Thresholds change only by explicit project-owner approval before candidate evaluation, with a recorded new policy_version; the optimizing model may not lower them after seeing results.",
+  "baseline_roles": {
+    "B-main": "unmodified actual kickoff main built with recorded locked settings; historical end-to-end impact and preservation reference",
+    "B-source": "predeclared correct/buildable feature or rescue producer per eligible scenario; nonregression of inherited useful behavior, never a broken or deliberately slow source",
+    "B-unified": "first independently accepted complete consolidation before new RFC optimizations, selected by the frozen rule; primary denominator for new implementation speedups",
+    "F": "final assembled candidate, then rebuilt actual landed revision; must meet equivalent-work correctness, resource, latency and source-closure gates"
+  },
+  "exclusion_rules": [
+    "exclusions are defined before observing candidate results",
+    "exclude only objectively invalid protocol violations and retain the reason in the audit record",
+    "keep every valid raw sample, including slower runs",
+    "any rerun follows the complete frozen procedure and remains in the audit record",
+    "inconclusive bounds are not passes; fixed additional collection may be authorized prospectively"
+  ],
+  "frozen_from": "repo-scan-consolidate-and-optimize-goal.md section 7.4 (verbatim thresholds)",
+  "gates": [
+    {
+      "bound": "u95_one_sided",
+      "comparison": "<=",
+      "description": "On the frozen primary directory-heavy, cold-application/warm-filesystem, identity-only discovery scenario under the throughput profile, U95(R) <= 0.75: at least 25% elapsed-time reduction supported by the defined bound.",
+      "id": "PERF-PRIMARY",
+      "kind": "timing",
+      "profile": "throughput",
+      "reference": "B-unified",
+      "scenario": "dir-heavy-cold-app-warm-fs-identity-throughput",
+      "statistic": "paired_block_ratio",
+      "threshold": 0.75
+    },
+    {
+      "bound": "u95_one_sided",
+      "comparison": "<=",
+      "description": "Across the predeclared primary identity-only discovery suite, upper bound on equal-weight geometric-mean elapsed-time ratio <= 0.85: material aggregate reduction, not one cherry-picked win.",
+      "id": "PERF-SUITE",
+      "kind": "timing_aggregate",
+      "profile": "throughput",
+      "reference": "B-unified",
+      "scenarios": [
+        "dir-heavy-cold-app-warm-fs-identity-throughput",
+        "wide-file-heavy-warm-fs-identity",
+        "deep-tree-warm-fs-identity",
+        "huge-git-object-store-warm-fs-identity",
+        "many-tiny-repos-warm-fs-identity",
+        "ignored-hidden-nested-warm-fs-identity"
+      ],
+      "statistic": "equal_weight_geometric_mean_ratio",
+      "threshold": 0.85
+    },
+    {
+      "bound": "u95_one_sided",
+      "comparison": "<=",
+      "description": "Each frozen critical existing-behavior scenario, including low-impact scans, cached CLI queries, reconciliation, report/event/output paths and applicable native fallback, has U95(R) <= 1.05.",
+      "id": "PERF-NOREGRESS",
+      "kind": "timing",
+      "reference": "B-unified plus predeclared eligible B-main/B-source per scenario",
+      "scenarios": [
+        "low-impact-warm-full-scan",
+        "cached-cli-lookup",
+        "incremental-reconciliation",
+        "report-render-and-validate",
+        "event-follow-replay",
+        "native-fallback-traversal"
+      ],
+      "statistic": "paired_block_ratio",
+      "threshold": 1.05
+    },
+    {
+      "applies_to": "native accelerator per capability/scope class versus reference walker",
+      "bound": "u95_one_sided",
+      "comparison": "<=",
+      "description": "A native accelerator may be automatically selected for a capability/scope class only after exact correctness/coverage qualification and U95(R_native/reference) <= 0.90 for that class; otherwise keep it experimental/disabled or use the walker.",
+      "id": "PERF-NATIVE-PROMOTION",
+      "kind": "timing",
+      "statistic": "paired_block_ratio",
+      "threshold": 0.9
+    },
+    {
+      "budgets": "resource_profiles",
+      "description": "Every measured profile passes its frozen byte/item/FD/admission/helper budgets; the original low-impact caps are retained rather than expanded to get green.",
+      "id": "PERF-RESOURCE",
+      "kind": "budget"
+    },
+    {
+      "description": "All applicable structural work-budget integration assertions pass (goal section 7.2).",
+      "id": "PERF-MECHANISM",
+      "kind": "structural_assertions"
+    }
+  ],
+  "host_classes": {
+    "known": [
+      "macos-apfs",
+      "macos-hfsplus",
+      "linux-native",
+      "windows-ntfs"
+    ],
+    "lease": "one exclusive benchmark lease per physical host/device",
+    "mandatory_native": [
+      "macos-apfs",
+      "linux-native",
+      "windows-ntfs"
+    ],
+    "primary": "macos-apfs",
+    "primary_frozen_at": "kickoff"
+  },
+  "policy_version": 1,
+  "ratio_definition": "R = F elapsed time / B-unified elapsed time under identical semantics. U95(R) is the predeclared simultaneous one-sided 95% upper confidence bound. For explicitly identified nonregression/source/promotion comparisons, the separately frozen eligible reference is used; B-main is never silently substituted for B-unified.",
+  "repeated_run_protocol": {
+    "analysis": "seeded bootstrap",
+    "block_order": "randomized balanced baseline/candidate order within paired blocks",
+    "bootstrap_resamples": 10000,
+    "confidence": 0.95,
+    "cross_scenario_weights": "equal",
+    "invalid_duration_handling": "zero, negative, or missing durations and nonzero sample exit codes make the run INVALID_EVIDENCE; samples are never silently dropped",
+    "min_paired_blocks": 20,
+    "multiplicity_method": "joint bootstrap over the declared gate family",
+    "rng_seed": 761031364449,
+    "short_operation_rule": "short operations use fixed blocks of repeated CLI launches; per-launch and block data are recorded and correlation is accounted for",
+    "sidedness": "one-sided upper",
+    "simultaneous_across_gate_family": true,
+    "stop_rule": "fixed sample size selected before candidate evaluation; no early stop on a green bound and no selective repetition"
+  },
+  "resource_profiles": {
+    "low_impact": {
+      "cores": 1,
+      "max_open_fds": 64,
+      "notes": "kickoff-main low-impact contract retained unchanged"
+    },
+    "throughput": {
+      "cores": "TBD",
+      "helper_processes": "TBD",
+      "max_open_fds": "TBD",
+      "memory_bytes": "TBD",
+      "notes": "documented throughput profile with frozen numeric budgets; placeholders are filled from the baseline-only pilot and frozen before candidate evaluation",
+      "queue_bytes": "TBD",
+      "queue_items": "TBD",
+      "status": "pending_baseline_pilot"
+    }
+  },
+  "sample_size_selection": {
+    "description": "Baseline-only pilot runs establish dataset scales, measurable-but-not-exhausting runtimes, and the final fixed sample size before any candidate is evaluated; the winner's best dataset is never selected afterward.",
+    "rule": "baseline-only pilot before candidate evaluation",
+    "status": "pending_baseline_pilot"
+  },
+  "schema": "repo-scan/policy/1",
+  "sha256": "5ab448fcfbc7d56a4e461f61bde675494bf8b2a5f48f420f7e40c59ac6672b73"
+}
