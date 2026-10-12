@@ -1,0 +1,26 @@
+{
+  "expected_graph": {
+    "description": "One 512-deep chain with 128 side branches of depth 32; repositories at depths 12, 128 and 300.",
+    "invariants": [
+      "no depth-based truncation",
+      "repository at depth 300 is discovered"
+    ]
+  },
+  "id": "deep-tree",
+  "manifest_schema": "repo-scan/dataset-manifest/1",
+  "notes": "pilot-calibration placeholder scale; frozen after the baseline-only pilot.",
+  "scale": {
+    "chain_depth": 512,
+    "deepest_repo_depth": 300,
+    "dirs": 4096,
+    "files": 8192,
+    "repos": 3,
+    "roots": 1,
+    "side_branch_depth": 32,
+    "side_branches": 128
+  },
+  "schema": "repo-scan/dataset-recipe/1",
+  "seed": 910003,
+  "status": "pending_baseline_pilot",
+  "title": "Deep tree"
+}

@@ -1,0 +1,23 @@
+{
+  "expected_graph": {
+    "description": "2000 independent one-commit repositories with one remote each.",
+    "invariants": [
+      "every repository appears exactly once",
+      "no remote-URL-based merging of independent clones"
+    ]
+  },
+  "id": "many-tiny-repos",
+  "manifest_schema": "repo-scan/dataset-manifest/1",
+  "notes": "pilot-calibration placeholder scale; frozen after the baseline-only pilot.",
+  "scale": {
+    "commits_per_repo": 1,
+    "files_per_repo": 3,
+    "remotes_per_repo": 1,
+    "repos": 2000,
+    "roots": 1
+  },
+  "schema": "repo-scan/dataset-recipe/1",
+  "seed": 910005,
+  "status": "pending_baseline_pilot",
+  "title": "Many tiny repositories"
+}
