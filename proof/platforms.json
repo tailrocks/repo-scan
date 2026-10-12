@@ -1,0 +1,111 @@
+{
+  "current_host_capability_discovery": {
+    "current_host": {
+      "destination": "run-manifest.json host section",
+      "record": "os, arch, filesystem of scope root, capability probe results"
+    },
+    "linux": [
+      "probe inotify availability and watch limits",
+      "detect filesystems returning DT_UNKNOWN from enumeration"
+    ],
+    "macos": [
+      "probe searchfs syscall availability on the scope volume",
+      "probe FSEvents CopyUUIDForDevice and per-volume stream creation",
+      "identify the scope root filesystem as apfs or other"
+    ],
+    "windows": [
+      "probe FSCTL_ENUM_USN_DATA privilege on the scope volume",
+      "identify ntfs volumes and reparse point behavior"
+    ]
+  },
+  "fallback_obligations": [
+    "capability-denied native sources fall back to the portable walker with identical coverage obligations",
+    "fallback activation is recorded in the run manifest with the capability evidence",
+    "an unqualified filesystem is reported unqualified, never generalized from apfs evidence"
+  ],
+  "known_platforms": [
+    "linux",
+    "macos",
+    "windows"
+  ],
+  "mandatory_native_jobs": [
+    {
+      "fallback": "dua-core bulk reader walker with scope fencing",
+      "filesystem": "apfs",
+      "host_class": "macos-apfs",
+      "id": "macos-apfs-native",
+      "mechanisms": [
+        "searchfs",
+        "FSEvents",
+        "getattrlistbulk"
+      ],
+      "platform": "macos",
+      "qualification_tests": [
+        "native_macos::searchfs_candidate_source_qualification_tbd",
+        "native_macos::fsevents_history_and_drop_qualification_tbd",
+        "native_macos::bulk_reader_equivalence_qualification_tbd"
+      ],
+      "required": true
+    },
+    {
+      "fallback": "portable walker with explicit unknown-type metadata fallback",
+      "filesystem": "native local fs",
+      "host_class": "linux-native",
+      "id": "linux-native",
+      "mechanisms": [
+        "buffered enumeration",
+        "DT_UNKNOWN handling",
+        "inotify"
+      ],
+      "platform": "linux",
+      "qualification_tests": [
+        "native_linux::traversal_and_unknown_type_qualification_tbd",
+        "native_linux::inotify_new_directory_overflow_downtime_tbd"
+      ],
+      "required": true
+    },
+    {
+      "fallback": "ordinary-permission traversal without automatic elevation",
+      "filesystem": "ntfs",
+      "host_class": "windows-ntfs",
+      "id": "windows-ntfs-native",
+      "mechanisms": [
+        "ordinary-permission traversal",
+        "FSCTL_ENUM_USN_DATA",
+        "FSCTL_READ_USN_JOURNAL"
+      ],
+      "platform": "windows",
+      "qualification_tests": [
+        "native_windows::ntfs_baseline_enumeration_qualification_tbd",
+        "native_windows::usn_change_replay_qualification_tbd",
+        "native_windows::ordinary_permission_fallback_qualification_tbd"
+      ],
+      "required": true
+    }
+  ],
+  "mandatory_tests": [
+    "native_macos::searchfs_candidate_source_qualification_tbd",
+    "native_macos::fsevents_history_and_drop_qualification_tbd",
+    "native_macos::bulk_reader_equivalence_qualification_tbd",
+    "native_linux::traversal_and_unknown_type_qualification_tbd",
+    "native_linux::inotify_new_directory_overflow_downtime_tbd",
+    "native_windows::ntfs_baseline_enumeration_qualification_tbd",
+    "native_windows::usn_change_replay_qualification_tbd",
+    "native_windows::ordinary_permission_fallback_qualification_tbd"
+  ],
+  "schema": "repo-scan/platforms/1",
+  "skip_policy": "a mandatory test reported ignored or absent from the executed log fails the integration verdict; unavailable native infrastructure is BLOCKED, never green",
+  "supported_cases": [
+    "macos apfs searchfs volume candidate source with continuation and restart",
+    "macos fsevents per-volume history with drop detection",
+    "linux buffered enumeration with DT_UNKNOWN fallback and inotify watching",
+    "windows ntfs usn enumeration and journal replay with ordinary privileges",
+    "portable walker on every platform as the always-available reference"
+  ],
+  "unsupported_cases": [
+    "hfsplus searchfs qualification is unqualified unless separately evidenced",
+    "network or removable filesystems are excluded from native volume sources",
+    "usn journal replay without the required privilege falls back, never elevates",
+    "cloud placeholder files are not hydrated by metadata-only discovery"
+  ]
+}
