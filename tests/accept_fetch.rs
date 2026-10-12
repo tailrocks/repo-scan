@@ -1288,7 +1288,9 @@ fn fetch07_kill_mid_fetch_resume_skips_completed_retries_pending() {
     let (scan_id, pre_success): (String, Vec<(String, i64)>) = rt.block_on(async {
         let db = state.join("payload").join("catalog.db");
         assert!(db.exists(), "catalog survives SIGKILL");
-        let store = TursoStore::open_read_only(&db).await.expect("reopen after kill");
+        let store = TursoStore::open_read_only(&db)
+            .await
+            .expect("reopen after kill");
         let mut rows = store
             .connection()
             .query("SELECT id, state FROM scan_requests", ())

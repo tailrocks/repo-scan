@@ -746,4 +746,3 @@ pub fn commit_chain(parent: &Path, name: &str, n: u32) -> (PathBuf, Vec<String>)
     }
     (dir, oids)
 }
-
