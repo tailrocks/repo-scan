@@ -1,0 +1,6 @@
+{
+  "exceptions": [],
+  "legacy_tests": [],
+  "policy": "no new unit tests; migrate meaningful legacy unit coverage to integration",
+  "schema": "repo-scan/test-migration/1"
+}
