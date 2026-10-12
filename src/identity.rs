@@ -25,6 +25,14 @@ pub const MATCHING_POLICY: &str = "github-effective-remotes-v1";
 /// Canonical GitHub host matched by the policy (case-insensitive).
 pub const GITHUB_HOST: &str = "github.com";
 
+/// Documented GitHub SSH-over-HTTPS-port endpoint (Step 10): only the
+/// `ssh://git@ssh.github.com:443/owner/repo` shape normalizes; any other
+/// scheme or port on this host yields `None`.
+pub const SSH_GITHUB_HOST: &str = "ssh.github.com";
+
+/// Port of the documented [`SSH_GITHUB_HOST`] endpoint.
+pub const SSH_GITHUB_PORT: u16 = 443;
+
 /// Placeholder substituted for embedded credentials.
 pub const REDACTED: &str = "<redacted>";
 
@@ -51,13 +59,25 @@ pub enum MatchDisposition {
 /// `unresolvable_identity` with the reason).
 ///
 /// Accepted: `https://`/`http://` (usernames lowercased, credentials and
-/// query/fragment ignored), `ssh://` with default port, and scp-like
-/// `[user@]github.com:owner/repo[.git]`. A single trailing `.git` segment
-/// suffix and one trailing slash are stripped. SSH aliases resolving to
-/// github.com via `~/.ssh/config` are honored read-only (no execution).
-/// `git://`, `file:`, local paths, `ext::`, helper transports, non-default
-/// ports, and non-GitHub hosts yield `None`.
+/// query/fragment ignored), `ssh://` with default port, the documented
+/// `ssh://[user@]ssh.github.com:443/owner/repo[.git]` endpoint, and
+/// scp-like `[user@]github.com:owner/repo[.git]`. A single trailing `.git`
+/// segment suffix and one trailing slash are stripped. SSH aliases
+/// resolving to github.com via `~/.ssh/config` are honored read-only (no
+/// execution) on SSH transports only — never for `http(s)` hosts (Step
+/// 10). `git://`, `file:`, local paths, `ext::`, helper transports,
+/// non-default ports, and non-GitHub hosts yield `None`.
 pub fn normalize_github_url(url: &str) -> Option<String> {
+    normalize_github_url_with(url, &load_ssh_aliases())
+}
+
+/// [`normalize_github_url`] over a caller-supplied alias map: hot paths
+/// (probe remotes, per-store classify) load once per scan and thread
+/// the map through instead of re-reading `~/.ssh/config` per remote.
+pub fn normalize_github_url_with(
+    url: &str,
+    ssh_aliases: &HashMap<String, String>,
+) -> Option<String> {
     let url = url.trim();
     if url.is_empty() {
         return None;
@@ -67,13 +87,20 @@ pub fn normalize_github_url(url: &str) -> Option<String> {
         gix::url::Scheme::Https | gix::url::Scheme::Http | gix::url::Scheme::Ssh => {}
         _ => return None,
     }
+    let ssh_transport = matches!(parsed.scheme, gix::url::Scheme::Ssh);
     let host = parsed.host.as_deref()?;
-    if !is_github_host(host) {
-        return None;
-    }
-    if let Some(port) = parsed.port {
-        if Some(port) != parsed.scheme.default_port() {
+    if host.eq_ignore_ascii_case(SSH_GITHUB_HOST) {
+        if !ssh_transport || parsed.port != Some(SSH_GITHUB_PORT) {
             return None;
+        }
+    } else {
+        if !github_host_matches_with(host, ssh_transport, ssh_aliases) {
+            return None;
+        }
+        if let Some(port) = parsed.port {
+            if Some(port) != parsed.scheme.default_port() {
+                return None;
+            }
         }
     }
     let path = std::str::from_utf8(parsed.path.as_bytes()).ok()?;
@@ -129,6 +156,17 @@ pub fn classify_remote(
     remote_url: &str,
     role: &str,
 ) -> (MatchDisposition, Vec<String>) {
+    classify_remote_with(canonical_target, remote_url, role, &load_ssh_aliases())
+}
+
+/// [`classify_remote`] over a caller-supplied alias map (see
+/// [`normalize_github_url_with`]).
+pub fn classify_remote_with(
+    canonical_target: &str,
+    remote_url: &str,
+    role: &str,
+    ssh_aliases: &HashMap<String, String>,
+) -> (MatchDisposition, Vec<String>) {
     // Evidence lines persist into the catalog and the report, so they
     // use the strict remote form: opaque query/fragment tails drop
     // entirely rather than leaking through key-based scrubbing (RETEST-2).
@@ -156,7 +194,7 @@ pub fn classify_remote(
             )],
         );
     }
-    if let Some(normalized) = normalize_github_url(remote_url) {
+    if let Some(normalized) = normalize_github_url_with(remote_url, ssh_aliases) {
         if normalized == canonical_target {
             return (
                 MatchDisposition::Confirmed,
@@ -188,7 +226,7 @@ pub fn classify_remote(
             }
         }
     }
-    lenient_noncanonical_verdict(canonical_target, remote_url, role, &redacted)
+    lenient_noncanonical_verdict_with(canonical_target, remote_url, role, &redacted, ssh_aliases)
 }
 
 /// Compare a local repository target against one effective remote observation.
@@ -261,12 +299,23 @@ pub fn classify_remotes<'a>(
     canonical_target: &str,
     remotes: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> (MatchDisposition, Vec<String>) {
+    classify_remotes_with(canonical_target, remotes, &load_ssh_aliases())
+}
+
+/// [`classify_remotes`] over a caller-supplied alias map (see
+/// [`normalize_github_url_with`]).
+pub fn classify_remotes_with<'a>(
+    canonical_target: &str,
+    remotes: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ssh_aliases: &HashMap<String, String>,
+) -> (MatchDisposition, Vec<String>) {
     let mut evidence = Vec::new();
     let mut seen = 0u32;
     let mut ranks: Vec<MatchDisposition> = Vec::new();
     for (url, role) in remotes {
         seen += 1;
-        let (disposition, mut lines) = classify_remote(canonical_target, url, role);
+        let (disposition, mut lines) =
+            classify_remote_with(canonical_target, url, role, ssh_aliases);
         evidence.append(&mut lines);
         ranks.push(disposition);
     }
@@ -1754,7 +1803,17 @@ fn scrub_embedded_scp(text: &str) -> String {
             return;
         }
         // Preserve surrounding punctuation; redact the core shape only.
-        let core = token.trim_start_matches(['\'', '"', '`', '(', '[', '<']);
+        // `<redacted>` is itself our username placeholder, not a wrapper
+        // around another scp-like token. Keeping its opening angle bracket
+        // makes repeated sanitation idempotent.
+        let prefix = token.trim_start_matches(['\'', '"', '`', '(', '[']);
+        let leading = token.len() - prefix.len();
+        let (lead, core) = if prefix.starts_with("<redacted>@") {
+            (leading, prefix)
+        } else {
+            let core = prefix.trim_start_matches('<');
+            (leading + prefix.len() - core.len(), core)
+        };
         let stripped =
             core.trim_end_matches(['\'', '"', '`', '.', ',', ';', ':', '!', '?', ')', ']', '>']);
         if stripped.is_empty() {
@@ -1766,10 +1825,6 @@ fn scrub_embedded_scp(text: &str) -> String {
             .or_else(|| redact_colon_user_host(stripped))
         {
             Some(redacted) => {
-                let lead = token.len()
-                    - token
-                        .trim_start_matches(['\'', '"', '`', '(', '[', '<'])
-                        .len();
                 out.push_str(&token[..lead]);
                 out.push_str(&redacted);
                 // `stripped` borrows from `core`, which starts `lead`
@@ -2129,20 +2184,48 @@ fn value_span(text: &str, k: usize) -> Option<(usize, usize, Option<char>)> {
     Some((k, j, None))
 }
 
-/// True when `host` is github.com directly or via an SSH alias.
+/// True when `host` literally is github.com (case-insensitive). Pure:
+/// never consults `~/.ssh/config`. Use [`github_host_matches`] when SSH
+/// aliases may apply.
+pub fn is_github_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case(GITHUB_HOST)
+}
+
+/// True when `host` names GitHub for the given transport: literally, or —
+/// on SSH transports only — via a `~/.ssh/config` alias resolving to
+/// github.com. `http(s)` URLs never consult aliases, so a user alias can
+/// never masquerade as the HTTPS host (Step 10).
 ///
 /// Alias resolution is read-only (`~/.ssh/config`, `Host`/`HostName` only;
 /// no `ProxyCommand` or any other directive is honored or executed).
-pub fn is_github_host(host: &str) -> bool {
+pub fn github_host_matches(host: &str, ssh_transport: bool) -> bool {
+    github_host_matches_with(host, ssh_transport, &load_ssh_aliases())
+}
+
+/// [`github_host_matches`] over a caller-supplied alias map (see
+/// [`normalize_github_url_with`]).
+pub fn github_host_matches_with(
+    host: &str,
+    ssh_transport: bool,
+    ssh_aliases: &HashMap<String, String>,
+) -> bool {
     if host.eq_ignore_ascii_case(GITHUB_HOST) {
         return true;
     }
-    resolve_ssh_alias(host).is_some_and(|real| real.eq_ignore_ascii_case(GITHUB_HOST))
+    ssh_transport
+        && resolve_ssh_alias_with(host, ssh_aliases)
+            .is_some_and(|real| real.eq_ignore_ascii_case(GITHUB_HOST))
 }
 
 /// Resolve an SSH alias to its configured `HostName` (lowercased), if any.
 pub fn resolve_ssh_alias(host: &str) -> Option<String> {
-    load_ssh_aliases().get(&host.to_lowercase()).cloned()
+    resolve_ssh_alias_with(host, &load_ssh_aliases())
+}
+
+/// [`resolve_ssh_alias`] over a caller-supplied alias map (see
+/// [`normalize_github_url_with`]).
+pub fn resolve_ssh_alias_with(host: &str, ssh_aliases: &HashMap<String, String>) -> Option<String> {
+    ssh_aliases.get(&host.to_lowercase()).cloned()
 }
 
 /// Maximum bytes read from an SSH config file (SR-STATE-05). Past the
@@ -2292,11 +2375,12 @@ fn is_valid_repo(repo: &str) -> bool {
 }
 
 /// Verdict for remotes that fail strict normalization, with evidence.
-fn lenient_noncanonical_verdict(
+fn lenient_noncanonical_verdict_with(
     canonical_target: &str,
     remote_url: &str,
     role: &str,
     redacted: &str,
+    ssh_aliases: &HashMap<String, String>,
 ) -> (MatchDisposition, Vec<String>) {
     let parsed = match gix::url::parse(remote_url.trim()) {
         Ok(parsed) => parsed,
@@ -2337,12 +2421,18 @@ fn lenient_noncanonical_verdict(
             )],
         );
     }
-    if !is_github_host(host) {
+    let ssh_transport = matches!(parsed.scheme, gix::url::Scheme::Ssh);
+    if !github_host_matches_with(host, ssh_transport, ssh_aliases) {
         if !host.contains('.') && !host.eq_ignore_ascii_case("localhost") {
+            let alias_note = if ssh_transport {
+                " with no matching SSH alias"
+            } else {
+                ""
+            };
             return (
                 MatchDisposition::UnresolvableIdentity,
                 vec![format!(
-                    "Effective {role} remote `{redacted}` uses single-label host `{host}` with no matching SSH alias; identity cannot be determined."
+                    "Effective {role} remote `{redacted}` uses single-label host `{host}`{alias_note}; identity cannot be determined."
                 )],
             );
         }

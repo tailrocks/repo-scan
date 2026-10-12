@@ -202,7 +202,7 @@ fn probe_runs_in_owned_tempdir_with_isolated_template() {
     let log = tmp.path().join("probe.log");
     let git = tmp.path().join("git");
     let script = format!(
-        "#!/bin/sh\necho \"CWD=$PWD ARGV=$*\" >> \"{}\"\nif [ \"$1\" = \"--version\" ]; then\necho \"git version 2.47.1\"\nexit 0\nfi\necho \" --porcelain[<version>]  machine-readable output\"\nexit 0\n",
+        "#!/bin/sh\necho \"CWD=$PWD ARGV=$*\" >> \"{}\"\ncase \" $* \" in *\" --no-lazy-fetch --version \"*) echo \"git version 2.47.1\"; exit 0;; esac\nif [ \"$1\" = \"--version\" ]; then\necho \"git version 2.47.1\"\nexit 0\nfi\necho \" --porcelain[<version>]  machine-readable output\"\nexit 0\n",
         log.display()
     );
     repo_scan::privacy::private_write_0600(&git, script.as_bytes()).unwrap();
@@ -210,11 +210,13 @@ fn probe_runs_in_owned_tempdir_with_isolated_template() {
 
     let found = FallbackGit::probe(&git).expect("capable fixture must probe");
     assert!(found.capabilities().feature_probe_ok);
+    assert!(found.supports_no_lazy_fetch());
 
     let logged = std::fs::read_to_string(&log).expect("log");
     let ambient = std::env::current_dir().expect("cwd");
     let mut saw_init = false;
     let mut saw_status = false;
+    let mut saw_no_lazy_fetch = false;
     for line in logged.lines() {
         if line.contains(" ARGV=--version") {
             continue; // identity spawn inherits CWD by design (no repo)
@@ -279,8 +281,22 @@ fn probe_runs_in_owned_tempdir_with_isolated_template() {
                 "probe neutralizes fsmonitor: {line}"
             );
         }
+        if line.contains("--no-lazy-fetch --version") {
+            saw_no_lazy_fetch = true;
+            assert!(
+                line.contains("core.hooksPath=/dev/null"),
+                "no-lazy-fetch probe neutralizes hooks: {line}"
+            );
+            assert!(
+                line.contains("core.fsmonitor=false"),
+                "no-lazy-fetch probe neutralizes fsmonitor: {line}"
+            );
+        }
     }
-    assert!(saw_init && saw_status, "both spawns logged:\n{logged}");
+    assert!(
+        saw_init && saw_status && saw_no_lazy_fetch,
+        "all capability probes logged:\n{logged}"
+    );
 }
 
 /// PATH-GIT-06: empty, relative, directory, and non-executable binary
@@ -898,7 +914,9 @@ fn includes_disabled_with_explicit_gap() {
 
     let inspector = GixInspector::new();
     let instance = inspector.open_exact(&repo).expect("open with include");
-    let remotes = inspector.remotes(&instance).expect("remotes");
+    let remotes = inspector
+        .remotes_with_aliases(&instance, &repo_scan::identity::load_ssh_aliases())
+        .expect("remotes");
     assert!(
         remotes.iter().all(|r| r.name != b"smuggled"),
         "included remote must not leak: {remotes:?}"
