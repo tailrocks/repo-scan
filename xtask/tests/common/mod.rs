@@ -267,3 +267,28 @@ pub fn make_requirements(green_evidence: Vec<Value>, implementer: &str, verifier
         }],
     })
 }
+
+/// An experiments registry with one experiment in a valid disposition, its
+/// evidence pointing at `artifact` (goal section 3.2 dispositions).
+pub fn make_experiments(artifact: &Path) -> Value {
+    json!({
+        "schema": "repo-scan/experiments/1",
+        "experiments": [{
+            "id": "EXP-X",
+            "class": "required",
+            "hypothesis": "h",
+            "trigger": "t",
+            "controlled_variable": "c",
+            "expected_benefit": "b",
+            "acceptance_rule": "a",
+            "rejection_rule": "r",
+            "default_enablement": "off",
+            "status": "complete",
+            "disposition": "evaluated_not_enabled",
+            "evidence": [{
+                "path": artifact.display().to_string(),
+                "sha256": sha256_file(artifact),
+            }],
+        }],
+    })
+}

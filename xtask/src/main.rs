@@ -22,6 +22,7 @@ mod baseline;
 mod benchmark;
 mod canon;
 mod evaluate;
+mod experiments;
 mod integration;
 mod policy;
 mod requirements;
@@ -155,8 +156,9 @@ enum ProofCommands {
         out_root: PathBuf,
     },
     /// Final reconciliation: every mandatory requirement has green evidence
-    /// with verifier != implementer, evidence hashes match, source coverage
-    /// is complete, and the named commit exists. Prints PASS only then.
+    /// with verifier != implementer, evidence hashes match, every experiment
+    /// has a valid disposition, source coverage is complete, and the named
+    /// commit exists. Prints PASS only then.
     VerifyFinal {
         /// Final code commit to reconcile.
         #[arg(long)]
@@ -165,6 +167,8 @@ enum ProofCommands {
         requirements: PathBuf,
         #[arg(long, default_value = "proof/sources.lock.json")]
         sources: PathBuf,
+        #[arg(long, default_value = "proof/experiments.json")]
+        experiments: PathBuf,
         /// Repository to reconcile against (default: current directory).
         #[arg(long)]
         repo: Option<PathBuf>,
@@ -226,8 +230,9 @@ fn main() {
                 commit,
                 requirements,
                 sources,
+                experiments,
                 repo,
-            } => verify::cmd_verify_final(&commit, &requirements, &sources, repo),
+            } => verify::cmd_verify_final(&commit, &requirements, &sources, &experiments, repo),
             ProofCommands::Benchmark {
                 policy,
                 baseline_bin,

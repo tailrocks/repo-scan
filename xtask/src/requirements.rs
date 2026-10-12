@@ -39,7 +39,7 @@ pub struct Requirement {
     pub status: String,
 }
 
-fn is_hex64(s: &str) -> bool {
+pub(crate) fn is_hex64(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
@@ -108,7 +108,7 @@ fn get_opt_str(
     }
 }
 
-fn get_evidence(
+pub(crate) fn parse_evidence_array(
     obj: &serde_json::Map<String, Value>,
     key: &str,
     ctx: &str,
@@ -181,9 +181,9 @@ pub fn load(path: &Path) -> Result<Vec<Requirement>, Vec<String>> {
         }
         let tests = get_str_list(obj, "tests", &ctx, true, &mut errors);
         let oracle = get_str(obj, "oracle", &ctx, &mut errors);
-        let red_evidence = get_evidence(obj, "red_evidence", &ctx, &mut errors);
-        let green_evidence = get_evidence(obj, "green_evidence", &ctx, &mut errors);
-        let negative_controls = get_evidence(obj, "negative_controls", &ctx, &mut errors);
+        let red_evidence = parse_evidence_array(obj, "red_evidence", &ctx, &mut errors);
+        let green_evidence = parse_evidence_array(obj, "green_evidence", &ctx, &mut errors);
+        let negative_controls = parse_evidence_array(obj, "negative_controls", &ctx, &mut errors);
         let performance_gate_ids =
             get_str_list(obj, "performance_gate_ids", &ctx, true, &mut errors);
         let implementer = get_opt_str(obj, "implementer", &ctx, &mut errors);

@@ -36,6 +36,20 @@ Missing samples, malformed JSON, empty timing arrays, changed policy hashes,
 checksum mismatches, unrecognized platforms, and skipped mandatory tests are
 never converted into exit 0.
 
+Two anti-cherry-picking rules are enforced by `evaluate` and `benchmark`:
+
+- The block-order/bootstrap seed is frozen in `policy.json`. A manifest (or
+  `--seed`) carrying any other seed is INVALID_EVIDENCE.
+- `gates_evaluated` must include every gate the policy binds to a scenario
+  the run covers (`scenario_mandatory_gates`), and a run covering every
+  PERF-SUITE scenario must declare PERF-SUITE. A primary-scenario run
+  evaluated only against PERF-NOREGRESS cannot PASS.
+
+`verify-final` additionally loads `proof/experiments.json`: every experiment
+needs a disposition of `qualified_enabled` or `evaluated_not_enabled` with
+hashed evidence, or `not_triggered` with hashed executed-trigger evidence
+(goal section 3.2).
+
 ## Run bundles
 
 `baseline`/`benchmark`/`integration` write run directories under

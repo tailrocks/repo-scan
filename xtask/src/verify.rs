@@ -6,6 +6,9 @@
 //!   implementer != verifier (both set),
 //! - every green-evidence artifact exists and matches its recorded SHA-256
 //!   (else INVALID_EVIDENCE),
+//! - every experiment/conditional has a valid disposition with evidence
+//!   (goal section 3.2): `qualified_enabled` or `evaluated_not_enabled`
+//!   with evidence, or `not_triggered` with executed-trigger evidence,
 //! - the frozen sources lock exactly covers the repository's
 //!   refs/goal/sources/ refs with matching heads/trees/parents.
 //! No handwritten PASS, agent summary, or copied badge is accepted.
@@ -13,10 +16,44 @@
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
+use crate::requirements::Evidence;
+
+fn check_evidence_artifact(repo: &Path, what: &str, ev: &Evidence, problems: &mut Vec<String>) {
+    let path = {
+        let p = PathBuf::from(&ev.path);
+        if p.is_absolute() {
+            p
+        } else {
+            repo.join(p)
+        }
+    };
+    if !path.is_file() {
+        problems.push(format!(
+            "{what}: evidence artifact missing: {}",
+            path.display()
+        ));
+        return;
+    }
+    match crate::canon::sha256_file(&path) {
+        Ok(actual) if actual == ev.sha256 => {}
+        Ok(actual) => problems.push(format!(
+            "{what}: evidence hash mismatch for {} (recorded {}, actual {})",
+            path.display(),
+            ev.sha256,
+            actual
+        )),
+        Err(e) => problems.push(format!(
+            "{what}: cannot hash evidence {}: {e}",
+            path.display()
+        )),
+    }
+}
+
 pub fn cmd_verify_final(
     commit: &str,
     requirements_path: &Path,
     sources_path: &Path,
+    experiments_path: &Path,
     repo: Option<PathBuf>,
 ) -> i32 {
     let repo = repo.unwrap_or_else(|| PathBuf::from("."));
@@ -35,6 +72,13 @@ pub fn cmd_verify_final(
         Ok(r) => r,
         Err(errors) => crate::invalid(format!(
             "requirements validation failed: {}",
+            errors.join("; ")
+        )),
+    };
+    let experiments = match crate::experiments::load(experiments_path) {
+        Ok(e) => e,
+        Err(errors) => crate::invalid(format!(
+            "experiments validation failed: {}",
             errors.join("; ")
         )),
     };
@@ -63,37 +107,51 @@ pub fn cmd_verify_final(
             )),
         }
         for ev in &req.green_evidence {
-            let path = {
-                let p = PathBuf::from(&ev.path);
-                if p.is_absolute() {
-                    p
-                } else {
-                    repo.join(p)
+            check_evidence_artifact(&repo, &req.id, ev, &mut evidence_problems);
+        }
+    }
+
+    for exp in &experiments {
+        match exp.disposition.as_deref() {
+            Some("qualified_enabled") | Some("evaluated_not_enabled") => {
+                if exp.evidence.is_empty() {
+                    failures.push(format!(
+                        "experiment {}: disposition requires evidence",
+                        exp.id
+                    ));
                 }
-            };
-            if !path.is_file() {
-                evidence_problems.push(format!(
-                    "{}: evidence artifact missing: {}",
-                    req.id,
-                    path.display()
-                ));
-                continue;
+                for ev in &exp.evidence {
+                    check_evidence_artifact(
+                        &repo,
+                        &format!("experiment {}", exp.id),
+                        ev,
+                        &mut evidence_problems,
+                    );
+                }
             }
-            match crate::canon::sha256_file(&path) {
-                Ok(actual) if actual == ev.sha256 => {}
-                Ok(actual) => evidence_problems.push(format!(
-                    "{}: evidence hash mismatch for {} (recorded {}, actual {})",
-                    req.id,
-                    path.display(),
-                    ev.sha256,
-                    actual
-                )),
-                Err(e) => evidence_problems.push(format!(
-                    "{}: cannot hash evidence {}: {e}",
-                    req.id,
-                    path.display()
-                )),
+            Some("not_triggered") => {
+                // A conditional may be not_triggered only when its frozen
+                // trigger test was executed and false (goal section 3.2).
+                if exp.trigger_evidence.is_empty() {
+                    failures.push(format!(
+                        "experiment {}: not_triggered requires executed trigger evidence",
+                        exp.id
+                    ));
+                }
+                for ev in &exp.trigger_evidence {
+                    check_evidence_artifact(
+                        &repo,
+                        &format!("experiment {} trigger", exp.id),
+                        ev,
+                        &mut evidence_problems,
+                    );
+                }
             }
+            Some(other) => failures.push(format!(
+                "experiment {}: unknown disposition '{other}'",
+                exp.id
+            )),
+            None => failures.push(format!("experiment {}: no disposition recorded", exp.id)),
         }
     }
 
@@ -136,6 +194,7 @@ pub fn cmd_verify_final(
         json!({
             "commit": commit,
             "requirements": reqs.len(),
+            "experiments": experiments.len(),
             "sources_checked": report.sources_checked,
         }),
     );

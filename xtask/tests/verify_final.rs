@@ -1,5 +1,6 @@
 //! Black-box tests for `proof verify-final`: PASS only when every mandatory
-//! requirement has hashed green evidence, verifier != implementer, the
+//! requirement has hashed green evidence, verifier != implementer, every
+//! experiment carries a valid evidenced disposition (goal section 3.2), the
 //! commit exists, and source coverage is complete.
 
 mod common;
@@ -14,6 +15,7 @@ struct Fixture {
     artifact: PathBuf,
     requirements_path: PathBuf,
     lock_path: PathBuf,
+    experiments_path: PathBuf,
 }
 
 fn evidence_for(artifact: &Path) -> Vec<Value> {
@@ -35,11 +37,15 @@ fn fixture(green: Vec<Value>, implementer: &str, verifier: &str, omit_beta: bool
     let requirements = make_requirements(green, implementer, verifier);
     let requirements_path = repo.dir.path().join("requirements.json");
     write_json(&requirements_path, &requirements);
+    // Default: one experiment with a valid disposition.
+    let experiments_path = repo.dir.path().join("experiments.json");
+    write_json(&experiments_path, &common::make_experiments(&artifact));
     Fixture {
         repo,
         artifact,
         requirements_path,
         lock_path,
+        experiments_path,
     }
 }
 
@@ -54,9 +60,15 @@ impl Fixture {
             self.requirements_path.to_str().unwrap(),
             "--sources",
             self.lock_path.to_str().unwrap(),
+            "--experiments",
+            self.experiments_path.to_str().unwrap(),
             "--repo",
             self.repo.dir.path().to_str().unwrap(),
         ])
+    }
+
+    fn rewrite_experiments(&self, experiments: Value) {
+        write_json(&self.experiments_path, &experiments);
     }
 
     fn rewrite_requirements(&self, green: Vec<Value>, implementer: &str, verifier: &str) {
@@ -165,4 +177,69 @@ fn verify_final_rejects_omitted_source() {
         "stdout: {}",
         stdout(&out)
     );
+}
+
+#[test]
+fn verify_final_rejects_missing_experiment_disposition() {
+    let f = fixture(Vec::new(), "implementer-a", "verifier-b", false);
+    let green = evidence_for(&f.artifact);
+    f.rewrite_requirements(green, "implementer-a", "verifier-b");
+    f.rewrite_experiments(json!({
+        "schema": "repo-scan/experiments/1",
+        "experiments": [{
+            "id": "EXP-X",
+            "status": "pending"
+        }],
+    }));
+    let head_b = f.repo.head_b.clone();
+    let out = f.run_verify(&head_b);
+    assert_eq!(code(&out), 1, "stdout: {}", stdout(&out));
+    assert!(
+        stdout(&out).contains("no disposition"),
+        "stdout: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn verify_final_rejects_not_triggered_without_executed_trigger() {
+    let f = fixture(Vec::new(), "implementer-a", "verifier-b", false);
+    let green = evidence_for(&f.artifact);
+    f.rewrite_requirements(green, "implementer-a", "verifier-b");
+    f.rewrite_experiments(json!({
+        "schema": "repo-scan/experiments/1",
+        "experiments": [{
+            "id": "EXP-COND-X",
+            "disposition": "not_triggered"
+        }],
+    }));
+    let head_b = f.repo.head_b.clone();
+    let out = f.run_verify(&head_b);
+    assert_eq!(code(&out), 1, "stdout: {}", stdout(&out));
+    assert!(
+        stdout(&out).contains("trigger evidence"),
+        "stdout: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn verify_final_rejects_experiment_evidence_hash_mismatch() {
+    let f = fixture(Vec::new(), "implementer-a", "verifier-b", false);
+    let green = evidence_for(&f.artifact);
+    f.rewrite_requirements(green, "implementer-a", "verifier-b");
+    f.rewrite_experiments(json!({
+        "schema": "repo-scan/experiments/1",
+        "experiments": [{
+            "id": "EXP-X",
+            "disposition": "qualified_enabled",
+            "evidence": [{
+                "path": f.artifact.display().to_string(),
+                "sha256": "2".repeat(64),
+            }],
+        }],
+    }));
+    let head_b = f.repo.head_b.clone();
+    let out = f.run_verify(&head_b);
+    assert_eq!(code(&out), 2, "stdout: {}", stdout(&out));
 }
