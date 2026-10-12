@@ -4,7 +4,10 @@
 //!
 //! ```sh
 //! cargo run --locked -p xtask -- proof inventory
+//! cargo run --locked -p xtask -- proof baseline --policy proof/policy.json --bin <bin> --dataset dir-heavy
 //! cargo run --locked -p xtask -- proof red --requirements proof/requirements.json
+//! cargo run --locked -p xtask -- proof benchmark --policy proof/policy.json \
+//!     --baseline-bin <a> --candidate-bin <b> --scenario <id> --blocks 20
 //! ```
 //!
 //! Exit codes follow goal section 3.2:
@@ -12,9 +15,14 @@
 //! An absent sample, malformed JSON, unrecognized platform, or skipped
 //! mandatory test is never converted into exit 0.
 
+mod baseline;
+mod benchmark;
 mod canon;
+mod policy;
 mod requirements;
+mod runs;
 mod sources;
+mod stats;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -90,11 +98,62 @@ enum ProofCommands {
         #[arg(long, default_value = "proof/sources.lock.json")]
         sources: PathBuf,
     },
+    /// Run a binary against a dataset recipe, capturing timing samples and
+    /// counters into proof-out/<run-id>/ with a run manifest.
+    Baseline {
+        #[arg(long, default_value = "proof/policy.json")]
+        policy: PathBuf,
+        /// Binary under measurement.
+        #[arg(long)]
+        bin: PathBuf,
+        /// Dataset recipe id (proof/datasets/<id>.json) or path to a recipe.
+        #[arg(long)]
+        dataset: String,
+        /// Repetitions (default 5).
+        #[arg(long)]
+        samples: Option<usize>,
+        /// Output root for run evidence.
+        #[arg(long, default_value = "proof-out")]
+        out_root: PathBuf,
+        /// Arguments passed to the measured binary (after --).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// List requirements with empty green_evidence; exit 1 while any
     /// required item lacks evidence (shows the pending state).
     Red {
         #[arg(long, default_value = "proof/requirements.json")]
         requirements: PathBuf,
+    },
+    /// Paired-block benchmark between two binaries with seeded randomized
+    /// balanced order; raw samples are written as JSONL to the run dir.
+    Benchmark {
+        #[arg(long, default_value = "proof/policy.json")]
+        policy: PathBuf,
+        #[arg(long)]
+        baseline_bin: PathBuf,
+        #[arg(long)]
+        candidate_bin: PathBuf,
+        /// Scenario id from the frozen policy.
+        #[arg(long)]
+        scenario: String,
+        /// Paired blocks (default: policy minimum; never below it).
+        #[arg(long)]
+        blocks: Option<usize>,
+        /// RNG seed for block order (default: policy seed).
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Comma-separated gate ids to declare for later evaluation
+        /// (default: PERF-PRIMARY for the primary scenario, else
+        /// PERF-NOREGRESS).
+        #[arg(long)]
+        gates: Option<String>,
+        /// Output root for run evidence.
+        #[arg(long, default_value = "proof-out")]
+        out_root: PathBuf,
+        /// Arguments passed to both binaries (after --).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 }
 
@@ -103,7 +162,36 @@ fn main() {
     let code = match cli.command {
         Commands::Proof { command } => match command {
             ProofCommands::Inventory { repo, sources } => sources::cmd_inventory(repo, &sources),
+            ProofCommands::Baseline {
+                policy,
+                bin,
+                dataset,
+                samples,
+                out_root,
+                args,
+            } => baseline::cmd_baseline(&policy, &bin, &dataset, samples, &out_root, &args),
             ProofCommands::Red { requirements } => requirements::cmd_red(&requirements),
+            ProofCommands::Benchmark {
+                policy,
+                baseline_bin,
+                candidate_bin,
+                scenario,
+                blocks,
+                seed,
+                gates,
+                out_root,
+                args,
+            } => benchmark::cmd_benchmark(
+                &policy,
+                &baseline_bin,
+                &candidate_bin,
+                &scenario,
+                blocks,
+                seed,
+                gates,
+                &out_root,
+                &args,
+            ),
         },
     };
     std::process::exit(code);
