@@ -1,0 +1,24 @@
+{
+  "expected_graph": {
+    "description": "50k-directory hierarchy averaging 2.4 files per directory with 400 repositories; primary PERF-PRIMARY fixture family.",
+    "invariants": [
+      "exact directory count traversed",
+      "exact candidate set equals manifest"
+    ]
+  },
+  "id": "dir-heavy",
+  "manifest_schema": "repo-scan/dataset-manifest/1",
+  "notes": "pilot-calibration placeholder scale; frozen after the baseline-only pilot.",
+  "scale": {
+    "avg_files_per_dir": 2.4,
+    "dirs": 50000,
+    "files": 120000,
+    "max_depth": 6,
+    "repos": 400,
+    "roots": 1
+  },
+  "schema": "repo-scan/dataset-recipe/1",
+  "seed": 910002,
+  "status": "pending_baseline_pilot",
+  "title": "Directory-heavy tree"
+}

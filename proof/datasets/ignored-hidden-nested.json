@@ -1,0 +1,26 @@
+{
+  "expected_graph": {
+    "description": "Repositories hidden under dot-directories, ignored by .gitignore/.ignore, nested inside other working trees, and placed under cache/tmp/build/package directories.",
+    "invariants": [
+      "exhaustive policy finds every repository",
+      "no blanket pruning of node_modules/target/cache/tmp",
+      "finding a repository never silently prunes its working tree"
+    ]
+  },
+  "id": "ignored-hidden-nested",
+  "manifest_schema": "repo-scan/dataset-manifest/1",
+  "notes": "pilot-calibration placeholder scale; frozen after the baseline-only pilot.",
+  "scale": {
+    "administrative_nesting_repos": 20,
+    "cache_tmp_build_package_dirs": 20,
+    "hidden_repos": 30,
+    "ignored_repos": 30,
+    "nested_repos": 20,
+    "repos": 120,
+    "roots": 1
+  },
+  "schema": "repo-scan/dataset-recipe/1",
+  "seed": 910009,
+  "status": "pending_baseline_pilot",
+  "title": "Ignored/hidden nested repositories"
+}

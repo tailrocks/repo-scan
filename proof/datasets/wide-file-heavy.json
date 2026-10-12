@@ -1,0 +1,25 @@
+{
+  "expected_graph": {
+    "description": "200 wide directories with 500 regular files each; 25 repositories distributed across the tree.",
+    "invariants": [
+      "every repository discovered exactly once",
+      "no ordinary file produces catalog rows"
+    ]
+  },
+  "id": "wide-file-heavy",
+  "manifest_schema": "repo-scan/dataset-manifest/1",
+  "notes": "pilot-calibration placeholder scale; frozen after the baseline-only pilot.",
+  "scale": {
+    "dirs": 200,
+    "files_per_dir": 500,
+    "max_depth": 3,
+    "refs_per_repo": 5,
+    "repos": 25,
+    "roots": 1,
+    "total_files": 100000
+  },
+  "schema": "repo-scan/dataset-recipe/1",
+  "seed": 910001,
+  "status": "pending_baseline_pilot",
+  "title": "Wide file-heavy tree"
+}

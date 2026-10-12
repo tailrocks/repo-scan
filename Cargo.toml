@@ -4,6 +4,16 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+# Workspace root. The proof-runner crate lives in xtask/ so that the frozen
+# acceptance runner is invocable as `cargo run --locked -p xtask -- proof ...`
+# (goal section 3). The root package remains the default workspace member, so
+# existing `cargo build` / `cargo test` / `cargo bench` invocations in the
+# repository root keep targeting only the repo-scan package; xtask adds no
+# dependencies to the repo-scan build graph (its deps clap/serde/serde_json/
+# sha2/tempfile were already in Cargo.lock).
+[workspace]
+members = [".", "xtask"]
+
 
 [lib]
 name = "repo_scan"

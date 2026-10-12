@@ -1,0 +1,22 @@
+{
+  "expected_graph": {
+    "description": "64 independent clones sharing one identical remote URL and one bare upstream.",
+    "invariants": [
+      "all 64 clones remain distinct logical identities",
+      "equal remotes never merge clones"
+    ]
+  },
+  "id": "independent-clones",
+  "manifest_schema": "repo-scan/dataset-manifest/1",
+  "notes": "pilot-calibration placeholder scale; frozen after the baseline-only pilot.",
+  "scale": {
+    "clones": 64,
+    "identical_remote_url": true,
+    "roots": 1,
+    "upstream_bare_repos": 1
+  },
+  "schema": "repo-scan/dataset-recipe/1",
+  "seed": 910008,
+  "status": "pending_baseline_pilot",
+  "title": "Independent clones of one remote"
+}
