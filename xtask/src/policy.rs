@@ -6,6 +6,7 @@
 //! invalid evidence (goal section 3.3 "changed threshold hash").
 
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -31,6 +32,7 @@ pub struct Policy {
     pub primary_scenario: String,
     pub suite_scenarios: Vec<String>,
     pub noregress_scenarios: Vec<String>,
+    pub scenario_mandatory_gates: BTreeMap<String, Vec<String>>,
     pub gates: Vec<Gate>,
 }
 
@@ -144,6 +146,53 @@ pub fn load(path: &Path) -> Result<Policy, String> {
         .map(|g| g.scenarios.clone())
         .ok_or_else(|| format!("{}: PERF-NOREGRESS gate missing", path.display()))?;
 
+    let scenario_mandatory_gates = match raw
+        .get("scenario_mandatory_gates")
+        .and_then(Value::as_object)
+    {
+        Some(m) => {
+            let mut out = BTreeMap::new();
+            for (scenario, gates_v) in m {
+                let arr = gates_v.as_array().ok_or_else(|| {
+                    format!(
+                        "{}: scenario_mandatory_gates['{scenario}'] must be an array",
+                        path.display()
+                    )
+                })?;
+                let mut gs = Vec::new();
+                for (i, g) in arr.iter().enumerate() {
+                    let g = g.as_str().filter(|s| !s.is_empty()).ok_or_else(|| {
+                        format!(
+                            "{}: scenario_mandatory_gates['{scenario}'][{i}] must be a \
+                             non-empty string",
+                            path.display()
+                        )
+                    })?;
+                    gs.push(g.to_string());
+                }
+                out.insert(scenario.clone(), gs);
+            }
+            out
+        }
+        None => {
+            return Err(format!(
+                "{}: missing scenario_mandatory_gates map",
+                path.display()
+            ))
+        }
+    };
+
+    for (scenario, gs) in &scenario_mandatory_gates {
+        for g in gs {
+            if !gates.iter().any(|gate| &gate.id == g) {
+                return Err(format!(
+                    "{}: scenario_mandatory_gates['{scenario}'] references undefined gate '{g}'",
+                    path.display()
+                ));
+            }
+        }
+    }
+
     Ok(Policy {
         path: path.to_path_buf(),
         self_hash: computed,
@@ -154,6 +203,7 @@ pub fn load(path: &Path) -> Result<Policy, String> {
         primary_scenario,
         suite_scenarios,
         noregress_scenarios,
+        scenario_mandatory_gates,
         gates,
     })
 }

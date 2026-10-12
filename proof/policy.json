@@ -14,6 +14,7 @@
     "inconclusive bounds are not passes; fixed additional collection may be authorized prospectively"
   ],
   "frozen_from": "repo-scan-consolidate-and-optimize-goal.md section 7.4 (verbatim thresholds)",
+  "gate_declaration_rule": "a run must declare in gates_evaluated every gate bound to a scenario it covers, and a run covering every PERF-SUITE scenario must declare PERF-SUITE; run-declared gate subsets cannot skip a mandatory gate",
   "gates": [
     {
       "bound": "u95_one_sided",
@@ -141,6 +142,29 @@
     "rule": "baseline-only pilot before candidate evaluation",
     "status": "pending_baseline_pilot"
   },
+  "scenario_mandatory_gates": {
+    "cached-cli-lookup": [
+      "PERF-NOREGRESS"
+    ],
+    "dir-heavy-cold-app-warm-fs-identity-throughput": [
+      "PERF-PRIMARY"
+    ],
+    "event-follow-replay": [
+      "PERF-NOREGRESS"
+    ],
+    "incremental-reconciliation": [
+      "PERF-NOREGRESS"
+    ],
+    "low-impact-warm-full-scan": [
+      "PERF-NOREGRESS"
+    ],
+    "native-fallback-traversal": [
+      "PERF-NOREGRESS"
+    ],
+    "report-render-and-validate": [
+      "PERF-NOREGRESS"
+    ]
+  },
   "schema": "repo-scan/policy/1",
-  "sha256": "5ab448fcfbc7d56a4e461f61bde675494bf8b2a5f48f420f7e40c59ac6672b73"
+  "sha256": "f8e295085c51181ab0e77006583238893396861a29e664aa804277dad95ab9a3"
 }

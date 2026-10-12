@@ -74,7 +74,16 @@ pub fn cmd_benchmark(
             crate::invalid(format!("gate '{id}' is not defined in the frozen policy"));
         }
     }
-    let seed = seed.unwrap_or(policy.rng_seed);
+    // The block-order seed is frozen in the policy; a different seed would
+    // produce a run the evaluator must reject, so refuse it at collection.
+    let seed = match seed {
+        Some(s) if s != policy.rng_seed => crate::invalid(format!(
+            "--seed {s} differs from the frozen policy seed {}; authoritative runs use \
+             the frozen seed",
+            policy.rng_seed
+        )),
+        _ => policy.rng_seed,
+    };
 
     let run = match crate::runs::create(out_root) {
         Ok(r) => r,

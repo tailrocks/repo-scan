@@ -9,7 +9,7 @@
 //! INVALID_EVIDENCE — never zero.
 
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::policy::Policy;
@@ -238,10 +238,19 @@ pub fn cmd_evaluate(run_dir: &Path) -> i32 {
             .collect(),
         _ => crate::invalid("run manifest lacks a non-empty gates_evaluated array"),
     };
-    let seed = manifest
+    // The analysis seed is frozen in the policy; a manifest carrying any
+    // other seed means the run does not implement the frozen procedure.
+    let seed = match manifest
         .pointer("/protocol/rng_seed")
         .and_then(Value::as_u64)
-        .unwrap_or(policy.rng_seed);
+    {
+        Some(s) if s == policy.rng_seed => s,
+        Some(s) => crate::invalid(format!(
+            "manifest protocol.rng_seed {s} does not match the frozen policy seed {}",
+            policy.rng_seed
+        )),
+        None => crate::invalid("run manifest lacks protocol.rng_seed"),
+    };
 
     let samples = match load_samples(&run_dir.join(crate::runs::SAMPLES_FILE)) {
         Ok(s) => s,
@@ -252,6 +261,34 @@ pub fn cmd_evaluate(run_dir: &Path) -> i32 {
         Err(errors) => invalid_errors(errors),
     };
 
+    // A run covering a scenario must declare every gate the frozen policy
+    // binds to that scenario; a suite-complete run must declare PERF-SUITE.
+    // Run-declared gate subsets cannot skip a mandatory gate.
+    let present: BTreeSet<&str> = ratios.keys().map(String::as_str).collect();
+    let mut mandatory: BTreeSet<&str> = BTreeSet::new();
+    for scenario in &present {
+        if let Some(gates) = policy.scenario_mandatory_gates.get(*scenario) {
+            for g in gates {
+                mandatory.insert(g.as_str());
+            }
+        }
+    }
+    if policy
+        .suite_scenarios
+        .iter()
+        .all(|s| present.contains(s.as_str()))
+    {
+        mandatory.insert("PERF-SUITE");
+    }
+    for m in &mandatory {
+        if !gate_ids.iter().any(|g| g == m) {
+            crate::invalid(format!(
+                "run covers samples requiring mandatory gate '{m}', but gates_evaluated \
+                 does not declare it; a subset evaluation cannot skip mandatory gates"
+            ));
+        }
+    }
+
     let mut outcomes: Vec<GateOutcome> = Vec::new();
     for id in &gate_ids {
         let Some(gate) = policy.gate(id) else {
@@ -259,21 +296,76 @@ pub fn cmd_evaluate(run_dir: &Path) -> i32 {
         };
         match gate.kind.as_str() {
             "timing" => {
-                let scenario = match (&gate.scenario, id.as_str()) {
-                    (Some(s), _) => s.clone(),
-                    (None, _) => manifest
+                let threshold = gate.threshold.unwrap_or(f64::NAN);
+                if let Some(scenario) = &gate.scenario {
+                    outcomes.push(eval_timing_gate(
+                        id, scenario, &ratios, threshold, &policy, seed,
+                    ));
+                } else if !gate.scenarios.is_empty() {
+                    // Multi-scenario gate (PERF-NOREGRESS): evaluate every
+                    // listed scenario the run covers. Declaring the gate for
+                    // a run that covers none of them is invalid evidence; the
+                    // gate never falls back to the run's primary scenario.
+                    let mut per_scenario = Vec::new();
+                    let mut covered = 0usize;
+                    let mut any_invalid = false;
+                    let mut all_pass = true;
+                    for s in &gate.scenarios {
+                        if !ratios.contains_key(s) {
+                            continue;
+                        }
+                        covered += 1;
+                        let o = eval_timing_gate(id, s, &ratios, threshold, &policy, seed);
+                        match o.status {
+                            "pass" => {}
+                            "invalid" => any_invalid = true,
+                            _ => all_pass = false,
+                        }
+                        per_scenario
+                            .push(json!({"scenario": s, "status": o.status, "detail": o.detail}));
+                    }
+                    if covered == 0 {
+                        outcomes.push(GateOutcome {
+                            id: id.clone(),
+                            status: "invalid",
+                            detail: json!({
+                                "error": format!(
+                                    "gate '{id}' declares scenarios {:?} but the run covers none of them",
+                                    gate.scenarios
+                                )
+                            }),
+                        });
+                    } else {
+                        outcomes.push(GateOutcome {
+                            id: id.clone(),
+                            status: if any_invalid {
+                                "invalid"
+                            } else if all_pass {
+                                "pass"
+                            } else {
+                                "fail"
+                            },
+                            detail: json!({
+                                "threshold": threshold,
+                                "scenarios": per_scenario,
+                            }),
+                        });
+                    }
+                } else {
+                    // Gates without a frozen scenario (PERF-NATIVE-PROMOTION)
+                    // evaluate the scenario named by the run manifest.
+                    let scenario = manifest
                         .get("scenario")
                         .and_then(Value::as_str)
                         .unwrap_or("")
-                        .to_string(),
-                };
-                if scenario.is_empty() {
-                    crate::invalid(format!("gate '{id}' has no scenario to evaluate"));
+                        .to_string();
+                    if scenario.is_empty() {
+                        crate::invalid(format!("gate '{id}' has no scenario to evaluate"));
+                    }
+                    outcomes.push(eval_timing_gate(
+                        id, &scenario, &ratios, threshold, &policy, seed,
+                    ));
                 }
-                let threshold = gate.threshold.unwrap_or(f64::NAN);
-                outcomes.push(eval_timing_gate(
-                    id, &scenario, &ratios, threshold, &policy, seed,
-                ));
             }
             "timing_aggregate" => {
                 let mut groups = Vec::new();

@@ -182,3 +182,81 @@ fn benchmark_then_evaluate_identical_binaries_fails_improvement() {
         stdout(&out)
     );
 }
+
+#[test]
+fn evaluate_rejects_manifest_seed_different_from_policy() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let run_dir = make_benchmark_bundle(dir.path(), 0.70, BLOCKS);
+    let mut manifest = common::read_json(&run_dir.join("run-manifest.json"));
+    manifest["protocol"]["rng_seed"] = serde_json::json!(42u64);
+    write_json(&run_dir.join("run-manifest.json"), &manifest);
+    rewrite_checksums(&run_dir);
+    let out = run(&["proof", "evaluate", "--run-dir", run_dir.to_str().unwrap()]);
+    assert_eq!(code(&out), 2, "stdout: {}", stdout(&out));
+    assert!(
+        stdout(&out).contains("rng_seed"),
+        "stdout: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn evaluate_rejects_primary_run_missing_mandatory_primary_gate() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // Ratio 0.9 would satisfy PERF-NOREGRESS (<= 1.05) but must never skip
+    // the mandatory PERF-PRIMARY gate on a primary-scenario run.
+    let run_dir = make_benchmark_bundle(dir.path(), 0.90, BLOCKS);
+    let mut manifest = common::read_json(&run_dir.join("run-manifest.json"));
+    manifest["gates_evaluated"] = serde_json::json!(["PERF-NOREGRESS"]);
+    write_json(&run_dir.join("run-manifest.json"), &manifest);
+    rewrite_checksums(&run_dir);
+    let out = run(&["proof", "evaluate", "--run-dir", run_dir.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_ne!(code(&out), 0, "stdout: {text}");
+    assert_eq!(code(&out), 2, "stdout: {text}");
+    assert!(text.contains("PERF-PRIMARY"), "stdout: {text}");
+    assert!(text.contains("mandatory"), "stdout: {text}");
+}
+
+#[test]
+fn evaluate_rejects_noregress_gate_without_noregress_scenarios() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // Declaring PERF-NOREGRESS while covering only the primary scenario is
+    // invalid even when the mandatory primary gate is also declared and the
+    // primary gate itself passes.
+    let run_dir = make_benchmark_bundle(dir.path(), 0.70, BLOCKS);
+    let mut manifest = common::read_json(&run_dir.join("run-manifest.json"));
+    manifest["gates_evaluated"] = serde_json::json!(["PERF-PRIMARY", "PERF-NOREGRESS"]);
+    write_json(&run_dir.join("run-manifest.json"), &manifest);
+    rewrite_checksums(&run_dir);
+    let out = run(&["proof", "evaluate", "--run-dir", run_dir.to_str().unwrap()]);
+    assert_eq!(code(&out), 2, "stdout: {}", stdout(&out));
+}
+
+/// `proof benchmark` refuses a --seed that differs from the frozen policy.
+#[cfg(unix)]
+#[test]
+fn benchmark_rejects_seed_override() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let policy = common::policy_path();
+    let scenario = common::primary_scenario();
+    let out = run(&[
+        "proof",
+        "benchmark",
+        "--policy",
+        policy.to_str().unwrap(),
+        "--baseline-bin",
+        "/usr/bin/true",
+        "--candidate-bin",
+        "/usr/bin/true",
+        "--scenario",
+        &scenario,
+        "--blocks",
+        "20",
+        "--seed",
+        "1",
+        "--out-root",
+        dir.path().to_str().unwrap(),
+    ]);
+    assert_eq!(code(&out), 2, "stdout: {}", stdout(&out));
+}
