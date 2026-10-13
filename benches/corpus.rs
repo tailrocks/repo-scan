@@ -71,7 +71,7 @@ impl Rng {
     pub fn new(seed: u64) -> Self {
         Rng(seed)
     }
-    pub fn next(&mut self) -> u64 {
+    pub fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -81,7 +81,7 @@ impl Rng {
     pub fn bytes(&mut self, n: usize) -> Vec<u8> {
         let mut out = Vec::with_capacity(n);
         while out.len() < n {
-            out.extend_from_slice(&self.next().to_le_bytes());
+            out.extend_from_slice(&self.next_u64().to_le_bytes());
         }
         out.truncate(n);
         out
@@ -1372,7 +1372,7 @@ impl<'a> DigestWalk<'a> {
             };
             entries.push((e.file_name(), e.path(), ft));
         }
-        entries.sort_by(|a, b| os_bytes(&a.0).cmp(&os_bytes(&b.0)));
+        entries.sort_by_key(|e| os_bytes(&e.0));
         for (name, child, ft) in entries {
             let child_rel = rel.join(&name);
             let relhex = hex(&path_bytes(&child_rel));
@@ -1594,7 +1594,7 @@ pub fn generate(recipe_arg: &str, out: &Path, tier: &str) -> Res<GenReport> {
 
     // --- Truth inspection (installed git, read-only). ---
     let t1 = Instant::now();
-    gen.repos.sort_by(|a, b| path_bytes(a).cmp(&path_bytes(b)));
+    gen.repos.sort_by_key(|r| path_bytes(r));
     gen.repos.dedup();
     let mut truths = Vec::with_capacity(gen.repos.len());
     for repo in &gen.repos {
