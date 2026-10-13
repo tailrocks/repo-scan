@@ -1,0 +1,403 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://repo-scan.local/schemas/report-v1.4.schema.json",
+  "title": "repo-scan report v1.4",
+  "description": "Normative report contract for repo-scan v1 reports. All listed fields are required; unknown values use an explicitly allowed null or state, never omission. Record objects reject undeclared fields in version 1. Non-null relationship IDs must resolve within the report, except envelope, scan, and historical successor IDs (external catalog history) and native identities / event cursors (opaque strings, not foreign keys). Relationship counts must agree with emitted records. ID resolution and count agreement are validated by the REPORT-01 test harness, not by this schema alone.",
+  "type": "object",
+  "required": [
+    "schema_version", "report_id", "created_at", "tool", "scan", "coverage",
+    "resources", "volumes", "paths", "roots", "repositories", "checkouts",
+    "branches", "remotes", "storage_links", "aliases", "candidates",
+    "errors", "generated_artifacts"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": "1.4.0" },
+    "report_id": { "$ref": "#/$defs/Id" },
+    "created_at": { "$ref": "#/$defs/Time" },
+    "tool": { "$ref": "#/$defs/Tool" },
+    "scan": { "$ref": "#/$defs/Scan" },
+    "coverage": { "$ref": "#/$defs/Coverage" },
+    "resources": { "$ref": "#/$defs/Resources" },
+    "volumes": { "type": "array", "items": { "$ref": "#/$defs/Volume" } },
+    "paths": { "type": "array", "items": { "$ref": "#/$defs/Path" } },
+    "roots": { "type": "array", "items": { "$ref": "#/$defs/Root" } },
+    "repositories": { "type": "array", "items": { "$ref": "#/$defs/Repository" } },
+    "checkouts": { "type": "array", "items": { "$ref": "#/$defs/Checkout" } },
+    "branches": { "type": "array", "items": { "$ref": "#/$defs/Branch" } },
+    "remotes": { "type": "array", "items": { "$ref": "#/$defs/Remote" } },
+    "storage_links": { "type": "array", "items": { "$ref": "#/$defs/StorageLink" } },
+    "aliases": { "type": "array", "items": { "$ref": "#/$defs/Alias" } },
+    "candidates": { "type": "array", "items": { "$ref": "#/$defs/Candidate" } },
+    "errors": { "type": "array", "items": { "$ref": "#/$defs/Error" } },
+    "generated_artifacts": { "type": "array", "items": { "$ref": "#/$defs/GeneratedArtifact" } }
+  },
+  "$defs": {
+    "Id": { "type": "string", "minLength": 1 },
+    "Time": { "type": "string", "format": "date-time" },
+    "Count": { "type": "integer", "minimum": 0 },
+    "Tool": {
+      "type": "object",
+      "required": ["name", "version", "source_commit"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "const": "repo-scan" },
+        "version": { "type": "string" },
+        "source_commit": { "type": ["string", "null"] }
+      }
+    },
+    "Scan": {
+      "type": "object",
+      "required": [
+        "id", "generation", "epoch", "catalog_revision", "target_url",
+        "canonical_url", "targets", "matching_policy", "scope", "state", "started_at",
+        "finished_at", "superseded_by", "cached", "status_mode"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "generation": { "$ref": "#/$defs/Count" },
+        "epoch": { "$ref": "#/$defs/Count" },
+        "catalog_revision": { "$ref": "#/$defs/Count" },
+        "target_url": { "type": "string" },
+        "canonical_url": { "type": ["string", "null"] },
+        "targets": { "type": "array", "items": { "$ref": "#/$defs/ScanTarget" } },
+        "matching_policy": { "type": "string" },
+        "scope": { "enum": ["machine", "roots"] },
+        "state": { "enum": ["running", "complete", "incomplete", "interrupted", "failed", "superseded"] },
+        "started_at": { "$ref": "#/$defs/Time" },
+        "finished_at": { "type": ["string", "null"], "format": "date-time" },
+        "superseded_by": { "type": ["string", "null"], "minLength": 1 },
+        "cached": { "type": "boolean" },
+        "status_mode": { "enum": ["metadata", "summary", "full"] }
+      }
+    },
+    "ScanTarget": {
+      "type": "object",
+      "required": ["raw", "canonical", "matched_repositories"],
+      "additionalProperties": false,
+      "properties": {
+        "raw": { "type": "string" },
+        "canonical": { "type": ["string", "null"] },
+        "matched_repositories": { "$ref": "#/$defs/Count" }
+      }
+    },
+    "Coverage": {
+      "type": "object",
+      "required": [
+        "filesystem", "identity", "status", "directories_complete",
+        "tasks_pending", "gaps", "unresolvable_candidates", "scope_boundaries"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "filesystem": { "enum": ["complete", "incomplete", "unknown"] },
+        "identity": { "enum": ["complete_under_policy", "unproven"] },
+        "status": { "enum": ["complete", "incomplete", "not_requested"] },
+        "directories_complete": { "$ref": "#/$defs/Count" },
+        "tasks_pending": { "$ref": "#/$defs/Count" },
+        "gaps": { "$ref": "#/$defs/Count" },
+        "unresolvable_candidates": { "$ref": "#/$defs/Count" },
+        "scope_boundaries": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "Resources": {
+      "type": "object",
+      "required": [
+        "profile", "cpu_target_cores", "rss_target_bytes", "peak_rss_bytes",
+        "cpu_seconds", "enumerated_entries", "db_transactions", "db_sync_calls"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "profile": { "type": "string" },
+        "cpu_target_cores": { "type": "number", "exclusiveMinimum": 0 },
+        "rss_target_bytes": { "$ref": "#/$defs/Count" },
+        "peak_rss_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "cpu_seconds": { "type": ["number", "null"], "minimum": 0 },
+        "enumerated_entries": { "$ref": "#/$defs/Count" },
+        "db_transactions": { "$ref": "#/$defs/Count" },
+        "db_sync_calls": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "Volume": {
+      "type": "object",
+      "required": ["id", "native_identity", "namespace", "filesystem", "kind", "state", "observed_at", "error_ids"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "native_identity": { "type": ["string", "null"] },
+        "namespace": { "type": "string" },
+        "filesystem": { "type": ["string", "null"] },
+        "kind": { "enum": ["local", "network", "virtual", "unknown"] },
+        "state": { "enum": ["available", "inaccessible", "unavailable", "unknown"] },
+        "observed_at": { "type": ["string", "null"], "format": "date-time" },
+        "error_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } }
+      }
+    },
+    "Path": {
+      "type": "object",
+      "required": ["id", "display", "encoding", "value", "volume_id", "object_id", "incarnation"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "display": { "type": "string", "description": "Escaped presentation text only." },
+        "encoding": { "enum": ["utf8", "base64"] },
+        "value": { "type": "string", "description": "Exact Unicode string when the raw bytes are valid UTF-8, else standard Base64 of the original bytes." },
+        "volume_id": { "type": ["string", "null"], "minLength": 1 },
+        "object_id": { "type": ["string", "null"] },
+        "incarnation": { "type": ["string", "null"] }
+      }
+    },
+    "EncodedName": {
+      "type": "object",
+      "required": ["display", "encoding", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "display": { "type": "string" },
+        "encoding": { "enum": ["utf8", "base64"] },
+        "value": { "type": "string" }
+      }
+    },
+    "Root": {
+      "type": "object",
+      "required": ["id", "path_id", "volume_id", "state", "observed_at", "event_history_uuid", "ingested_cursor", "reconciled_cursor", "error_ids"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "path_id": { "$ref": "#/$defs/Id" },
+        "volume_id": { "type": ["string", "null"], "minLength": 1 },
+        "state": { "enum": ["complete", "pending", "inaccessible", "unavailable", "error"] },
+        "observed_at": { "type": ["string", "null"], "format": "date-time" },
+        "event_history_uuid": { "type": ["string", "null"] },
+        "ingested_cursor": { "type": ["string", "null"] },
+        "reconciled_cursor": { "type": ["string", "null"] },
+        "error_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } }
+      }
+    },
+    "Repository": {
+      "type": "object",
+      "required": ["id", "git_path_id", "common_path_id", "bare", "format", "object_format", "match", "evidence", "observed_at", "tool_managed", "error_ids"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "git_path_id": { "$ref": "#/$defs/Id" },
+        "common_path_id": { "$ref": "#/$defs/Id" },
+        "bare": { "type": ["boolean", "null"] },
+        "format": { "type": "string" },
+        "object_format": { "type": "string" },
+        "match": { "enum": ["confirmed", "related", "probable", "nonmatch", "unresolvable_identity"] },
+        "evidence": { "type": "array", "items": { "type": "string" } },
+        "observed_at": { "$ref": "#/$defs/Time" },
+        "tool_managed": { "type": ["string", "null"] },
+        "error_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } }
+      }
+    },
+    "Checkout": {
+      "type": "object",
+      "required": ["id", "repository_id", "root_path_id", "git_path_id", "kind", "availability", "head", "status", "observed_at", "error_ids"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "repository_id": { "$ref": "#/$defs/Id" },
+        "root_path_id": { "type": ["string", "null"], "minLength": 1 },
+        "git_path_id": { "$ref": "#/$defs/Id" },
+        "kind": { "enum": ["main", "linked", "submodule", "unknown"] },
+        "availability": { "enum": ["present", "missing", "inaccessible", "broken", "unknown"] },
+        "head": { "$ref": "#/$defs/Head" },
+        "status": { "$ref": "#/$defs/Status" },
+        "observed_at": { "$ref": "#/$defs/Time" },
+        "error_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } }
+      }
+    },
+    "Head": {
+      "type": "object",
+      "required": ["state", "ref_name", "oid"],
+      "additionalProperties": false,
+      "properties": {
+        "state": { "enum": ["branch", "detached", "unborn", "invalid", "unknown"] },
+        "ref_name": {
+          "anyOf": [{ "$ref": "#/$defs/EncodedName" }, { "type": "null" }]
+        },
+        "oid": {
+          "anyOf": [{ "$ref": "#/$defs/ObjectId" }, { "type": "null" }]
+        }
+      }
+    },
+    "ObjectId": {
+      "type": "object",
+      "required": ["algorithm", "hex"],
+      "additionalProperties": false,
+      "properties": {
+        "algorithm": { "type": "string" },
+        "hex": { "type": "string", "pattern": "^([0-9a-f]{2})+$" }
+      },
+      "description": "hex is a nonempty even number of lowercase hex chars; known algorithms enforce their lengths (sha1: 40, sha256: 64).",
+      "allOf": [
+        {
+          "if": { "properties": { "algorithm": { "const": "sha1" } } },
+          "then": { "properties": { "hex": { "minLength": 40, "maxLength": 40 } } }
+        },
+        {
+          "if": { "properties": { "algorithm": { "const": "sha256" } } },
+          "then": { "properties": { "hex": { "minLength": 64, "maxLength": 64 } } }
+        }
+      ]
+    },
+    "Branch": {
+      "type": "object",
+      "required": ["id", "repository_id", "checkout_scope_id", "kind", "name", "oid", "symbolic_target", "upstream", "state", "observed_at", "error_ids", "freshness", "freshness_at", "comparison", "ahead", "behind"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "repository_id": { "$ref": "#/$defs/Id" },
+        "checkout_scope_id": { "type": ["string", "null"], "minLength": 1 },
+        "kind": { "enum": ["local", "remote_tracking", "other"] },
+        "name": { "$ref": "#/$defs/EncodedName" },
+        "oid": { "anyOf": [{ "$ref": "#/$defs/ObjectId" }, { "type": "null" }] },
+        "symbolic_target": { "anyOf": [{ "$ref": "#/$defs/EncodedName" }, { "type": "null" }] },
+        "upstream": { "anyOf": [{ "$ref": "#/$defs/EncodedName" }, { "type": "null" }] },
+        "state": { "enum": ["valid", "unborn", "invalid", "unsupported"] },
+        "observed_at": { "$ref": "#/$defs/Time" },
+        "error_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+        "freshness": { "enum": ["current", "stale", "unknown"] },
+        "freshness_at": { "anyOf": [{ "$ref": "#/$defs/Time" }, { "type": "null" }] },
+        "comparison": { "enum": ["equal", "ahead", "behind", "diverged", "no_upstream", "upstream_missing", "pending", "incomplete_history", "error"] },
+        "ahead": { "type": ["integer", "null"], "minimum": 0 },
+        "behind": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "Status": {
+      "type": "object",
+      "required": ["state", "mode", "started_at", "finished_at", "staged", "unstaged", "untracked", "conflicts", "working_state", "untracked_units", "submodules", "unknown_fields", "error_ids"],
+      "additionalProperties": false,
+      "properties": {
+        "state": { "enum": ["complete", "partial", "pending", "not_requested", "unsupported", "unstable", "error"] },
+        "mode": { "enum": ["metadata", "summary", "full"] },
+        "started_at": { "type": ["string", "null"], "format": "date-time" },
+        "finished_at": { "type": ["string", "null"], "format": "date-time" },
+        "staged": { "type": ["integer", "null"], "minimum": 0 },
+        "unstaged": { "type": ["integer", "null"], "minimum": 0 },
+        "untracked": { "type": ["integer", "null"], "minimum": 0 },
+        "conflicts": { "type": ["integer", "null"], "minimum": 0 },
+        "working_state": { "enum": ["clean", "dirty", "conflicted", "pending", "partial", "unstable", "unknown", "error", "not_applicable"] },
+        "untracked_units": { "enum": ["collapsed_entries", "files", "not_requested"] },
+        "submodules": { "enum": ["checked", "not_requested", "unknown"] },
+        "unknown_fields": { "type": "array", "items": { "type": "string" } },
+        "error_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } }
+      },
+      "description": "Cross-field rule: metadata mode has null counts and untracked_units not_requested; summary uses collapsed_entries; full uses files. Unknown counts stay null even when units are known.",
+      "allOf": [
+        {
+          "if": { "properties": { "mode": { "const": "metadata" } } },
+          "then": {
+            "properties": {
+              "staged": { "type": "null" },
+              "unstaged": { "type": "null" },
+              "untracked": { "type": "null" },
+              "conflicts": { "type": "null" },
+              "untracked_units": { "const": "not_requested" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "mode": { "const": "summary" } } },
+          "then": { "properties": { "untracked_units": { "const": "collapsed_entries" } } }
+        },
+        {
+          "if": { "properties": { "mode": { "const": "full" } } },
+          "then": { "properties": { "untracked_units": { "const": "files" } } }
+        }
+      ]
+    },
+    "Remote": {
+      "type": "object",
+      "required": ["id", "repository_id", "checkout_scope_id", "name", "role", "url", "canonical_url", "observed_at", "refresh"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "repository_id": { "$ref": "#/$defs/Id" },
+        "checkout_scope_id": { "type": ["string", "null"], "minLength": 1 },
+        "name": { "$ref": "#/$defs/EncodedName" },
+        "role": { "enum": ["fetch", "push"] },
+        "url": { "type": "string", "description": "Credentials redacted." },
+        "canonical_url": { "type": ["string", "null"] },
+        "observed_at": { "$ref": "#/$defs/Time" },
+        "refresh": { "anyOf": [{ "$ref": "#/$defs/RemoteRefresh" }, { "type": "null" }] }
+      }
+    },
+    "RemoteRefresh": {
+      "type": "object",
+      "required": ["status", "observed_at", "duration_ms", "refs_updated"],
+      "additionalProperties": false,
+      "properties": {
+        "status": { "enum": ["success", "failed", "unsupported"] },
+        "observed_at": { "$ref": "#/$defs/Time" },
+        "duration_ms": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] },
+        "refs_updated": { "$ref": "#/$defs/Count" }
+      }
+    },
+    "StorageLink": {
+      "type": "object",
+      "required": ["id", "from_repository_id", "to_path_id", "kind", "evidence"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "from_repository_id": { "$ref": "#/$defs/Id" },
+        "to_path_id": { "$ref": "#/$defs/Id" },
+        "kind": { "enum": ["common_directory", "alternate_objects", "shared_object_store", "observed_hardlink"] },
+        "evidence": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "Alias": {
+      "type": "object",
+      "required": ["path_id", "target_path_id", "kind", "verified_at"],
+      "additionalProperties": false,
+      "properties": {
+        "path_id": { "$ref": "#/$defs/Id" },
+        "target_path_id": { "$ref": "#/$defs/Id" },
+        "kind": { "enum": ["symlink", "firmlink", "mount_alias", "same_object"] },
+        "verified_at": { "$ref": "#/$defs/Time" }
+      }
+    },
+    "Candidate": {
+      "type": "object",
+      "required": ["id", "path_id", "repository_id", "disposition", "reason", "retry_after", "error_ids"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "path_id": { "$ref": "#/$defs/Id" },
+        "repository_id": { "type": ["string", "null"], "minLength": 1 },
+        "disposition": { "enum": ["probe_pending", "probe_failed", "unsupported", "unresolvable_identity"] },
+        "reason": { "type": "string" },
+        "retry_after": { "type": ["string", "null"], "format": "date-time" },
+        "error_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } }
+      }
+    },
+    "Error": {
+      "type": "object",
+      "required": ["id", "path_id", "operation", "category", "message", "retryable", "attempts", "first_seen", "last_seen", "next_retry"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "path_id": { "type": ["string", "null"], "minLength": 1 },
+        "operation": { "type": "string" },
+        "category": { "type": "string" },
+        "message": { "type": "string" },
+        "retryable": { "type": "boolean" },
+        "attempts": { "$ref": "#/$defs/Count" },
+        "first_seen": { "$ref": "#/$defs/Time" },
+        "last_seen": { "$ref": "#/$defs/Time" },
+        "next_retry": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "GeneratedArtifact": {
+      "type": "object",
+      "required": ["path_id", "kind", "created_after_status"],
+      "additionalProperties": false,
+      "properties": {
+        "path_id": { "$ref": "#/$defs/Id" },
+        "kind": { "enum": ["report", "tool_state"] },
+        "created_after_status": { "type": "boolean" }
+      }
+    }
+  }
+}

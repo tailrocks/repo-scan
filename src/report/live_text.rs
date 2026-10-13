@@ -6,14 +6,15 @@
 //! on each new snapshot; identical reports render byte-identical text.
 //!
 //! Layout: header line, coverage line, totals line, then detail rows
-//! (repositories, checkouts, candidates, errors) capped at
+//! (repositories, checkouts, branches, candidates, errors) capped at
 //! [`MAX_DETAIL_ROWS`] with a `... (N more)` overflow line.
 
 use crate::report::model::Report;
 use std::collections::HashMap;
 
-/// Maximum detail rows (repositories + checkouts + candidates + errors)
-/// emitted before the `... (N more)` overflow line.
+/// Maximum detail rows (repositories + checkouts + branches +
+/// candidates + errors) emitted before the `... (N more)` overflow
+/// line.
 pub const MAX_DETAIL_ROWS: usize = 200;
 
 /// Replacement character for control characters in display text.
@@ -23,10 +24,12 @@ const CONTROL_REPLACEMENT: char = '\u{FFFD}';
 /// inject newlines, ESC bytes, or other terminal control sequences.
 /// Local copy of the main display-sanitizing rule; std only.
 fn sanitize(text: &str) -> String {
-    if !text.chars().any(|c| c.is_control()) {
-        return text.to_string();
+    let scrubbed = crate::identity::scrub_text(text);
+    if !scrubbed.chars().any(|c| c.is_control()) {
+        return scrubbed;
     }
-    text.chars()
+    scrubbed
+        .chars()
         .map(|c| {
             if c.is_control() {
                 CONTROL_REPLACEMENT
@@ -39,9 +42,6 @@ fn sanitize(text: &str) -> String {
 
 /// Render `report` as deterministic plain text (no ANSI, no cursor codes).
 ///
-/// Pre-staged for the live-outputs group: nothing calls this in production
-/// yet; the scan/resume `--format` lanes refuse loudly until it is wired.
-///
 /// Header carries scan id, state, scope, and target; coverage carries
 /// filesystem/identity/status plus gaps and pending tasks (never a
 /// percentage of an unknown total); totals count `repositories`,
@@ -49,10 +49,13 @@ fn sanitize(text: &str) -> String {
 /// lengths. Detail rows follow in vec order:
 /// `R <id> <format> match=<m> <common display>`,
 /// `C <id> kind=<k> avail=<a> head=<state> status=<state>`,
+/// `B <id> kind=<k> cmp=<comparison> ahead=<a|-> behind=<b|-> <display>`,
 /// `? <id> <disposition> <reason>`,
 /// `! <id> <operation> <category> <message>`.
 /// At most [`MAX_DETAIL_ROWS`] detail rows are emitted; the remainder
-/// collapses into one `... (N more)` line.
+/// collapses into one `... (N more)` line. Every record class the
+/// totals count carries its IDs here (within the cap), so the human
+/// lane joins the Wave2b cross-format ID agreement.
 pub fn render_plain(report: &Report) -> String {
     let mut out = String::new();
 
@@ -119,6 +122,18 @@ pub fn render_plain(report: &Report) -> String {
             sanitize(&checkout.status.state),
         ));
     }
+    for branch in &report.branches {
+        let counts = |n: Option<u64>| n.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
+        rows.push(format!(
+            "B {} kind={} cmp={} ahead={} behind={} {}",
+            sanitize(&branch.id),
+            sanitize(&branch.kind),
+            sanitize(&branch.comparison),
+            counts(branch.ahead),
+            counts(branch.behind),
+            sanitize(&branch.name.display),
+        ));
+    }
     for candidate in &report.candidates {
         rows.push(format!(
             "? {} {} {}",
@@ -157,7 +172,8 @@ pub fn render_plain(report: &Report) -> String {
 mod tests {
     use super::*;
     use crate::report::model::{
-        Candidate, Checkout, Coverage, ErrorRecord, Head, Repository, Resources, Scan, Status, Tool,
+        Branch, Candidate, Checkout, Coverage, EncodedName, ErrorRecord, Head, PathRecord,
+        Repository, Resources, Scan, Status, Tool,
     };
 
     fn empty_report() -> Report {
@@ -210,6 +226,7 @@ mod tests {
             volumes: vec![],
             paths: vec![],
             roots: vec![],
+            groups: vec![],
             repositories: vec![],
             checkouts: vec![],
             branches: vec![],
@@ -219,6 +236,7 @@ mod tests {
             candidates: vec![],
             errors: vec![],
             generated_artifacts: vec![],
+            totals: Default::default(),
         }
     }
 
@@ -259,6 +277,8 @@ mod tests {
                 staged: None,
                 unstaged: None,
                 untracked: None,
+                conflicts: None,
+                working_state: "pending".to_string(),
                 untracked_units: "collapsed_entries".to_string(),
                 submodules: "unknown".to_string(),
                 unknown_fields: vec![],
@@ -341,5 +361,49 @@ mod tests {
         let text = render_plain(&report);
         assert!(!text.as_bytes().contains(&0x1b), "ESC found: {text:?}");
         assert!(!text.as_bytes().contains(&0x07), "BEL found: {text:?}");
+    }
+
+    #[test]
+    fn credential_shaped_paths_and_branch_names_are_redacted() {
+        let mut report = empty_report();
+        let raw = "https://alice:super-secret@example.invalid/repo";
+        report.paths.push(PathRecord {
+            id: "p1".to_string(),
+            display: raw.to_string(),
+            encoding: "utf8".to_string(),
+            value: raw.to_string(),
+            volume_id: None,
+            object_id: None,
+            incarnation: None,
+        });
+        report.repositories.push(repo("repo-1"));
+        report.branches.push(Branch {
+            id: "branch-1".to_string(),
+            repository_id: "repo-1".to_string(),
+            checkout_scope_id: None,
+            kind: "local".to_string(),
+            name: EncodedName {
+                display: raw.to_string(),
+                encoding: "utf8".to_string(),
+                value: raw.to_string(),
+            },
+            oid: None,
+            symbolic_target: None,
+            upstream: None,
+            state: "valid".to_string(),
+            observed_at: "2026-10-07T00:00:00Z".to_string(),
+            error_ids: vec![],
+            freshness: "unknown".to_string(),
+            freshness_at: None,
+            comparison: "no_upstream".to_string(),
+            ahead: None,
+            behind: None,
+        });
+        let text = render_plain(&report);
+        assert!(!text.contains("super-secret"), "password leaked: {text}");
+        assert!(
+            text.contains("<redacted>"),
+            "redaction marker missing: {text}"
+        );
     }
 }

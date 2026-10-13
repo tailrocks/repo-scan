@@ -332,7 +332,7 @@ fn test_inputs(report_id: &str) -> ReportInputs {
         target_url: "https://github.com/OWNER/REPO".to_string(),
         canonical_url: Some("https://github.com/owner/repo".to_string()),
         targets: vec![],
-        scope: "roots".to_string(),
+        scope: "machine".to_string(),
         scan_state: "complete".to_string(),
         started_at_ms: 1_759_154_398_000,
         finished_at_ms: Some(1_759_154_400_000),
@@ -341,7 +341,7 @@ fn test_inputs(report_id: &str) -> ReportInputs {
         status_mode: StatusMode::Summary,
         directories_complete: 2,
         tasks_pending: 0,
-        scope_boundaries: vec!["Only the explicit fixture root was requested.".to_string()],
+        scope_boundaries: Vec::new(),
         profile: "conservative".to_string(),
         cpu_target_cores: 1.0,
         rss_target_bytes: 268_435_456,
@@ -515,6 +515,7 @@ fn example_report_matches_schema_structure() {
         "volumes",
         "paths",
         "roots",
+        "groups",
         "repositories",
         "checkouts",
         "branches",
@@ -524,6 +525,7 @@ fn example_report_matches_schema_structure() {
         "candidates",
         "errors",
         "generated_artifacts",
+        "totals",
     ]
     .into_iter()
     .map(str::to_string)
@@ -566,6 +568,11 @@ fn example_report_matches_schema_structure() {
         "state",
         "observed_at",
         "error_ids",
+        "freshness",
+        "freshness_at",
+        "comparison",
+        "ahead",
+        "behind",
     ] {
         assert!(branch.get(key).is_some(), "branch.{key} present");
     }
@@ -621,9 +628,11 @@ fn status_cross_field_rules() {
             mode: "metadata".to_string(),
             started_at: None,
             finished_at: None,
-            staged: Some(0),
+            staged: None,
             unstaged: None,
             untracked: None,
+            conflicts: Some(0),
+            working_state: "unknown".to_string(),
             untracked_units: "not_requested".to_string(),
             submodules: "not_requested".to_string(),
             unknown_fields: Vec::new(),
@@ -648,6 +657,8 @@ fn status_cross_field_rules() {
             staged: None,
             unstaged: None,
             untracked: None,
+            conflicts: None,
+            working_state: "pending".to_string(),
             untracked_units: "files".to_string(),
             submodules: "unknown".to_string(),
             unknown_fields: Vec::new(),
@@ -672,6 +683,8 @@ fn status_cross_field_rules() {
             staged: None,
             unstaged: None,
             untracked: None,
+            conflicts: None,
+            working_state: "pending".to_string(),
             untracked_units: "files".to_string(),
             submodules: "unknown".to_string(),
             unknown_fields: Vec::new(),
@@ -681,6 +694,48 @@ fn status_cross_field_rules() {
         &mut problems,
     );
     assert!(problems.is_empty(), "{problems:?}");
+
+    // A clean result requires a completed summary/full status. Metadata
+    // has not read working-tree state, and incomplete/failed observations
+    // cannot claim a clean result.
+    for (state, mode) in [
+        ("complete", "metadata"),
+        ("partial", "summary"),
+        ("unsupported", "summary"),
+        ("error", "full"),
+    ] {
+        problems.clear();
+        validate_status(
+            &Status {
+                state: state.to_string(),
+                mode: mode.to_string(),
+                started_at: None,
+                finished_at: None,
+                staged: None,
+                unstaged: None,
+                untracked: None,
+                conflicts: None,
+                working_state: "clean".to_string(),
+                untracked_units: match mode {
+                    "metadata" => "not_requested",
+                    "summary" => "collapsed_entries",
+                    _ => "files",
+                }
+                .to_string(),
+                submodules: "unknown".to_string(),
+                unknown_fields: Vec::new(),
+                error_ids: Vec::new(),
+            },
+            "probe",
+            &mut problems,
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("clean requires complete status")),
+            "{state}/{mode}: {problems:?}"
+        );
+    }
 }
 
 #[test]
@@ -1265,7 +1320,7 @@ fn caller_owned_sections_stream() {
 fn schema_validator() -> jsonschema::Validator {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/schemas/report-v1.1.schema.json"
+        "/schemas/report-v1.5.schema.json"
     );
     let bytes = std::fs::read(path).expect("read shipped schema");
     let schema: serde_json::Value = serde_json::from_slice(&bytes).expect("schema parses");
@@ -1309,4 +1364,560 @@ fn real_json_schema_rejects_broken_reports() {
         .map(|e| e.to_string())
         .collect();
     assert!(!errors.is_empty(), "violations must be reported");
+}
+
+#[test]
+fn totals_must_match_emitted_records() {
+    let mut report = example_report();
+    report.totals.stores += 1;
+    let err = validate_report(&report).expect_err("totals must agree");
+    assert!(err.to_string().contains("totals do not agree"), "{err}");
+}
+
+#[test]
+fn branch_kind_constrains_freshness_and_comparison() {
+    let mut report = example_report();
+    report.branches[0].freshness = "current".to_string();
+    report.branches[0].freshness_at = Some("2026-09-30T11:59:59Z".to_string());
+    let err = validate_report(&report).expect_err("local branch cannot carry remote freshness");
+    assert!(
+        err.to_string().contains("must have unknown freshness"),
+        "{err}"
+    );
+
+    let mut report = example_report();
+    let branch = &mut report.branches[0];
+    branch.kind = "remote_tracking".to_string();
+    branch.comparison = "ahead".to_string();
+    branch.ahead = Some(1);
+    branch.behind = Some(0);
+    let err = validate_report(&report).expect_err("remote branch cannot carry local comparison");
+    assert!(
+        err.to_string().contains("must have pending comparison"),
+        "{err}"
+    );
+}
+
+#[test]
+fn roots_report_excludes_catalog_and_stub_volumes_outside_roots() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = open_store(&dir);
+    let now = 1_759_154_400_000;
+    let (_catalog_root, repo_root) = seed_catalog(&store, now);
+    runtime().block_on(async {
+        store
+            .upsert_volume(
+                &NewVolume {
+                    id: "vol-outside",
+                    native_identity: Some("native-outside"),
+                    namespace: "outside",
+                    filesystem: Some("apfs"),
+                    kind: "local",
+                    state: "available",
+                },
+                Some(now),
+            )
+            .await
+            .expect("outside volume");
+        let outside = store
+            .upsert_dir(
+                None,
+                b"outside",
+                "/outside",
+                "vol-outside",
+                "obj-outside",
+                "1",
+                now,
+            )
+            .await
+            .expect("outside directory");
+        store
+            .upsert_dir(
+                Some(outside),
+                b"missing-volume",
+                "/outside/missing-volume",
+                "stub-outside",
+                "obj-stub-outside",
+                "1",
+                now,
+            )
+            .await
+            .expect("directory with unknown volume");
+    });
+
+    let mut inputs = test_inputs("report-roots-volumes-1");
+    inputs.scope = "roots".to_string();
+    inputs.scope_boundaries = vec!["Only the explicit fixture root was requested.".to_string()];
+    inputs.roots.push(RootInput {
+        id: "root-in-scope".to_string(),
+        dir_id: Some(repo_root),
+        path_bytes: None,
+        volume_id: Some("vol-1".to_string()),
+        state: "complete".to_string(),
+        observed_at_ms: Some(now),
+        event_history_uuid: None,
+        ingested_cursor: None,
+        reconciled_cursor: None,
+        error_ids: Vec::new(),
+    });
+    let (bytes, stats) = runtime()
+        .block_on(async { stream_report_from_store(&store, &inputs, Vec::new()).await })
+        .expect("stream roots report");
+    let report: Report = serde_json::from_slice(&bytes).expect("parse report");
+    assert_eq!(stats.volumes, 1);
+    assert_eq!(
+        report
+            .volumes
+            .iter()
+            .map(|volume| volume.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["vol-1"]
+    );
+}
+
+#[test]
+fn roots_report_scopes_volume_event_errors_to_referenced_volumes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = open_store(&dir);
+    let now = 1_759_154_400_000;
+    let (_catalog_root, repo_root) = seed_catalog(&store, now);
+    runtime().block_on(async {
+        store
+            .upsert_volume(
+                &NewVolume {
+                    id: "vol-outside",
+                    native_identity: Some("native-outside"),
+                    namespace: "outside",
+                    filesystem: Some("apfs"),
+                    kind: "local",
+                    state: "available",
+                },
+                Some(now),
+            )
+            .await
+            .expect("outside volume");
+        store
+            .upsert_dir(
+                None,
+                b"outside",
+                "/outside",
+                "vol-outside",
+                "obj-outside",
+                "1",
+                now,
+            )
+            .await
+            .expect("outside directory");
+        store
+            .record_error(
+                "event-in-scope",
+                "volume:vol-1",
+                "event-batch-error",
+                "in-scope event history failed",
+                None,
+                now,
+            )
+            .await
+            .expect("in-scope event error");
+        store
+            .record_error(
+                "event-out-of-scope",
+                "volume:vol-outside",
+                "event-batch-error",
+                "out-of-scope event history failed",
+                None,
+                now,
+            )
+            .await
+            .expect("out-of-scope event error");
+    });
+
+    // SLICE-4 NOTE: B11 additionally covers event-monitor volume
+    // identities (`volume:macos-volume-uuid-1` via
+    // `ReportInputs::event_volume_ids`); that field is slice-5 wiring, so
+    // this port covers the catalog-derived volume scope only.
+    let mut inputs = test_inputs("report-roots-volume-errors-1");
+    inputs.scope = "roots".to_string();
+    inputs.scope_boundaries = vec!["Only the explicit fixture root was requested.".to_string()];
+    inputs.roots.push(RootInput {
+        id: "root-in-scope".to_string(),
+        dir_id: Some(repo_root),
+        path_bytes: None,
+        volume_id: Some("vol-1".to_string()),
+        state: "complete".to_string(),
+        observed_at_ms: Some(now),
+        event_history_uuid: None,
+        ingested_cursor: None,
+        reconciled_cursor: None,
+        error_ids: Vec::new(),
+    });
+    let (bytes, _) = runtime()
+        .block_on(async { stream_report_from_store(&store, &inputs, Vec::new()).await })
+        .expect("stream roots report");
+    let report: Report = serde_json::from_slice(&bytes).expect("parse report");
+    let errors: Vec<&str> = report
+        .errors
+        .iter()
+        .map(|error| error.id.as_str())
+        .collect();
+    assert_eq!(errors, ["event-in-scope"]);
+    assert_eq!(report.coverage.gaps, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn roots_report_includes_catalog_paths_saved_through_symlink_alias() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let physical = dir.path().join("physical-root");
+    let alias = dir.path().join("alias-root");
+    std::fs::create_dir(&physical).expect("physical root");
+    symlink(&physical, &alias).expect("root symlink");
+    let git_path = alias.join("repo/.git");
+    let checkout_path = alias.join("repo");
+    let store = open_store(&dir);
+    let now = 1_759_154_400_000;
+    runtime().block_on(async {
+        store
+            .upsert_git_instance(
+                &NewGitInstance {
+                    id: "alias-repo",
+                    git_path: git_path.as_os_str().as_encoded_bytes(),
+                    common_path: git_path.as_os_str().as_encoded_bytes(),
+                    incarnation: "alias-repo-incarnation",
+                    format: "git-files",
+                    bare: Some(false),
+                    object_format: "sha1",
+                    disposition: "confirmed",
+                    evidence_json: "[]",
+                },
+                now,
+            )
+            .await
+            .expect("seed alias repository");
+        store
+            .upsert_checkout(
+                &NewCheckout {
+                    id: "alias-checkout",
+                    instance_id: "alias-repo",
+                    root_path: Some(checkout_path.as_os_str().as_encoded_bytes()),
+                    git_path: git_path.as_os_str().as_encoded_bytes(),
+                    relationship: "main",
+                    availability: "present",
+                    head_state: "branch",
+                    head_ref: None,
+                    head_oid: None,
+                    head_algo: None,
+                },
+                now,
+            )
+            .await
+            .expect("seed alias checkout");
+    });
+
+    // SLICE-4 NOTE: B11 passes the canonical identity as
+    // `RootInput::scope_path_bytes`; the builder resolves the same
+    // identity through its bounded canonicalizer (slice-5 wires the
+    // caller-resolved field).
+    let mut inputs = test_inputs("report-roots-symlink-alias-1");
+    inputs.scope = "roots".to_string();
+    inputs.scope_boundaries = vec!["Only the explicit fixture root was requested.".to_string()];
+    inputs.roots.push(RootInput {
+        id: "root-alias".to_string(),
+        dir_id: None,
+        path_bytes: Some(alias.as_os_str().as_encoded_bytes().to_vec()),
+        volume_id: None,
+        state: "complete".to_string(),
+        observed_at_ms: Some(now),
+        event_history_uuid: None,
+        ingested_cursor: None,
+        reconciled_cursor: None,
+        error_ids: Vec::new(),
+    });
+    let (bytes, stats) = runtime()
+        .block_on(async { stream_report_from_store(&store, &inputs, Vec::new()).await })
+        .expect("stream alias report");
+    let report: Report = serde_json::from_slice(&bytes).expect("parse report");
+    assert_eq!(stats.repositories, 1);
+    assert_eq!(stats.checkouts, 1);
+    assert_eq!(report.repositories[0].id, "alias-repo");
+    assert_eq!(report.checkouts[0].id, "alias-checkout");
+}
+
+#[cfg(unix)]
+#[test]
+fn roots_report_includes_catalog_paths_saved_through_another_symlink_alias() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let physical = dir.path().join("physical-root");
+    let alias_a = dir.path().join("alias-root-a");
+    let alias_c = dir.path().join("alias-root-c");
+    std::fs::create_dir(&physical).expect("physical root");
+    symlink(&physical, &alias_a).expect("first root symlink");
+    symlink(&physical, &alias_c).expect("second root symlink");
+    let git_path = alias_a.join("repo/.git");
+    let checkout_path = alias_a.join("repo");
+    let store = open_store(&dir);
+    let now = 1_759_154_400_000;
+    runtime().block_on(async {
+        store
+            .upsert_git_instance(
+                &NewGitInstance {
+                    id: "alias-a-repo",
+                    git_path: git_path.as_os_str().as_encoded_bytes(),
+                    common_path: git_path.as_os_str().as_encoded_bytes(),
+                    incarnation: "alias-a-repo-incarnation",
+                    format: "git-files",
+                    bare: Some(false),
+                    object_format: "sha1",
+                    disposition: "confirmed",
+                    evidence_json: "[]",
+                },
+                now,
+            )
+            .await
+            .expect("seed alias A repository");
+        store
+            .upsert_checkout(
+                &NewCheckout {
+                    id: "alias-a-checkout",
+                    instance_id: "alias-a-repo",
+                    root_path: Some(checkout_path.as_os_str().as_encoded_bytes()),
+                    git_path: git_path.as_os_str().as_encoded_bytes(),
+                    relationship: "main",
+                    availability: "present",
+                    head_state: "branch",
+                    head_ref: None,
+                    head_oid: None,
+                    head_algo: None,
+                },
+                now,
+            )
+            .await
+            .expect("seed alias A checkout");
+        store
+            .record_status_full(
+                &NewStatus {
+                    checkout_id: "alias-a-checkout",
+                    mode: "summary",
+                    state: "complete",
+                    started_ms: Some(now - 10),
+                    finished_ms: Some(now),
+                    staged: Some(1),
+                    unstaged: Some(0),
+                    untracked: Some(0),
+                    untracked_units: "collapsed_entries",
+                    submodules: "checked",
+                    unknown_fields: "[]",
+                    input_fingerprint: None,
+                    observed_rev: 1,
+                },
+                Some(0),
+                Some("dirty"),
+                now,
+            )
+            .await
+            .expect("seed alias A status");
+        store
+            .upsert_ref(
+                &NewRef {
+                    id: "alias-a-main",
+                    instance_id: "alias-a-repo",
+                    checkout_scope_id: Some("alias-a-checkout"),
+                    kind: "local",
+                    name: b"refs/heads/main",
+                    oid: Some(b"1111111111111111111111111111111111111111"),
+                    algo: Some("sha1"),
+                    symbolic_target: None,
+                    upstream: None,
+                    state: "valid",
+                },
+                now,
+            )
+            .await
+            .expect("seed alias A branch");
+        assert!(store
+            .update_ref_comparison("alias-a-main", "no_upstream", None, None)
+            .await
+            .expect("seed alias A analysis"));
+    });
+
+    let mut inputs = test_inputs("report-roots-symlink-alias-c-1");
+    inputs.scope = "roots".to_string();
+    inputs.scope_boundaries = vec!["Only the explicit fixture root was requested.".to_string()];
+    inputs.roots.push(RootInput {
+        id: "root-alias-c".to_string(),
+        dir_id: None,
+        path_bytes: Some(alias_c.as_os_str().as_encoded_bytes().to_vec()),
+        volume_id: None,
+        state: "complete".to_string(),
+        observed_at_ms: Some(now),
+        event_history_uuid: None,
+        ingested_cursor: None,
+        reconciled_cursor: None,
+        error_ids: Vec::new(),
+    });
+    inputs.aliases.push(AliasInput {
+        path_bytes: alias_c.as_os_str().as_encoded_bytes().to_vec(),
+        target_path_bytes: alias_a.as_os_str().as_encoded_bytes().to_vec(),
+        kind: "same_object".to_string(),
+        verified_at_ms: now,
+    });
+    let (bytes, stats) = runtime()
+        .block_on(async { stream_report_from_store(&store, &inputs, Vec::new()).await })
+        .expect("stream alias C report");
+    let report: Report = serde_json::from_slice(&bytes).expect("parse report");
+    assert_eq!(stats.repositories, 1);
+    assert_eq!(stats.checkouts, 1);
+    let repository = report
+        .repositories
+        .iter()
+        .find(|repository| repository.id == "alias-a-repo")
+        .expect("A-spelled repository remains in C report");
+    let repository_path = report
+        .paths
+        .iter()
+        .find(|path| path.id == repository.git_path_id)
+        .expect("repository Git path");
+    assert_eq!(repository_path.value, git_path.display().to_string());
+    let checkout = report
+        .checkouts
+        .iter()
+        .find(|checkout| checkout.id == "alias-a-checkout")
+        .expect("A-spelled checkout remains in C report");
+    let checkout_path_id = checkout
+        .root_path_id
+        .as_deref()
+        .expect("checkout root path ID");
+    let checkout_path_record = report
+        .paths
+        .iter()
+        .find(|path| path.id == checkout_path_id)
+        .expect("checkout root path");
+    assert_eq!(
+        checkout_path_record.value,
+        checkout_path.display().to_string()
+    );
+    assert_eq!(checkout.status.state, "complete");
+    assert_eq!(checkout.status.working_state, "dirty");
+    let branch = report
+        .branches
+        .iter()
+        .find(|branch| branch.id == "alias-a-main")
+        .expect("A-spelled branch remains in C report");
+    assert_eq!(branch.comparison, "no_upstream");
+}
+
+#[test]
+fn real_json_schema_rejects_nested_unknown_properties() {
+    let validator = schema_validator();
+    let bytes = include_bytes!("data/example-report.json");
+
+    for section in ["tool", "scan", "coverage", "resources"] {
+        let mut report: serde_json::Value = serde_json::from_slice(bytes).expect("example parses");
+        report[section]["unexpected"] = serde_json::Value::Bool(true);
+        assert!(
+            !validator.is_valid(&report),
+            "{section} must reject undeclared properties"
+        );
+    }
+
+    let mut report: serde_json::Value = serde_json::from_slice(bytes).expect("example parses");
+    report["totals"]["unexpected"] = serde_json::Value::Bool(true);
+    assert!(
+        !validator.is_valid(&report),
+        "totals rejects unknown fields"
+    );
+
+    let mut report: serde_json::Value = serde_json::from_slice(bytes).expect("example parses");
+    report["totals"]["analysis"]["unexpected"] = serde_json::Value::Bool(true);
+    assert!(
+        !validator.is_valid(&report),
+        "analysis totals rejects unknown fields"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Streaming-validator resource bounds (contract C4): the 24 MiB fail-closed
+// ID and account-key indexes refuse bound-crossing reports through the
+// public staged-validation entry, with bounded, non-echoing diagnostics.
+// ---------------------------------------------------------------------------
+
+/// Enough 60 KiB path IDs to cross the 24 MiB fail-closed ID bound
+/// (430 * 60 KiB > 24 MiB), each record well under the 1 MiB per-record
+/// cap so the ID index is the tripping bound.
+#[test]
+fn staged_validation_fails_closed_at_the_24mib_id_bound() {
+    let mut value = serde_json::to_value(example_report()).expect("value");
+    let paths = value["paths"].as_array_mut().expect("paths");
+    for index in 0..430 {
+        let id = format!("path-pad-{index:04}-{}", "x".repeat(60 * 1024));
+        paths.push(serde_json::json!({
+            "id": id,
+            "display": "/synthetic",
+            "encoding": "utf8",
+            "value": "/synthetic",
+            "volume_id": null,
+            "object_id": null,
+            "incarnation": null
+        }));
+    }
+    // Keep the declared totals honest so the ID bound is the refusal.
+    value["totals"]["observed_paths"] =
+        serde_json::Value::from(value["paths"].as_array().expect("paths").len() as u64);
+    let bytes = serde_json::to_vec(&value).expect("serialize oversized-id report");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let staged = dir.path().join("id-flood.json");
+    repo_scan::privacy::private_write_0600(&staged, &bytes).expect("write staged report");
+    let error = validate_staged_report(&staged).expect_err("24 MiB ID bound refuses");
+    let diagnostic = error.to_string();
+    assert!(
+        diagnostic.contains("ID bytes exceed"),
+        "fail-closed ID bound: {diagnostic}"
+    );
+    assert!(
+        diagnostic.len() < 4096,
+        "diagnostic is bounded, never echoes the flood: {}",
+        diagnostic.len()
+    );
+}
+
+/// Distinct 50 KiB (host, account) pairs cross the 24 MiB account-key
+/// bound (600 * 50 KiB > 24 MiB) with small repos and correct group-ID
+/// shape, so the account-key index is among the refusing bounds.
+#[test]
+fn staged_validation_fails_closed_at_the_24mib_account_key_bound() {
+    let mut value = serde_json::to_value(example_report()).expect("value");
+    let groups = value["groups"].as_array_mut().expect("groups");
+    for index in 0..600 {
+        let account = format!("{:04}{}", index, "a".repeat(50 * 1024));
+        groups.push(serde_json::json!({
+            "id": format!("github.com/{account}/repo-{index}"),
+            "host": "github.com",
+            "account": account,
+            "repo": format!("repo-{index}")
+        }));
+    }
+    let group_count = value["groups"].as_array().expect("groups").len() as u64;
+    value["totals"]["groups"] = serde_json::Value::from(group_count);
+    value["totals"]["accounts"] = serde_json::Value::from(group_count);
+    let bytes = serde_json::to_vec(&value).expect("serialize account-flood report");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let staged = dir.path().join("account-flood.json");
+    repo_scan::privacy::private_write_0600(&staged, &bytes).expect("write staged report");
+    let error = validate_staged_report(&staged).expect_err("24 MiB account-key bound refuses");
+    let diagnostic = error.to_string();
+    assert!(
+        diagnostic.contains("account-key bytes exceed"),
+        "fail-closed account-key bound: {diagnostic}"
+    );
+    assert!(
+        diagnostic.len() < 4096,
+        "diagnostic is bounded, never echoes the flood: {}",
+        diagnostic.len()
+    );
 }

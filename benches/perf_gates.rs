@@ -924,6 +924,8 @@ fn pressure_phase(sustained_peak: Option<u64>, threshold: u64) -> (serde_json::V
         staged: None,
         unstaged: None,
         untracked: None,
+        conflicts: None,
+        working_state: "pending".to_string(),
         untracked_units: "collapsed_entries".to_string(),
         submodules: "unknown".to_string(),
         unknown_fields: vec![
