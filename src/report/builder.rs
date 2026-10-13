@@ -1375,21 +1375,23 @@ async fn stream_with_pre_pass<W: Write>(
         generation: inputs.generation,
         epoch: inputs.epoch,
         catalog_revision,
-        target_url: redact_remote_url(&inputs.target_url),
+        // SLICE-5 (resolves the SLICE-4 NOTE): defense-in-depth scrub over
+        // the redacted forms — the identity slice's scp-form redaction
+        // idempotency fix landed, so the double wrap is safe.
+        target_url: scrub_text(&redact_remote_url(&inputs.target_url)),
         canonical_url: inputs
             .canonical_url
             .as_ref()
-            .map(|url| redact_remote_url(url)),
-        // SLICE-4 NOTE: B11 additionally wraps these in `scrub_text` for
-        // defense-in-depth; that requires the identity slice's scp-form
-        // redaction idempotency fix (`scp_remote_redaction_is_idempotent`),
-        // otherwise an already-redacted scp-like target double-wraps.
+            .map(|url| scrub_text(&redact_remote_url(url))),
         targets: inputs
             .targets
             .iter()
             .map(|t| ScanTarget {
-                raw: redact_remote_url(&t.raw),
-                canonical: t.canonical.as_ref().map(|url| redact_remote_url(url)),
+                raw: scrub_text(&redact_remote_url(&t.raw)),
+                canonical: t
+                    .canonical
+                    .as_ref()
+                    .map(|url| scrub_text(&redact_remote_url(url))),
                 matched_repositories: t.matched_repositories,
             })
             .collect(),

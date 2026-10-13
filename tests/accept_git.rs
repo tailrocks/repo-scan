@@ -768,7 +768,6 @@ fn branch_named<'a>(report: &'a Value, repo_id: &str, name: &str) -> &'a Value {
 /// A rewritten (non-default) fetch refspec resolves to the non-default
 /// full comparison ref, exactly as installed git spells it (Step 10).
 #[test]
-#[ignore = "slice-5: needs upstream/comparison persistence, Step-10 status model, or M1/M8 main.rs behavior; un-ignore there"]
 fn upstream10_custom_fetch_refspec_resolves_full_ref() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("ws");
@@ -801,7 +800,6 @@ fn upstream10_custom_fetch_refspec_resolves_full_ref() {
 /// later valid refspec — pinned against installed git, which resolves
 /// past them (probed: `rev-parse --symbolic-full-name` succeeds).
 #[test]
-#[ignore = "slice-5: needs upstream/comparison persistence, Step-10 status model, or M1/M8 main.rs behavior; un-ignore there"]
 fn upstream10_garbage_first_refspec_skips_to_valid() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("ws");
@@ -863,7 +861,6 @@ fn upstream10_garbage_first_refspec_skips_to_valid() {
 /// resolver returned `None` on the first non-matching line and dropped
 /// the branch's upstream.
 #[test]
-#[ignore = "slice-5: needs upstream/comparison persistence, Step-10 status model, or M1/M8 main.rs behavior; un-ignore there"]
 fn upstream10_non_matching_first_refspec_skips_to_valid() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("ws");
@@ -920,7 +917,6 @@ fn upstream10_non_matching_first_refspec_skips_to_valid() {
 /// resolver keeps first-match-wins, and the existence rule then yields
 /// a null upstream rather than a ref git does not use.
 #[test]
-#[ignore = "slice-5: needs upstream/comparison persistence, Step-10 status model, or M1/M8 main.rs behavior; un-ignore there"]
 fn upstream10_first_match_missing_never_falls_through() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("ws");
@@ -974,7 +970,6 @@ fn upstream10_first_match_missing_never_falls_through() {
 /// A local upstream (`remote = .`) resolves to the local merge ref itself
 /// (Step 10).
 #[test]
-#[ignore = "slice-5: needs upstream/comparison persistence, Step-10 status model, or M1/M8 main.rs behavior; un-ignore there"]
 fn upstream10_local_dot_resolves_merge_ref() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("ws");
@@ -1003,7 +998,6 @@ fn upstream10_local_dot_resolves_merge_ref() {
 /// `refs/remotes/origin/HEAD` exists and resolves, but gix returns it
 /// without a peel, so no OID comparison is possible.
 #[test]
-#[ignore = "slice-5: needs upstream/comparison persistence, Step-10 status model, or M1/M8 main.rs behavior; un-ignore there"]
 fn upstream10_oid_less_present_upstream_compares_error() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("ws");
@@ -1048,7 +1042,6 @@ fn upstream10_oid_less_present_upstream_compares_error() {
 
 /// Branch stanzas living in an `include.path` file resolve (Step 10).
 #[test]
-#[ignore = "slice-5: needs upstream/comparison persistence, Step-10 status model, or M1/M8 main.rs behavior; un-ignore there"]
 fn upstream10_include_file_stanzas_resolve() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("ws");
@@ -1075,7 +1068,6 @@ fn upstream10_include_file_stanzas_resolve() {
 /// `config.worktree`) resolves for that checkout's branch, while the
 /// main checkout's untracked branch stays null (Step 10).
 #[test]
-#[ignore = "slice-5: needs upstream/comparison persistence, Step-10 status model, or M1/M8 main.rs behavior; un-ignore there"]
 fn upstream10_worktree_config_resolves_for_checkout() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("ws");
@@ -1113,7 +1105,6 @@ fn upstream10_worktree_config_resolves_for_checkout() {
 /// Unix-only (raw-byte refnames via packed-refs).
 #[cfg(unix)]
 #[test]
-#[ignore = "slice-5: needs upstream/comparison persistence, Step-10 status model, or M1/M8 main.rs behavior; un-ignore there"]
 fn upstream10_non_utf8_branch_resolves_byte_exact() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStringExt;
@@ -1169,7 +1160,6 @@ fn upstream10_non_utf8_branch_resolves_byte_exact() {
 /// fetch value would also poison remote identity parsing — a separate
 /// lane — so the refspec case uses the valid-but-unmappable shape.)
 #[test]
-#[ignore = "slice-5: needs upstream/comparison persistence, Step-10 status model, or M1/M8 main.rs behavior; un-ignore there"]
 fn upstream10_unresolvable_yields_null() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("ws");
@@ -1214,7 +1204,6 @@ fn upstream10_unresolvable_yields_null() {
 /// Swallowing would drop linked checkouts from inventory without a
 /// trace; the gap detail names the registry.
 #[test]
-#[ignore = "slice-5: needs upstream/comparison persistence, Step-10 status model, or M1/M8 main.rs behavior; un-ignore there"]
 fn worktree_registry_unreadable_parks_with_gap() {
     use repo_scan::store::TursoStore;
     use std::os::unix::fs::PermissionsExt;
@@ -1284,7 +1273,6 @@ fn worktree_registry_unreadable_parks_with_gap() {
 /// cover the materialized worktree only). A non-sparse control repo in
 /// the same world carries no such note.
 #[test]
-#[ignore = "slice-5: needs upstream/comparison persistence, Step-10 status model, or M1/M8 main.rs behavior; un-ignore there"]
 fn status11_sparse_checkout_declares_scope_with_git_parity() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("ws");
@@ -1356,7 +1344,6 @@ fn status11_sparse_checkout_declares_scope_with_git_parity() {
 /// count (Step 10 case 10): the two unmerged paths never read as staged,
 /// unstaged, dirty, or clean.
 #[test]
-#[ignore = "slice-5: needs upstream/comparison persistence, Step-10 status model, or M1/M8 main.rs behavior; un-ignore there"]
 fn status10_conflict_only_reports_conflicted() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("ws");
@@ -1395,7 +1382,6 @@ fn checkouts_by_kind(report: &Value) -> HashMap<&str, &Value> {
 /// parent manifest reconciles clean, and the scan reports `complete`
 /// with `submodules: checked` and zero gaps (no false gap).
 #[test]
-#[ignore = "slice-5: needs upstream/comparison persistence, Step-10 status model, or M1/M8 main.rs behavior; un-ignore there"]
 fn submodule_healthy_traversal_covered_reports_complete() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("ws");
@@ -1441,7 +1427,6 @@ fn submodule_healthy_traversal_covered_reports_complete() {
 /// inspected — the scan must report `incomplete` with a loud
 /// `submodule-uninspected` gap naming it, never silent `complete`.
 #[test]
-#[ignore = "slice-5: needs upstream/comparison persistence, Step-10 status model, or M1/M8 main.rs behavior; un-ignore there"]
 fn submodule_manifested_absent_gaps_loudly() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("ws");

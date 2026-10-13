@@ -11,11 +11,7 @@
 //! branches and the `origin` remote match uniquely in each report
 //! (seed upstreams carry no remotes of their own).
 //!
-//! Slice-2 note: every test is `#[ignore]`d until slice 5 wires the
-//! `--fetch` phase into `main.rs` (today `scan --fetch` refuses loudly)
-//! and the catalog gains the `remote_refreshes` rows these tests read.
-//! `TursoStore::open` became `open_read_only` for main's store API.
-//! Un-ignore in slice 5; do not delete.
+//! Slice-5: the `--fetch` phase is wired; every test runs.
 
 mod common;
 
@@ -255,7 +251,6 @@ fn origin_refresh_detail(state: &Path) -> Option<String> {
 /// FETCH-E2E-01: a behind tracking ref advances to the upstream tip,
 /// labels `current`, and the local branch tip + worktree stay untouched.
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch01_success_advances_tracking_marks_current() {
     let tmp = fixture::scratch_root("fetch01");
     let state = tmp.path().join("state");
@@ -329,7 +324,6 @@ fn fetch01_success_advances_tracking_marks_current() {
 /// FETCH-E2E-02: an already-current remote still records success with
 /// zero updated refs and a `current` label (no-op fetch is honest).
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch02_up_to_date_fetch_is_success_with_zero_updates() {
     let tmp = fixture::scratch_root("fetch02");
     let state = tmp.path().join("state");
@@ -377,7 +371,6 @@ fn fetch02_up_to_date_fetch_is_success_with_zero_updates() {
 /// `unsupported` and its branch tips stay byte-identical: the
 /// branch-tip-writing refspec is never executed.
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch03_mirror_is_unsupported_branch_tips_untouched() {
     let tmp = fixture::scratch_root("fetch03");
     let state = tmp.path().join("state");
@@ -454,7 +447,6 @@ fn fetch03_mirror_is_unsupported_branch_tips_untouched() {
 /// both map to `refs/remotes/foo/bar/main`. Refuse both before either
 /// fetch can overwrite or claim that shared ref.
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch_remote_namespace_overlap_refuses_both_without_ref_update() {
     let tmp = fixture::scratch_root("fetch-remote-namespace-overlap");
     let state = tmp.path().join("state");
@@ -552,7 +544,6 @@ fn fetch_remote_namespace_overlap_refuses_both_without_ref_update() {
 /// inside the remote's tracking namespace. An existing Git symref can
 /// redirect that destination to a local branch, so refuse before fetch.
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch_destination_symref_escape_refused_without_branch_update() {
     let tmp = fixture::scratch_root("fetch-destination-symref");
     let state = tmp.path().join("state");
@@ -631,7 +622,6 @@ fn fetch_destination_symref_escape_refused_without_branch_update() {
 /// ref outside the repository.
 #[cfg(unix)]
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch_empty_nested_ref_symlink_refused_without_external_write() {
     use std::os::unix::fs::symlink;
 
@@ -696,7 +686,6 @@ fn fetch_empty_nested_ref_symlink_refused_without_external_write() {
 /// append a table outside the repository.
 #[cfg(unix)]
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch_reftable_root_symlink_refused_without_external_write() {
     use std::os::unix::fs::symlink;
 
@@ -777,7 +766,6 @@ fn fetch_reftable_root_symlink_refused_without_external_write() {
 /// object database.
 #[cfg(unix)]
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch_commit_graph_symlink_is_not_written_through() {
     use std::os::unix::fs::symlink;
 
@@ -861,7 +849,6 @@ fn fetch_commit_graph_symlink_is_not_written_through() {
 /// local tracking ref is KEPT (no prune) and labeled `stale`, while a
 /// still-present branch labels `current`.
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch04_deleted_upstream_branch_stays_stale_tracking_kept() {
     let tmp = fixture::scratch_root("fetch04");
     let state = tmp.path().join("state");
@@ -946,7 +933,6 @@ fn fetch04_deleted_upstream_branch_stays_stale_tracking_kept() {
 /// FETCH-E2E-05 (Step 15.23): a ref outside the effective fetch
 /// refspecs is never labeled `current`, even when the fetch succeeds.
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch05_excluded_ref_never_labeled_current() {
     let tmp = fixture::scratch_root("fetch05");
     let state = tmp.path().join("state");
@@ -1023,7 +1009,6 @@ fn fetch05_excluded_ref_never_labeled_current() {
 /// FETCH-E2E-06: an unreachable remote records `failed`, keeps prior
 /// freshness (never `current`), and the scan reports incomplete work.
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch06_failed_remote_records_failure_keeps_unknown() {
     let tmp = fixture::scratch_root("fetch06");
     let state = tmp.path().join("state");
@@ -1161,7 +1146,6 @@ fn tracking_oid(clone: &Path) -> Option<String> {
 /// families still pending are retried and record `failed` against the
 /// broken remotes. Without per-family skip, every row would be failed.
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch07_kill_mid_fetch_resume_skips_completed_retries_pending() {
     const FAMILIES: usize = 16;
 
@@ -1380,7 +1364,6 @@ fn fetch07_kill_mid_fetch_resume_skips_completed_retries_pending() {
 /// re-executes the fetch (one row per family, overwritten in place)
 /// and picks up commits that landed after the first scan.
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch08_second_scan_refetches_and_picks_up_new_commits() {
     let tmp = fixture::scratch_root("fetch08");
     let state = tmp.path().join("state");
@@ -1467,7 +1450,6 @@ fn fetch08_second_scan_refetches_and_picks_up_new_commits() {
 /// (`unsupported`) and NOTHING executes: the sentinel the ext command
 /// would create must not exist after the scan.
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch09_ext_transport_refused_without_execution() {
     let tmp = fixture::scratch_root("fetch09");
     let state = tmp.path().join("state");
@@ -1525,7 +1507,6 @@ fn fetch09_ext_transport_refused_without_execution() {
 /// URL to `ext::` is caught on the EFFECTIVE url (`unsupported`, zero
 /// execution) — gating the configured string alone would miss it.
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch10_insteadof_to_ext_refused_without_execution() {
     let tmp = fixture::scratch_root("fetch10");
     let state = tmp.path().join("state");
@@ -1582,7 +1563,6 @@ fn fetch10_insteadof_to_ext_refused_without_execution() {
 /// (`unsupported`) even though the file transport itself would
 /// succeed — the helper would execute repo-chosen code at fetch time.
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch11_repo_credential_helper_refused() {
     let tmp = fixture::scratch_root("fetch11");
     let state = tmp.path().join("state");
@@ -1629,7 +1609,6 @@ fn fetch11_repo_credential_helper_refused() {
 /// before Git can reach a challenge and execute the helper.
 #[cfg(unix)]
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch20_repo_url_credential_helper_refused_without_execution() {
     use std::sync::atomic::Ordering;
 
@@ -1689,7 +1668,6 @@ fn fetch20_repo_url_credential_helper_refused_without_execution() {
 /// before its command can execute.
 #[cfg(unix)]
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch21_repo_git_proxy_refused_without_execution() {
     let tmp = fixture::scratch_root("fetch21");
     let state = tmp.path().join("state");
@@ -1746,7 +1724,6 @@ fn fetch21_repo_git_proxy_refused_without_execution() {
 /// configuration. Refuse before fetch negotiation can invoke it.
 #[cfg(unix)]
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch22_repo_alternate_refs_command_refused_without_execution() {
     let tmp = fixture::scratch_root("fetch22");
     let state = tmp.path().join("state");
@@ -1806,7 +1783,6 @@ fn fetch22_repo_alternate_refs_command_refused_without_execution() {
 /// hooks directory and must be refused before a fetch updates refs.
 #[cfg(unix)]
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch23_repo_configured_hook_refused_without_execution() {
     let tmp = fixture::scratch_root("fetch23");
     let state = tmp.path().join("state");
@@ -1866,7 +1842,6 @@ fn fetch23_repo_configured_hook_refused_without_execution() {
 /// FETCH-GATE-04: a repo-scope `core.sshCommand` refuses the fetch
 /// (`unsupported`): the ssh override would execute repo-chosen code.
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch12_repo_ssh_command_refused() {
     let tmp = fixture::scratch_root("fetch12");
     let state = tmp.path().join("state");
@@ -1911,7 +1886,6 @@ fn fetch12_repo_ssh_command_refused() {
 /// `uploadpack` from repo config and local transports execute it, so
 /// the sentinel the wrapper would create must not exist after the scan.
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch13_repo_uploadpack_refused_without_execution() {
     let tmp = fixture::scratch_root("fetch13");
     let state = tmp.path().join("state");
@@ -1987,7 +1961,6 @@ fn fetch13_repo_uploadpack_refused_without_execution() {
 /// configured uploadpack must be refused before it can execute.
 #[cfg(unix)]
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch17_symlinked_repo_config_uploadpack_refused_without_execution() {
     use std::os::unix::fs::symlink;
 
@@ -2060,7 +2033,6 @@ fn fetch17_symlinked_repo_config_uploadpack_refused_without_execution() {
 /// post-fetch freshness audit lists only heads and tags. It must not
 /// create a tracking ref that would then look deleted upstream.
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch18_custom_source_namespace_is_unsupported() {
     let tmp = fixture::scratch_root("fetch18");
     let state = tmp.path().join("state");
@@ -2136,7 +2108,6 @@ fn run_with_path(args: &[&str], cwd: &Path, state: &Path, path_dir: &Path) -> st
 /// helper code, so it must be refused before the fetch spawn.
 #[cfg(unix)]
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch15_repo_remote_vcs_helper_refused_without_execution() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -2194,7 +2165,6 @@ fn fetch15_repo_remote_vcs_helper_refused_without_execution() {
 /// fetch (`unsupported`) for symmetry with `uploadpack` — a fetch never
 /// reads it, but a repo overriding pack commands is hostile either way.
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch14_repo_receivepack_refused() {
     let tmp = fixture::scratch_root("fetch14");
     let state = tmp.path().join("state");
@@ -2238,7 +2208,6 @@ fn fetch14_repo_receivepack_refused() {
 }
 
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch_remote_exec_refusal_scrubs_credential_shaped_subsection() {
     let tmp = fixture::scratch_root("fetch-remote-key-privacy");
     let state = tmp.path().join("state");
@@ -2310,7 +2279,6 @@ fn fetch_remote_exec_refusal_scrubs_credential_shaped_subsection() {
 /// input. Neither the catalog's refusal detail nor the report may persist
 /// the credential-shaped value supplied through repo-local config.
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch16_untrusted_refspec_text_is_not_persisted_or_reported() {
     let tmp = fixture::scratch_root("fetch16");
     let state = tmp.path().join("state");
@@ -2369,7 +2337,6 @@ fn fetch16_untrusted_refspec_text_is_not_persisted_or_reported() {
 /// prior root. The old store is made locally invalid after its first
 /// successful fetch; a global fetch pass would change its refresh status.
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch_scope_filter_skips_prior_root_stores() {
     let tmp = fixture::scratch_root("fetch-scope");
     let state = tmp.path().join("state");
@@ -2473,7 +2440,6 @@ fn fetch_scope_filter_skips_prior_root_stores() {
 /// sentinel's absence proves the gate stopped the fetch before any
 /// transport ran.
 #[test]
-#[ignore = "slice-5: needs fetch-phase wiring in main.rs and catalog remote_refreshes; un-ignore there"]
 fn fetch15_helper_transport_refused_without_execution() {
     let tmp = fixture::scratch_root("fetch15");
     let state = tmp.path().join("state");

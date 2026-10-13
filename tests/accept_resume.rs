@@ -197,6 +197,9 @@ fn resume01_kill_mid_scan_resume_completes_without_redo() {
             root_s.as_str(),
             "--report",
             report_s.as_str(),
+            // Wave6: explicit human keeps the footer lines.
+            "--format",
+            "human",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -372,6 +375,9 @@ fn resume01_kill_mid_scan_resume_completes_without_redo() {
             "--report",
             report_s.as_str(),
             "--force-rescan",
+            // Wave6: explicit human keeps the footer lines.
+            "--format",
+            "human",
         ],
         tmp.path(),
         &state,
@@ -513,6 +519,9 @@ fn resume02_incomplete_scan_keeps_old_findings() {
             root_s.as_str(),
             "--report",
             report_s.as_str(),
+            // Wave6: explicit human keeps the footer lines.
+            "--format",
+            "human",
         ],
         tmp.path(),
         &state,
@@ -535,6 +544,9 @@ fn resume02_incomplete_scan_keeps_old_findings() {
             missing_s.as_str(),
             "--report",
             report_s.as_str(),
+            // Wave6: explicit human keeps the footer lines.
+            "--format",
+            "human",
         ],
         tmp.path(),
         &state,
@@ -630,6 +642,9 @@ fn resume03_two_target_resume_re_serves_every_target() {
             root_s.as_str(),
             "--report",
             report_s.as_str(),
+            // Wave6: explicit human keeps the footer lines.
+            "--format",
+            "human",
         ],
         &cwd,
         &state,
@@ -688,6 +703,9 @@ fn resume04_all_scan_resume_keeps_all_marker() {
             root_s.as_str(),
             "--report",
             report_s.as_str(),
+            // Wave6: explicit human keeps the footer lines.
+            "--format",
+            "human",
         ],
         &cwd,
         &state,
@@ -1251,6 +1269,123 @@ fn resume_rediscovery_does_not_reemit_unresolvable_delta() {
             1,
             "one transition across the reconcile re-probe: {added:?}"
         );
+        store.close().await.expect("close");
+    });
+}
+
+/// OUTPUTS-m4: the `--format json` failure tail mirrors the journaled
+/// `scan_failed` payload — cursor, scrubbed error, resume capability +
+/// command — instead of a thin id triple. The cursor agrees with the
+/// committed event row byte for byte.
+#[cfg(unix)]
+#[test]
+fn failure_json_tail_mirrors_scan_failed_payload() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct Restore<'a> {
+        path: &'a Path,
+    }
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.path, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    fixture::normal_clone(&root, "repo");
+    let rodir = tmp.path().join("rodir");
+    repo_scan::privacy::private_dir_0700(&rodir).expect("mkdir");
+    let dest = rodir.join("rep.json");
+    std::fs::set_permissions(&rodir, std::fs::Permissions::from_mode(0o555)).expect("chmod 555");
+    let _restore = Restore { path: &rodir };
+    if repo_scan::privacy::private_write_0600(&rodir.join(".probe"), b"x").is_ok() {
+        let _ = std::fs::remove_file(rodir.join(".probe"));
+        eprintln!("failure_json_tail: destination dir is writable (privileged user); skipping");
+        return;
+    }
+
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            dest.to_str().expect("utf8"),
+            "--format",
+            "json",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "publication failure is operational failure; stderr: {}",
+        stderr_text(&out)
+    );
+    let tail: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("json tail is one JSON document");
+    let stdout_text = String::from_utf8_lossy(&out.stdout);
+    let temp_path = tmp.path().display().to_string();
+    let state_path = state.display().to_string();
+    assert!(
+        !stdout_text.contains(&temp_path),
+        "temporary path leaked in JSON failure tail: {tail}"
+    );
+    assert!(
+        !stdout_text.contains(&state_path),
+        "state path leaked in JSON failure tail: {tail}"
+    );
+    assert_eq!(tail["state"], "failed");
+    let scan_id = tail["scan_id"].as_str().expect("scan_id").to_string();
+    assert!(tail.get("report_id").is_some(), "tail: {tail}");
+    assert_eq!(tail["resumable"], true, "tail: {tail}");
+    assert!(
+        tail["resume_cmd"]
+            .as_str()
+            .is_some_and(|cmd| cmd.contains(&scan_id)),
+        "resume_cmd names the scan: {tail}"
+    );
+    assert!(
+        tail["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "scrubbed error: {tail}"
+    );
+
+    // The cursor is the committed event's cursor, not a reconstruction.
+    let rt = runtime();
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("reopen");
+        let mut after = 0u64;
+        let mut failed_records = None;
+        loop {
+            let rows = store
+                .read_scan_events(&scan_id, after, 500)
+                .await
+                .expect("read journal");
+            if rows.is_empty() {
+                break;
+            }
+            for row in &rows {
+                after = after.max(row.seq);
+                if row.event_type == "scan_failed" {
+                    failed_records = Some(row.records.clone());
+                }
+            }
+            if rows.len() < 500 {
+                break;
+            }
+        }
+        let records: serde_json::Value =
+            serde_json::from_slice(&failed_records.expect("scan_failed journaled"))
+                .expect("records JSON");
+        assert_eq!(tail["cursor"], records["cursor"], "tail: {tail}");
+        assert_eq!(tail["error"], records["error"], "tail: {tail}");
+        assert_eq!(tail["resume_cmd"], records["resume_cmd"], "tail: {tail}");
         store.close().await.expect("close");
     });
 }

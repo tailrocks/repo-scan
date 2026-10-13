@@ -11,7 +11,9 @@ mod main_under_test;
 
 use common::fixture;
 use repo_scan::model::{StatusMode, TaskState};
-use repo_scan::store::{NewTask, Store, TursoStore};
+use repo_scan::store::{
+    NewCheckout, NewGitInstance, NewScan, NewTask, Store, TaskOutcome, TursoStore, WriterBatch,
+};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcCommand;
 
@@ -23,7 +25,10 @@ fn binary() -> PathBuf {
 }
 
 fn runtime() -> tokio::runtime::Runtime {
+    // All drivers on: the pooled drain needs the timer (renewal ticks)
+    // and the blocking pool (worker threads).
     tokio::runtime::Builder::new_current_thread()
+        .enable_all()
         .build()
         .expect("runtime")
 }
@@ -585,4 +590,765 @@ fn rsf_chainargos_progress_rate_and_content() {
             && l.contains("volume=")),
         "stderr progress context: {stderr}"
     );
+}
+
+#[test]
+fn buffered_error_detail_is_scrubbed_in_catalog_and_journal() {
+    let rt = runtime();
+    rt.block_on(async {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = open_store(&tmp.path().join("catalog.db")).await;
+        store
+            .create_scan_request(
+                &NewScan {
+                    id: "scan-secret-detail",
+                    url_raw: b"--all",
+                    url_canonical: None,
+                    scope: "roots",
+                    status_mode: "metadata",
+                    report_dest: None,
+                    targets_json: None,
+                    format: Some("jsonl"),
+                    all_targets: Some(true),
+                },
+                repo_scan::store::now_ms(),
+            )
+            .await
+            .expect("create scan");
+
+        let detail = "fetch failed for \
+            https://ghp_R5T1JOURNALUSER:journal-secret@example.invalid/repo?token=query-secret";
+        main_under_test::test_buffer_record_error(&store, "scan-secret-detail", detail)
+            .await
+            .expect("buffer error");
+
+        let error = store
+            .get_error("gap:test-secret-detail")
+            .await
+            .expect("get error")
+            .expect("error row");
+        let events = store
+            .read_scan_events("scan-secret-detail", 0, 10)
+            .await
+            .expect("read events");
+        let event = events
+            .iter()
+            .find(|row| row.event_type == "error")
+            .expect("error event");
+        let records: serde_json::Value =
+            serde_json::from_slice(&event.records).expect("parse event records");
+        let journal_detail = records["detail"].as_str().expect("detail");
+
+        assert!(!error.detail.contains("ghp_R5T1JOURNALUSER"));
+        assert!(!error.detail.contains("journal-secret"));
+        assert!(!error.detail.contains("query-secret"));
+        assert!(error.detail.contains("fetch failed"));
+        assert_eq!(journal_detail, "diagnostic details omitted for privacy");
+    });
+}
+
+#[test]
+fn completion_gap_followup_scrubs_detail_before_database_persistence() {
+    let rt = runtime();
+    rt.block_on(async {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = open_store(&tmp.path().join("catalog.db")).await;
+        let now = repo_scan::store::now_ms();
+        let task_id = "task-completion-gap-privacy";
+        seed_enum_task(&store, task_id, 1, Path::new("/scope/completion"), now).await;
+        let epoch = store.epoch();
+        let claimed = store
+            .claim_tasks(epoch, 1, 60_000, now)
+            .await
+            .expect("claim task")
+            .into_iter()
+            .next()
+            .expect("claimed task");
+        let detail = "fetch failed for \
+            https://ghp_R5T1COMPLETIONCANARY00000000000000000000:completion-secret@example.invalid/repo?token=query-secret";
+        store
+            .complete_task_report_gap(
+                task_id,
+                claimed.token,
+                epoch,
+                &TaskOutcome::Retry {
+                    category: String::from("test-completion-gap"),
+                    detail: detail.to_string(),
+                    retry_after_ms: now + 60_000,
+                },
+                now,
+            )
+            .await
+            .expect("commit completion outcome");
+        main_under_test::test_buffer_completion_gap_detail(&store, task_id, detail, now)
+            .await
+            .expect("buffer completion gap follow-up");
+
+        let error = store
+            .get_error(&format!("gap:{task_id}"))
+            .await
+            .expect("read error")
+            .expect("completion error row");
+        assert!(!error.detail.contains("COMPLETIONCANARY"));
+        assert!(!error.detail.contains("completion-secret"));
+        assert!(!error.detail.contains("query-secret"));
+        assert!(error.detail.contains("fetch failed"));
+        store.close().await.expect("close");
+    });
+}
+
+#[test]
+fn derivation_cap_marks_report_scan_and_terminal_incomplete() {
+    const ERROR_COUNT: usize = 4_097;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("root");
+    let state = tmp.path().join("state");
+    repo_scan::privacy::private_dir_0700(&root).expect("make root");
+    repo_scan::privacy::private_dir_0700(&state).expect("make state");
+    let payload = repo_scan::store::owner::payload_dir(&state);
+    repo_scan::privacy::private_dir_0700(&payload).expect("make payload");
+    let catalog = repo_scan::store::owner::catalog_db_path(&state);
+
+    let rt = runtime();
+    rt.block_on(async {
+        let store = open_store(&catalog).await;
+        let scope_key = repo_scan::config::scope_key_for_dir(&root);
+        let now = repo_scan::store::now_ms();
+        let mut batch = WriterBatch::new();
+        for n in 0..ERROR_COUNT {
+            batch.push(
+                "INSERT INTO errors (id, scope_key, category, detail, attempts, first_seen_ms, \
+                    last_seen_ms, next_retry_ms, open) VALUES (?1, ?2, 'probe-failed', \
+                    'synthetic probe failure', 1, ?3, ?3, NULL, 1)",
+                vec![
+                    turso::Value::Text(format!("probe-cap-{n:05}")),
+                    turso::Value::Text(scope_key.clone()),
+                    turso::Value::Integer(now),
+                ],
+            );
+            if batch.should_flush() {
+                store.flush(&mut batch).await.expect("flush errors");
+            }
+        }
+        if !batch.is_empty() {
+            store.flush(&mut batch).await.expect("flush final errors");
+        }
+        let scoped_count = main_under_test::test_count_open_errors_for_roots_with_event_volumes(
+            &store,
+            std::slice::from_ref(&root),
+            std::slice::from_ref(&root),
+            &[],
+        )
+        .await
+        .expect("count seeded scoped errors");
+        assert_eq!(scoped_count, ERROR_COUNT as u64);
+        store.close().await.expect("close seeded catalog");
+    });
+
+    let out = run_str(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().unwrap(),
+            "--format",
+            "json",
+        ],
+        &root,
+        &state,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "scan stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parse report");
+    assert_eq!(report["scan"]["state"], "incomplete");
+    assert!(report["coverage"]["gaps"].as_u64().unwrap_or_default() > 0);
+    let scan_id = report["scan"]["id"].as_str().expect("scan id");
+
+    let rt = runtime();
+    rt.block_on(async {
+        let store = open_store(&catalog).await;
+        let scan = store
+            .get_scan(scan_id)
+            .await
+            .expect("read scan")
+            .expect("scan row");
+        assert!(
+            scan.state.starts_with("incomplete:roots:"),
+            "state: {}",
+            scan.state
+        );
+        let events = store
+            .read_scan_events(scan_id, 0, 100)
+            .await
+            .expect("read terminal events");
+        let terminal = events
+            .iter()
+            .find(|event| event.event_type == "scan_incomplete")
+            .expect("scan_incomplete terminal event");
+        let records: serde_json::Value =
+            serde_json::from_slice(&terminal.records).expect("parse terminal records");
+        assert!(records["counts"]["open_gaps"].as_u64().unwrap_or_default() > 0);
+        store.close().await.expect("close");
+    });
+}
+
+#[test]
+fn error_derivation_cap_resumes_after_last_candidate() {
+    let rt = runtime();
+    rt.block_on(async {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = open_store(&tmp.path().join("catalog.db")).await;
+        let now = repo_scan::store::now_ms();
+        let scope_path = Path::new("/scope/cap-errors");
+        let scope_key = repo_scan::config::scope_key_for_dir(scope_path);
+        for id in ["candidate-a", "candidate-b"] {
+            store
+                .record_error(
+                    id,
+                    &scope_key,
+                    "probe-failed",
+                    "synthetic candidate",
+                    None,
+                    now,
+                )
+                .await
+                .expect("seed candidate error");
+        }
+        let roots = [PathBuf::from(scope_path)];
+        let root_scopes = [scope_key];
+
+        let first =
+            main_under_test::test_scan_error_derivations_for_roots(&store, &root_scopes, &roots, 1)
+                .await
+                .expect("first capped error pass");
+        assert_eq!(first.candidate_ids, ["cand-err:candidate-a"]);
+
+        let second =
+            main_under_test::test_scan_error_derivations_for_roots(&store, &root_scopes, &roots, 1)
+                .await
+                .expect("resumed error pass");
+        assert_eq!(second.candidate_ids, ["cand-err:candidate-b"]);
+        store.close().await.expect("close store");
+    });
+}
+
+#[test]
+fn initial_tui_header_target_scrubs_credential_shaped_local_path() {
+    let target = repo_scan::report::tui::safe_tui_target(
+        "/tmp/password=ghp_TESTTUITARGETCANARY00000000000000000000/repo",
+    );
+    assert!(!target.contains("TESTTUITARGETCANARY"));
+}
+
+#[test]
+fn instance_derivation_cap_resumes_after_last_repository() {
+    let rt = runtime();
+    rt.block_on(async {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = open_store(&tmp.path().join("catalog.db")).await;
+        let now = repo_scan::store::now_ms();
+        for (id, path) in [
+            ("instance-a", b"/scope/instance-a/.git".as_slice()),
+            ("instance-b", b"/scope/instance-b/.git".as_slice()),
+        ] {
+            store
+                .upsert_git_instance(
+                    &NewGitInstance {
+                        id,
+                        git_path: path,
+                        common_path: path,
+                        incarnation: id,
+                        format: "git-files",
+                        bare: Some(false),
+                        object_format: "sha1",
+                        disposition: "unresolvable_identity",
+                        evidence_json: "[]",
+                    },
+                    now,
+                )
+                .await
+                .expect("seed unresolvable instance");
+        }
+
+        let first = main_under_test::test_scan_instance_derivations_with_cap(&store, 1)
+            .await
+            .expect("first capped instance pass");
+        assert_eq!(first.candidate_ids, ["cand:instance-a"]);
+
+        let second = main_under_test::test_scan_instance_derivations_with_cap(&store, 1)
+            .await
+            .expect("resumed instance pass");
+        assert_eq!(second.candidate_ids, ["cand:instance-b"]);
+        store.close().await.expect("close store");
+    });
+}
+
+#[test]
+fn interrupted_journal_root_path_is_scrubbed_before_persistence() {
+    use repo_scan::walk::roots::{PlannedRoot, RootPriority};
+
+    let rt = runtime();
+    rt.block_on(async {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = open_store(&tmp.path().join("catalog.db")).await;
+        store
+            .create_scan_request(
+                &NewScan {
+                    id: "scan-interrupted-path-privacy",
+                    url_raw: b"--all",
+                    url_canonical: None,
+                    scope: "roots",
+                    status_mode: "summary",
+                    report_dest: None,
+                    targets_json: None,
+                    format: Some("human"),
+                    all_targets: Some(true),
+                },
+                repo_scan::store::now_ms(),
+            )
+            .await
+            .expect("create scan request");
+        let roots = [PlannedRoot {
+            path: PathBuf::from("/tmp/password=ghp_TESTINTERRUPTCANARY00000000000000000000/root"),
+            priority: RootPriority::Normal,
+            namespace: String::from("test"),
+            volume: None,
+        }];
+        main_under_test::test_append_interrupted_roots_event(
+            &store,
+            "scan-interrupted-path-privacy",
+            &roots,
+        )
+        .await
+        .expect("append interrupted event");
+        let rows = store
+            .read_scan_events("scan-interrupted-path-privacy", 0, 10)
+            .await
+            .expect("read event");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_type, "scan_interrupted");
+        let record = String::from_utf8_lossy(&rows[0].records);
+        assert!(!record.contains("TESTINTERRUPTCANARY"));
+        store.close().await.expect("close");
+    });
+}
+
+#[test]
+fn resume_classifies_redacted_no_remote_local_target_without_reopening_path() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let secret_parent = tmp
+        .path()
+        .join("password=ghp_TESTNOREMOTECANARY00000000000000000000");
+    repo_scan::privacy::private_dir_0700(&secret_parent).expect("make local repo parent");
+    let local_repo = fixture::normal_clone(&secret_parent, "repo");
+    fixture::git(&local_repo, &["remote", "remove", "origin"]);
+    let raw = local_repo.to_string_lossy().into_owned();
+    let (_, canonical) = main_under_test::test_resolve_target_identity(&raw)
+        .expect("resolve local repository without remote");
+    assert!(canonical.starts_with("file://"));
+
+    let state = tmp.path().join("state");
+    repo_scan::privacy::private_dir_0700(&state).expect("make state");
+    let payload = repo_scan::store::owner::payload_dir(&state);
+    repo_scan::privacy::private_dir_0700(&payload).expect("make payload");
+    let catalog = repo_scan::store::owner::catalog_db_path(&state);
+    let rt = runtime();
+    let scan_id = rt.block_on(async {
+        let store = open_store(&catalog).await;
+        let id = main_under_test::test_mint_resume_target(&store, &raw, &canonical)
+            .await
+            .expect("persist privacy-safe target");
+        let outcome = repo_scan::config::encode_outcome(
+            130,
+            Some(3),
+            "report-redacted-local-target",
+            false,
+            None,
+        );
+        store
+            .update_scan_state(
+                &id,
+                "interrupted",
+                Some(&outcome),
+                None,
+                repo_scan::store::now_ms(),
+            )
+            .await
+            .expect("mark resumable scan interrupted");
+        store.close().await.expect("close catalog");
+        id
+    });
+
+    // The stored target and canonical file URL both contain only the
+    // redaction marker. Resume must classify them as unavailable before it
+    // tries to reopen the original path, which is removed here.
+    let rt = runtime();
+    rt.block_on(async {
+        let store = open_store(&catalog).await;
+        let row = store
+            .get_scan(&scan_id)
+            .await
+            .expect("read saved scan")
+            .expect("saved scan row");
+        assert!(!String::from_utf8_lossy(&row.url_raw).contains("NOREMOTECANARY"));
+        assert!(
+            !String::from_utf8_lossy(row.url_canonical.as_deref().unwrap())
+                .contains("NOREMOTECANARY")
+        );
+        assert!(!row
+            .targets_json
+            .as_deref()
+            .unwrap()
+            .contains("NOREMOTECANARY"));
+        let restored = main_under_test::test_resume_targets_for_row(&row);
+        assert_eq!(restored, ["repo-scan:redacted-local-target"]);
+        let resolved = main_under_test::test_resolve_saved_targets(&row)
+            .expect_err("redacted local target is not reopened");
+        assert!(resolved
+            .to_string()
+            .contains("saved local target path was redacted"));
+        assert!(!resolved.to_string().contains("NOREMOTECANARY"));
+        store.close().await.expect("close");
+    });
+    std::fs::remove_dir_all(&local_repo).expect("remove original target before resume");
+    let out = run_str(&["resume", &scan_id], tmp.path(), &state);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("saved local target path was redacted"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("NOREMOTECANARY"));
+}
+
+#[test]
+fn resume_command_never_exposes_state_path() {
+    let ordinary_path = "/tmp/RESUME_PATH_CANARY/repo scan state";
+    let spaced = main_under_test::test_resume_cmd_for(Path::new(ordinary_path), "scan-1");
+    assert!(spaced.contains("${REPO_SCAN_STATE_DIR:?set REPO_SCAN_STATE_DIR"));
+    assert!(spaced.ends_with("resume 'scan-1'"));
+    assert!(!spaced.contains(ordinary_path));
+    assert!(!spaced.contains("RESUME_PATH_CANARY"));
+
+    let secret = main_under_test::test_resume_cmd_for(
+        Path::new("/tmp/password=RESUMECMDCANARY/state"),
+        "scan-2",
+    );
+    assert!(
+        secret.contains("${REPO_SCAN_STATE_DIR:?set REPO_SCAN_STATE_DIR to this scan's state dir}")
+    );
+    assert!(!secret.contains("RESUMECMDCANARY"));
+    assert!(!secret.contains("<redacted>"));
+    assert!(secret.ends_with("resume 'scan-2'"));
+}
+
+#[test]
+fn resume_uses_canonical_identity_when_local_target_path_was_scrubbed() {
+    let rt = runtime();
+    rt.block_on(async {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = open_store(&tmp.path().join("catalog.db")).await;
+        let raw = "/tmp/password=ghp_TESTRESUMECANARY00000000000000000000/repo";
+        let canonical = "https://github.com/owner/repo";
+        let targets = serde_json::json!([{"raw": raw, "canonical": canonical}]).to_string();
+        store
+            .create_scan_request(
+                &NewScan {
+                    id: "scan-resume-scrubbed-local-target",
+                    url_raw: raw.as_bytes(),
+                    url_canonical: Some(canonical.as_bytes()),
+                    scope: "roots",
+                    status_mode: "summary",
+                    report_dest: None,
+                    targets_json: Some(&targets),
+                    format: Some("human"),
+                    all_targets: Some(false),
+                },
+                repo_scan::store::now_ms(),
+            )
+            .await
+            .expect("create scan row");
+        let row = store
+            .get_scan("scan-resume-scrubbed-local-target")
+            .await
+            .expect("read scan row")
+            .expect("scan exists");
+        assert!(!String::from_utf8_lossy(&row.url_raw).contains("TESTRESUMECANARY"));
+        let targets = main_under_test::test_resume_targets_for_row(&row);
+        assert_eq!(targets, [canonical]);
+        store.close().await.expect("close");
+    });
+}
+
+#[test]
+fn root_cursors_follow_canonical_mount_for_symlink_aliases() {
+    let (volume_id, history_uuid) = main_under_test::test_root_cursor_alias_mapping(
+        Path::new("/tmp/root-alias"),
+        Path::new("/private/volume/worktrees/project"),
+        Path::new("/private/volume"),
+        "macos-volume-uuid-1",
+        "history-alias-test",
+    );
+    assert_eq!(volume_id.as_deref(), Some("macos-volume-uuid-1"));
+    assert_eq!(history_uuid.as_deref(), Some("history-alias-test"));
+}
+
+#[test]
+fn root_volume_selection_uses_canonical_identity_for_symlink_aliases() {
+    let mounts = [PathBuf::from("/"), PathBuf::from("/private/volume")];
+    let physical_root = PathBuf::from("/private/volume/worktrees/project");
+    assert_eq!(
+        main_under_test::test_deepest_mount_index(&physical_root, &mounts),
+        Some(1),
+        "the alias's resolved root selects its actual nested volume"
+    );
+}
+
+/// Roots-scoped error derivation matches `status:` scopes by checkout ID,
+/// while instance derivations use the separate owning repository IDs.
+#[test]
+fn roots_error_derivation_includes_only_in_scope_checkout_status_errors() {
+    let rt = runtime();
+    rt.block_on(async {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("catalog.db");
+        let store = open_store(&db).await;
+        let now = repo_scan::store::now_ms();
+        for (repo_id, checkout_id, root_path, git_path) in [
+            (
+                "repo-in",
+                "checkout-in",
+                b"/scope/in/repo".as_slice(),
+                b"/scope/in/repo/.git".as_slice(),
+            ),
+            (
+                "repo-out",
+                "checkout-out",
+                b"/scope/out/repo".as_slice(),
+                b"/scope/out/repo/.git".as_slice(),
+            ),
+        ] {
+            store
+                .upsert_git_instance(
+                    &NewGitInstance {
+                        id: repo_id,
+                        git_path,
+                        common_path: git_path,
+                        incarnation: repo_id,
+                        format: "git-files",
+                        bare: Some(false),
+                        object_format: "sha1",
+                        disposition: "confirmed",
+                        evidence_json: "[]",
+                    },
+                    now,
+                )
+                .await
+                .expect("seed git instance");
+            store
+                .upsert_checkout(
+                    &NewCheckout {
+                        id: checkout_id,
+                        instance_id: repo_id,
+                        root_path: Some(root_path),
+                        git_path,
+                        relationship: "main",
+                        availability: "present",
+                        head_state: "branch",
+                        head_ref: None,
+                        head_oid: None,
+                        head_algo: None,
+                    },
+                    now,
+                )
+                .await
+                .expect("seed checkout");
+            store
+                .record_error(
+                    &format!("status-error-{checkout_id}"),
+                    &repo_scan::config::scope_key_for_status(checkout_id),
+                    "status-error",
+                    "synthetic status error",
+                    None,
+                    now,
+                )
+                .await
+                .expect("seed status error");
+        }
+
+        store
+            .record_error(
+                "a-probe-error",
+                &repo_scan::config::scope_key_for_dir(Path::new("/scope/in")),
+                "probe-failed",
+                "synthetic in-scope probe failure",
+                None,
+                now,
+            )
+            .await
+            .expect("seed candidate error");
+        let roots = [PathBuf::from("/scope/in")];
+        let root_scopes = [repo_scan::config::scope_key_for_dir(Path::new("/scope/in"))];
+        let derived =
+            main_under_test::test_scan_error_derivations_for_roots(&store, &root_scopes, &roots, 1)
+                .await
+                .expect("scan scoped errors");
+        assert_eq!(
+            derived.scanned, 2,
+            "the in-scope candidate and checkout error are scanned"
+        );
+        assert_eq!(derived.candidates, 1, "the candidate cap is respected");
+
+        let root_a = [PathBuf::from("/scope/in")];
+        let root_a_gap = repo_scan::config::report_derivation_gap_id("errors", Some(&root_a));
+        let root_a_gap_scope = repo_scan::config::report_derivation_gap_scope_key(Some(&root_a));
+        store
+            .record_error(
+                &root_a_gap,
+                &root_a_gap_scope,
+                "report-derivation-truncated",
+                "root A derivation budget reached",
+                None,
+                now,
+            )
+            .await
+            .expect("seed root A derivation gap");
+        let roots_b = [PathBuf::from("/scope/out")];
+        let scopes_b = [repo_scan::config::scope_key_for_dir(Path::new(
+            "/scope/out",
+        ))];
+        let later =
+            main_under_test::test_scan_error_derivations_for_roots(&store, &scopes_b, &roots_b, 1)
+                .await
+                .expect("scan root B errors");
+        assert_eq!(
+            later.scanned, 1,
+            "root B includes its status error but not root A's persisted derivation gap"
+        );
+        assert_eq!(later.candidates, 0);
+        store.close().await.expect("close store");
+    });
+}
+
+#[test]
+fn roots_run_boundary_counts_only_in_scope_errors_and_unresolvable_repos() {
+    let rt = runtime();
+    rt.block_on(async {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = open_store(&tmp.path().join("catalog.db")).await;
+        let now = repo_scan::store::now_ms();
+        let generation = store
+            .create_generation("roots", "running", None, now)
+            .await
+            .expect("generation");
+
+        for suffix in ["a", "b"] {
+            let root = format!("/scope/{suffix}");
+            let git_path = format!("{root}/repo/.git");
+            let repository_id = format!("unresolvable-{suffix}");
+            store
+                .upsert_git_instance(
+                    &NewGitInstance {
+                        id: &repository_id,
+                        git_path: git_path.as_bytes(),
+                        common_path: git_path.as_bytes(),
+                        incarnation: suffix,
+                        format: "git-files",
+                        bare: None,
+                        object_format: "sha1",
+                        disposition: "unresolvable_identity",
+                        evidence_json: "[]",
+                    },
+                    now,
+                )
+                .await
+                .expect("seed unresolvable instance");
+            store
+                .record_error(
+                    &format!("gap-{suffix}"),
+                    &repo_scan::config::scope_key_for_dir(Path::new(&root)),
+                    "permission-denied",
+                    "synthetic scope error",
+                    None,
+                    now,
+                )
+                .await
+                .expect("seed scope error");
+        }
+
+        let roots_b = [PathBuf::from("/scope/b")];
+        let only_b = main_under_test::test_run_boundary_for_roots(
+            &store,
+            store.epoch(),
+            generation,
+            1,
+            CANON_A,
+            StatusMode::Metadata,
+            "scan-roots-boundary",
+            &roots_b,
+        )
+        .await
+        .expect("run B boundary");
+        assert_eq!(only_b.open_gaps, 1, "root B counts only its gap");
+        assert_eq!(only_b.unresolvable, 1, "root B counts only its repo");
+
+        let roots_c = [PathBuf::from("/scope/c")];
+        let neither = main_under_test::test_run_boundary_for_roots(
+            &store,
+            store.epoch(),
+            generation,
+            1,
+            CANON_A,
+            StatusMode::Metadata,
+            "scan-roots-boundary-c",
+            &roots_c,
+        )
+        .await
+        .expect("run C boundary");
+        assert_eq!(neither.open_gaps, 0, "root A/B gaps do not leak into C");
+        assert_eq!(neither.unresolvable, 0, "root A/B repos do not leak into C");
+        store.close().await.expect("close store");
+    });
+}
+
+#[test]
+fn scoped_progress_gap_count_accepts_root_event_volume_uuid() {
+    let rt = runtime();
+    rt.block_on(async {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = open_store(&tmp.path().join("catalog.db")).await;
+        let now = repo_scan::store::now_ms();
+        for (id, volume) in [
+            ("gap-in-root-volume", "macos-volume-uuid-1"),
+            ("gap-outside-volume", "macos-volume-uuid-2"),
+        ] {
+            store
+                .record_error(
+                    id,
+                    &format!("volume:{volume}"),
+                    "event-batch-error",
+                    "synthetic event gap",
+                    None,
+                    now,
+                )
+                .await
+                .expect("seed volume gap");
+        }
+        let roots = [PathBuf::from("/scope/root")];
+        let count = main_under_test::test_count_open_errors_for_roots_with_event_volumes(
+            &store,
+            &roots,
+            &roots,
+            &[String::from("macos-volume-uuid-1")],
+        )
+        .await
+        .expect("count scoped errors");
+        assert_eq!(count, 1, "only the root's monitored volume gap counts");
+        store.close().await.expect("close");
+    });
 }

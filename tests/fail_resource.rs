@@ -249,74 +249,6 @@ fn state03_error_derivations_cap_and_gap() {
             Some(1),
             "truncation must record an open gap row"
         );
-        // The gap row itself is not a probe candidate, so generous caps
-        // still derive exactly the ten fixtures with no truncation.
-        let wide = main_under_test::DerivationCaps::default_caps();
-        let second = main_under_test::scan_error_derivations(&store, &[scope], &wide)
-            .await
-            .expect("scan");
-        assert!(!second.truncated);
-        assert_eq!(second.candidates.len(), 10);
-        assert_eq!(second.scanned, 11, "ten fixtures plus the gap row");
-    });
-}
-
-/// B11 port of the second half of `state03_error_derivations_cap_and_gap`:
-/// with the scan-bound derivation cursor (B11 main.rs), a resumed pass
-/// derives only the suffix after its stored cursor and keeps the gap open
-/// until a from-start pass emits every candidate and resolves it. The
-/// consolidation main.rs derivations have no cursor yet (a wide second
-/// pass re-derives everything and the gap stays open), so B11's REPLACED
-/// tail assertions live here as an ignored companion — the base test
-/// above keeps asserting current behavior, unweakened.
-#[test]
-#[ignore = "pending main.rs scan-bound derivation cursor + gap resolution — slice 5"]
-fn state03_error_derivations_b11_cursor_resume() {
-    let rt = runtime();
-    rt.block_on(async {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store = TursoStore::open(&db_in(&dir)).await.expect("open");
-        let scope = config::scope_key_for_dir(&dir.path().join("root"));
-        let now = now_ms();
-        for n in 0..10 {
-            store
-                .record_error(
-                    &format!("deriv-err-{n:02}"),
-                    &scope,
-                    "probe-failed",
-                    "boom",
-                    None,
-                    now,
-                )
-                .await
-                .expect("record");
-        }
-        let tiny = main_under_test::DerivationCaps {
-            max_error_candidates: 3,
-            max_root_error_ids: 100,
-            max_instance_candidates: 100,
-            max_storage_links: 100,
-            max_first_common: 100,
-        };
-        let first =
-            main_under_test::scan_error_derivations(&store, std::slice::from_ref(&scope), &tiny)
-                .await
-                .expect("scan");
-        assert!(
-            first.truncated,
-            "10 rows past a 3-candidate cap must truncate"
-        );
-        assert!(
-            first.candidates.len() <= 3,
-            "got {}",
-            first.candidates.len()
-        );
-        assert_eq!(first.root_error_ids.len(), 1);
-        assert_eq!(
-            error_open_flag(&store, "gap:report-derivation:errors").await,
-            Some(1),
-            "truncation must record an open gap row"
-        );
         // A resumed pass derives only the suffix after its stored cursor.
         // It must keep the gap open because this report still lacks the
         // first three candidates from the prior pass.
@@ -351,79 +283,11 @@ fn state03_error_derivations_b11_cursor_resume() {
     });
 }
 
+
 /// SR-STATE-03: instance derivations stop at the aggregate cap with the
 /// same gap-and-preserve contract.
 #[test]
 fn state03_instance_derivations_cap_and_gap() {
-    let rt = runtime();
-    rt.block_on(async {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store = TursoStore::open(&db_in(&dir)).await.expect("open");
-        let now = now_ms();
-        for n in 0..10 {
-            let id = format!("deriv-inst-{n:02}");
-            let git = format!("/nonexistent-{n:02}/.git");
-            let common = format!("/nonexistent-{n:02}/.git-common");
-            store
-                .upsert_git_instance(
-                    &NewGitInstance {
-                        id: &id,
-                        git_path: git.as_bytes(),
-                        common_path: common.as_bytes(),
-                        incarnation: "1",
-                        format: "git-files",
-                        bare: Some(false),
-                        object_format: "sha1",
-                        disposition: "unresolvable_identity",
-                        evidence_json: "[]",
-                    },
-                    now,
-                )
-                .await
-                .expect("instance");
-        }
-        let tiny = main_under_test::DerivationCaps {
-            max_error_candidates: 100,
-            max_root_error_ids: 100,
-            max_instance_candidates: 3,
-            max_storage_links: 100,
-            max_first_common: 100,
-        };
-        let first = main_under_test::scan_instance_derivations(&store, &tiny)
-            .await
-            .expect("scan");
-        assert!(
-            first.truncated,
-            "10 rows past a 3-candidate cap must truncate"
-        );
-        assert!(
-            first.candidates.len() <= 3,
-            "got {}",
-            first.candidates.len()
-        );
-        assert_eq!(
-            error_open_flag(&store, "gap:report-derivation:instances").await,
-            Some(1),
-            "truncation must record an open gap row"
-        );
-        let wide = main_under_test::DerivationCaps::default_caps();
-        let second = main_under_test::scan_instance_derivations(&store, &wide)
-            .await
-            .expect("scan");
-        assert!(!second.truncated);
-        assert_eq!(second.candidates.len(), 10);
-        assert_eq!(second.storage_links.len(), 10, "one common-dir edge each");
-    });
-}
-
-/// B11 port of the second half of `state03_instance_derivations_cap_and_gap`:
-/// same scan-bound derivation cursor contract as the error companion
-/// above — the resumed pass derives the suffix only and keeps the gap
-/// open until a from-start pass resolves it. Ignored until the main.rs
-/// derivation cursor lands; the base test above is untouched.
-#[test]
-#[ignore = "pending main.rs scan-bound derivation cursor + gap resolution — slice 5"]
-fn state03_instance_derivations_b11_cursor_resume() {
     let rt = runtime();
     rt.block_on(async {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -503,6 +367,7 @@ fn state03_instance_derivations_b11_cursor_resume() {
         );
     });
 }
+
 
 /// SR-EVENT-01: rotation fires past the max stream age; stall suspicion
 /// needs BOTH a stale heartbeat and an advanced global clock.
