@@ -7,6 +7,7 @@ schema = 1
 
 # Optional workflow display and policy settings. Omitted values use Velnor defaults.
 [workflow]
+policy = "consumer-v1"
 runner_label = "ubuntu-24.04"
 default_branch = "main"
 
@@ -47,3 +48,9 @@ default_branch = "main"
 # "jdx/mr-boxington-action" = { version = "v1.5.0", sha = "9df1d4b18b2147788a7ee7a2c7b84ecf62fd89d3" }
 # "Swatinem/rust-cache" = { version = "v2.9.2", sha = "6323deb102c322ba6fcbdcafc7e3dddab59af2b6" }
 # Values must be an allowlisted action's matching release version and full SHA.
+
+[stacks.rust.binary_release]
+enabled = true
+manifest_path = "Cargo.toml"
+package = "repo-scan"
+bin = "repo-scan"
