@@ -53,7 +53,11 @@ fn report_inputs(report_id: &str, generation: u64, scan_state: &str) -> ReportIn
         target_url: "https://github.com/OWNER/REPO".to_string(),
         canonical_url: Some("https://github.com/owner/repo".to_string()),
         targets: vec![],
-        scope: "roots".to_string(),
+        // Machine scope: report 1.5 scopes roots-scoped reports to the
+        // requested roots, and root-scoped volume-event errors link through
+        // `ReportInputs::event_volume_ids` (B11), which the main.rs slice
+        // wires; this scripted reconcile fixture spans the machine.
+        scope: "machine".to_string(),
         scan_state: scan_state.to_string(),
         started_at_ms: 1_759_154_398_000,
         finished_at_ms: Some(1_759_154_400_000),

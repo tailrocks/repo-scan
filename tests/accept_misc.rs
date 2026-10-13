@@ -820,6 +820,8 @@ fn perf_03_no_false_clean_and_cpu_accounting_survives_respawn() {
         staged: None,
         unstaged: None,
         untracked: None,
+        conflicts: None,
+        working_state: "pending".to_string(),
         untracked_units: "collapsed_entries".to_string(),
         submodules: "unknown".to_string(),
         unknown_fields: Vec::new(),
