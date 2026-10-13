@@ -20842,8 +20842,14 @@ where
     Fut: std::future::Future<Output = repo_scan::Result<()>>,
 {
     match repo_scan::scan_events::read_guarded_scan_event_page_with_hook(
-        store, scan_id, after, limit, after_guard,
-    ).await? {
+        store,
+        scan_id,
+        after,
+        limit,
+        after_guard,
+    )
+    .await?
+    {
         GuardedScanEventPage::Pruned => Ok(None),
         GuardedScanEventPage::Rows(rows) => Ok(Some(rows)),
     }

@@ -283,7 +283,6 @@ fn state03_error_derivations_cap_and_gap() {
     });
 }
 
-
 /// SR-STATE-03: instance derivations stop at the aggregate cap with the
 /// same gap-and-preserve contract.
 #[test]
@@ -367,7 +366,6 @@ fn state03_instance_derivations_cap_and_gap() {
         );
     });
 }
-
 
 /// SR-EVENT-01: rotation fires past the max stream age; stall suspicion
 /// needs BOTH a stale heartbeat and an advanced global clock.
