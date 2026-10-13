@@ -39,6 +39,15 @@ name = "perf_gates"
 harness = false
 test = false
 
+# GOV-04 dataset generator: deterministic corpus builder with truth manifests
+# (goal section 7.1). Plain main; invoke as
+# `cargo bench --bench corpus -- --recipe <id-or-path> --out <dir> [--tier T]`
+# (cargo run has no --bench selector).
+[[bench]]
+name = "corpus"
+harness = false
+test = false
+
 [features]
 default = []
 # Phase 1: no optional runtime features. Platform backends are cfg-gated
