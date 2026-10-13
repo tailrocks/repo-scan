@@ -1838,3 +1838,86 @@ fn real_json_schema_rejects_nested_unknown_properties() {
         "analysis totals rejects unknown fields"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Streaming-validator resource bounds (contract C4): the 24 MiB fail-closed
+// ID and account-key indexes refuse bound-crossing reports through the
+// public staged-validation entry, with bounded, non-echoing diagnostics.
+// ---------------------------------------------------------------------------
+
+/// Enough 60 KiB path IDs to cross the 24 MiB fail-closed ID bound
+/// (430 * 60 KiB > 24 MiB), each record well under the 1 MiB per-record
+/// cap so the ID index is the tripping bound.
+#[test]
+fn staged_validation_fails_closed_at_the_24mib_id_bound() {
+    let mut value = serde_json::to_value(example_report()).expect("value");
+    let paths = value["paths"].as_array_mut().expect("paths");
+    for index in 0..430 {
+        let id = format!("path-pad-{index:04}-{}", "x".repeat(60 * 1024));
+        paths.push(serde_json::json!({
+            "id": id,
+            "display": "/synthetic",
+            "encoding": "utf8",
+            "value": "/synthetic",
+            "volume_id": null,
+            "object_id": null,
+            "incarnation": null
+        }));
+    }
+    // Keep the declared totals honest so the ID bound is the refusal.
+    value["totals"]["observed_paths"] =
+        serde_json::Value::from(value["paths"].as_array().expect("paths").len() as u64);
+    let bytes = serde_json::to_vec(&value).expect("serialize oversized-id report");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let staged = dir.path().join("id-flood.json");
+    repo_scan::privacy::private_write_0600(&staged, &bytes).expect("write staged report");
+    let error = validate_staged_report(&staged).expect_err("24 MiB ID bound refuses");
+    let diagnostic = error.to_string();
+    assert!(
+        diagnostic.contains("ID bytes exceed"),
+        "fail-closed ID bound: {diagnostic}"
+    );
+    assert!(
+        diagnostic.len() < 4096,
+        "diagnostic is bounded, never echoes the flood: {}",
+        diagnostic.len()
+    );
+}
+
+/// Distinct 50 KiB (host, account) pairs cross the 24 MiB account-key
+/// bound (600 * 50 KiB > 24 MiB) with small repos and correct group-ID
+/// shape, so the account-key index is among the refusing bounds.
+#[test]
+fn staged_validation_fails_closed_at_the_24mib_account_key_bound() {
+    let mut value = serde_json::to_value(example_report()).expect("value");
+    let groups = value["groups"].as_array_mut().expect("groups");
+    for index in 0..600 {
+        let account = format!("{:04}{}", index, "a".repeat(50 * 1024));
+        groups.push(serde_json::json!({
+            "id": format!("github.com/{account}/repo-{index}"),
+            "host": "github.com",
+            "account": account,
+            "repo": format!("repo-{index}")
+        }));
+    }
+    let group_count = value["groups"].as_array().expect("groups").len() as u64;
+    value["totals"]["groups"] = serde_json::Value::from(group_count);
+    value["totals"]["accounts"] = serde_json::Value::from(group_count);
+    let bytes = serde_json::to_vec(&value).expect("serialize account-flood report");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let staged = dir.path().join("account-flood.json");
+    repo_scan::privacy::private_write_0600(&staged, &bytes).expect("write staged report");
+    let error = validate_staged_report(&staged).expect_err("24 MiB account-key bound refuses");
+    let diagnostic = error.to_string();
+    assert!(
+        diagnostic.contains("account-key bytes exceed"),
+        "fail-closed account-key bound: {diagnostic}"
+    );
+    assert!(
+        diagnostic.len() < 4096,
+        "diagnostic is bounded, never echoes the flood: {}",
+        diagnostic.len()
+    );
+}
