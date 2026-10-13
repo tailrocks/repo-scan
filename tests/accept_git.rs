@@ -1216,7 +1216,7 @@ fn upstream10_unresolvable_yields_null() {
 #[test]
 #[ignore = "slice-5: needs upstream/comparison persistence, Step-10 status model, or M1/M8 main.rs behavior; un-ignore there"]
 fn worktree_registry_unreadable_parks_with_gap() {
-    use repo_scan::store::{Store, TursoStore};
+    use repo_scan::store::TursoStore;
     use std::os::unix::fs::PermissionsExt;
 
     struct Restore<'a> {

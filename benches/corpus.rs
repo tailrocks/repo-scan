@@ -1631,8 +1631,8 @@ pub fn generate(recipe_arg: &str, out: &Path, tier: &str) -> Res<GenReport> {
     for t in &truths {
         for w in &t.worktrees {
             let key = rel_bytes(&root, &w.path)?;
-            if !worktree_seen.contains_key(&key) {
-                worktree_seen.insert(key, worktree_json(&root, w)?);
+            if let std::collections::btree_map::Entry::Vacant(e) = worktree_seen.entry(key) {
+                e.insert(worktree_json(&root, w)?);
             }
         }
     }
