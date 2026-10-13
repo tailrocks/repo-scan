@@ -315,6 +315,15 @@ impl Admission {
         }
     }
 
+    /// Currently unheld shared permits: the binding upper bound on how
+    /// many more operations of any class mix can be admitted (every
+    /// class consumes one shared permit). The scheduler caps its claim
+    /// batch at this so claimed tasks are admittable instead of
+    /// claimed-then-released (one sync commit per release).
+    pub fn free_shared(&self) -> usize {
+        self.eff_shared_cap().saturating_sub(self.shared_in_use)
+    }
+
     /// Effective shared-permit cap (halved, minimum 1, while throttled).
     fn eff_shared_cap(&self) -> usize {
         if self.cpu_throttled {
