@@ -1,0 +1,115 @@
+{
+  "group_id": "5245997ceaf22f05d55253d1",
+  "schema": "github-repatriation.mapped-empty-directory-layout.v1",
+  "sources": [
+    {
+      "directories": [
+        {
+          "mode": 493,
+          "relative_path": ".cargo"
+        },
+        {
+          "mode": 493,
+          "relative_path": ".github"
+        },
+        {
+          "mode": 493,
+          "relative_path": ".github-before"
+        },
+        {
+          "mode": 493,
+          "relative_path": ".github-before/actions"
+        },
+        {
+          "mode": 493,
+          "relative_path": ".github-before/actions/u24"
+        },
+        {
+          "mode": 493,
+          "relative_path": ".github-before/actions/velnor-tool-seed"
+        },
+        {
+          "mode": 493,
+          "relative_path": ".github-before/actions/velnor-tools-cache-restore"
+        },
+        {
+          "mode": 493,
+          "relative_path": ".github-before/actions/velnor-tools-prelude-u24"
+        },
+        {
+          "mode": 493,
+          "relative_path": ".github-before/scripts"
+        },
+        {
+          "mode": 493,
+          "relative_path": ".github-before/workflows"
+        },
+        {
+          "mode": 493,
+          "relative_path": ".github/actions"
+        },
+        {
+          "mode": 493,
+          "relative_path": ".github/actions/u26"
+        },
+        {
+          "mode": 493,
+          "relative_path": ".github/actions/velnor-tool-seed"
+        },
+        {
+          "mode": 493,
+          "relative_path": ".github/actions/velnor-tools-cache-restore"
+        },
+        {
+          "mode": 493,
+          "relative_path": ".github/actions/velnor-tools-prelude-u26"
+        },
+        {
+          "mode": 493,
+          "relative_path": ".github/scripts"
+        },
+        {
+          "mode": 493,
+          "relative_path": ".github/workflows"
+        },
+        {
+          "mode": 493,
+          "relative_path": ".velnor"
+        },
+        {
+          "mode": 493,
+          "relative_path": "benches/results"
+        },
+        {
+          "mode": 493,
+          "relative_path": "docs"
+        },
+        {
+          "mode": 493,
+          "relative_path": "docs/workflows"
+        },
+        {
+          "mode": 493,
+          "relative_path": "fixtures"
+        },
+        {
+          "mode": 493,
+          "relative_path": "schemas"
+        },
+        {
+          "mode": 493,
+          "relative_path": "src/scheduler"
+        },
+        {
+          "mode": 493,
+          "relative_path": "tests/common"
+        },
+        {
+          "mode": 493,
+          "relative_path": "tests/data"
+        }
+      ],
+      "source_id": "6f8c328d2269c1d5dca20839"
+    }
+  ]
+}
