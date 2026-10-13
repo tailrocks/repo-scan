@@ -351,22 +351,26 @@ fn enumeration_batches_flush_at_first_limit() {
 }
 
 #[test]
-fn machine_root_plan_seeds_and_fair_schedules() {
-    use repo_scan::walk::roots::{plan_machine_roots, seed_roots, RootPlan, RootPriority};
+fn machine_root_plan_seeds_first_then_mounts() {
+    use repo_scan::walk::roots::{plan_machine_roots, seed_roots, RootPriority};
     let seeds = seed_roots();
     assert!(seeds.iter().any(|r| r.path.as_path() == Path::new("/tmp")));
     assert!(seeds.iter().all(|r| r.priority == RootPriority::Early));
     let planned = plan_machine_roots(&[]);
     assert!(planned.len() >= seeds.len());
-    // Round-robin: a large root cannot starve the others.
-    let mut plan = RootPlan::new(planned);
-    let n = plan.len();
-    assert!(n > 1);
-    let mut seen = BTreeSet::new();
-    for _ in 0..n {
-        seen.insert(plan.next().unwrap().path.clone());
-    }
-    assert_eq!(seen.len(), n, "every root visited once per cycle");
+    // Plan order is the schedule order: every seed precedes every mount
+    // (fairness across roots comes from FIFO claims over this order,
+    // pinned end-to-end by the multi-root no-starvation test).
+    let first_mount = planned
+        .iter()
+        .position(|r| r.priority == RootPriority::Normal)
+        .unwrap_or(planned.len());
+    assert!(
+        planned[..first_mount]
+            .iter()
+            .all(|r| r.priority == RootPriority::Early),
+        "seeds precede mounts"
+    );
 }
 
 fn fixture_task(id: &str, scope: &str) -> Task {

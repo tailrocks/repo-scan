@@ -379,6 +379,87 @@ pub const IDENTITY_IO_TIMEOUT: Duration = Duration::from_secs(1);
 /// no owner [`Admission`](crate::scheduler::admission::Admission) handle).
 static IDENTITY_IO_LIVE: AtomicUsize = AtomicUsize::new(0);
 
+/// Process-lifetime bounded identity-I/O calls (routing telemetry: every
+/// coordinator stat flows through [`bounded_identity_io`], so this
+/// advances once per resolve attempt whatever the outcome).
+static IDENTITY_IO_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Total bounded identity-I/O calls so far (see `IDENTITY_IO_CALLS`).
+pub fn identity_io_calls() -> u64 {
+    IDENTITY_IO_CALLS.load(Ordering::Relaxed) as u64
+}
+
+/// Canonicalize one scope path on the bounded identity-I/O lane. `None`
+/// means admission, timeout, or worker creation failed; callers that use
+/// canonical paths to commit invalidation must stop before their
+/// transaction so the event remains retryable.
+///
+/// This is the shared bounded canonicalizer (B11 shape) that
+/// `config::try_canonical_scope_path` wraps: slice 5 wires `config.rs`
+/// (and the SLICE-1 SHIM sites in `store::catalog`) onto this lane.
+pub fn bounded_canonicalize(path: &Path) -> Option<Result<PathBuf, std::io::ErrorKind>> {
+    let path = path.to_path_buf();
+    bounded_identity_io(move || path.canonicalize().map_err(|error| error.kind()))
+}
+
+/// Normalize a scope path without consulting the filesystem (lexical
+/// `.`/`..` collapse; B11 `config::normalize_scope_path` semantics). This
+/// is the deterministic fallback used when bounded root identity lookup
+/// cannot finish; symlinks remain distinct in that case, which may start
+/// a fresh generation but cannot reuse coverage under an unverified
+/// alias.
+///
+/// SLICE-W SHIM: the shared helper's final home is `crate::config`
+/// (slice 5, B11 shape); this walk-local copy keeps the roots/topology
+/// fallbacks identical until then.
+pub(crate) fn normalize_scope_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    let mut rooted = false;
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => {
+                rooted = true;
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    normalized.pop();
+                } else if !rooted {
+                    normalized.push("..");
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        normalized
+    }
+}
+
+/// Injected resolver seam for proving a stalled filesystem operation
+/// cannot hold the current-thread coordinator indefinitely.
+#[cfg(test)]
+fn bounded_canonicalize_with(
+    resolve: impl FnOnce() -> Option<PathBuf> + Send + 'static,
+) -> Option<PathBuf> {
+    // Keep this regression isolated from other unit tests that use the
+    // process-wide production budget in parallel. It still exercises the
+    // same admission and worker-lifetime logic with the production cap and
+    // timeouts.
+    IDENTITY_IO_CALLS.fetch_add(1, Ordering::Relaxed);
+    bounded_identity_io_on(&TEST_IDENTITY_IO_LIVE, resolve).flatten()
+}
+
+#[cfg(test)]
+static TEST_IDENTITY_IO_LIVE: AtomicUsize = AtomicUsize::new(0);
+
 /// Run blocking identity I/O (`canonicalize`/`metadata`) on a worker
 /// thread with bounded admission plus a timeout. `None` means the slot
 /// wait expired, the worker timed out, or the spawn failed: the caller
@@ -388,11 +469,25 @@ fn bounded_identity_io<T>(op: impl FnOnce() -> T + Send + 'static) -> Option<T>
 where
     T: Send + 'static,
 {
+    IDENTITY_IO_CALLS.fetch_add(1, Ordering::Relaxed);
+    bounded_identity_io_on(&IDENTITY_IO_LIVE, op)
+}
+
+/// Shared admission and timeout implementation. The test seam uses a
+/// private counter so parallel tests cannot consume part of the production
+/// process-wide cap while its assertions are running.
+fn bounded_identity_io_on<T>(
+    live_count: &'static AtomicUsize,
+    op: impl FnOnce() -> T + Send + 'static,
+) -> Option<T>
+where
+    T: Send + 'static,
+{
     let start = Instant::now();
     let admitted = loop {
-        let live = IDENTITY_IO_LIVE.load(Ordering::Relaxed);
+        let live = live_count.load(Ordering::Relaxed);
         if live < IDENTITY_IO_CAP
-            && IDENTITY_IO_LIVE
+            && live_count
                 .compare_exchange_weak(live, live + 1, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
         {
@@ -406,10 +501,10 @@ where
     if !admitted {
         return None;
     }
-    struct SlotGuard;
-    impl Drop for SlotGuard {
+    struct CountGuard(&'static AtomicUsize);
+    impl Drop for CountGuard {
         fn drop(&mut self) {
-            IDENTITY_IO_LIVE.fetch_sub(1, Ordering::Relaxed);
+            self.0.fetch_sub(1, Ordering::Relaxed);
         }
     }
     // R1: the permit is owned by the detached worker, not the caller.
@@ -423,7 +518,7 @@ where
     if std::thread::Builder::new()
         .name(String::from("identity-io"))
         .spawn({
-            let guard = SlotGuard;
+            let guard = CountGuard(live_count);
             move || {
                 let _held = guard;
                 let _ = tx.send(op());
@@ -436,16 +531,65 @@ where
     rx.recv_timeout(IDENTITY_IO_TIMEOUT).ok()
 }
 
+/// Canonical paths and owning-volume device numbers for a set of scan roots.
+/// The whole batch runs inside one admitted identity-I/O worker, so even a
+/// stalled network mount cannot block the coordinator's generation-key
+/// construction past the standard identity timeout. Failed identities are
+/// returned as `None` entries; callers must retain a safe lexical key.
+pub fn bounded_scope_identities(roots: &[PathBuf]) -> Option<Vec<(PathBuf, Option<u64>)>> {
+    let owned = roots.to_vec();
+    bounded_identity_io(move || {
+        owned
+            .iter()
+            .map(|root| {
+                // A failed canonicalization must not leave lexical aliases
+                // such as `unused/../missing` as distinct generation scopes.
+                // Keep the same deterministic lexical fallback used when the
+                // bounded identity worker itself cannot complete.
+                let canonical = root
+                    .canonicalize()
+                    .unwrap_or_else(|_| normalize_scope_path(root));
+                let dev = std::fs::metadata(&canonical)
+                    .ok()
+                    .map(|metadata| super::fs_entry_metadata(&metadata).dev);
+                (canonical, dev)
+            })
+            .collect()
+    })
+}
+
 /// Bounded physical identity for one coordinator path (R7 alias sharing:
-/// follows symlinks). `None` on stat failure: the caller persists
-/// unknown/gap instead of silently substituting a path-derived identity.
-/// Avoids spawning dedicated OS threads for simple path/identity checks (R07).
+/// follows symlinks). Runs through `bounded_identity_io` (cap-2
+/// admission plus a 1 s timeout): `None` on stat failure, slot refusal,
+/// or timeout — the caller persists unknown/gap instead of silently
+/// substituting a path-derived identity. A hung path never stalls the
+/// coordinator past the budget.
 #[cfg(unix)]
 pub fn bounded_dir_identity(path: &Path) -> Option<(u64, u64)> {
-    std::fs::metadata(path).ok().map(|md| {
-        let meta = super::fs_entry_metadata(&md);
-        (meta.dev, meta.ino)
+    let owned = path.to_path_buf();
+    bounded_identity_io(move || {
+        std::fs::metadata(&owned).ok().map(|md| {
+            let meta = super::fs_entry_metadata(&md);
+            (meta.dev, meta.ino)
+        })
     })
+    .flatten()
+}
+
+/// Bounded owning-volume device for one coordinator path (per-claim
+/// breaker keying). Like [`bounded_dir_identity`] but never follows
+/// symlinks (`symlink_metadata`): the link itself keys the breaker, so a
+/// hung link target cannot stall the resolve. `None` (stat failure,
+/// refusal, timeout) keys the shared `unknown` bucket.
+#[cfg(unix)]
+pub fn bounded_volume_dev(path: &Path) -> Option<u64> {
+    let owned = path.to_path_buf();
+    bounded_identity_io(move || {
+        std::fs::symlink_metadata(&owned)
+            .ok()
+            .map(|md| super::fs_entry_metadata(&md).dev)
+    })
+    .flatten()
 }
 
 /// Non-unix targets have no stable `(dev, ino)` identity, so coordinator
@@ -453,6 +597,13 @@ pub fn bounded_dir_identity(path: &Path) -> Option<(u64, u64)> {
 /// path-derived fallback that splits or shares tasks unpredictably).
 #[cfg(not(unix))]
 pub fn bounded_dir_identity(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// Non-unix twin of [`bounded_volume_dev`]: no stable device numbers,
+/// so breaker keying always lands in the shared `unknown` bucket.
+#[cfg(not(unix))]
+pub fn bounded_volume_dev(_path: &Path) -> Option<u64> {
     None
 }
 
@@ -1302,7 +1453,13 @@ mod tests {
     /// exceeding the cap), and the count drains once the workers exit.
     #[test]
     fn identity_io_timeout_abandons_wait_not_cap() {
-        let baseline = IDENTITY_IO_LIVE.load(Ordering::Relaxed);
+        // Private counter (TEST_IDENTITY_IO_LIVE): sibling lib tests run
+        // in parallel over the production IDENTITY_IO_LIVE budget, so
+        // baseline arithmetic against the shared counter flakes (their
+        // in-flight workers pollute the baseline and drain before the
+        // assertions below). The seam exercises the same admission and
+        // worker-lifetime logic with the production cap and timeouts.
+        let baseline = TEST_IDENTITY_IO_LIVE.load(Ordering::Relaxed);
         let mut releases = Vec::new();
         let mut callers = Vec::new();
         for _ in 0..IDENTITY_IO_CAP {
@@ -1310,10 +1467,10 @@ mod tests {
             let (release_tx, release_rx) = mpsc::channel::<()>();
             releases.push(release_tx);
             callers.push(std::thread::spawn(move || {
-                bounded_identity_io(move || {
+                bounded_canonicalize_with(move || {
                     let _ = started_tx.send(());
                     let _ = release_rx.recv();
-                    7u32
+                    Some(PathBuf::from("/resolved"))
                 })
             }));
             started_rx
@@ -1322,20 +1479,21 @@ mod tests {
         }
         // Both workers are blocked inside `op()` while their callers sit
         // in `recv_timeout`: the cap is fully charged.
-        assert!(IDENTITY_IO_LIVE.load(Ordering::Relaxed) >= baseline + IDENTITY_IO_CAP);
+        assert!(TEST_IDENTITY_IO_LIVE.load(Ordering::Relaxed) >= baseline + IDENTITY_IO_CAP);
         // Every caller abandons its wait at the timeout ...
         for caller in callers {
             assert_eq!(caller.join().expect("caller joins"), None);
         }
         // ... but the stalled workers still hold the cap (pre-fix code
         // dropped the caller-owned guard here and fell back to baseline).
-        assert!(IDENTITY_IO_LIVE.load(Ordering::Relaxed) >= baseline + IDENTITY_IO_CAP);
+        assert!(TEST_IDENTITY_IO_LIVE.load(Ordering::Relaxed) >= baseline + IDENTITY_IO_CAP);
         // Releasing the workers drains the cap back to baseline: no leak.
         drop(releases);
         let drain_by = Instant::now() + Duration::from_secs(10);
-        while IDENTITY_IO_LIVE.load(Ordering::Relaxed) != baseline && Instant::now() < drain_by {
+        while TEST_IDENTITY_IO_LIVE.load(Ordering::Relaxed) != baseline && Instant::now() < drain_by
+        {
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(IDENTITY_IO_LIVE.load(Ordering::Relaxed), baseline);
+        assert_eq!(TEST_IDENTITY_IO_LIVE.load(Ordering::Relaxed), baseline);
     }
 }
