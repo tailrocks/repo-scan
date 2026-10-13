@@ -643,191 +643,9 @@ struct PrePass {
     tasks_pending: u64,
 }
 
-// ---------------------------------------------------------------------------
-// SLICE-4 SHIM: scope-path identity helpers (B11 `config::*` shape).
-// The shared helpers belong to `crate::config` / `crate::walk::topology`
-// (`bounded_canonicalize`), owned by other slices; `store::catalog` carries
-// the same SLICE-1 SHIM copies. Once the config/walk slice lands them,
-// delete this block and call the shared functions. Until then these private
-// copies keep the same fail-closed contract without touching files owned by
-// other slices.
-// ---------------------------------------------------------------------------
-
-/// Normalize a scope path without consulting the filesystem (lexical
-/// `.`/`..` collapse). Deterministic fallback of
-/// [`try_canonical_scope_path`]; symlinks remain distinct under it.
-/// Ported from B11 `config::normalize_scope_path` (see the SLICE-4 SHIM
-/// note above).
-fn normalize_scope_path(path: &Path) -> PathBuf {
-    use std::path::Component;
-
-    let mut normalized = PathBuf::new();
-    let mut rooted = false;
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => {
-                rooted = true;
-                normalized.push(component.as_os_str());
-            }
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if matches!(
-                    normalized.components().next_back(),
-                    Some(Component::Normal(_))
-                ) {
-                    normalized.pop();
-                } else if !rooted {
-                    normalized.push("..");
-                }
-            }
-            Component::Normal(part) => normalized.push(part),
-        }
-    }
-    if normalized.as_os_str().is_empty() {
-        PathBuf::from(".")
-    } else {
-        normalized
-    }
-}
-
-/// Report-local identity-I/O budget (mirrors the coordinator's
-/// `IDENTITY_IO_*` bounds in `walk::topology` and the store's
-/// `STORE_IDENTITY_IO_*` shim in `store::catalog`): at most 2 concurrent
-/// resolves, a 1 s wait for a slot, and a 1 s timeout per resolve. Past
-/// either bound the resolve fails unknown (`None`) and the caller fails
-/// closed — the report lane never blocks indefinitely on a hung path.
-const REPORT_IDENTITY_IO_CAP: usize = 2;
-/// How long a resolve waits for an identity-I/O slot before failing unknown.
-const REPORT_IDENTITY_IO_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
-/// Timeout for one bounded identity resolve on its worker thread.
-const REPORT_IDENTITY_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// Live report identity-I/O workers (process-wide).
-static REPORT_IDENTITY_IO_LIVE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Run blocking identity I/O (`canonicalize`) on a worker thread with
-/// bounded admission plus a timeout. `None` means the slot wait expired,
-/// the worker timed out, or the spawn failed: the caller must treat the
-/// identity as unknown and fail closed. Same contract as the coordinator's
-/// worker in `walk::topology`; duplicated report-locally only until the
-/// shared helper lands (see SLICE-4 SHIM note above).
-fn report_bounded_identity_io<T>(op: impl FnOnce() -> T + Send + 'static) -> Option<T>
-where
-    T: Send + 'static,
-{
-    use std::sync::atomic::Ordering;
-
-    let start = std::time::Instant::now();
-    let admitted = loop {
-        let live = REPORT_IDENTITY_IO_LIVE.load(Ordering::Relaxed);
-        if live < REPORT_IDENTITY_IO_CAP
-            && REPORT_IDENTITY_IO_LIVE
-                .compare_exchange_weak(live, live + 1, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-        {
-            break true;
-        }
-        if start.elapsed() >= REPORT_IDENTITY_IO_SLOT_WAIT {
-            break false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    };
-    if !admitted {
-        return None;
-    }
-    struct SlotGuard;
-    impl Drop for SlotGuard {
-        fn drop(&mut self) {
-            REPORT_IDENTITY_IO_LIVE.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
-    // The permit is owned by the detached worker, not the caller: the
-    // live count covers the worker's full blocked lifetime, and
-    // `recv_timeout` abandons only the wait.
-    let (tx, rx) = std::sync::mpsc::channel();
-    if std::thread::Builder::new()
-        .name(String::from("report-identity-io"))
-        .spawn({
-            let guard = SlotGuard;
-            move || {
-                let _held = guard;
-                let _ = tx.send(op());
-            }
-        })
-        .is_err()
-    {
-        return None;
-    }
-    rx.recv_timeout(REPORT_IDENTITY_IO_TIMEOUT).ok()
-}
-
-/// Bounded form of scope-path canonicalization (B11
-/// `config::try_canonical_scope_path` shape): absolute paths resolve
-/// through a bounded identity-I/O worker (`canonicalize`, so symlink
-/// spellings collapse onto the physical path); relative paths keep their
-/// lexical spelling; a missing path falls back to the normalized lexical
-/// spelling (a missing path has no live alias to fan out). `None` means
-/// the identity could not be resolved within the admission/timeout
-/// limits — callers must treat the alias as unverified.
-fn try_canonical_scope_path(path: &Path) -> Option<PathBuf> {
-    if !path.is_absolute() {
-        return Some(path.to_path_buf());
-    }
-    let owned = path.to_path_buf();
-    match report_bounded_identity_io(move || {
-        std::fs::canonicalize(&owned).map_err(|error| error.kind())
-    }) {
-        Some(Ok(canonical)) => Some(canonical),
-        // A missing path has no live alias to fan out, so its normalized
-        // lexical spelling is a safe fallback. Other resolution failures
-        // and worker timeouts are unknown identities and fail closed.
-        Some(Err(std::io::ErrorKind::NotFound)) => Some(normalize_scope_path(path)),
-        Some(Err(_)) | None => None,
-    }
-}
-
-/// True when `path` is lexically at or below one of the explicit roots.
-/// Both sides normalize `.`/`..` without filesystem access, so this is
-/// safe for report filtering and remains component-boundary aware.
-/// Ported from B11 `config::path_is_within_roots` (SLICE-4 SHIM).
-fn path_is_within_roots(path: &Path, roots: &[PathBuf]) -> bool {
-    let path = normalize_scope_path(path);
-    roots
-        .iter()
-        .any(|root| path.starts_with(normalize_scope_path(root)))
-}
-
-/// Stable identity for report-derivation gaps attached to an explicit
-/// root set. Paths are normalized lexically, sorted, and deduplicated so
-/// root order does not create duplicate gap families. Ported from B11
-/// `config::report_derivation_gap_scope_key` (SLICE-4 SHIM).
-fn report_derivation_gap_scope_key(roots: Option<&[PathBuf]>) -> String {
-    let Some(roots) = roots else {
-        return String::from("gap:report-derivation");
-    };
-    use sha2::Digest;
-    let mut paths: Vec<Vec<u8>> = roots
-        .iter()
-        .map(|root| crate::config::path_as_bytes(&normalize_scope_path(root)))
-        .collect();
-    paths.sort();
-    paths.dedup();
-    let mut hasher = sha2::Sha256::new();
-    for path in paths {
-        hasher.update((path.len() as u64).to_be_bytes());
-        hasher.update(path);
-    }
-    format!(
-        "gap:report-derivation:roots:{}",
-        crate::config::encode_hex(&hasher.finalize())
-    )
-}
-
 fn report_path_in_roots(path_bytes: &[u8], roots: &[PathBuf]) -> bool {
     let path = crate::config::path_from_bytes(path_bytes.to_vec());
-    path_is_within_roots(&path, roots)
+    crate::config::path_is_within_roots(&path, roots)
 }
 
 /// Extend an explicit report scope with a currently observed root alias.
@@ -839,7 +657,7 @@ fn report_path_in_roots(path_bytes: &[u8], roots: &[PathBuf]) -> bool {
 fn extend_roots_with_verified_aliases(roots: &mut Vec<PathBuf>, aliases: &[AliasInput]) {
     let anchors: HashSet<PathBuf> = roots
         .iter()
-        .map(|root| normalize_scope_path(root))
+        .map(|root| crate::config::normalize_scope_path(root))
         .collect();
     for alias in aliases {
         if alias.kind != "same_object" {
@@ -847,8 +665,8 @@ fn extend_roots_with_verified_aliases(roots: &mut Vec<PathBuf>, aliases: &[Alias
         }
         let path = crate::config::path_from_bytes(alias.path_bytes.clone());
         let target = crate::config::path_from_bytes(alias.target_path_bytes.clone());
-        let path_key = normalize_scope_path(&path);
-        let target_key = normalize_scope_path(&target);
+        let path_key = crate::config::normalize_scope_path(&path);
+        let target_key = crate::config::normalize_scope_path(&target);
         let counterpart = if anchors.contains(&path_key) {
             &target
         } else if anchors.contains(&target_key) {
@@ -857,18 +675,18 @@ fn extend_roots_with_verified_aliases(roots: &mut Vec<PathBuf>, aliases: &[Alias
             continue;
         };
         let (Some(path_identity), Some(target_identity)) = (
-            try_canonical_scope_path(&path),
-            try_canonical_scope_path(&target),
+            crate::config::try_canonical_scope_path(&path),
+            crate::config::try_canonical_scope_path(&target),
         ) else {
             continue;
         };
         if path_identity != target_identity {
             continue;
         }
-        let counterpart_key = normalize_scope_path(counterpart);
+        let counterpart_key = crate::config::normalize_scope_path(counterpart);
         if !roots
             .iter()
-            .any(|root| normalize_scope_path(root) == counterpart_key)
+            .any(|root| crate::config::normalize_scope_path(root) == counterpart_key)
         {
             roots.push(counterpart.clone());
         }
@@ -887,11 +705,12 @@ fn report_error_in_scope(
     };
     match crate::config::parse_scope_key(scope_key) {
         Some(crate::config::ScopeRef::Dir(path) | crate::config::ScopeRef::Git(path)) => {
-            path_is_within_roots(&path, roots)
+            crate::config::path_is_within_roots(&path, roots)
         }
         Some(crate::config::ScopeRef::Status(checkout_id)) => checkouts.contains_key(&checkout_id),
         None => {
-            scope_key == report_derivation_gap_scope_key(identity_roots.or(Some(roots)))
+            scope_key
+                == crate::config::report_derivation_gap_scope_key(identity_roots.or(Some(roots)))
                 || scope_key
                     .strip_prefix("volume:")
                     .is_some_and(|id| volumes.contains(id))
@@ -949,8 +768,8 @@ async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Res
             // builder resolves the same identity through the bounded
             // canonicalizer here. Unresolvable identity keeps the
             // requested spelling (lexical scoping stays honest).
-            let identity =
-                try_canonical_scope_path(&requested).unwrap_or_else(|| requested.clone());
+            let identity = crate::config::try_canonical_scope_path(&requested)
+                .unwrap_or_else(|| requested.clone());
             if !roots.contains(&requested) {
                 roots.push(requested);
             }

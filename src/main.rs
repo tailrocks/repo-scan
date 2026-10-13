@@ -1628,7 +1628,9 @@ async fn scan_failure_tail(
     report_id: &str,
     snapshot_path: &Path,
     resolved: repo_scan::cli::OutputFormat,
-    err: &str,
+    // The payload stays path-free (C3/ADJ-03): the JSON arm carries the
+    // redacted-detail constant, so the raw error text never serializes.
+    _err: &str,
 ) -> repo_scan::Result<ExitCode> {
     use repo_scan::cli::OutputFormat;
     if resolved == OutputFormat::Jsonl {
@@ -8721,6 +8723,7 @@ fn fallback_status_counts(
         staged: Some(staged),
         unstaged: Some(unstaged),
         untracked: Some(untracked),
+        conflicts: None,
         // F-note1: the fallback spawn runs under the same empty
         // global/system config isolation as the gix path, so it carries
         // the same inspected-scope declaration.
