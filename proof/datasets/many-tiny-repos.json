@@ -8,12 +8,26 @@
   },
   "id": "many-tiny-repos",
   "manifest_schema": "repo-scan/dataset-manifest/1",
-  "notes": "pilot-calibration placeholder scale; frozen after the baseline-only pilot.",
+  "notes": "scale = final target, still pending baseline-pilot calibration; scale_pilot = M5-Max pilot measurable in seconds; scale_smoke = CI smoke.",
   "scale": {
     "commits_per_repo": 1,
     "files_per_repo": 3,
     "remotes_per_repo": 1,
     "repos": 2000,
+    "roots": 1
+  },
+  "scale_pilot": {
+    "commits_per_repo": 1,
+    "files_per_repo": 3,
+    "remotes_per_repo": 1,
+    "repos": 40,
+    "roots": 1
+  },
+  "scale_smoke": {
+    "commits_per_repo": 1,
+    "files_per_repo": 3,
+    "remotes_per_repo": 1,
+    "repos": 4,
     "roots": 1
   },
   "schema": "repo-scan/dataset-recipe/1",

@@ -1,6 +1,6 @@
 {
   "expected_graph": {
-    "description": "64 independent clones sharing one identical remote URL and one bare upstream.",
+    "description": "64 independent clones sharing one identical remote URL and one bare upstream (seeded locally, pushed, scratch removed).",
     "invariants": [
       "all 64 clones remain distinct logical identities",
       "equal remotes never merge clones"
@@ -8,9 +8,21 @@
   },
   "id": "independent-clones",
   "manifest_schema": "repo-scan/dataset-manifest/1",
-  "notes": "pilot-calibration placeholder scale; frozen after the baseline-only pilot.",
+  "notes": "scale = final target, still pending baseline-pilot calibration; scale_pilot = M5-Max pilot measurable in seconds; scale_smoke = CI smoke.",
   "scale": {
     "clones": 64,
+    "identical_remote_url": true,
+    "roots": 1,
+    "upstream_bare_repos": 1
+  },
+  "scale_pilot": {
+    "clones": 6,
+    "identical_remote_url": true,
+    "roots": 1,
+    "upstream_bare_repos": 1
+  },
+  "scale_smoke": {
+    "clones": 2,
     "identical_remote_url": true,
     "roots": 1,
     "upstream_bare_repos": 1

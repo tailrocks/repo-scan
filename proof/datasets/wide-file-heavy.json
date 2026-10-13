@@ -1,22 +1,44 @@
 {
   "expected_graph": {
-    "description": "200 wide directories with 500 regular files each; 25 repositories distributed across the tree.",
+    "description": "200 wide directories with 500 regular files each; 25 repositories distributed across the tree; a small set of non-UTF-8 ordinary names under wide/nonutf8 (unix).",
     "invariants": [
       "every repository discovered exactly once",
-      "no ordinary file produces catalog rows"
+      "no ordinary file produces catalog rows",
+      "non-UTF-8 names surface losslessly (manifest path_b64)"
     ]
   },
   "id": "wide-file-heavy",
   "manifest_schema": "repo-scan/dataset-manifest/1",
-  "notes": "pilot-calibration placeholder scale; frozen after the baseline-only pilot.",
+  "notes": "scale = final target, still pending baseline-pilot calibration; scale_pilot = M5-Max pilot measurable in seconds; scale_smoke = CI smoke.",
   "scale": {
     "dirs": 200,
     "files_per_dir": 500,
     "max_depth": 3,
+    "non_utf8_entries": 64,
     "refs_per_repo": 5,
     "repos": 25,
     "roots": 1,
     "total_files": 100000
+  },
+  "scale_pilot": {
+    "dirs": 40,
+    "files_per_dir": 100,
+    "max_depth": 3,
+    "non_utf8_entries": 4,
+    "refs_per_repo": 3,
+    "repos": 5,
+    "roots": 1,
+    "total_files": 4000
+  },
+  "scale_smoke": {
+    "dirs": 6,
+    "files_per_dir": 8,
+    "max_depth": 2,
+    "non_utf8_entries": 1,
+    "refs_per_repo": 2,
+    "repos": 2,
+    "roots": 1,
+    "total_files": 48
   },
   "schema": "repo-scan/dataset-recipe/1",
   "seed": 910001,

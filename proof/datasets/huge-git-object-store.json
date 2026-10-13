@@ -8,12 +8,28 @@
   },
   "id": "huge-git-object-store",
   "manifest_schema": "repo-scan/dataset-manifest/1",
-  "notes": "pilot-calibration placeholder scale; frozen after the baseline-only pilot.",
+  "notes": "scale = final target, still pending baseline-pilot calibration; scale_pilot = M5-Max pilot measurable in seconds; scale_smoke = CI smoke. Loose objects are dangling blobs written via batched git hash-object; packs via git pack-objects with loose sources removed.",
   "scale": {
     "loose_objects": 200000,
     "pack_bytes_approx": 2000000000,
     "packfiles": 12,
     "refs": 50,
+    "repos": 1,
+    "roots": 1
+  },
+  "scale_pilot": {
+    "loose_objects": 4000,
+    "pack_bytes_approx": 200000,
+    "packfiles": 2,
+    "refs": 8,
+    "repos": 1,
+    "roots": 1
+  },
+  "scale_smoke": {
+    "loose_objects": 128,
+    "pack_bytes_approx": 8192,
+    "packfiles": 1,
+    "refs": 3,
     "repos": 1,
     "roots": 1
   },
