@@ -35,6 +35,61 @@ run on `ubuntu-24.04`:
 `publish-baseline` publishes CI baseline data, not a `repo-scan` executable.
 The Rust job has no binary packaging or release step.
 
+## xtask proof tasks
+
+`mise.toml` declares two repository tasks around the `xtask` proof runner
+(see `xtask/README.md` for the subcommand contract):
+
+| Task | Command | Purpose |
+| --- | --- | --- |
+| `proof-inventory` | `cargo run --locked -p xtask -- proof inventory` | Validate `proof/sources.lock.json` against the live repository; exits nonzero when source refs drift. |
+| `proof-selftest` | `cargo test --locked -p xtask` | Run the xtask black-box integration tests, including the corrupt-bundle negative controls. |
+
+Both are intended as PR gates but are not yet wired into the generated
+workflow; see "Proof-task CI wiring state" below.
+
+`proof red` is deliberately not a gate: it exits 1 while any requirement has
+empty `green_evidence`, and pending requirements are the expected state during
+consolidation, so gating on it would fail every pull request by design.
+`proof evaluate` is not a gate either: it verifies recorded run directories
+under `proof-out/` (baseline/benchmark/integration outputs), which per-commit
+CI does not produce.
+
+## Proof-task CI wiring state
+
+Wiring is blocked on generator support in the pinned Velnor Actions 0.1.4
+release:
+
+- The `[stacks.rust] custom_tasks` key shown in this repository's
+  `.velnor/config.toml` comments is not implemented by the released 0.1.4
+  binary: it is rejected as `unknown_config_field` under both config schema 1
+  and schema 2, does not appear in the binary's strings, and the binary's own
+  `init` template instead warns "Do not put free-form Mise commands in
+  credential-bearing Rust jobs."
+- The mechanism 0.1.4 does accept — `[[workflow.tasks]]` entries of
+  `kind = "verification"` with `mise_task` — fails closed during `generate`
+  in this repository: verification jobs are emitted with the generator's
+  `ubuntu-26.04` default runner while this repository pins
+  `runner_label = "ubuntu-24.04"`, and the generated actionlint configuration
+  registers only `ubuntu-24.04`, so actionlint validation rejects the output.
+  No 0.1.4 config key retargets verification-task runners (`runner` accepts
+  only `linux-x64` or `macos-arm64`).
+
+Separately, regeneration from the current configuration already drifts: the
+Rust detector now finds the `xtask` workspace crate, so `generate` adds a
+`rust-xtask` job (format, Clippy, tests, documentation, on `ubuntu-24.04`)
+and adds it to the `Required` job's `needs`. The committed `ci.yml` predates
+the `xtask` crate. That regeneration is generator-correct, and its xtask test
+step (`cargo test --locked --offline --manifest-path xtask/Cargo.toml`)
+already covers `proof-selftest`; `proof-inventory` still has no CI home in
+0.1.4. `.github/workflows/` is generator-owned, so the regeneration is
+tracked outside this change.
+
+A native macOS CI job remains blocked on Velnor macOS runner support (a
+generator change, not a repository edit — the plan gate fails closed on
+hand-edited workflows and retires unmanaged files); see the consolidation CI
+research notes (`repo-scan-proof/analysis/ci/README.md`, 2026-10-13).
+
 ## Binary release state
 
 The published Velnor Actions 0.1.4 release does not emit a consumer-selectable
