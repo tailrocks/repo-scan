@@ -22,12 +22,18 @@ use repo_scan::report::builder::{
     validate_bound_staged_report_id_capped, AliasInput, ArtifactInput, CandidateInput,
     ReportInputs as LibReportInputs, ReportPipeline, RootInput, StorageLinkInput,
 };
-use repo_scan::scan_events::{is_terminal_event, Cursor, Envelope, EventType, Op};
-use repo_scan::scheduler::{backoff_for_attempt, Admission, CircuitBreaker, OpClass};
+use repo_scan::scan_events::{
+    classify_cursor, is_progress_coalescible, is_terminal_event, is_terminal_name,
+    retention_cutoff, Cursor, Envelope, EventType, Op, ResumeAction, MAX_RETAINED_SCAN_EVENTS,
+};
+use repo_scan::scheduler::{backoff_for_attempt, Admission, CircuitBreaker, OpClass, Permit};
+#[cfg(test)]
+use repo_scan::store::FrontierTask;
 use repo_scan::store::{
-    self, CheckpointCoordinator, CheckpointPolicy, ClaimedTask, CompletionDelta, NewCheckout,
-    NewGitInstance, NewRef, NewRemote, NewScan, NewScanEvent, NewStatus, NewTask, NewVolume,
-    OwnerGuard, ScanEventRow, Store, TaskOutcome, TursoStore, WriterBatch,
+    self, CheckpointCoordinator, CheckpointPolicy, ClaimedTask, CompletionDelta, CompletionGap,
+    NewCheckout, NewGitInstance, NewRef, NewRemote, NewRemoteRefresh, NewScan, NewScanEvent,
+    NewStatus, NewTask, NewVolume, OwnerGuard, ScanEventRow, Store, TaskOutcome, TursoStore,
+    WriterBatch,
 };
 use repo_scan::telemetry::{live_helper_rss_bytes, FootprintSampler, SamplerInputs};
 use repo_scan::walk::roots::{plan_machine_roots, PlannedRoot, RootPriority};
@@ -39,8 +45,10 @@ use repo_scan::walk::{ChildKind, ListOptions, WalkItem};
 use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::Mutex;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Set by the SIGINT handler; the scan loop polls it between tasks and
@@ -52,6 +60,61 @@ const KIND_ENUM: &str = "enumerate_dir";
 const KIND_PROBE: &str = "probe_git";
 const KIND_STATUS: &str = "status";
 const KIND_RECONCILE: &str = "reconcile";
+const KIND_ANALYZE: &str = "analyze_store";
+
+/// Drain phase (goal Step 8): discovery claims enumeration, probes,
+/// and reconciliation only; analysis kinds (`status`, `analyze_store`)
+/// wait for the post-`inventory_ready` drain. Enqueue sites stay
+/// unrestricted — execution is gated at claim time, so pre-boundary
+/// enqueues (probe-scheduled status/analysis) simply wait their turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainPhase {
+    Discovery,
+    Analysis,
+}
+
+/// Step 8 order proof (D3): set once the generation's `inventory_ready`
+/// commits. Analysis read entries ([`observed_refs`], [`observed_head`],
+/// [`compute_branch_comparisons`], [`collect_status_reads`]) audit
+/// against it — any start while the boundary is open counts in
+/// [`PRE_BOUNDARY_ANALYSIS_READS`] and the terminal payload carries the
+/// total, so case 12 asserts on read starts, not journal order alone.
+/// Process-lifetime is scan-lifetime (one command per process); resume
+/// is a fresh process with a fresh boundary.
+static BOUNDARY_CLOSED: AtomicBool = AtomicBool::new(false);
+/// Analysis reads started before `inventory_ready` committed (must stay
+/// zero; see [`BOUNDARY_CLOSED`]).
+static PRE_BOUNDARY_ANALYSIS_READS: AtomicU64 = AtomicU64::new(0);
+
+/// Audit one analysis read start against the Step 8 boundary: counts
+/// (and loudly reports) starts while the boundary is still open. Called
+/// at the entry of every analysis read — refs, head, graph comparison,
+/// and status takes — which all run behind the Analysis drain gate.
+fn audit_analysis_read_start(site: &'static str) {
+    if !BOUNDARY_CLOSED.load(Ordering::SeqCst) {
+        PRE_BOUNDARY_ANALYSIS_READS.fetch_add(1, Ordering::SeqCst);
+        eprintln!(
+            "repo-scan: boundary violation: analysis read ({site}) started before inventory_ready"
+        );
+    }
+}
+
+/// Terminal-payload boundary audit value (D4): total pre-boundary
+/// analysis read starts (zero on every healthy scan).
+fn boundary_audit_value() -> serde_json::Value {
+    serde_json::json!({
+        "pre_boundary_analysis_reads": PRE_BOUNDARY_ANALYSIS_READS.load(Ordering::SeqCst),
+    })
+}
+
+impl DrainPhase {
+    fn kinds(self) -> &'static [&'static str] {
+        match self {
+            DrainPhase::Discovery => &[KIND_ENUM, KIND_PROBE, KIND_RECONCILE],
+            DrainPhase::Analysis => &[KIND_ANALYZE, KIND_STATUS],
+        }
+    }
+}
 
 /// Tasks claimed per scheduler round (far below the 1,024 prefetch cap).
 const CLAIM_BATCH: usize = 16;
@@ -171,7 +234,12 @@ fn dispatch() -> ExitCode {
     };
     // Single-threaded owner: no backend thread pool can bypass the §5
     // admission gates, and all database work stays on this one context.
-    let rt = match tokio::runtime::Builder::new_current_thread().build() {
+    // All drivers on: the pooled drain needs the timer (renewal ticks)
+    // and the blocking pool (worker threads).
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => {
             return fail(&repo_scan::Error::Store(format!(
@@ -197,7 +265,11 @@ fn dispatch() -> ExitCode {
 /// input echoed by validation, git/config paths), and terminal
 /// diagnostics must never emit them raw.
 fn fail(e: &repo_scan::Error) -> ExitCode {
-    eprintln!("repo-scan: error: {}", identity::scrub_text(&e.to_string()));
+    let scrubbed = identity::scrub_text(&e.to_string());
+    eprintln!(
+        "repo-scan: error: {}",
+        repo_scan::report::encode::escape_display(&scrubbed)
+    );
     e.exit_code()
 }
 
@@ -261,7 +333,7 @@ fn acquire_guard_with(
                     return Err(repo_scan::Error::OwnerBusy(format!(
                         "another repo-scan owner holds {} (waited {} ms); \
                          refusing to open the database independently",
-                        store::owner::lock_path(state_dir).display(),
+                        safe_path_display(&store::owner::lock_path(state_dir)),
                         config::OWNER_WAIT_MAX_MS,
                     )));
                 }
@@ -410,6 +482,16 @@ fn escape_display(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Credential-scrub and control-escape a local path before human output.
+fn safe_path_display(path: &Path) -> String {
+    safe_human_text(&path.display().to_string())
+}
+
+fn safe_human_text(text: &str) -> String {
+    let scrubbed = identity::scrub_text(text);
+    repo_scan::report::encode::escape_display(&scrubbed)
+}
+
 fn status_mode_str(mode: StatusMode) -> &'static str {
     match mode {
         StatusMode::Metadata => "metadata",
@@ -442,10 +524,14 @@ fn output_format_from_str(text: &str) -> Option<repo_scan::cli::OutputFormat> {
 /// wired only for `query --scan`; refuse loudly instead of silently
 /// ignoring the flag (mirrors the `query --scan` stub).
 fn refuse_unwired_format(command: &str, format: repo_scan::cli::OutputFormat) -> ExitCode {
+    let format_name = match format {
+        repo_scan::cli::OutputFormat::Human => "human",
+        repo_scan::cli::OutputFormat::Json => "json",
+        repo_scan::cli::OutputFormat::Jsonl => "jsonl",
+    };
     eprintln!(
-        "repo-scan: not yet implemented: {command} --format {} executes in the live-outputs \
-         slice; omit --format (or use `--format human`) for now",
-        format.name()
+        "repo-scan: not yet implemented: {command} --format {format_name} executes in the \
+         live-outputs slice; omit --format (or use `--format human`) for now"
     );
     ExitCode::OperationalFailure
 }
@@ -1365,7 +1451,11 @@ async fn run_scan_inner(
             }).collect::<Vec<_>>(),
             "options": {
                 "all": resolved.all,
-                "format": args.format.map(repo_scan::cli::OutputFormat::name),
+                "format": args.format.map(|f| match f {
+                    repo_scan::cli::OutputFormat::Human => "human",
+                    repo_scan::cli::OutputFormat::Json => "json",
+                    repo_scan::cli::OutputFormat::Jsonl => "jsonl",
+                }),
                 "status": format!("{:?}", args.status),
                 "force_rescan": args.force_rescan,
                 "fetch": args.fetch,
@@ -1806,7 +1896,11 @@ async fn run_scan_inner(
                 },
                 "options": {
                     "all": resolved.all,
-                    "format": args.format.map(repo_scan::cli::OutputFormat::name),
+                    "format": args.format.map(|f| match f {
+                        repo_scan::cli::OutputFormat::Human => "human",
+                        repo_scan::cli::OutputFormat::Json => "json",
+                        repo_scan::cli::OutputFormat::Jsonl => "jsonl",
+                    }),
                     "status": format!("{:?}", args.status),
                     "force_rescan": args.force_rescan,
                     "fetch": args.fetch,
@@ -2090,7 +2184,11 @@ async fn mint_scan_id(
             .collect::<Vec<_>>(),
     )
     .map_err(|e| repo_scan::Error::Report(e.to_string()))?;
-    let format_str = format.map(repo_scan::cli::OutputFormat::name);
+    let format_str = format.map(|f| match f {
+        repo_scan::cli::OutputFormat::Human => "human",
+        repo_scan::cli::OutputFormat::Json => "json",
+        repo_scan::cli::OutputFormat::Jsonl => "jsonl",
+    });
     for _ in 0..3 {
         let id = config::new_scan_id();
         let inserted = store
@@ -10027,6 +10125,7 @@ async fn continue_saved_scan(
         format,
         fetch: false,
         color: None,
+        workers: None,
     };
     run_scan_inner(
         cfg,
