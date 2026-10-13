@@ -24,9 +24,9 @@ use crate::report::encode::{
     oid_hex_from_bytes,
 };
 use crate::report::model::{
-    Alias, Branch, Candidate, Checkout, Coverage, ErrorRecord, GeneratedArtifact, Head, ObjectId,
-    PathRecord, Remote, Report, Repository, Resources, Root, Scan, ScanTarget, Status, StorageLink,
-    Tool, Volume,
+    Alias, AnalysisTotals, Branch, Candidate, Checkout, Coverage, ErrorRecord, GeneratedArtifact,
+    Group, Head, ObjectId, PathRecord, Remote, RemoteRefresh, Report, Repository, Resources, Root,
+    Scan, ScanTarget, Status, StorageLink, Tool, Totals, Volume,
 };
 use crate::report::publish::{
     check_report_id, check_staged_memory_budget, check_streaming_measurement_memory_budget,
@@ -183,6 +183,8 @@ pub struct StreamStats {
     pub stub_volumes: u64,
     pub paths: u64,
     pub roots: u64,
+    pub groups: u64,
+    pub accounts: u64,
     pub repositories: u64,
     pub checkouts: u64,
     pub branches: u64,
@@ -253,6 +255,19 @@ fn opt_blob(row: &turso::Row, idx: usize) -> crate::Result<Option<Vec<u8>>> {
         turso::Value::Blob(value) => Ok(Some(value)),
         other => Err(Error::Store(format!(
             "report: column {idx} expected BLOB or NULL, got {other:?}"
+        ))),
+    }
+}
+
+/// Nullable count column (`refs.ahead`/`refs.behind`, report 1.4.0):
+/// NULL reads `None`; a negative stored value is catalog corruption
+/// and fails loudly instead of wrapping.
+fn opt_count(row: &turso::Row, idx: usize, what: &str) -> crate::Result<Option<u64>> {
+    match opt_i64(row, idx)? {
+        None => Ok(None),
+        Some(value) if value >= 0 => Ok(Some(value as u64)),
+        Some(value) => Err(Error::Store(format!(
+            "report: refs {what} {value} is negative: catalog corruption"
         ))),
     }
 }
@@ -609,16 +624,348 @@ async fn row_exists(
 /// paths) are complete.
 struct PrePass {
     included_repos: HashSet<String>,
+    included_groups: HashSet<String>,
+    /// Explicit roots carried by this snapshot; `None` means machine scope.
+    scope_roots: Option<Vec<PathBuf>>,
+    /// Canonical roots used only to identify this request's derivation gap.
+    scope_identity_roots: Option<Vec<PathBuf>>,
     unresolvable_repo: bool,
     checkout_repos: HashMap<String, String>,
     statuses: HashMap<String, Status>,
+    /// Latest `--fetch` attempt per (store id, remote name bytes),
+    /// scoped to emitted repositories (report 1.2.0).
+    refreshes: HashMap<(String, Vec<u8>), RemoteRefresh>,
+    included_volumes: HashSet<String>,
+    scope_volumes: HashSet<String>,
     stub_volumes: Vec<String>,
     interner: PathInterner,
     open_errors: u64,
     tasks_pending: u64,
 }
 
+// ---------------------------------------------------------------------------
+// SLICE-4 SHIM: scope-path identity helpers (B11 `config::*` shape).
+// The shared helpers belong to `crate::config` / `crate::walk::topology`
+// (`bounded_canonicalize`), owned by other slices; `store::catalog` carries
+// the same SLICE-1 SHIM copies. Once the config/walk slice lands them,
+// delete this block and call the shared functions. Until then these private
+// copies keep the same fail-closed contract without touching files owned by
+// other slices.
+// ---------------------------------------------------------------------------
+
+/// Normalize a scope path without consulting the filesystem (lexical
+/// `.`/`..` collapse). Deterministic fallback of
+/// [`try_canonical_scope_path`]; symlinks remain distinct under it.
+/// Ported from B11 `config::normalize_scope_path` (see the SLICE-4 SHIM
+/// note above).
+fn normalize_scope_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    let mut rooted = false;
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => {
+                rooted = true;
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    normalized.pop();
+                } else if !rooted {
+                    normalized.push("..");
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        normalized
+    }
+}
+
+/// Report-local identity-I/O budget (mirrors the coordinator's
+/// `IDENTITY_IO_*` bounds in `walk::topology` and the store's
+/// `STORE_IDENTITY_IO_*` shim in `store::catalog`): at most 2 concurrent
+/// resolves, a 1 s wait for a slot, and a 1 s timeout per resolve. Past
+/// either bound the resolve fails unknown (`None`) and the caller fails
+/// closed — the report lane never blocks indefinitely on a hung path.
+const REPORT_IDENTITY_IO_CAP: usize = 2;
+/// How long a resolve waits for an identity-I/O slot before failing unknown.
+const REPORT_IDENTITY_IO_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+/// Timeout for one bounded identity resolve on its worker thread.
+const REPORT_IDENTITY_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Live report identity-I/O workers (process-wide).
+static REPORT_IDENTITY_IO_LIVE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Run blocking identity I/O (`canonicalize`) on a worker thread with
+/// bounded admission plus a timeout. `None` means the slot wait expired,
+/// the worker timed out, or the spawn failed: the caller must treat the
+/// identity as unknown and fail closed. Same contract as the coordinator's
+/// worker in `walk::topology`; duplicated report-locally only until the
+/// shared helper lands (see SLICE-4 SHIM note above).
+fn report_bounded_identity_io<T>(op: impl FnOnce() -> T + Send + 'static) -> Option<T>
+where
+    T: Send + 'static,
+{
+    use std::sync::atomic::Ordering;
+
+    let start = std::time::Instant::now();
+    let admitted = loop {
+        let live = REPORT_IDENTITY_IO_LIVE.load(Ordering::Relaxed);
+        if live < REPORT_IDENTITY_IO_CAP
+            && REPORT_IDENTITY_IO_LIVE
+                .compare_exchange_weak(live, live + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            break true;
+        }
+        if start.elapsed() >= REPORT_IDENTITY_IO_SLOT_WAIT {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    if !admitted {
+        return None;
+    }
+    struct SlotGuard;
+    impl Drop for SlotGuard {
+        fn drop(&mut self) {
+            REPORT_IDENTITY_IO_LIVE.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    // The permit is owned by the detached worker, not the caller: the
+    // live count covers the worker's full blocked lifetime, and
+    // `recv_timeout` abandons only the wait.
+    let (tx, rx) = std::sync::mpsc::channel();
+    if std::thread::Builder::new()
+        .name(String::from("report-identity-io"))
+        .spawn({
+            let guard = SlotGuard;
+            move || {
+                let _held = guard;
+                let _ = tx.send(op());
+            }
+        })
+        .is_err()
+    {
+        return None;
+    }
+    rx.recv_timeout(REPORT_IDENTITY_IO_TIMEOUT).ok()
+}
+
+/// Bounded form of scope-path canonicalization (B11
+/// `config::try_canonical_scope_path` shape): absolute paths resolve
+/// through a bounded identity-I/O worker (`canonicalize`, so symlink
+/// spellings collapse onto the physical path); relative paths keep their
+/// lexical spelling; a missing path falls back to the normalized lexical
+/// spelling (a missing path has no live alias to fan out). `None` means
+/// the identity could not be resolved within the admission/timeout
+/// limits — callers must treat the alias as unverified.
+fn try_canonical_scope_path(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return Some(path.to_path_buf());
+    }
+    let owned = path.to_path_buf();
+    match report_bounded_identity_io(move || {
+        std::fs::canonicalize(&owned).map_err(|error| error.kind())
+    }) {
+        Some(Ok(canonical)) => Some(canonical),
+        // A missing path has no live alias to fan out, so its normalized
+        // lexical spelling is a safe fallback. Other resolution failures
+        // and worker timeouts are unknown identities and fail closed.
+        Some(Err(std::io::ErrorKind::NotFound)) => Some(normalize_scope_path(path)),
+        Some(Err(_)) | None => None,
+    }
+}
+
+/// True when `path` is lexically at or below one of the explicit roots.
+/// Both sides normalize `.`/`..` without filesystem access, so this is
+/// safe for report filtering and remains component-boundary aware.
+/// Ported from B11 `config::path_is_within_roots` (SLICE-4 SHIM).
+fn path_is_within_roots(path: &Path, roots: &[PathBuf]) -> bool {
+    let path = normalize_scope_path(path);
+    roots
+        .iter()
+        .any(|root| path.starts_with(normalize_scope_path(root)))
+}
+
+/// Stable identity for report-derivation gaps attached to an explicit
+/// root set. Paths are normalized lexically, sorted, and deduplicated so
+/// root order does not create duplicate gap families. Ported from B11
+/// `config::report_derivation_gap_scope_key` (SLICE-4 SHIM).
+fn report_derivation_gap_scope_key(roots: Option<&[PathBuf]>) -> String {
+    let Some(roots) = roots else {
+        return String::from("gap:report-derivation");
+    };
+    use sha2::Digest;
+    let mut paths: Vec<Vec<u8>> = roots
+        .iter()
+        .map(|root| crate::config::path_as_bytes(&normalize_scope_path(root)))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    let mut hasher = sha2::Sha256::new();
+    for path in paths {
+        hasher.update((path.len() as u64).to_be_bytes());
+        hasher.update(path);
+    }
+    format!(
+        "gap:report-derivation:roots:{}",
+        crate::config::encode_hex(&hasher.finalize())
+    )
+}
+
+fn report_path_in_roots(path_bytes: &[u8], roots: &[PathBuf]) -> bool {
+    let path = crate::config::path_from_bytes(path_bytes.to_vec());
+    path_is_within_roots(&path, roots)
+}
+
+/// Extend an explicit report scope with a currently observed root alias.
+/// Alias records are report evidence, but only a same-object edge that
+/// touches an exact requested/identity root can extend scope. Re-resolve
+/// both endpoints through the bounded canonicalizer before trusting the
+/// persisted counterpart path; this rejects stale aliases and never
+/// promotes a nested symlink target into the whole report scope.
+fn extend_roots_with_verified_aliases(roots: &mut Vec<PathBuf>, aliases: &[AliasInput]) {
+    let anchors: HashSet<PathBuf> = roots
+        .iter()
+        .map(|root| normalize_scope_path(root))
+        .collect();
+    for alias in aliases {
+        if alias.kind != "same_object" {
+            continue;
+        }
+        let path = crate::config::path_from_bytes(alias.path_bytes.clone());
+        let target = crate::config::path_from_bytes(alias.target_path_bytes.clone());
+        let path_key = normalize_scope_path(&path);
+        let target_key = normalize_scope_path(&target);
+        let counterpart = if anchors.contains(&path_key) {
+            &target
+        } else if anchors.contains(&target_key) {
+            &path
+        } else {
+            continue;
+        };
+        let (Some(path_identity), Some(target_identity)) = (
+            try_canonical_scope_path(&path),
+            try_canonical_scope_path(&target),
+        ) else {
+            continue;
+        };
+        if path_identity != target_identity {
+            continue;
+        }
+        let counterpart_key = normalize_scope_path(counterpart);
+        if !roots
+            .iter()
+            .any(|root| normalize_scope_path(root) == counterpart_key)
+        {
+            roots.push(counterpart.clone());
+        }
+    }
+}
+
+fn report_error_in_scope(
+    scope_key: &str,
+    roots: Option<&[PathBuf]>,
+    identity_roots: Option<&[PathBuf]>,
+    checkouts: &HashMap<String, String>,
+    volumes: &HashSet<String>,
+) -> bool {
+    let Some(roots) = roots else {
+        return true;
+    };
+    match crate::config::parse_scope_key(scope_key) {
+        Some(crate::config::ScopeRef::Dir(path) | crate::config::ScopeRef::Git(path)) => {
+            path_is_within_roots(&path, roots)
+        }
+        Some(crate::config::ScopeRef::Status(checkout_id)) => checkouts.contains_key(&checkout_id),
+        None => {
+            scope_key == report_derivation_gap_scope_key(identity_roots.or(Some(roots)))
+                || scope_key
+                    .strip_prefix("volume:")
+                    .is_some_and(|id| volumes.contains(id))
+        }
+    }
+}
+
+/// Return volume IDs represented by directory rows under the supplied roots.
+/// The synthetic `explicit-roots` volume is deliberately not inferred here:
+/// it represents the whole request and cannot safely attribute a volume event
+/// to one root.
+pub async fn volume_ids_within_roots(
+    conn: &turso::Connection,
+    roots: &[PathBuf],
+) -> crate::Result<HashSet<String>> {
+    let mut rows = conn
+        .query("SELECT id, volume_id FROM directories ORDER BY id ASC", ())
+        .await
+        .map_err(store_err)?;
+    let mut cache = FullPathCache::new();
+    let mut volumes = HashSet::new();
+    while let Some(row) = rows.next().await.map_err(store_err)? {
+        let dir_id = req_i64(&row, 0)?;
+        let full = resolve_full_path(conn, dir_id, &mut cache).await?;
+        if report_path_in_roots(&full, roots) {
+            let volume = req_text(&row, 1)?;
+            if volume != "explicit-roots" {
+                volumes.insert(volume);
+            }
+        }
+    }
+    Ok(volumes)
+}
+
 async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Result<PrePass> {
+    let (mut scope_roots, scope_identity_roots) = if inputs.scope == "roots" {
+        let mut roots = Vec::with_capacity(inputs.roots.len().saturating_mul(2));
+        let mut identities = Vec::with_capacity(inputs.roots.len());
+        let mut cache = FullPathCache::new();
+        for root in &inputs.roots {
+            let bytes = match (&root.dir_id, &root.path_bytes) {
+                (Some(dir_id), None) => resolve_full_path(conn, *dir_id, &mut cache).await?,
+                (None, Some(bytes)) => bytes.clone(),
+                _ => {
+                    return Err(Error::Report(format!(
+                        "root {} must set exactly one of dir_id or path_bytes",
+                        root.id
+                    )))
+                }
+            };
+            let requested = crate::config::path_from_bytes(bytes);
+            // SLICE-4 SHIM: B11 carries the caller-resolved canonical
+            // identity on `RootInput::scope_path_bytes`; that field is a
+            // slice-5 wiring item (main.rs owns the call site), so the
+            // builder resolves the same identity through the bounded
+            // canonicalizer here. Unresolvable identity keeps the
+            // requested spelling (lexical scoping stays honest).
+            let identity =
+                try_canonical_scope_path(&requested).unwrap_or_else(|| requested.clone());
+            if !roots.contains(&requested) {
+                roots.push(requested);
+            }
+            if !roots.contains(&identity) {
+                roots.push(identity.clone());
+            }
+            identities.push(identity);
+        }
+        (Some(roots), Some(identities))
+    } else {
+        (None, None)
+    };
+    if let Some(roots) = scope_roots.as_mut() {
+        extend_roots_with_verified_aliases(roots, &inputs.aliases);
+    }
     let mut known_volumes = HashSet::new();
     {
         let mut rows = conn
@@ -630,7 +977,26 @@ async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Res
         }
     }
     let mut referenced_volumes = HashSet::new();
-    {
+    if let Some(roots) = &scope_roots {
+        let mut rows = conn
+            .query("SELECT id, volume_id FROM directories ORDER BY id ASC", ())
+            .await
+            .map_err(store_err)?;
+        let mut cache = FullPathCache::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            let dir_id = req_i64(&row, 0)?;
+            let full = resolve_full_path(conn, dir_id, &mut cache).await?;
+            if report_path_in_roots(&full, roots) {
+                referenced_volumes.insert(req_text(&row, 1)?);
+            }
+        }
+        referenced_volumes.extend(
+            inputs
+                .roots
+                .iter()
+                .filter_map(|root| root.volume_id.clone()),
+        );
+    } else {
         let mut rows = conn
             .query("SELECT DISTINCT volume_id FROM directories", ())
             .await
@@ -639,11 +1005,46 @@ async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Res
             referenced_volumes.insert(req_text(&row, 0)?);
         }
     }
+    let included_volumes: HashSet<String> = known_volumes
+        .intersection(&referenced_volumes)
+        .cloned()
+        .collect();
     let mut stub_volumes: Vec<String> = referenced_volumes
         .difference(&known_volumes)
         .cloned()
         .collect();
     stub_volumes.sort();
+    let scope_volumes: HashSet<String> = referenced_volumes
+        .iter()
+        .filter(|id| id.as_str() != "explicit-roots")
+        .cloned()
+        .collect();
+    // SLICE-4 SHIM: B11 additionally extends `scope_volumes` with
+    // caller-supplied event-monitor volume identities
+    // (`ReportInputs::event_volume_ids`); that field is a slice-5 wiring
+    // item, so `volume:<id>` errors are scoped by catalog-derived volume
+    // membership only.
+
+    // Checkout paths are needed to recognize worktrees whose Git metadata
+    // lives outside the requested roots. Keep only the owning store IDs,
+    // then reload and intern just those checkout rows after repo filtering.
+    let mut in_scope_checkout_repos = HashSet::new();
+    if let Some(roots) = &scope_roots {
+        let mut rows = conn
+            .query(
+                "SELECT instance_id, root_path, git_path FROM checkouts ORDER BY id ASC",
+                (),
+            )
+            .await
+            .map_err(store_err)?;
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            let instance_id = req_text(&row, 0)?;
+            let path = opt_blob(&row, 1)?.unwrap_or(req_blob(&row, 2)?);
+            if report_path_in_roots(&path, roots) {
+                in_scope_checkout_repos.insert(instance_id);
+            }
+        }
+    }
 
     let mut included_repos = HashSet::new();
     let mut unresolvable_repo = false;
@@ -662,7 +1063,10 @@ async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Res
             let common_path = req_blob(&row, 2)?;
             let disposition = req_text(&row, 3)?;
             let included = inputs.include_nonmatching || disposition != "nonmatch";
-            if !included {
+            let in_scope = scope_roots.as_ref().is_none_or(|roots| {
+                report_path_in_roots(&git_path, roots) || in_scope_checkout_repos.contains(&id)
+            });
+            if !included || !in_scope {
                 continue;
             }
             if disposition == "unresolvable_identity" {
@@ -697,13 +1101,29 @@ async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Res
         }
     }
 
+    let mut included_groups = HashSet::new();
+    {
+        let mut rows = conn
+            .query(
+                "SELECT group_id, instance_id FROM group_members ORDER BY group_id ASC",
+                (),
+            )
+            .await
+            .map_err(store_err)?;
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            if included_repos.contains(&req_text(&row, 1)?) {
+                included_groups.insert(req_text(&row, 0)?);
+            }
+        }
+    }
+
     let mut statuses = HashMap::new();
     {
         let mut rows = conn
             .query(
                 "SELECT checkout_id, mode, state, started_ms, finished_ms, staged, \
                     unstaged, untracked, untracked_units, submodules, unknown_fields, \
-                    observed_rev FROM status_observations \
+                    observed_rev, conflicts, working_state FROM status_observations \
                     ORDER BY checkout_id ASC, observed_rev DESC",
                 (),
             )
@@ -727,6 +1147,10 @@ async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Res
                     staged: opt_i64(&row, 5)?.map(|v| v.max(0) as u64),
                     unstaged: opt_i64(&row, 6)?.map(|v| v.max(0) as u64),
                     untracked: opt_i64(&row, 7)?.map(|v| v.max(0) as u64),
+                    conflicts: opt_i64(&row, 12)?.map(|v| v.max(0) as u64),
+                    // Report 1.3.0: NULL (legacy pre-v5 rows) reads
+                    // `unknown`, never a guessed state.
+                    working_state: opt_text(&row, 13)?.unwrap_or_else(|| "unknown".to_string()),
                     untracked_units: req_text(&row, 8)?,
                     submodules: req_text(&row, 9)?,
                     unknown_fields: parse_string_array(&req_text(&row, 10)?),
@@ -811,13 +1235,22 @@ async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Res
 
     let open_errors = {
         let mut rows = conn
-            .query("SELECT COUNT(*) FROM errors WHERE open = 1", ())
+            .query("SELECT scope_key FROM errors WHERE open = 1", ())
             .await
             .map_err(store_err)?;
-        match rows.next().await.map_err(store_err)? {
-            Some(row) => req_i64(&row, 0)?.max(0) as u64,
-            None => 0,
+        let mut count = 0u64;
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            if report_error_in_scope(
+                &req_text(&row, 0)?,
+                scope_roots.as_deref(),
+                scope_identity_roots.as_deref(),
+                &checkout_repos,
+                &scope_volumes,
+            ) {
+                count += 1;
+            }
         }
+        count
     };
 
     // RSP-008: pending/leased work is counted in this same read
@@ -845,6 +1278,36 @@ async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Res
         }
     };
 
+    // Latest `--fetch` attempt per store + remote name (report
+    // 1.2.0), scoped to emitted repositories like `statuses`.
+    let mut refreshes = HashMap::new();
+    {
+        let mut rows = conn
+            .query(
+                "SELECT store_id, remote_name, status, observed_at_ms, duration_ms, \
+                    refs_updated FROM remote_refreshes",
+                (),
+            )
+            .await
+            .map_err(store_err)?;
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            let store_id = req_text(&row, 0)?;
+            if !included_repos.contains(&store_id) {
+                continue;
+            }
+            let remote_name = req_blob(&row, 1)?;
+            refreshes.insert(
+                (store_id, remote_name),
+                RemoteRefresh {
+                    status: req_text(&row, 2)?,
+                    observed_at: ms_to_rfc3339(req_i64(&row, 3)?),
+                    duration_ms: opt_i64(&row, 4)?,
+                    refs_updated: req_i64(&row, 5)?.max(0) as u64,
+                },
+            );
+        }
+    }
+
     // Resource gate: the interned-path peak is real report memory;
     // refuse loudly when it already exceeds the caller's RSS target
     // instead of streaming a report built over budget.
@@ -857,9 +1320,15 @@ async fn pre_pass(conn: &turso::Connection, inputs: &ReportInputs) -> crate::Res
 
     Ok(PrePass {
         included_repos,
+        included_groups,
+        scope_roots,
+        scope_identity_roots,
         unresolvable_repo,
         checkout_repos,
         statuses,
+        refreshes,
+        included_volumes,
+        scope_volumes,
         stub_volumes,
         interner,
         open_errors,
@@ -889,9 +1358,9 @@ async fn verify_error_ids(
 }
 
 fn default_status(mode: StatusMode) -> Status {
-    let (state, submodules) = match mode {
-        StatusMode::Metadata => ("not_requested", "not_requested"),
-        _ => ("pending", "unknown"),
+    let (state, submodules, working_state) = match mode {
+        StatusMode::Metadata => ("not_requested", "not_requested", "unknown"),
+        _ => ("pending", "unknown", "pending"),
     };
     Status {
         state: state.to_string(),
@@ -901,6 +1370,8 @@ fn default_status(mode: StatusMode) -> Status {
         staged: None,
         unstaged: None,
         untracked: None,
+        conflicts: None,
+        working_state: working_state.to_string(),
         untracked_units: untracked_units_for(mode).to_string(),
         submodules: submodules.to_string(),
         unknown_fields: Vec::new(),
@@ -1008,6 +1479,10 @@ async fn stream_with_pre_pass<W: Write>(
     writer: W,
 ) -> crate::Result<(W, StreamStats)> {
     let mut stats = StreamStats::default();
+    let mut totals = Totals {
+        bare_stores: Some(0),
+        ..Totals::default()
+    };
     let unresolvable_candidates = inputs
         .candidates
         .iter()
@@ -1086,6 +1561,10 @@ async fn stream_with_pre_pass<W: Write>(
             .canonical_url
             .as_ref()
             .map(|url| redact_remote_url(url)),
+        // SLICE-4 NOTE: B11 additionally wraps these in `scrub_text` for
+        // defense-in-depth; that requires the identity slice's scp-form
+        // redaction idempotency fix (`scp_remote_redaction_is_idempotent`),
+        // otherwise an already-redacted scp-like target double-wraps.
         targets: inputs
             .targets
             .iter()
@@ -1151,8 +1630,12 @@ async fn stream_with_pre_pass<W: Write>(
             .await
             .map_err(store_err)?;
         while let Some(row) = rows.next().await.map_err(store_err)? {
+            let id = req_text(&row, 0)?;
+            if pre.scope_roots.is_some() && !pre.included_volumes.contains(&id) {
+                continue;
+            }
             stream.array_item(&Volume {
-                id: req_text(&row, 0)?,
+                id,
                 native_identity: opt_text(&row, 1)?,
                 namespace: req_text(&row, 2)?,
                 filesystem: opt_text(&row, 3)?,
@@ -1196,6 +1679,13 @@ async fn stream_with_pre_pass<W: Write>(
             let dir_id = req_i64(&row, 0)?;
             let volume_id = req_text(&row, 1)?;
             let full = resolve_full_path(reader, dir_id, &mut cache).await?;
+            if pre
+                .scope_roots
+                .as_ref()
+                .is_some_and(|roots| !report_path_in_roots(&full, roots))
+            {
+                continue;
+            }
             let (encoding, value, display) = encode_bytes(&full);
             stream.array_item(&PathRecord {
                 id: format!("path-{dir_id}"),
@@ -1227,6 +1717,8 @@ async fn stream_with_pre_pass<W: Write>(
         stats.paths += 1;
     }
     stream.end_array()?;
+
+    totals.observed_paths = stats.paths;
 
     // Caller-owned roots.
     stream.begin_array_field("roots")?;
@@ -1260,6 +1752,46 @@ async fn stream_with_pre_pass<W: Write>(
     }
     stream.end_array()?;
 
+    // GitHub groups are distinct normalized identities linked through at
+    // least one emitted store. The query stays catalog-backed and streams
+    // rows in ID order; it does not materialize every group in memory.
+    stream.begin_array_field("groups")?;
+    {
+        let mut rows = reader
+            .query(
+                "SELECT DISTINCT g.id, g.host, g.account, g.repo \
+                    FROM github_groups g \
+                    JOIN group_members gm ON gm.group_id = g.id \
+                    JOIN git_instances gi ON gi.id = gm.instance_id \
+                    WHERE (?1 = 1 OR gi.disposition != 'nonmatch') \
+                    ORDER BY g.id ASC",
+                vec![turso::Value::Integer(i64::from(inputs.include_nonmatching))],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut last_account: Option<(String, String)> = None;
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            if !pre.included_groups.contains(&req_text(&row, 0)?) {
+                continue;
+            }
+            let host = req_text(&row, 1)?;
+            let account = req_text(&row, 2)?;
+            let account_key = (host.clone(), account.clone());
+            if last_account.as_ref() != Some(&account_key) {
+                stats.accounts += 1;
+                last_account = Some(account_key);
+            }
+            stream.array_item(&Group {
+                id: req_text(&row, 0)?,
+                host,
+                account,
+                repo: req_text(&row, 3)?,
+            })?;
+            stats.groups += 1;
+        }
+    }
+    stream.end_array()?;
+
     // Repositories (matching scope; nonmatching skipped unless requested).
     let interned = |bytes: &[u8]| -> crate::Result<String> {
         pre.interner.by_bytes.get(bytes).cloned().ok_or_else(|| {
@@ -1281,11 +1813,21 @@ async fn stream_with_pre_pass<W: Write>(
             if !pre.included_repos.contains(&id) {
                 continue;
             }
+            let bare = opt_i64(&row, 4)?.map(|flag| flag != 0);
+            match bare {
+                Some(true) => {
+                    if let Some(count) = totals.bare_stores.as_mut() {
+                        *count += 1;
+                    }
+                }
+                Some(false) => {}
+                None => totals.bare_stores = None,
+            }
             stream.array_item(&Repository {
                 id,
                 git_path_id: interned(&req_blob(&row, 1)?)?,
                 common_path_id: interned(&req_blob(&row, 2)?)?,
-                bare: opt_i64(&row, 4)?.map(|flag| flag != 0),
+                bare,
                 format: req_text(&row, 3)?,
                 object_format: req_text(&row, 5)?,
                 match_disposition: req_text(&row, 6)?,
@@ -1298,6 +1840,7 @@ async fn stream_with_pre_pass<W: Write>(
         }
     }
     stream.end_array()?;
+    totals.stores = stats.repositories;
 
     // Checkouts with their latest status observation (or an honest
     // pending/not_requested placeholder when none was recorded).
@@ -1315,7 +1858,7 @@ async fn stream_with_pre_pass<W: Write>(
         while let Some(row) = rows.next().await.map_err(store_err)? {
             let id = req_text(&row, 0)?;
             let instance_id = req_text(&row, 1)?;
-            if !pre.included_repos.contains(&instance_id) {
+            if !pre.checkout_repos.contains_key(&id) {
                 stats.skipped_orphans += 1;
                 continue;
             }
@@ -1328,6 +1871,13 @@ async fn stream_with_pre_pass<W: Write>(
                 .get(&id)
                 .cloned()
                 .unwrap_or_else(|| default_status(inputs.status_mode));
+            if req_text(&row, 5)? == "present" {
+                totals.present_checkouts += 1;
+                if req_text(&row, 4)? == "linked" {
+                    totals.linked_worktrees += 1;
+                }
+            }
+            record_analysis_total(&mut totals.analysis, &status.state);
             stream.array_item(&Checkout {
                 id,
                 repository_id: instance_id,
@@ -1352,27 +1902,57 @@ async fn stream_with_pre_pass<W: Write>(
     // Branches (refs scoped to emitted repositories and checkouts).
     stream.begin_array_field("branches")?;
     {
-        let mut rows = reader
-            .query(
-                "SELECT id, instance_id, checkout_scope_id, kind, name, oid, algo, \
-                    symbolic_target, upstream, state, observed_at_ms \
-                    FROM refs ORDER BY id ASC",
-                (),
-            )
-            .await
-            .map_err(store_err)?;
+        // Report 1.4.0: the v6 comparison columns ride the SELECT
+        // when physically present; pre-v6 catalogs emit
+        // `pending`/null (same legacy read as pre-1.4 snapshots).
+        let v6 = crate::store::catalog::refs_has_comparison(reader).await?;
+        let sql = if v6 {
+            "SELECT id, instance_id, checkout_scope_id, kind, name, oid, algo, \
+                symbolic_target, upstream, state, observed_at_ms, freshness, \
+                freshness_at_ms, comparison_state, ahead, behind \
+                FROM refs ORDER BY id ASC"
+        } else {
+            "SELECT id, instance_id, checkout_scope_id, kind, name, oid, algo, \
+                symbolic_target, upstream, state, observed_at_ms, freshness, \
+                freshness_at_ms \
+                FROM refs ORDER BY id ASC"
+        };
+        let mut rows = reader.query(sql, ()).await.map_err(store_err)?;
         while let Some(row) = rows.next().await.map_err(store_err)? {
             let instance_id = req_text(&row, 1)?;
             if !pre.included_repos.contains(&instance_id) {
                 stats.skipped_orphans += 1;
                 continue;
             }
-            let scope = opt_text(&row, 2)?.filter(|id| pre.checkout_repos.contains_key(id));
+            let checkout_scope = opt_text(&row, 2)?;
+            if pre.scope_roots.is_some()
+                && checkout_scope
+                    .as_ref()
+                    .is_some_and(|id| !pre.checkout_repos.contains_key(id))
+            {
+                continue;
+            }
+            let scope = checkout_scope.filter(|id| pre.checkout_repos.contains_key(id));
+            let (comparison, ahead, behind) = if v6 {
+                (
+                    opt_text(&row, 13)?.unwrap_or_else(|| String::from("pending")),
+                    opt_count(&row, 14, "ahead")?,
+                    opt_count(&row, 15, "behind")?,
+                )
+            } else {
+                (String::from("pending"), None, None)
+            };
+            let kind = req_text(&row, 3)?;
+            match kind.as_str() {
+                "local" => totals.local_branches += 1,
+                "remote_tracking" => totals.remote_tracking_refs += 1,
+                _ => {}
+            }
             stream.array_item(&Branch {
                 id: req_text(&row, 0)?,
                 repository_id: instance_id,
                 checkout_scope_id: scope,
-                kind: req_text(&row, 3)?,
+                kind,
                 name: encode_name(&req_blob(&row, 4)?),
                 oid: object_id_from_parts(opt_blob(&row, 5)?, opt_text(&row, 6)?),
                 symbolic_target: opt_blob(&row, 7)?.as_deref().map(encode_name),
@@ -1380,6 +1960,12 @@ async fn stream_with_pre_pass<W: Write>(
                 state: req_text(&row, 9)?,
                 observed_at: ms_to_rfc3339(req_i64(&row, 10)?),
                 error_ids: Vec::new(),
+                // Report 1.2.0: NULL (legacy/unlabeled) reads `unknown`.
+                freshness: opt_text(&row, 11)?.unwrap_or_else(|| String::from("unknown")),
+                freshness_at: opt_i64(&row, 12)?.map(ms_to_rfc3339),
+                comparison,
+                ahead,
+                behind,
             })?;
             stats.branches += 1;
         }
@@ -1406,12 +1992,21 @@ async fn stream_with_pre_pass<W: Write>(
                 stats.skipped_orphans += 1;
                 continue;
             }
-            let scope = opt_text(&row, 2)?.filter(|id| pre.checkout_repos.contains_key(id));
+            let checkout_scope = opt_text(&row, 2)?;
+            if pre.scope_roots.is_some()
+                && checkout_scope
+                    .as_ref()
+                    .is_some_and(|id| !pre.checkout_repos.contains_key(id))
+            {
+                continue;
+            }
+            let scope = checkout_scope.filter(|id| pre.checkout_repos.contains_key(id));
+            let name_bytes = req_blob(&row, 3)?;
             stream.array_item(&Remote {
                 id: req_text(&row, 0)?,
-                repository_id: instance_id,
+                repository_id: instance_id.clone(),
                 checkout_scope_id: scope,
-                name: encode_name(&req_blob(&row, 3)?),
+                name: encode_name(&name_bytes),
                 role: req_text(&row, 4)?,
                 url: cap_report_field(&redact_remote_url(&String::from_utf8_lossy(&req_blob(
                     &row, 5,
@@ -1420,6 +2015,10 @@ async fn stream_with_pre_pass<W: Write>(
                     cap_report_field(&redact_remote_url(&String::from_utf8_lossy(&bytes)))
                 }),
                 observed_at: ms_to_rfc3339(req_i64(&row, 7)?),
+                // Report 1.2.0: latest attempt for this store + remote
+                // name (`None` when never attempted). Name-keyed, so
+                // both role rows for one remote share the attempt.
+                refresh: pre.refreshes.get(&(instance_id, name_bytes)).cloned(),
             })?;
             stats.remotes += 1;
         }
@@ -1475,6 +2074,7 @@ async fn stream_with_pre_pass<W: Write>(
         stats.aliases += 1;
     }
     stream.end_array()?;
+    totals.aliases = stats.aliases;
 
     stream.begin_array_field("candidates")?;
     for candidate in &inputs.candidates {
@@ -1498,6 +2098,7 @@ async fn stream_with_pre_pass<W: Write>(
         stats.candidates += 1;
     }
     stream.end_array()?;
+    totals.unresolved_candidates = unresolvable_candidates;
 
     // Open errors; a `dir:{n}` scope resolves to its path when the row
     // exists, otherwise the linkage stays honestly null.
@@ -1515,6 +2116,15 @@ async fn stream_with_pre_pass<W: Write>(
         while let Some(row) = rows.next().await.map_err(store_err)? {
             let id = req_text(&row, 0)?;
             let scope_key = req_text(&row, 1)?;
+            if !report_error_in_scope(
+                &scope_key,
+                pre.scope_roots.as_deref(),
+                pre.scope_identity_roots.as_deref(),
+                &pre.checkout_repos,
+                &pre.scope_volumes,
+            ) {
+                continue;
+            }
             let category = req_text(&row, 2)?;
             let path_id = error_path_id(reader, &scope_key).await?;
             let retryable = req_i64(&row, 8)? != 0
@@ -1536,6 +2146,7 @@ async fn stream_with_pre_pass<W: Write>(
         }
     }
     stream.end_array()?;
+    totals.gaps = stats.errors;
 
     stream.begin_array_field("generated_artifacts")?;
     for artifact in &inputs.generated_artifacts {
@@ -1554,9 +2165,25 @@ async fn stream_with_pre_pass<W: Write>(
     }
     stream.end_array()?;
 
+    totals.observed_paths = stats.paths;
+    totals.groups = stats.groups;
+    totals.accounts = stats.accounts;
+    totals.stores = stats.repositories;
+    totals.aliases = stats.aliases;
+    stream.field("totals", &totals)?;
     stream.end_object()?;
     let writer = stream.finish()?;
     Ok((writer, stats))
+}
+
+fn record_analysis_total(totals: &mut AnalysisTotals, state: &str) {
+    match state {
+        "complete" => totals.completed += 1,
+        "pending" | "not_requested" => totals.pending += 1,
+        "unsupported" => totals.unavailable += 1,
+        "partial" | "unstable" | "error" => totals.failed += 1,
+        _ => totals.pending += 1,
+    }
 }
 
 async fn error_path_id(
@@ -1934,6 +2561,199 @@ impl ReportPipeline {
             published: false,
             checksum: receipt.checksum,
         })
+    }
+
+    /// Stream the report into controlled staging, verify it, retain the
+    /// snapshot, and write the verified JSON document to `out` (normally
+    /// stdout) — the Wave2b `scan --format json` lane. The bytes are the
+    /// retained snapshot bytes verbatim plus one newline: no prose, no
+    /// ANSI, no cursor codes. Invalid staging is quarantined, never
+    /// retained. Returns `Ok(false)` when the consumer went away
+    /// (broken pipe): the snapshot stays retained, the writer just stops.
+    pub async fn emit_to_json(
+        store: &crate::store::TursoStore,
+        inputs: &ReportInputs,
+        staging_dir: &Path,
+        snapshot_dir: &Path,
+        now_ms: i64,
+        out: &mut dyn std::io::Write,
+    ) -> crate::Result<bool> {
+        let staged = stage_report(store, inputs, staging_dir)
+            .await
+            .map_err(stage_refusal)?;
+        let bound = BoundStaged::open(&staged).map_err(|e| {
+            quarantine_staging(&staged);
+            crate::error::Error::Report(format!(
+                "refusing invalid staged report {}: {e}",
+                staged.display()
+            ))
+        })?;
+        let staged_report_id =
+            validate_bound_staged_report_id_capped(&bound, inputs.rss_target_bytes).map_err(
+                |e| {
+                    quarantine_staging(&staged);
+                    crate::error::Error::Report(format!(
+                        "refusing invalid staged report {}: {e}",
+                        staged.display()
+                    ))
+                },
+            )?;
+        if staged_report_id != inputs.report_id {
+            quarantine_staging(&staged);
+            return Err(Error::Report(format!(
+                "staged report {} has a report_id that does not match the expected snapshot id",
+                staged.display()
+            )));
+        }
+        let receipt = retain_bound(
+            store,
+            &bound,
+            snapshot_dir,
+            &inputs.report_id,
+            inputs.catalog_revision,
+            inputs.generation,
+            now_ms,
+        )
+        .await?;
+        if receipt.sha256 != bound.sha256() {
+            store
+                .set_snapshot_publication(&inputs.report_id, "failed")
+                .await?;
+            return Err(Error::Report(format!(
+                "snapshot {} digest does not match staged bytes",
+                receipt.path.display()
+            )));
+        }
+        let pipe_open = crate::report::output::write_machine_bytes(out, bound.bytes())?;
+        drop(bound);
+        store
+            .set_snapshot_publication(&inputs.report_id, "retained")
+            .await?;
+        let _ = std::fs::remove_file(&staged);
+        Ok(pipe_open)
+    }
+
+    /// Stream the report into controlled staging, verify it, and retain
+    /// the snapshot without rendering or publishing — the Wave2b
+    /// `scan --format jsonl` lane (the journal replay on stdout is the
+    /// output; the retained snapshot is the state the human/JSON lanes
+    /// read). Returns the snapshot path.
+    pub async fn stage_and_retain(
+        store: &crate::store::TursoStore,
+        inputs: &ReportInputs,
+        staging_dir: &Path,
+        snapshot_dir: &Path,
+        now_ms: i64,
+    ) -> crate::Result<PathBuf> {
+        let staged = stage_report(store, inputs, staging_dir)
+            .await
+            .map_err(stage_refusal)?;
+        let bound = BoundStaged::open(&staged).map_err(|e| {
+            quarantine_staging(&staged);
+            crate::error::Error::Report(format!(
+                "refusing invalid staged report {}: {e}",
+                staged.display()
+            ))
+        })?;
+        let staged_report_id =
+            validate_bound_staged_report_id_capped(&bound, inputs.rss_target_bytes).map_err(
+                |e| {
+                    quarantine_staging(&staged);
+                    crate::error::Error::Report(format!(
+                        "refusing invalid staged report {}: {e}",
+                        staged.display()
+                    ))
+                },
+            )?;
+        if staged_report_id != inputs.report_id {
+            quarantine_staging(&staged);
+            return Err(Error::Report(format!(
+                "staged report {} has a report_id that does not match the expected snapshot id",
+                staged.display()
+            )));
+        }
+        let receipt = retain_bound(
+            store,
+            &bound,
+            snapshot_dir,
+            &inputs.report_id,
+            inputs.catalog_revision,
+            inputs.generation,
+            now_ms,
+        )
+        .await?;
+        if receipt.sha256 != bound.sha256() {
+            store
+                .set_snapshot_publication(&inputs.report_id, "failed")
+                .await?;
+            return Err(Error::Report(format!(
+                "snapshot {} digest does not match staged bytes",
+                receipt.path.display()
+            )));
+        }
+        store
+            .set_snapshot_publication(&inputs.report_id, "retained")
+            .await?;
+        let _ = std::fs::remove_file(&staged);
+        Ok(receipt.path)
+    }
+
+    /// Publish one live `--report` replacement (Wave2b case 17): stage,
+    /// verify, and atomically replace `dest` — WITHOUT retaining a
+    /// snapshot (snapshots are immutable by report ID, so accumulating
+    /// one per live tick would be unbounded; the live destination is
+    /// the replaceable snapshot). Every concurrently read file is valid
+    /// JSON from exactly one revision: readers see either the old or
+    /// the new destination, never a mix. Callers throttle (see
+    /// [`crate::report::output::LiveThrottle`]) and treat failure as a
+    /// best-effort skip: a live tick must never fail the scan.
+    pub async fn publish_live(
+        store: &crate::store::TursoStore,
+        inputs: &ReportInputs,
+        staging_dir: &Path,
+        dest: &Path,
+        state_dir: &Path,
+    ) -> crate::Result<crate::report::publish::PublishReceipt> {
+        let staged = stage_report(store, inputs, staging_dir)
+            .await
+            .map_err(stage_refusal)?;
+        let bound = BoundStaged::open(&staged).map_err(|e| {
+            quarantine_staging(&staged);
+            crate::error::Error::Report(format!(
+                "refusing invalid staged report {}: {e}",
+                staged.display()
+            ))
+        })?;
+        let staged_report_id =
+            match validate_bound_staged_report_id_capped(&bound, inputs.rss_target_bytes) {
+                Ok(id) => id,
+                Err(e) => {
+                    quarantine_staging(&staged);
+                    return Err(crate::error::Error::Report(format!(
+                        "refusing invalid staged report {}: {e}",
+                        staged.display()
+                    )));
+                }
+            };
+        if staged_report_id != inputs.report_id {
+            quarantine_staging(&staged);
+            return Err(Error::Report(format!(
+                "staged report {} has a report_id that does not match the expected snapshot id",
+                staged.display()
+            )));
+        }
+        let receipt =
+            publish_bound(&bound, dest, state_dir).inspect_err(|_| quarantine_staging(&staged))?;
+        if receipt.sha256 != bound.sha256() {
+            quarantine_staging(&staged);
+            return Err(Error::Report(format!(
+                "live destination {} digest does not match staged bytes",
+                dest.display()
+            )));
+        }
+        drop(bound);
+        let _ = std::fs::remove_file(&staged);
+        Ok(receipt)
     }
 
     /// Retry a failed publication from retained snapshot bytes without
