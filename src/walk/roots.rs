@@ -4,13 +4,17 @@
 //! each fairly. Likely locations are seeded for early useful results but
 //! never substitute for complete scope: `/tmp`, `/private/tmp`, the
 //! effective user home, `/private/var/folders`, and configured Cargo
-//! locations are priorities, and a large ordinary root must not starve the
-//! temporary locations indefinitely (hence round-robin scheduling across
-//! roots). Nothing is excluded by directory name (`target`, `.cargo`,
-//! `.cache`, `node_modules`, `.git` are all in scope).
+//! locations are priorities. Scheduling order: seeds first, then mounts in
+//! plan order; the scheduler enqueues one enumeration task per root in
+//! that order and claims FIFO within each task class with R06
+//! class-interleaved claims, so a large tree under one root cannot starve
+//! the others indefinitely — every root's tasks eventually claim (a stuck
+//! scope becomes a gap, never a silent skip). Nothing is excluded by
+//! directory name (`target`, `.cargo`, `.cache`, `node_modules`, `.git`
+//! are all in scope).
 
 use crate::platform::{MountPoint, VolumeId};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Scheduling priority of one planned root. Priority orders first contact;
 /// every root is still attempted fairly.
@@ -107,16 +111,70 @@ pub fn plan_machine_roots(mounts: &[MountPoint]) -> Vec<PlannedRoot> {
 /// flags exist yet; traversal-time filesystem-class filtering is
 /// deterministic from the mount set, so it needs no extra key input.
 pub fn generation_scope_key(policy: &str, roots: &[PlannedRoot]) -> String {
+    let identities = scope_root_identities(roots);
+    generation_scope_key_with_identities(policy, roots, &identities)
+}
+
+/// Bounded canonical identities used both for generation keys and report
+/// scope filtering. A timeout falls back to normalized lexical spelling,
+/// matching [`generation_scope_key`] so aliases cannot diverge between
+/// generation selection and catalog/report filtering.
+pub fn scope_root_identities(roots: &[PlannedRoot]) -> Vec<(PathBuf, Option<u64>)> {
+    let paths: Vec<PathBuf> = roots.iter().map(|root| root.path.clone()).collect();
+    // Root canonicalization and volume identity both run through the
+    // topology layer's bounded identity-I/O worker. If admission or the
+    // timeout fails, use the normalized lexical spelling and an explicit
+    // unknown-device marker; when the identity becomes available later,
+    // the key changes and safely starts a fresh generation.
+    let identities = crate::walk::topology::bounded_scope_identities(&paths);
+    roots
+        .iter()
+        .enumerate()
+        .map(|(index, root)| {
+            identities
+                .as_ref()
+                .and_then(|items| items.get(index))
+                .cloned()
+                .unwrap_or_else(|| {
+                    (
+                        crate::walk::topology::normalize_scope_path(&root.path),
+                        None,
+                    )
+                })
+        })
+        .collect()
+}
+
+/// Generation-key builder for a previously resolved identity snapshot.
+/// The caller can pass the same bounded results to root-scope filters.
+pub fn generation_scope_key_with_identities(
+    policy: &str,
+    roots: &[PlannedRoot],
+    identities: &[(PathBuf, Option<u64>)],
+) -> String {
     let mut entries: Vec<Vec<u8>> = roots
         .iter()
-        .map(|root| {
-            let canonical = std::fs::canonicalize(&root.path).unwrap_or_else(|_| root.path.clone());
+        .enumerate()
+        .map(|(index, root)| {
+            let (canonical, dev) = identities
+                .get(index)
+                .map(|(path, dev)| (path.clone(), *dev))
+                .unwrap_or_else(|| {
+                    (
+                        crate::walk::topology::normalize_scope_path(&root.path),
+                        None,
+                    )
+                });
             let mut entry = Vec::new();
             entry.extend_from_slice(root.namespace.as_bytes());
             entry.push(0);
             entry.extend_from_slice(&crate::config::path_as_bytes(&canonical));
             entry.push(0);
-            entry.extend_from_slice(root_volume_dev(&root.path).to_string().as_bytes());
+            entry.extend_from_slice(
+                dev.map(|value| value.to_string())
+                    .unwrap_or_else(|| String::from("unknown"))
+                    .as_bytes(),
+            );
             entry
         })
         .collect();
@@ -128,68 +186,6 @@ pub fn generation_scope_key(policy: &str, roots: &[PlannedRoot]) -> String {
         joined.push(0);
     }
     format!("v2:{policy}:{}", crate::config::encode_hex(&joined))
-}
-
-/// Device number pinning a root's volume (unix; 0 elsewhere / on error).
-fn root_volume_dev(path: &Path) -> u64 {
-    std::fs::metadata(path)
-        .map(|md| volume_dev(&md))
-        .unwrap_or(0)
-}
-
-#[cfg(unix)]
-fn volume_dev(md: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    md.dev()
-}
-
-#[cfg(not(unix))]
-fn volume_dev(_md: &std::fs::Metadata) -> u64 {
-    0
-}
-
-/// Round-robin cursor over the planned roots. The scheduler pulls roots
-/// through [`RootPlan::next`] so a huge tree under one root cannot starve
-/// the others — each root gets interleaved directory tasks.
-#[derive(Debug)]
-pub struct RootPlan {
-    roots: Vec<PlannedRoot>,
-    cursor: usize,
-}
-
-impl RootPlan {
-    /// Plan over these roots in the given order.
-    pub fn new(roots: Vec<PlannedRoot>) -> Self {
-        Self { roots, cursor: 0 }
-    }
-
-    /// Next root in round-robin order, or `None` when the plan is empty.
-    // Not `Iterator::next`: the borrowed item cannot be an `Item` type, and
-    // the cursor cycles forever rather than terminating.
-    #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Option<&PlannedRoot> {
-        if self.roots.is_empty() {
-            return None;
-        }
-        let root = &self.roots[self.cursor % self.roots.len()];
-        self.cursor = self.cursor.wrapping_add(1);
-        Some(root)
-    }
-
-    /// Number of planned roots.
-    pub fn len(&self) -> usize {
-        self.roots.len()
-    }
-
-    /// True when the plan holds no roots.
-    pub fn is_empty(&self) -> bool {
-        self.roots.is_empty()
-    }
-
-    /// All planned roots in plan order.
-    pub fn roots(&self) -> &[PlannedRoot] {
-        &self.roots
-    }
 }
 
 #[cfg(test)]
@@ -208,8 +204,26 @@ mod tests {
     fn scratch(case: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("repo-scan-scopekey-{}-{case}", std::process::id()));
+        // Pid-scoped: only this live process owns the name, so a leftover
+        // from a dead pid-holder is safe to clear (pid-reuse flake).
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch");
         dir
+    }
+
+    #[test]
+    fn scratch_survives_stale_pid_reuse() {
+        // A previous test process with a recycled pid leaves its scratch
+        // dir behind; scratch() must start clean so symlink creation below
+        // cannot fail with EEXIST (the spelling_variants_share_key flake).
+        let base = scratch("stale-reuse");
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).expect("real");
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("plant stale link");
+        let base = scratch("stale-reuse");
+        let link = base.join("link");
+        std::os::unix::fs::symlink(base.join("real"), &link).expect("reuse after stale");
     }
 
     #[test]
@@ -262,5 +276,20 @@ mod tests {
         let via_real = generation_scope_key("roots", &[explicit(real)]);
         let via_link = generation_scope_key("roots", &[explicit(link)]);
         assert_eq!(via_real, via_link);
+    }
+
+    #[test]
+    fn missing_root_has_stable_lexical_scope_key() {
+        let base = scratch("missing-lexical");
+        let with_dotdot = base.join("unused").join("..").join("missing");
+        let normalized = base.join("missing");
+        let first = generation_scope_key("roots", &[explicit(with_dotdot)]);
+        let second = generation_scope_key("roots", &[explicit(normalized.clone())]);
+        let third = generation_scope_key("roots", &[explicit(normalized)]);
+        assert_eq!(
+            first, second,
+            "lexically equivalent paths share the fallback key"
+        );
+        assert_eq!(second, third, "the fallback key is deterministic");
     }
 }
