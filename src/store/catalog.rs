@@ -163,23 +163,6 @@ where
     rx.recv_timeout(STORE_IDENTITY_IO_TIMEOUT).ok()
 }
 
-/// Terminal-event check for [`TursoStore::append_terminal_scan_event`]
-/// over the journaled `event_type` NAME (the journal stores strings, not
-/// the typed enum). Mirrors B11's `scan_events::is_terminal_name`;
-/// implemented over the public `EventType` vocabulary so the store slice
-/// does not modify `scan_events.rs` (owned by the events slice, which
-/// may swap this for the shared helper once ported).
-fn is_terminal_event_name(name: &str) -> bool {
-    [
-        crate::scan_events::EventType::ScanCompleted,
-        crate::scan_events::EventType::ScanIncomplete,
-        crate::scan_events::EventType::ScanInterrupted,
-        crate::scan_events::EventType::ScanFailed,
-    ]
-    .iter()
-    .any(|t| t.name() == name)
-}
-
 /// Owner-held catalog handle. Only the owner constructs this.
 ///
 /// SR-STATE-06: `state_anchor` pins the state root with a lifetime
@@ -5324,7 +5307,7 @@ impl TursoStore {
         event: &NewScanEvent<'_>,
     ) -> crate::Result<bool> {
         self.forbid_write("append_terminal_scan_event")?;
-        if !is_terminal_event_name(event.event_type) {
+        if !crate::scan_events::is_terminal_name(event.event_type) {
             return Err(Error::InvalidArgs(format!(
                 "{} is not a terminal scan event",
                 event.event_type

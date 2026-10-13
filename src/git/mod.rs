@@ -171,6 +171,10 @@ pub struct StatusObservation {
     pub unstaged: Option<u64>,
     /// Untracked count in the mode's units.
     pub untracked: Option<u64>,
+    /// Distinct unmerged (conflicted) paths; `None` when the backend
+    /// could not determine it (metadata mode, unreadable index).
+    /// (SLICE-5: B11 Step-10 status model field.)
+    pub conflicts: Option<u64>,
     /// Fields the backend could not determine.
     pub unknown_fields: Vec<String>,
     /// Input fingerprints (head id, index mtime+size) for instability retry.
@@ -357,6 +361,138 @@ pub const SUBMODULE_RECURSION_GAP: &str = "submodule-recursion-unisolated";
 /// matches none of the `unstable`/`no-worktree`/`truncat` state-mapping
 /// substrings, so the report state is unaffected.
 pub const ISOLATED_SCOPE_DECLARATION: &str = "isolated-config-scope: only repository-local git config and attributes were consulted; user/system/global scope (core.excludesFile, global gitattributes, filter drivers) was ignored and no content conversion ran";
+
+/// Sparse-checkout declaration for the status path (spec "declare
+/// what was inspected"): when sparsity is enabled, counts cover the
+/// materialized worktree only — excluded paths never verify against
+/// the worktree (their staged state still counts: the index is not
+/// sparse). Returns the `unknown_fields` line, or `None` when sparsity
+/// is off. Deliberately matches none of the `working_state_of` /
+/// `status_state_of` state-mapping substrings: counts agree with
+/// installed `git status` exactly (pinned by the sparse parity test),
+/// so the state is unaffected — the note declares coverage scope.
+///
+/// `sparse_enabled` is the isolated-effective `core.sparseCheckout`
+/// flag (exactly what status traverses under); the patterns file is
+/// evidence only (`info/sparse-checkout` under the worktree admin dir
+/// first, the common dir second). A lone match-all (`/*`) or an empty
+/// file means the worktree is effectively full and declares so.
+pub fn sparse_checkout_note(sparse_enabled: bool, instance: &GitInstance) -> Option<String> {
+    if !sparse_enabled {
+        return None;
+    }
+    let mut candidates = vec![
+        instance.git_dir.join("info").join("sparse-checkout"),
+        instance.common_dir.join("info").join("sparse-checkout"),
+    ];
+    candidates.sort();
+    candidates.dedup();
+    let mut saw_file = false;
+    let mut effective: Vec<String> = Vec::new();
+    for candidate in &candidates {
+        let Some(bytes) = read_bounded_bytes(candidate, MAX_GIT_CONTROL_BYTES) else {
+            continue;
+        };
+        saw_file = true;
+        effective.extend(
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(str::to_string),
+        );
+    }
+    if !saw_file {
+        return Some(
+            "sparse-checkout: core.sparseCheckout is enabled but no readable \
+             info/sparse-checkout patterns file was found; counts cover the \
+             materialized worktree only"
+                .to_string(),
+        );
+    }
+    if effective.is_empty() || (effective.len() == 1 && effective[0] == "/*") {
+        return Some(
+            "sparse-checkout: core.sparseCheckout is enabled with match-all-only \
+             patterns; the worktree is effectively full"
+                .to_string(),
+        );
+    }
+    Some(format!(
+        "sparse-checkout: core.sparseCheckout is enabled with {} sparse pattern(s); \
+         counts cover the materialized worktree only — excluded paths are not \
+         worktree-verified",
+        effective.len()
+    ))
+}
+
+/// Isolated-effective `core.sparseCheckout` flag for one git dir (the
+/// same config scope the status path traverses under). `false` on any
+/// failure: an unopenable store cannot be proven sparse, and the gix
+/// leg (which owns an open repo) reads the flag from its own snapshot
+/// instead — this serves the installed-git fallback leg only.
+pub fn sparse_config_enabled(git_dir: &std::path::Path) -> bool {
+    open_repo_isolated(git_dir)
+        .map(|repo| repo.config_snapshot().boolean("core.sparseCheckout") == Some(true))
+        .unwrap_or(false)
+}
+
+/// Distinct unmerged paths in the open repo's index (Step 10).
+///
+/// Entries at stage 1/2/3 share one path per conflicted file, so paths
+/// deduplicate through a set. Read-only; `Err` carries the
+/// `unknown_fields` note and the caller records `conflicts: None`.
+fn unmerged_paths(repo: &gix::Repository) -> Result<std::collections::BTreeSet<Vec<u8>>, String> {
+    let index = repo
+        .index_or_empty()
+        .map_err(|e| format!("conflicts-unknown: cannot open index for stage scan: {e}"))?;
+    let mut paths = std::collections::BTreeSet::new();
+    for entry in index.entries() {
+        if !matches!(entry.stage(), gix::index::entry::Stage::Unconflicted) {
+            paths.insert(entry.path(&index).to_vec());
+        }
+        if paths.len() as u64 > STATUS_ITEM_CAP {
+            return Err(format!(
+                "conflicts-unknown: unmerged-path cap ({STATUS_ITEM_CAP}) reached; count is partial"
+            ));
+        }
+    }
+    Ok(paths)
+}
+
+/// Byte view of a bstr path for unmerged-set membership.
+fn path_bytes<T: AsRef<[u8]> + ?Sized>(path: &T) -> &[u8] {
+    path.as_ref()
+}
+
+/// Step 10 working-state vocabulary for one status observation.
+///
+/// `conflicted` wins on definite evidence (any unmerged path), then the
+/// observation markers (`unstable`, `not_applicable` for bare stores,
+/// `partial` for truncated counts), then the counts: any positive count
+/// is `dirty`, all-known-zero is `clean`, anything else (metadata mode,
+/// unreadable index) is `unknown` — never `clean`.
+pub fn working_state_of(obs: &StatusObservation) -> &'static str {
+    if obs.conflicts.is_some_and(|n| n > 0) {
+        return "conflicted";
+    }
+    if obs.unknown_fields.iter().any(|f| f.contains("unstable")) {
+        return "unstable";
+    }
+    if obs.unknown_fields.iter().any(|f| f.contains("no-worktree")) {
+        return "not_applicable";
+    }
+    if obs.unknown_fields.iter().any(|f| f.contains("truncat")) {
+        return "partial";
+    }
+    let counts = [obs.staged, obs.unstaged, obs.untracked, obs.conflicts];
+    if counts.iter().any(|c| c.is_some_and(|n| n > 0)) {
+        return "dirty";
+    }
+    if counts.iter().all(|c| *c == Some(0)) {
+        return "clean";
+    }
+    "unknown"
+}
 
 /// Attach [`ISOLATED_SCOPE_DECLARATION`] to a status observation,
 /// exactly once (idempotent across the instability-retry merge).
@@ -878,6 +1014,7 @@ impl GixInspector {
                 staged: None,
                 unstaged: None,
                 untracked: None,
+                conflicts: None,
                 unknown_fields: Vec::new(),
                 fingerprints,
             }));
@@ -888,6 +1025,7 @@ impl GixInspector {
                 staged: None,
                 unstaged: None,
                 untracked: None,
+                conflicts: None,
                 unknown_fields: vec![
                     "no-worktree: bare or worktree-less repository; status not applicable"
                         .to_string(),
@@ -935,9 +1073,21 @@ impl GixInspector {
             counts.staged = retry.staged;
             counts.unstaged = retry.unstaged;
             counts.untracked = retry.untracked;
+            counts.conflicts = retry.conflicts;
             counts.unknown_fields.extend(retry.unknown_fields);
         } else {
             counts.fingerprints = after;
+        }
+        // Sparse coverage declaration (pushed once, after the retry
+        // merge): counts cover the materialized worktree only. Reads
+        // the flag from this open repo's own isolated snapshot —
+        // exactly the config scope the traversal above ran under.
+        // (SLICE-5: B11 Step-10 sparse declaration.)
+        if let Some(note) = sparse_checkout_note(
+            repo.config_snapshot().boolean("core.sparseCheckout") == Some(true),
+            instance,
+        ) {
+            counts.unknown_fields.push(note);
         }
         Ok(with_scope_declaration(counts))
     }
@@ -972,6 +1122,23 @@ impl GixInspector {
         let mut untracked = 0u64;
         let mut unknown_fields = Vec::new();
         let mut item_errors = 0u32;
+        // gix status items carry no conflict variant: unmerged index
+        // entries surface as ordinary TreeIndex/IndexWorktree changes,
+        // so the unmerged set is read first and its paths are excluded
+        // from staged/unstaged tallies (Step 10 count separation). When
+        // the set itself is unreadable the tallies stay unfiltered and
+        // `conflicts` reads `None` (never a guessed zero).
+        // (SLICE-5: B11 Step-10 count separation.)
+        let (unmerged, conflicts) = match unmerged_paths(repo) {
+            Ok(set) => {
+                let count = Some(set.len() as u64);
+                (set, count)
+            }
+            Err(note) => {
+                unknown_fields.push(note);
+                (std::collections::BTreeSet::new(), None)
+            }
+        };
         for (tallied, item) in iter.enumerate() {
             if tallied as u64 >= STATUS_ITEM_CAP {
                 unknown_fields.push(format!(
@@ -980,13 +1147,36 @@ impl GixInspector {
                 break;
             }
             match item {
-                Ok(gix::status::Item::TreeIndex(_)) => staged += 1,
+                Ok(gix::status::Item::TreeIndex(change)) => {
+                    if !unmerged.contains(path_bytes(change.location())) {
+                        staged += 1;
+                    }
+                }
                 Ok(gix::status::Item::IndexWorktree(
-                    gix::status::index_worktree::Item::Modification { .. },
-                ))
-                | Ok(gix::status::Item::IndexWorktree(
-                    gix::status::index_worktree::Item::Rewrite { .. },
-                )) => unstaged += 1,
+                    gix::status::index_worktree::Item::Modification { rela_path, .. },
+                )) => {
+                    if !unmerged.contains(path_bytes(&rela_path)) {
+                        unstaged += 1;
+                    }
+                }
+                Ok(gix::status::Item::IndexWorktree(
+                    gix::status::index_worktree::Item::Rewrite { source, .. },
+                )) => {
+                    let unmerged_source = match &source {
+                        gix::status::index_worktree::RewriteSource::RewriteFromIndex {
+                            source_rela_path,
+                            ..
+                        } => unmerged.contains(path_bytes(source_rela_path)),
+                        // Copy sources originate in the directory walk
+                        // (untracked side); unmerged paths never appear.
+                        gix::status::index_worktree::RewriteSource::CopyFromDirectoryEntry {
+                            ..
+                        } => false,
+                    };
+                    if !unmerged_source {
+                        unstaged += 1;
+                    }
+                }
                 Ok(gix::status::Item::IndexWorktree(
                     gix::status::index_worktree::Item::DirectoryContents { .. },
                 )) => untracked += 1,
@@ -1006,6 +1196,7 @@ impl GixInspector {
             staged: Some(staged),
             unstaged: Some(unstaged),
             untracked: Some(untracked),
+            conflicts,
             unknown_fields,
             fingerprints: Vec::new(),
         })

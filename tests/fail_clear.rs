@@ -326,7 +326,6 @@ fn empty_dirs_removed_nonempty_report_incomplete() {
 /// slice lands (B11 wires it into `clear_unknown_files_matrix`; here it
 /// is a standalone test so the matrix keeps covering current behavior).
 #[test]
-#[ignore = "pending main.rs clear-output scrubbing (safe_human_text + note_incomplete on preserved) — main/privacy slice"]
 fn clear_preserved_and_incomplete_paths_are_scrubbed() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state = dir.path().join("password=CLEARPATHCANARY");

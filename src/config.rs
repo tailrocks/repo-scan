@@ -558,82 +558,15 @@ pub fn try_canonical_scope_path(path: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Config-local identity-I/O budget, mirroring the coordinator's
-/// `IDENTITY_IO_*` bounds in `walk::topology` (RSF-TOPOLOGY-ADMISSION):
-/// at most 2 concurrent resolves, a 1 s wait for a slot, and a 1 s
-/// timeout per resolve. Past either bound the resolve fails unknown
-/// (`None`) and the caller fails closed.
-const IDENTITY_IO_CAP: usize = 2;
-/// How long a resolve waits for an identity-I/O slot before failing unknown.
-const IDENTITY_IO_SLOT_WAIT: Duration = Duration::from_secs(1);
-/// Timeout for one bounded identity resolve on its worker thread.
-const IDENTITY_IO_TIMEOUT: Duration = Duration::from_secs(1);
-
-/// Live config identity-I/O workers (process-wide).
-static IDENTITY_IO_LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// Canonicalize one scope path on the bounded identity-I/O lane. `None`
-/// means admission, timeout, or worker creation failed; callers that use
-/// canonical paths to commit invalidation must stop before their
-/// transaction so the event remains retryable.
-///
-/// SLICE-C NOTE: B11 routes this through B09's
-/// `crate::walk::topology::bounded_canonicalize`; the walk slice has not
-/// landed on the consolidation line yet, so this config-local worker
-/// keeps the identical admission/timeout bounds (same shape as the
-/// store-local shim in `store::catalog`). Slice 5 may swap this private
-/// helper for the shared B09 one — the public contract of
-/// [`try_canonical_scope_path`] does not change.
+/// Canonicalize one scope path on the shared bounded identity-I/O lane
+/// ([`crate::walk::topology::bounded_canonicalize`], B11 shape — the SLICE-C
+/// NOTE's config-local worker is retired in favor of the walk slice's lane;
+/// same admission/timeout bounds). `None` means admission, timeout, or
+/// worker creation failed; callers that use canonical paths to commit
+/// invalidation must stop before their transaction so the event remains
+/// retryable.
 fn bounded_canonicalize(path: &Path) -> Option<Result<PathBuf, std::io::ErrorKind>> {
-    use std::sync::atomic::Ordering;
-    use std::time::Instant;
-
-    let op = {
-        let owned = path.to_path_buf();
-        move || std::fs::canonicalize(&owned).map_err(|error| error.kind())
-    };
-    let start = Instant::now();
-    let admitted = loop {
-        let live = IDENTITY_IO_LIVE.load(Ordering::Relaxed);
-        if live < IDENTITY_IO_CAP
-            && IDENTITY_IO_LIVE
-                .compare_exchange_weak(live, live + 1, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-        {
-            break true;
-        }
-        if start.elapsed() >= IDENTITY_IO_SLOT_WAIT {
-            break false;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    };
-    if !admitted {
-        return None;
-    }
-    struct SlotGuard;
-    impl Drop for SlotGuard {
-        fn drop(&mut self) {
-            IDENTITY_IO_LIVE.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
-    // The permit is owned by the detached worker, not the caller: the
-    // live count covers the worker's full blocked lifetime, and
-    // `recv_timeout` abandons only the wait.
-    let (tx, rx) = std::sync::mpsc::channel();
-    if std::thread::Builder::new()
-        .name(String::from("config-identity-io"))
-        .spawn({
-            let guard = SlotGuard;
-            move || {
-                let _held = guard;
-                let _ = tx.send(op());
-            }
-        })
-        .is_err()
-    {
-        return None;
-    }
-    rx.recv_timeout(IDENTITY_IO_TIMEOUT).ok()
+    crate::walk::topology::bounded_canonicalize(path)
 }
 
 /// Normalize a scope path without consulting the filesystem. This is the
