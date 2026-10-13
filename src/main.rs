@@ -23,8 +23,11 @@ use repo_scan::report::builder::{
     ReportInputs as LibReportInputs, ReportPipeline, RootInput, StorageLinkInput,
 };
 use repo_scan::scan_events::{
-    classify_cursor, is_progress_coalescible, is_terminal_event, is_terminal_name,
-    retention_cutoff, Cursor, Envelope, EventType, Op, ResumeAction, MAX_RETAINED_SCAN_EVENTS,
+    buffer_scan_event_dedupe, classify_cursor, event_id_from_journal, event_opaque_id,
+    event_safe_records, is_progress_coalescible, is_terminal_event, is_terminal_name,
+    load_scan_event_dedupe, prune_scan_events_through, retention_cutoff, scan_event_count, Cursor,
+    Envelope, EventType, Op, ResumeAction, ScanCursor, EVENT_RESUME_STATE_ARGUMENT,
+    MAX_RETAINED_SCAN_EVENTS,
 };
 use repo_scan::scheduler::{backoff_for_attempt, Admission, CircuitBreaker, OpClass, Permit};
 #[cfg(test)]
@@ -864,27 +867,76 @@ struct ScanJournal {
     emitted_stores: HashSet<String>,
     emitted_checkouts: HashSet<String>,
     emitted_branch_stores: HashSet<String>,
+    /// Seq of the coalesced `discovery_progress` gauge row, if journaled.
+    /// Later ticks update its payload in place and append a
+    /// `discovery_progress_updated` notification with a new cursor, so
+    /// replay retains one latest gauge while live readers observe each
+    /// committed update.
+    progress_seq: Option<u64>,
+    /// Seq of the journaled `inventory_ready` row, if any (replay-once:
+    /// a resumed run never re-emits the boundary event; a run killed
+    /// before the boundary still emits it because the prefix lacks it).
+    ready_seq: Option<u64>,
+    /// Seq of the journaled terminal row, if any (contract D4:
+    /// exactly one terminal per scan — a resumed run never appends a
+    /// second, so followers stop at the first and inspect completes;
+    /// the scan row carries the live verdict while a stale journal
+    /// terminal may stand, same as a retried publication).
+    terminal_seq: Option<u64>,
+    /// Gap ids already carrying an `error` event in this journal
+    /// (DB-m5: resume-time DB-vs-journal reconciliation re-buffers
+    /// only rows missing here — never a duplicate).
+    error_ids: HashSet<String>,
+    /// Instance ids already reported via `coverage_updated`
+    /// `unresolvable_added` in this journal. A repeat persist of the
+    /// same store (reconcile re-probe, resume re-discovery) upserts
+    /// fresh evidence but must not re-emit the candidate delta —
+    /// `repository_found` dedupes the same way, and the coverage
+    /// stream promises one transition per id.
+    emitted_unresolvable: HashSet<String>,
+    /// Highest seq known pruned by retention (heuristic for the
+    /// over-bound check; the `COUNT(*)` confirm is authoritative).
+    pruned_through: u64,
 }
 
 impl ScanJournal {
     async fn open(store: &TursoStore, scan_id: &str, rev: u64) -> repo_scan::Result<Self> {
         let mut max_seq = 0u64;
+        let mut min_seq = None;
         let mut last_rev = None;
         let mut last_off = 0u64;
         let mut emitted_stores = HashSet::new();
         let mut emitted_checkouts = HashSet::new();
         let mut emitted_branch_stores = HashSet::new();
+        let mut error_ids = HashSet::new();
+        let mut emitted_unresolvable = HashSet::new();
+        let mut progress_seq = None;
+        let mut ready_seq = None;
+        let mut terminal_seq = None;
         loop {
             let rows = store.read_scan_events(scan_id, max_seq, 500).await?;
             let short = rows.len() < 500;
             for row in &rows {
+                if min_seq.is_none() {
+                    min_seq = Some(row.seq);
+                }
                 max_seq = row.seq;
                 last_rev = Some(row.catalog_rev);
                 last_off = row.event_offset;
+                if row.event_type == EventType::DiscoveryProgress.name() {
+                    progress_seq = Some(row.seq);
+                }
+                if row.event_type == EventType::InventoryReady.name() {
+                    ready_seq = Some(row.seq);
+                }
+                if is_terminal_name(&row.event_type) {
+                    terminal_seq = Some(row.seq);
+                }
                 let id_key = match row.event_type.as_str() {
                     "repository_found" => Some((&mut emitted_stores, "store_id")),
                     "location_found" => Some((&mut emitted_checkouts, "checkout_id")),
                     "branch_batch" => Some((&mut emitted_branch_stores, "store_id")),
+                    "error" => Some((&mut error_ids, "id")),
                     _ => None,
                 };
                 if let Some((set, key)) = id_key {
@@ -896,12 +948,59 @@ impl ScanJournal {
                             ))
                         })?;
                     if let Some(id) = v.get(key).and_then(|v| v.as_str()) {
-                        set.insert(id.to_string());
+                        set.insert(event_id_from_journal(id));
+                    }
+                }
+                if row.event_type == "coverage_updated" {
+                    let v: serde_json::Value =
+                        serde_json::from_slice(&row.records).map_err(|e| {
+                            repo_scan::Error::Report(format!(
+                                "scan_events row seq {} carries corrupt records: {e}",
+                                row.seq,
+                            ))
+                        })?;
+                    if let Some(added) = v.get("unresolvable_added").and_then(|v| v.as_array()) {
+                        for id in added.iter().filter_map(|v| v.as_str()) {
+                            emitted_unresolvable.insert(event_id_from_journal(id));
+                        }
                     }
                 }
             }
             if short {
                 break;
+            }
+        }
+        // A retained terminal event closes the stream permanently. It is
+        // safe to skip dedupe hydration for that scan, including an older
+        // pruned-prefix journal whose side markers were cleaned atomically
+        // with its terminal event.
+        if terminal_seq.is_none() {
+            load_scan_event_dedupe(
+                store,
+                scan_id,
+                min_seq.is_none_or(|seq| seq <= 1),
+                &mut [
+                    ("repository_found", &mut emitted_stores),
+                    ("location_found", &mut emitted_checkouts),
+                    ("branch_batch", &mut emitted_branch_stores),
+                    ("error", &mut error_ids),
+                    ("coverage_updated", &mut emitted_unresolvable),
+                ],
+            )
+            .await?;
+        }
+        // The ready row can age out with the pruned prefix. Its sequence
+        // is also stored on the scan request before retention runs, so a
+        // resumed scan keeps the lifecycle boundary authoritative. A
+        // retained event with a NULL marker is the crash/legacy window:
+        // backfill it before any later emit can prune that event.
+        if let Some(scan) = store.get_scan(scan_id).await? {
+            match (ready_seq, scan.inventory_ready_seq) {
+                (Some(event_seq), None) => {
+                    store.mark_scan_inventory_ready(scan_id, event_seq).await?;
+                }
+                (None, Some(stored_seq)) => ready_seq = Some(stored_seq),
+                _ => {}
             }
         }
         Ok(Self {
@@ -914,18 +1013,36 @@ impl ScanJournal {
             emitted_stores,
             emitted_checkouts,
             emitted_branch_stores,
+            error_ids,
+            emitted_unresolvable,
+            progress_seq,
+            ready_seq,
+            terminal_seq,
+            // Retention prunes a contiguous prefix, so everything below
+            // the retained minimum is gone; a fresh journal starts at 1.
+            pruned_through: min_seq.map(|m| m.saturating_sub(1)).unwrap_or(0),
         })
+    }
+
+    /// True when the journaled prefix already carries a terminal row
+    /// (replay-once: a resumed run must not append a second terminal).
+    fn has_terminal(&self) -> bool {
+        self.terminal_seq.is_some()
+    }
+
+    /// True when the journaled prefix already carries `inventory_ready`
+    /// (replay-once: a resumed run must not re-emit the boundary).
+    fn has_ready(&self) -> bool {
+        self.ready_seq.is_some()
     }
 
     /// Cursor of the last committed event, for `scan_interrupted` /
     /// `scan_failed` payloads (`None` when nothing is journaled yet).
-    fn cursor(&self) -> Option<Cursor> {
+    fn cursor(&self) -> Option<ScanCursor> {
         match (self.last_seq, self.last_rev) {
-            (Some(seq), Some(rev)) => Some(Cursor {
-                seq,
-                catalog_rev: rev,
-                event_offset: self.last_off,
-            }),
+            (Some(seq), Some(rev)) => {
+                Some(ScanCursor::for_scan(&self.scan_id, seq, rev, self.last_off))
+            }
             _ => None,
         }
     }
@@ -947,6 +1064,11 @@ impl ScanJournal {
         (seq, off)
     }
 
+    /// Highest seq assigned so far (`next_seq - 1`; 0 when empty).
+    fn tip_seq(&self) -> u64 {
+        self.next_seq.saturating_sub(1)
+    }
+
     /// Journal one lifecycle event. Each call is its own transaction
     /// (lifecycle events are rare); per-record events buffer into the
     /// writer batch below instead.
@@ -955,10 +1077,31 @@ impl ScanJournal {
         store: &TursoStore,
         event_type: EventType,
         records: &serde_json::Value,
-    ) -> repo_scan::Result<()> {
+    ) -> repo_scan::Result<u64> {
+        self.emit_with_retention(store, event_type, records, MAX_RETAINED_SCAN_EVENTS)
+            .await
+    }
+
+    /// Journal a lifecycle event and enforce the retention cap in the same
+    /// direct-emission path. The explicit limit keeps the production rule
+    /// testable with a small deterministic journal.
+    async fn emit_with_retention(
+        &mut self,
+        store: &TursoStore,
+        event_type: EventType,
+        records: &serde_json::Value,
+        keep_rows: u64,
+    ) -> repo_scan::Result<u64> {
+        // A terminal closes this scan's event stream. Resumed work may still
+        // refresh catalog rows, but it must not append records after the
+        // terminal already consumed by followers.
+        if self.has_terminal() {
+            return Ok(0);
+        }
         let (seq, off) = self.assign();
-        let bytes =
-            serde_json::to_vec(records).map_err(|e| repo_scan::Error::Report(e.to_string()))?;
+        let safe_records = event_safe_records(event_type, records.clone());
+        let bytes = serde_json::to_vec(&safe_records)
+            .map_err(|e| repo_scan::Error::Report(e.to_string()))?;
         let event = NewScanEvent {
             scan_id: &self.scan_id,
             seq,
@@ -969,8 +1112,23 @@ impl ScanJournal {
             reset: false,
             records: &bytes,
         };
-        store.append_scan_event(&event).await?;
-        Ok(())
+        let appended = if is_terminal_event(event_type) {
+            store.append_terminal_scan_event(&event).await?
+        } else {
+            store.append_scan_event(&event).await?
+        };
+        if !appended {
+            return Ok(0);
+        }
+        if event_type == EventType::InventoryReady {
+            self.ready_seq = Some(seq);
+            store.mark_scan_inventory_ready(&self.scan_id, seq).await?;
+        }
+        if is_terminal_event(event_type) {
+            self.terminal_seq = Some(seq);
+        }
+        let pruned = maybe_prune_scan_journal(store, self, keep_rows).await?;
+        Ok(1 + u64::from(event_type == EventType::InventoryReady) + u64::from(pruned))
     }
 
     /// Buffer one `repository_found` into the writer batch: it commits
@@ -983,7 +1141,10 @@ impl ScanJournal {
         store_id: &str,
         records: &[u8],
     ) -> repo_scan::Result<Option<bool>> {
-        if !self.emitted_stores.insert(store_id.to_string()) {
+        if self.has_terminal() {
+            return Ok(None);
+        }
+        if !self.emitted_stores.insert(event_opaque_id(store_id)) {
             return Ok(None);
         }
         let (seq, off) = self.assign();
@@ -997,7 +1158,13 @@ impl ScanJournal {
             reset: false,
             records,
         };
-        Ok(Some(TursoStore::buffer_scan_event(batch, &event)?))
+        TursoStore::buffer_scan_event(batch, &event)?;
+        Ok(Some(buffer_scan_event_dedupe(
+            batch,
+            &self.scan_id,
+            EventType::RepositoryFound.name(),
+            store_id,
+        )))
     }
 
     /// Buffer one `location_found` into the writer batch (same atomicity
@@ -1008,7 +1175,10 @@ impl ScanJournal {
         checkout_id: &str,
         records: &[u8],
     ) -> repo_scan::Result<Option<bool>> {
-        if !self.emitted_checkouts.insert(checkout_id.to_string()) {
+        if self.has_terminal() {
+            return Ok(None);
+        }
+        if !self.emitted_checkouts.insert(event_opaque_id(checkout_id)) {
             return Ok(None);
         }
         let (seq, off) = self.assign();
@@ -1022,7 +1192,13 @@ impl ScanJournal {
             reset: false,
             records,
         };
-        Ok(Some(TursoStore::buffer_scan_event(batch, &event)?))
+        TursoStore::buffer_scan_event(batch, &event)?;
+        Ok(Some(buffer_scan_event_dedupe(
+            batch,
+            &self.scan_id,
+            EventType::LocationFound.name(),
+            checkout_id,
+        )))
     }
 
     /// Buffer one `location_updated` into the writer batch: it commits
@@ -1035,6 +1211,9 @@ impl ScanJournal {
         batch: &mut WriterBatch,
         records: &[u8],
     ) -> repo_scan::Result<Option<bool>> {
+        if self.has_terminal() {
+            return Ok(None);
+        }
         let (seq, off) = self.assign();
         let event = NewScanEvent {
             scan_id: &self.scan_id,
@@ -1050,14 +1229,18 @@ impl ScanJournal {
     }
 
     /// Buffer one `error` into the writer batch: it commits atomically
-    /// with the error row that caused it. No dedupe — errors are
-    /// point-in-time observations (`add`), bounded by the same retry caps
-    /// that bound the rows. Always `Some(should_flush)`.
+    /// with the error row that caused it. Error events are not suppressed:
+    /// they are point-in-time observations (`add`). Their IDs persist as
+    /// resume-reconciliation evidence so a pruned row is not re-journaled.
+    /// Always `Some(should_flush)`.
     fn buffer_error(
         &mut self,
         batch: &mut WriterBatch,
         records: &[u8],
     ) -> repo_scan::Result<Option<bool>> {
+        if self.has_terminal() {
+            return Ok(None);
+        }
         let (seq, off) = self.assign();
         let event = NewScanEvent {
             scan_id: &self.scan_id,
@@ -1069,18 +1252,28 @@ impl ScanJournal {
             reset: false,
             records,
         };
-        Ok(Some(TursoStore::buffer_scan_event(batch, &event)?))
+        let mut due = TursoStore::buffer_scan_event(batch, &event)?;
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(records) {
+            if let Some(id) = value.get("id").and_then(serde_json::Value::as_str) {
+                due |= buffer_scan_event_dedupe(batch, &self.scan_id, EventType::Error.name(), id);
+            }
+        }
+        Ok(Some(due))
     }
 
     /// Buffer one `coverage_updated` into the writer batch: it commits
-    /// atomically with the gap rows it describes. No dedupe — each call
-    /// carries a genuine transition (callers gate on `Runner::open_gaps`),
-    /// and `replace` replays in seq order. Always `Some(should_flush)`.
+    /// atomically with the gap rows it describes. Calls record genuine
+    /// transitions (callers gate on `Runner::open_gaps`); unresolvable
+    /// candidate IDs also persist for resume-time dedupe. `replace`
+    /// replays in seq order. Always `Some(should_flush)`.
     fn buffer_coverage_updated(
         &mut self,
         batch: &mut WriterBatch,
         records: &[u8],
     ) -> repo_scan::Result<Option<bool>> {
+        if self.has_terminal() {
+            return Ok(None);
+        }
         let (seq, off) = self.assign();
         let event = NewScanEvent {
             scan_id: &self.scan_id,
@@ -1092,7 +1285,23 @@ impl ScanJournal {
             reset: false,
             records,
         };
-        Ok(Some(TursoStore::buffer_scan_event(batch, &event)?))
+        let mut due = TursoStore::buffer_scan_event(batch, &event)?;
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(records) {
+            if let Some(ids) = value
+                .get("unresolvable_added")
+                .and_then(serde_json::Value::as_array)
+            {
+                for id in ids.iter().filter_map(serde_json::Value::as_str) {
+                    due |= buffer_scan_event_dedupe(
+                        batch,
+                        &self.scan_id,
+                        EventType::CoverageUpdated.name(),
+                        id,
+                    );
+                }
+            }
+        }
+        Ok(Some(due))
     }
 
     /// Buffer one `branch_batch` into the writer batch: it commits
@@ -1106,7 +1315,10 @@ impl ScanJournal {
         store_id: &str,
         records: &[u8],
     ) -> repo_scan::Result<Option<bool>> {
-        let first = self.emitted_branch_stores.insert(store_id.to_string());
+        if self.has_terminal() {
+            return Ok(None);
+        }
+        let first = self.emitted_branch_stores.insert(event_opaque_id(store_id));
         let op = if first { Op::Add } else { Op::Replace };
         let (seq, off) = self.assign();
         let event = NewScanEvent {
@@ -1119,20 +1331,173 @@ impl ScanJournal {
             reset: false,
             records,
         };
-        Ok(Some(TursoStore::buffer_scan_event(batch, &event)?))
+        TursoStore::buffer_scan_event(batch, &event)?;
+        Ok(Some(buffer_scan_event_dedupe(
+            batch,
+            &self.scan_id,
+            EventType::BranchBatch.name(),
+            store_id,
+        )))
+    }
+
+    /// Buffer one `discovery_progress` tick: it commits with the writer
+    /// batch (visible while later discovery is still active, never held
+    /// to phase end). The first tick inserts the coalesced gauge row;
+    /// later ticks update it in place and append a
+    /// `discovery_progress_updated` notification with a fresh cursor.
+    /// This keeps one latest gauge for replay while strict-after live
+    /// readers see subsequent progress. When retention pruned the gauge,
+    /// the next tick re-inserts it at a fresh seq. Always
+    /// `Some(should_flush)`.
+    fn buffer_discovery_progress(
+        &mut self,
+        batch: &mut WriterBatch,
+        records: &[u8],
+    ) -> repo_scan::Result<Option<bool>> {
+        if self.has_terminal() {
+            return Ok(None);
+        }
+        debug_assert!(is_progress_coalescible(EventType::DiscoveryProgress));
+        // A pruned gauge row reads as absent: re-insert below at a fresh
+        // seq (retention only deletes the prefix, so this test is exact).
+        if self
+            .progress_seq
+            .is_some_and(|seq| seq <= self.pruned_through)
+        {
+            self.progress_seq = None;
+        }
+        match self.progress_seq {
+            Some(seq) => {
+                let seq_i64 = i64::try_from(seq).map_err(|_| {
+                    repo_scan::Error::Store(format!("event seq {seq} exceeds i64 range"))
+                })?;
+                let update_due = batch.push(
+                    "UPDATE scan_events SET records = ?1 \
+                        WHERE scan_id = ?2 AND seq = ?3",
+                    vec![
+                        turso::Value::Blob(records.to_vec()),
+                        turso::Value::Text(self.scan_id.clone()),
+                        turso::Value::Integer(seq_i64),
+                    ],
+                );
+                let notification_due = self.buffer_discovery_progress_updated(batch, records)?;
+                Ok(Some(update_due || notification_due))
+            }
+            None => {
+                let event_type = EventType::DiscoveryProgress;
+                let (seq, off) = self.assign();
+                self.progress_seq = Some(seq);
+                let seq_i64 = i64::try_from(seq).map_err(|_| {
+                    repo_scan::Error::Store(format!("event seq {seq} exceeds i64 range"))
+                })?;
+                let rev_i64 = i64::try_from(self.rev).map_err(|_| {
+                    repo_scan::Error::Store(format!(
+                        "event catalog_rev {} exceeds i64 range",
+                        self.rev
+                    ))
+                })?;
+                let off_i64 = i64::try_from(off).map_err(|_| {
+                    repo_scan::Error::Store(format!("event offset {off} exceeds i64 range"))
+                })?;
+                Ok(Some(batch.push(
+                    "INSERT OR IGNORE INTO scan_events (scan_id, seq, catalog_rev, event_offset, \
+                        event_type, op, reset, records) \
+                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    vec![
+                        turso::Value::Text(self.scan_id.clone()),
+                        turso::Value::Integer(seq_i64),
+                        turso::Value::Integer(rev_i64),
+                        turso::Value::Integer(off_i64),
+                        turso::Value::Text(event_type.name().to_string()),
+                        turso::Value::Text(event_type.op().name().to_string()),
+                        turso::Value::Integer(0),
+                        turso::Value::Blob(records.to_vec()),
+                    ],
+                )))
+            }
+        }
+    }
+
+    /// Append the cursor-advancing notification for a coalesced progress
+    /// update. Its records carry the current gauge so a strict-after live
+    /// reader can apply the change without re-reading an earlier row.
+    fn buffer_discovery_progress_updated(
+        &mut self,
+        batch: &mut WriterBatch,
+        records: &[u8],
+    ) -> repo_scan::Result<bool> {
+        let event_type = EventType::DiscoveryProgressUpdated;
+        let (seq, off) = self.assign();
+        let seq_i64 = i64::try_from(seq)
+            .map_err(|_| repo_scan::Error::Store(format!("event seq {seq} exceeds i64 range")))?;
+        let rev_i64 = i64::try_from(self.rev).map_err(|_| {
+            repo_scan::Error::Store(format!("event catalog_rev {} exceeds i64 range", self.rev))
+        })?;
+        let off_i64 = i64::try_from(off).map_err(|_| {
+            repo_scan::Error::Store(format!("event offset {off} exceeds i64 range"))
+        })?;
+        Ok(batch.push(
+            "INSERT OR IGNORE INTO scan_events (scan_id, seq, catalog_rev, event_offset, \
+                event_type, op, reset, records) \
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            vec![
+                turso::Value::Text(self.scan_id.clone()),
+                turso::Value::Integer(seq_i64),
+                turso::Value::Integer(rev_i64),
+                turso::Value::Integer(off_i64),
+                turso::Value::Text(event_type.name().to_string()),
+                turso::Value::Text(event_type.op().name().to_string()),
+                turso::Value::Integer(0),
+                turso::Value::Blob(records.to_vec()),
+            ],
+        ))
     }
 }
 
-/// Resume command recorded in lifecycle payloads (D4): replays the exact
-/// state dir + scan id a follower needs to reconnect.
-fn resume_cmd_for(state_dir: &Path, scan_id: &str) -> String {
+/// Enforce Step 12 bounded retention after a flush committed: when the
+/// journal's cheap suspected check fires, confirm with `COUNT(*)` and
+/// prune to `keep_rows` (production passes
+/// [`MAX_RETAINED_SCAN_EVENTS`]), advancing the watermark. Returns true
+/// when a prune transaction committed (callers count it). Cursors the
+/// retained window no longer covers resolve to an explicit-reset
+/// snapshot via [`classify_cursor`], never a silent gap.
+async fn maybe_prune_scan_journal(
+    store: &TursoStore,
+    journal: &mut ScanJournal,
+    keep_rows: u64,
+) -> repo_scan::Result<bool> {
+    if journal.tip_seq().saturating_sub(journal.pruned_through) <= keep_rows.max(1) {
+        return Ok(false);
+    }
+    if scan_event_count(store, &journal.scan_id).await? <= keep_rows.max(1) {
+        return Ok(false);
+    }
+    let cutoff = retention_cutoff(journal.tip_seq(), keep_rows);
+    prune_scan_events_through(store, &journal.scan_id, cutoff).await?;
+    journal.pruned_through = cutoff.max(journal.pruned_through);
+    Ok(true)
+}
+
+/// Resume command recorded in lifecycle payloads (D4): the owner supplies
+/// the protected state directory through the environment, so no local path is
+/// copied into the event journal or JSONL stream.
+fn resume_cmd_for(_state_dir: &Path, scan_id: &str) -> String {
     format!(
-        "repo-scan --state-dir {} resume {scan_id}",
-        state_dir.display()
+        "repo-scan --state-dir {EVENT_RESUME_STATE_ARGUMENT} resume {}",
+        shell_quote(scan_id)
     )
 }
 
-/// `scan_failed` payload (Step 12): last committed cursor, scrubbed error,
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+pub fn test_resume_cmd_for(state_dir: &Path, scan_id: &str) -> String {
+    resume_cmd_for(state_dir, scan_id)
+}
+
+/// `scan_failed` payload (Step 12): last committed cursor, path-free error,
 /// resume capability + command. The staged snapshot survives a publication
 /// failure, so `resumable` is always true here.
 fn failed_records(
@@ -1151,6 +1516,7 @@ fn failed_records(
         "error": err,
         "resumable": true,
         "resume_cmd": resume_cmd_for(state_dir, scan_id),
+        "boundary_audit": boundary_audit_value(),
     })
 }
 
