@@ -512,7 +512,13 @@ fn binary_scan_resume_query_lifecycle() {
 
     // Resume the completed first scan from a different cwd: idempotent
     // terminal replay, no rescan, absolute destination intact.
-    let out = run(&["resume", scan_id.as_str()], &cwd_b, &state);
+    // Wave6: explicit human keeps the footer lines (the redirected
+    // default is now the JSONL journal replay).
+    let out = run(
+        &["resume", scan_id.as_str(), "--format", "human"],
+        &cwd_b,
+        &state,
+    );
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(stdout.contains("replayed"), "{stdout}");

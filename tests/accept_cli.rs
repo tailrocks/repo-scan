@@ -10,6 +10,10 @@
 
 mod common;
 
+#[path = "../src/main.rs"]
+#[allow(dead_code)]
+mod main_under_test;
+
 use clap::Parser;
 use common::fixture;
 use repo_scan::cli::{CacheAction, Cli, Command};
@@ -247,7 +251,13 @@ fn cli01_command_table_end_to_end() {
     assert!(stdout.contains("matches: 1"), "{stdout}");
 
     // resume of a completed scan: idempotent terminal replay (exit 0).
-    let out = run(&["resume", scan_id.as_str()], &env.cwd_b, &env.state);
+    // Wave6: explicit human keeps the footer lines (the redirected
+    // default is now the JSONL journal replay).
+    let out = run(
+        &["resume", scan_id.as_str(), "--format", "human"],
+        &env.cwd_b,
+        &env.state,
+    );
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
     let stdout = stdout_text(&out);
     assert!(stdout.contains("replayed"), "{stdout}");
@@ -457,7 +467,13 @@ fn cli03_completed_resume_idempotent_across_cwd() {
     let report_bytes = std::fs::read(env.cwd_a.join("rep.json")).expect("report");
     // Resume twice from the other cwd: same terminal result, no fresh scan.
     for _ in 0..2 {
-        let out = run(&["resume", scan_id.as_str()], &env.cwd_b, &env.state);
+        // Wave6: explicit human keeps the footer lines (the redirected
+        // default is now the JSONL journal replay).
+        let out = run(
+            &["resume", scan_id.as_str(), "--format", "human"],
+            &env.cwd_b,
+            &env.state,
+        );
         assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
         let stdout = stdout_text(&out);
         assert!(stdout.contains("replayed"), "{stdout}");
@@ -522,7 +538,11 @@ fn cli03_failed_publication_retries_to_absolute_dest() {
             .expect("chmod restore");
     }
     // Resume from the other cwd: no rescan, original absolute dest honored.
-    let out = run(&["resume", scan_id.as_str()], &env.cwd_b, &env.state);
+    let out = run(
+        &["resume", scan_id.as_str(), "--format", "human"],
+        &env.cwd_b,
+        &env.state,
+    );
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
     let stdout = stdout_text(&out);
     assert!(stdout.contains("publication retried"), "{stdout}");
@@ -596,7 +616,11 @@ fn cli03_failed_terminal_delivery_retries_saved_snapshot() {
         store.close().await.expect("close catalog");
     });
 
-    let resumed = run(&["resume", scan_id.as_str()], &env.cwd_b, &env.state);
+    let resumed = run(
+        &["resume", scan_id.as_str(), "--format", "human"],
+        &env.cwd_b,
+        &env.state,
+    );
     assert_eq!(
         resumed.status.code(),
         Some(0),
@@ -615,7 +639,11 @@ fn cli03_failed_terminal_delivery_retries_saved_snapshot() {
     assert_eq!(stdout_line(&resumed, "scan_id"), scan_id);
     assert_eq!(stdout_line(&resumed, "report_id"), report_id);
 
-    let replay = run(&["resume", scan_id.as_str()], &env.cwd_b, &env.state);
+    let replay = run(
+        &["resume", scan_id.as_str(), "--format", "human"],
+        &env.cwd_b,
+        &env.state,
+    );
     assert_eq!(
         replay.status.code(),
         Some(0),
@@ -729,7 +757,11 @@ fn cli03_superseded_resume_names_successor() {
     let successor = stdout_line(&out, "scan_id");
     assert_ne!(successor, stale_id);
     // Resume of the superseded request: exit 3 with a usable result.
-    let out = run(&["resume", stale_id], &env.cwd_b, &env.state);
+    let out = run(
+        &["resume", stale_id, "--format", "human"],
+        &env.cwd_b,
+        &env.state,
+    );
     assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr_text(&out));
     let stdout = stdout_text(&out);
     assert!(stdout.contains("superseded"), "{stdout}");
@@ -1870,7 +1902,7 @@ fn error_events_journal_completion_gaps() {
             assert_eq!(row.op, "add", "D4 op for error");
             let v: serde_json::Value = serde_json::from_slice(&row.records).expect("json");
             let id = v["id"].as_str().expect("event id");
-            assert!(id.starts_with("gap:"), "gap id: {id}");
+            assert!(id.starts_with("evt:"), "opaque gap id: {id}");
             assert!(
                 v["category"].as_str().is_some_and(|c| !c.is_empty()),
                 "category carried"
@@ -1881,7 +1913,18 @@ fn error_events_journal_completion_gaps() {
             );
             // Join: the payload names a real open catalog row; attempts and
             // open state are read there, never from the event.
-            let gap = store.get_error(id).await.expect("get").expect("gap row");
+            let raw_id = store
+                .list_open_error_ids()
+                .await
+                .expect("open gap ids")
+                .into_iter()
+                .find(|raw| main_under_test::test_event_opaque_id(raw).as_str() == id)
+                .expect("opaque event id maps to an open catalog gap");
+            let gap = store
+                .get_error(&raw_id)
+                .await
+                .expect("get")
+                .expect("gap row");
             assert!(gap.open, "gap row is open");
             assert!(gap.attempts >= 1, "recorded at least once");
             assert_eq!(gap.category, v["category"].as_str().expect("category"));
@@ -2045,10 +2088,6 @@ fn hex_of(bytes: &[u8]) -> String {
 /// opens exactly once (re-records are not transitions), unconditional
 /// closes of never-open rows stay silent, and a remote-less clone joins
 /// as an unresolvable candidate.
-///
-/// The scan root is canonicalized (see branch_batch_journals_persisted_refs):
-/// with a symlink-free root the store's double discovery resolves to one
-/// spelling, exercising the same-spelling re-probe dedupe on every platform.
 #[test]
 fn coverage_updated_reports_gap_deltas() {
     use repo_scan::store::{Store, TursoStore};
@@ -2082,21 +2121,7 @@ fn coverage_updated_reports_gap_deltas() {
         return;
     }
 
-    let out = run(
-        &[
-            "scan",
-            URL,
-            "--root",
-            std::fs::canonicalize(&env.fixture)
-                .expect("canonical fixture")
-                .to_str()
-                .expect("utf8"),
-            "--report",
-            "rep.json",
-        ],
-        &env.cwd_a,
-        &env.state,
-    );
+    let out = env.scan(&["--report", "rep.json"], &env.cwd_a);
     assert_eq!(
         out.status.code(),
         Some(3),
@@ -2155,18 +2180,38 @@ fn coverage_updated_reports_gap_deltas() {
         // retry/re-record count; every probe's unconditional close of a
         // never-open row stays silent.
         assert_eq!(opened.len(), 1, "one open transition: {opened:?}");
-        assert!(opened[0].starts_with("gap:"), "gap id: {}", opened[0]);
+        assert!(
+            opened[0].starts_with("evt:"),
+            "opaque gap id: {}",
+            opened[0]
+        );
         assert!(closed.is_empty(), "no genuine closes: {closed:?}");
+        let raw_gap_id = store
+            .list_open_error_ids()
+            .await
+            .expect("open gap ids")
+            .into_iter()
+            .find(|raw| main_under_test::test_event_opaque_id(raw).as_str() == opened[0].as_str())
+            .expect("event id maps to open catalog gap");
         let gap = store
-            .get_error(&opened[0])
+            .get_error(&raw_gap_id)
             .await
             .expect("get")
             .expect("gap row");
         assert!(gap.open, "opened id names an open row");
         // The remote-less clone joined as an unresolvable candidate.
         assert_eq!(unresolvable.len(), 1, "{unresolvable:?}");
+        let common = std::fs::canonicalize(noremote.join(".git")).expect("canonical common dir");
+        let instance_id = format!(
+            "git:{}",
+            repo_scan::config::encode_hex(&repo_scan::config::path_as_bytes(&common))
+        );
+        assert_eq!(
+            unresolvable[0],
+            main_under_test::test_event_opaque_id(&instance_id)
+        );
         let instance = store
-            .get_git_instance(&unresolvable[0])
+            .get_git_instance(&instance_id)
             .await
             .expect("get")
             .expect("instance row");
