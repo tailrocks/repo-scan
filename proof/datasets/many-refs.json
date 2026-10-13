@@ -1,6 +1,6 @@
 {
   "expected_graph": {
-    "description": "10 repositories with 50k refs each, mixed loose/packed, plus symbolic, detached and unborn HEAD cases.",
+    "description": "10 repositories with 50k refs each, mixed loose/packed (loose ref files plus a sorted packed-refs), plus nested-symbolic, detached and unborn HEAD cases assigned to the last repositories. Unborn repositories carry no refs.",
     "invariants": [
       "ref enumeration bounded per store/ref epoch",
       "HEAD states reported exactly"
@@ -8,7 +8,7 @@
   },
   "id": "many-refs",
   "manifest_schema": "repo-scan/dataset-manifest/1",
-  "notes": "pilot-calibration placeholder scale; frozen after the baseline-only pilot.",
+  "notes": "scale = final target, still pending baseline-pilot calibration; scale_pilot = M5-Max pilot measurable in seconds; scale_smoke = CI smoke.",
   "scale": {
     "detached_heads": 2,
     "loose_fraction": 0.1,
@@ -17,6 +17,26 @@
     "repos": 10,
     "roots": 1,
     "symbolic_heads": 2,
+    "unborn_heads": 1
+  },
+  "scale_pilot": {
+    "detached_heads": 1,
+    "loose_fraction": 0.1,
+    "packed_fraction": 0.9,
+    "refs_per_repo": 2000,
+    "repos": 4,
+    "roots": 1,
+    "symbolic_heads": 1,
+    "unborn_heads": 1
+  },
+  "scale_smoke": {
+    "detached_heads": 1,
+    "loose_fraction": 0.2,
+    "packed_fraction": 0.8,
+    "refs_per_repo": 60,
+    "repos": 4,
+    "roots": 1,
+    "symbolic_heads": 1,
     "unborn_heads": 1
   },
   "schema": "repo-scan/dataset-recipe/1",

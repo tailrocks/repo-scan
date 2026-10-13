@@ -9,13 +9,27 @@
   },
   "id": "many-linked-worktrees",
   "manifest_schema": "repo-scan/dataset-manifest/1",
-  "notes": "pilot-calibration placeholder scale; frozen after the baseline-only pilot.",
+  "notes": "scale = final target, still pending baseline-pilot calibration; scale_pilot = M5-Max pilot measurable in seconds; scale_smoke = CI smoke. refs_per_store must be >= worktrees_per_store + 1 (worktrees each claim one branch).",
   "scale": {
     "common_stores": 20,
     "refs_per_store": 40,
     "roots": 1,
     "total_checkouts": 500,
     "worktrees_per_store": 25
+  },
+  "scale_pilot": {
+    "common_stores": 3,
+    "refs_per_store": 8,
+    "roots": 1,
+    "total_checkouts": 15,
+    "worktrees_per_store": 4
+  },
+  "scale_smoke": {
+    "common_stores": 1,
+    "refs_per_store": 3,
+    "roots": 1,
+    "total_checkouts": 3,
+    "worktrees_per_store": 2
   },
   "schema": "repo-scan/dataset-recipe/1",
   "seed": 910006,
