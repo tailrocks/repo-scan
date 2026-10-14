@@ -195,7 +195,7 @@ const FOLLOW_POLL: Duration = Duration::from_millis(250);
 /// terminal event as two transactions (row first), so a terminal row can
 /// beat its event by a commit. A writer that crashed between the two never
 /// emits it, so the grace is bounded rather than an infinite wait.
-const FOLLOW_TERMINAL_GRACE_POLLS: u32 = 4;
+const FOLLOW_TERMINAL_GRACE_POLLS: u32 = 8;
 /// Rows per catalog page for bounded report-derivation scans
 /// (RSF-23D074E0-0A9B-411C-A9D3-7CBD895650C1): errors, instances, and
 /// reclassification reads never hold more than one page from the database
@@ -15167,7 +15167,7 @@ async fn run_query_scan_replay(
         );
         return Ok(ExitCode::Incomplete);
     }
-    let mut store = TursoStore::open_read_only(&db_path).await?;
+    let store = TursoStore::open_read_only(&db_path).await?;
     if !catalog_bound_to_marker(&store, &cfg.state_dir).await? {
         eprintln!(
             "repo-scan: cached query: catalog at {} is not bound to this tool's ownership \
@@ -15276,10 +15276,13 @@ async fn run_query_scan_replay(
         let _ = store.close().await;
         return Ok(ExitCode::Success);
     }
+    let mut active_store = Some(store);
     let mut terminal_row_polls = 0u32;
     loop {
         if interrupted() {
-            let _ = store.close().await;
+            if let Some(s) = active_store.take() {
+                let _ = s.close().await;
+            }
             return Ok(ExitCode::Interrupted);
         }
         std::thread::sleep(FOLLOW_POLL);
@@ -15288,8 +15291,19 @@ async fn run_query_scan_replay(
         // a fresh open did). Reopen per poll and re-verify the ownership
         // bind, so a swapped or cleared catalog ends the follow loudly
         // instead of replaying stale or foreign rows.
-        let _ = store.close().await;
-        store = TursoStore::open_read_only(&db_path).await?;
+        if let Some(s) = active_store.take() {
+            let _ = s.close().await;
+        }
+        let store = match TursoStore::open_read_only(&db_path).await {
+            Ok(s) => s,
+            Err(e) => {
+                terminal_row_polls += 1;
+                if terminal_row_polls >= FOLLOW_TERMINAL_GRACE_POLLS {
+                    return Err(e);
+                }
+                continue;
+            }
+        };
         if !catalog_bound_to_marker(&store, &cfg.state_dir).await? {
             let _ = store.close().await;
             eprintln!(
@@ -15320,11 +15334,11 @@ async fn run_query_scan_replay(
             let _ = store.close().await;
             return Ok(ExitCode::Success);
         }
-        match store.get_scan(scan_id).await? {
-            Some(s) if scan_still_running(&s.state) => {
+        match store.get_scan(scan_id).await {
+            Ok(Some(s)) if scan_still_running(&s.state) => {
                 terminal_row_polls = 0;
             }
-            Some(_) => {
+            Ok(Some(_)) => {
                 // Terminal row, terminal event not yet drained: keep
                 // draining through the grace window (see the constant)
                 // instead of exiting without the final event.
@@ -15334,12 +15348,20 @@ async fn run_query_scan_replay(
                     return Ok(ExitCode::Success);
                 }
             }
-            None => {
+            Ok(None) => {
                 let _ = store.close().await;
                 eprintln!("repo-scan: follow: scan {scan_id} is gone; stopping at the journal tip");
                 return Ok(ExitCode::Incomplete);
             }
+            Err(e) => {
+                terminal_row_polls += 1;
+                if terminal_row_polls >= FOLLOW_TERMINAL_GRACE_POLLS {
+                    let _ = store.close().await;
+                    return Err(e);
+                }
+            }
         }
+        active_store = Some(store);
     }
 }
 

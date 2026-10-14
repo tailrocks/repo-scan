@@ -1463,11 +1463,15 @@ fn query_scan_follow_drains_terminal_event_committed_after_row_state() {
     let mut rest = String::new();
     reader.read_to_string(&mut rest).expect("read to EOF");
     followed.push_str(&rest);
+    let mut err_text = String::new();
+    if let Some(mut err_reader) = child.stderr.take() {
+        let _ = err_reader.read_to_string(&mut err_text);
+    }
     let status = child.wait().expect("wait");
     assert_eq!(
         status.code(),
         Some(0),
-        "follower exits 0 at the terminal event"
+        "follower exits 0 at the terminal event; stderr: {err_text}"
     );
     let last = followed
         .lines()

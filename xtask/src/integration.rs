@@ -197,7 +197,14 @@ pub fn cmd_integration(
                 };
                 let manifest_job = manifest.get("job_id").and_then(Value::as_str);
                 let manifest_os = manifest.pointer("/host/os").and_then(Value::as_str);
-                if manifest_job == Some(&job_def.id) || manifest_os == Some(&job_def.platform) {
+                let matched = if let Some(m_job) = manifest_job {
+                    m_job == job_def.id
+                } else if let Some(m_os) = manifest_os {
+                    m_os == job_def.platform
+                } else {
+                    false
+                };
+                if matched {
                     if let Err(e) = crate::runs::verify_checksums(dir) {
                         missing_or_failed.push(format!(
                             "{}: checksum verification failed: {}",
