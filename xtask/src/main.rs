@@ -106,14 +106,14 @@ enum ProofCommands {
         sources: PathBuf,
     },
     /// Run a binary against a dataset recipe, capturing timing samples and
-    /// counters into proof-out/<run-id>/ with a run manifest.
+    /// counters into `proof-out/<run-id>/` with a run manifest.
     Baseline {
         #[arg(long, default_value = "proof/policy.json")]
         policy: PathBuf,
         /// Binary under measurement.
         #[arg(long)]
         bin: PathBuf,
-        /// Dataset recipe id (proof/datasets/<id>.json) or path to a recipe.
+        /// Dataset recipe id (`proof/datasets/<id>.json`) or path to a recipe.
         #[arg(long)]
         dataset: String,
         /// Repetitions (default 5).

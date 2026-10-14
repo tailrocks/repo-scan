@@ -3,6 +3,8 @@
 //! Everything runs through the built `xtask` binary; fixtures live in
 //! tempdirs so the source tree stays clean.
 
+#![allow(dead_code)]
+
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs;

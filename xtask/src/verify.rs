@@ -11,6 +11,7 @@
 //!   with evidence, or `not_triggered` with executed-trigger evidence,
 //! - the frozen sources lock exactly covers the repository's
 //!   refs/goal/sources/ refs with matching heads/trees/parents.
+//!
 //! No handwritten PASS, agent summary, or copied badge is accepted.
 
 use serde_json::json;

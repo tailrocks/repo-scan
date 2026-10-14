@@ -1,5 +1,5 @@
 //! `proof baseline`: run a named binary against a frozen dataset recipe and
-//! capture timing samples plus counters into proof-out/<run-id>/.
+//! capture timing samples plus counters into `proof-out/<run-id>/`.
 //!
 //! Timing is process start to exit; if the binary prints stage marker lines
 //! of the form `STAGE <name> <milliseconds>` they are parsed into the sample

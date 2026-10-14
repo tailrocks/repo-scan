@@ -1,6 +1,6 @@
 //! Run-directory lifecycle: creation, run manifests, and integrity checksums.
 //!
-//! Every run directory under proof-out/<run-id>/ contains a
+//! Every run directory under `proof-out/<run-id>/` contains a
 //! `run-manifest.json` (build/host metadata, binary hashes, command, exit,
 //! dataset identity, timestamps), raw artifacts (samples.jsonl, logs), and a
 //! `checksums.json` covering every other regular file in the directory.
@@ -54,7 +54,7 @@ pub struct RunDir {
     pub path: PathBuf,
 }
 
-/// Create proof-out/<run-id>/ (or `<out_root>/<run-id>/`).
+/// Create `proof-out/<run-id>/` (or `<out_root>/<run-id>/`).
 pub fn create(out_root: &Path) -> io::Result<RunDir> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
