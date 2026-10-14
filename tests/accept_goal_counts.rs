@@ -256,7 +256,6 @@ fn goal_exact_counts_main_plus_worktrees_plus_clone() {
 /// slice lands; the base test above keeps its TODO markers and all of its
 /// current assertions, unweakened.
 #[test]
-#[ignore = "pending report 1.5.0 groups/totals (D1) — report slice"]
 fn goal_groups_and_totals_match_rows() {
     let (_expect_local_a, _clone_a, _clone_b, report) = goal_counts_fixture();
     let repos = report["repositories"].as_array().expect("repositories[]");
