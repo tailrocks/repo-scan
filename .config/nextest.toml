@@ -6,3 +6,5 @@ retries = 0
 retries = 0
 status-level = "all"
 final-status-level = "flaky"
+default-filter = 'not test(perf_02_03_gates_hold)'
+

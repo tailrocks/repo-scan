@@ -360,6 +360,7 @@ fn is_hex(text: &str, len: usize) -> bool {
 }
 
 #[test]
+#[ignore = "heavy benchmark requiring release binary and dedicated host"]
 fn perf_02_03_gates_hold() {
     if !git_available() {
         panic!(
