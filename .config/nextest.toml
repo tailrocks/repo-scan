@@ -1,0 +1,8 @@
+# Nextest configuration for repo-scan
+[profile.default]
+retries = 0
+
+[profile.ci]
+retries = 0
+status-level = "all"
+final-status-level = "flaky"
