@@ -260,3 +260,36 @@ fn benchmark_rejects_seed_override() {
     ]);
     assert_eq!(code(&out), 2, "stdout: {}", stdout(&out));
 }
+
+#[cfg(unix)]
+#[test]
+fn benchmark_collects_multiple_scenarios() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let policy = common::policy_path();
+    let s1 = common::primary_scenario();
+    let s2 = "wide-file-heavy-warm-fs-identity";
+    let multi_scenario = format!("{s1},{s2}");
+    let out = run(&[
+        "proof",
+        "benchmark",
+        "--policy",
+        policy.to_str().unwrap(),
+        "--baseline-bin",
+        "/usr/bin/true",
+        "--candidate-bin",
+        "/usr/bin/true",
+        "--scenario",
+        &multi_scenario,
+        "--blocks",
+        "20",
+        "--out-root",
+        dir.path().to_str().unwrap(),
+    ]);
+    assert_eq!(code(&out), 0, "stdout: {}", stdout(&out));
+    let collected: serde_json::Value =
+        serde_json::from_str(&stdout(&out)).expect("collection json");
+    let run_dir = std::path::PathBuf::from(collected["run_dir"].as_str().unwrap());
+    let samples_content = std::fs::read_to_string(run_dir.join("samples.jsonl")).unwrap();
+    assert!(samples_content.contains(&s1));
+    assert!(samples_content.contains(s2));
+}

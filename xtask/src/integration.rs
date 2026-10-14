@@ -20,9 +20,17 @@ struct FileResults {
     ignored: Vec<String>,
 }
 
-/// Validate the platform matrix; returns (mandatory_tests, errors).
-fn validate_matrix(matrix: &Value) -> (Vec<String>, Vec<String>) {
+#[derive(Clone, Debug)]
+pub struct NativeJobInfo {
+    pub id: String,
+    pub platform: String,
+    pub qualification_tests: Vec<String>,
+}
+
+/// Validate the platform matrix; returns (jobs, mandatory_tests, errors).
+fn validate_matrix(matrix: &Value) -> (Vec<NativeJobInfo>, Vec<String>, Vec<String>) {
     let mut errors = Vec::new();
+    let mut jobs = Vec::new();
     if matrix.get("schema").and_then(Value::as_str).is_none() {
         errors.push("matrix lacks 'schema'".to_string());
     }
@@ -44,23 +52,49 @@ fn validate_matrix(matrix: &Value) -> (Vec<String>, Vec<String>) {
         .get("mandatory_native_jobs")
         .and_then(Value::as_array)
     {
-        Some(jobs) => {
-            for (i, job) in jobs.iter().enumerate() {
+        Some(job_arr) => {
+            for (i, job) in job_arr.iter().enumerate() {
                 let ctx = format!("mandatory_native_jobs[{i}]");
                 let Some(obj) = job.as_object() else {
                     errors.push(format!("{ctx}: not an object"));
                     continue;
                 };
-                match obj.get("platform").and_then(Value::as_str) {
-                    Some(p) if known.iter().any(|k| k == p) => {}
-                    Some(p) => errors.push(format!(
-                        "{ctx}: unrecognized platform '{p}' (known: {})",
-                        known.join(", ")
-                    )),
-                    None => errors.push(format!("{ctx}: missing 'platform'")),
-                }
-                if obj.get("id").and_then(Value::as_str).is_none() {
-                    errors.push(format!("{ctx}: missing 'id'"));
+                let id = match obj.get("id").and_then(Value::as_str) {
+                    Some(id) => id.to_string(),
+                    None => {
+                        errors.push(format!("{ctx}: missing 'id'"));
+                        String::new()
+                    }
+                };
+                let platform = match obj.get("platform").and_then(Value::as_str) {
+                    Some(p) if known.iter().any(|k| k == p) => p.to_string(),
+                    Some(p) => {
+                        errors.push(format!(
+                            "{ctx}: unrecognized platform '{p}' (known: {})",
+                            known.join(", ")
+                        ));
+                        String::new()
+                    }
+                    None => {
+                        errors.push(format!("{ctx}: missing 'platform'"));
+                        String::new()
+                    }
+                };
+                let qual_tests: Vec<String> = obj
+                    .get("qualification_tests")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !id.is_empty() && !platform.is_empty() {
+                    jobs.push(NativeJobInfo {
+                        id,
+                        platform,
+                        qualification_tests: qual_tests,
+                    });
                 }
             }
         }
@@ -82,7 +116,7 @@ fn validate_matrix(matrix: &Value) -> (Vec<String>, Vec<String>) {
             Vec::new()
         }
     };
-    (mandatory, errors)
+    (jobs, mandatory, errors)
 }
 
 /// Parse cargo test output into per-file results.
@@ -129,13 +163,15 @@ pub fn cmd_integration(
     matrix_path: &Path,
     repo: Option<PathBuf>,
     cmd: Option<String>,
+    job: Option<String>,
+    aggregate: Option<Vec<PathBuf>>,
     out_root: &Path,
 ) -> i32 {
     let matrix = match crate::canon::read_json(matrix_path) {
         Ok(m) => m,
         Err(e) => crate::invalid(e),
     };
-    let (mandatory, matrix_errors) = validate_matrix(&matrix);
+    let (jobs, mandatory, matrix_errors) = validate_matrix(&matrix);
     if !matrix_errors.is_empty() {
         crate::emit_exit(
             crate::EXIT_INVALID,
@@ -147,8 +183,121 @@ pub fn cmd_integration(
         Ok(s) => s,
         Err(e) => crate::invalid(format!("cannot hash matrix: {e}")),
     };
+
+    if let Some(dirs) = aggregate {
+        let mut job_status: BTreeMap<String, Value> = BTreeMap::new();
+        let mut missing_or_failed: Vec<String> = Vec::new();
+
+        for job_def in &jobs {
+            let mut found = false;
+            for dir in &dirs {
+                let manifest_path = dir.join(crate::runs::MANIFEST_FILE);
+                let Ok(manifest) = crate::canon::read_json(&manifest_path) else {
+                    continue;
+                };
+                let manifest_job = manifest.get("job_id").and_then(Value::as_str);
+                let manifest_os = manifest.pointer("/host/os").and_then(Value::as_str);
+                if manifest_job == Some(&job_def.id) || manifest_os == Some(&job_def.platform) {
+                    if let Err(e) = crate::runs::verify_checksums(dir) {
+                        missing_or_failed.push(format!(
+                            "{}: checksum verification failed: {}",
+                            job_def.id,
+                            e.join("; ")
+                        ));
+                        found = true;
+                        break;
+                    }
+                    let res_path = dir.join("integration-results.json");
+                    let Ok(res) = crate::canon::read_json(&res_path) else {
+                        missing_or_failed
+                            .push(format!("{}: missing integration-results.json", job_def.id));
+                        found = true;
+                        break;
+                    };
+                    let exit_code = res.get("exit_code").and_then(Value::as_i64).unwrap_or(-1);
+                    let problems = res
+                        .get("problems")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    if exit_code != 0 || !problems.is_empty() {
+                        missing_or_failed
+                            .push(format!("{}: run had failures or problems", job_def.id));
+                    } else {
+                        job_status.insert(
+                            job_def.id.clone(),
+                            json!({
+                                "platform": job_def.platform,
+                                "run_dir": dir.display().to_string(),
+                                "status": "pass",
+                            }),
+                        );
+                    }
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                missing_or_failed.push(format!(
+                    "{}: no matching run provided in aggregate",
+                    job_def.id
+                ));
+            }
+        }
+
+        if missing_or_failed.is_empty() {
+            crate::emit_exit(
+                crate::EXIT_PASS,
+                "PASS",
+                json!({
+                    "mode": "aggregate",
+                    "jobs": job_status,
+                }),
+            );
+        } else {
+            crate::emit_exit(
+                crate::EXIT_FAIL,
+                "FAIL",
+                json!({
+                    "mode": "aggregate",
+                    "problems": missing_or_failed,
+                }),
+            );
+        }
+    }
+
     let repo = repo.unwrap_or_else(|| PathBuf::from("."));
     let cmd = cmd.unwrap_or_else(|| DEFAULT_CMD.to_string());
+
+    let host_os = std::env::consts::OS;
+    let selected_job = match job {
+        Some(j_id) => jobs.iter().find(|j| j.id == j_id).cloned(),
+        None => jobs.iter().find(|j| j.platform == host_os).cloned(),
+    };
+    let selected_job_id = selected_job
+        .as_ref()
+        .map(|j| j.id.clone())
+        .unwrap_or_else(|| format!("{host_os}-native"));
+
+    let required_tests: Vec<String> = if let Some(ref j) = selected_job {
+        if !j.qualification_tests.is_empty() {
+            j.qualification_tests.clone()
+        } else {
+            let prefix = format!("native_{}::", j.platform);
+            let matching: Vec<String> = mandatory
+                .iter()
+                .filter(|t| t.starts_with(&prefix))
+                .cloned()
+                .collect();
+            if matching.is_empty() {
+                mandatory.clone()
+            } else {
+                matching
+            }
+        }
+    } else {
+        mandatory.clone()
+    };
 
     let run = match crate::runs::create(out_root) {
         Ok(r) => r,
@@ -192,7 +341,7 @@ pub fn cmd_integration(
             seen_tests.insert(name.clone(), (file, "ignored"));
         }
     }
-    for name in &mandatory {
+    for name in &required_tests {
         match seen_tests.get(name) {
             Some((file, "ignored")) => {
                 problems.push(format!("mandatory test skipped/ignored: {name} ({file})"))
@@ -220,6 +369,7 @@ pub fn cmd_integration(
         .collect();
     let results_doc = json!({
         "schema": "repo-scan/integration-results/1",
+        "job_id": selected_job_id,
         "command": cmd,
         "exit_code": exit_code,
         "files": results_json,
@@ -234,6 +384,7 @@ pub fn cmd_integration(
         "schema": "repo-scan/run-manifest/1",
         "run_id": run.id,
         "kind": "integration",
+        "job_id": selected_job_id,
         "created_at": started,
         "matrix": {"path": matrix_path.display().to_string(), "sha256": matrix_sha},
         "build": crate::runs::build_metadata(),
@@ -254,6 +405,7 @@ pub fn cmd_integration(
             crate::EXIT_PASS,
             "PASS",
             json!({
+                "job_id": selected_job_id,
                 "run_dir": run.path.display().to_string(),
                 "files": results.len(),
             }),
@@ -263,6 +415,7 @@ pub fn cmd_integration(
         crate::EXIT_FAIL,
         "FAIL",
         json!({
+            "job_id": selected_job_id,
             "run_dir": run.path.display().to_string(),
             "problems": problems,
         }),

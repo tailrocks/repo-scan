@@ -151,6 +151,12 @@ enum ProofCommands {
         /// Test command to execute instead of the default cargo invocation.
         #[arg(long)]
         cmd: Option<String>,
+        /// Specific mandatory native job id to execute/validate.
+        #[arg(long)]
+        job: Option<String>,
+        /// Aggregate multiple completed per-platform run directories into a matrix verdict.
+        #[arg(long, num_args = 1..)]
+        aggregate: Option<Vec<PathBuf>>,
         /// Output root for run evidence.
         #[arg(long, default_value = "proof-out")]
         out_root: PathBuf,
@@ -224,8 +230,10 @@ fn main() {
                 matrix,
                 repo,
                 cmd,
+                job,
+                aggregate,
                 out_root,
-            } => integration::cmd_integration(&matrix, repo, cmd, &out_root),
+            } => integration::cmd_integration(&matrix, repo, cmd, job, aggregate, &out_root),
             ProofCommands::VerifyFinal {
                 commit,
                 requirements,

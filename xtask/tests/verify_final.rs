@@ -243,3 +243,19 @@ fn verify_final_rejects_experiment_evidence_hash_mismatch() {
     let out = f.run_verify(&head_b);
     assert_eq!(code(&out), 2, "stdout: {}", stdout(&out));
 }
+
+#[test]
+fn verify_final_blocked_when_head_differs_from_commit() {
+    let f = fixture(Vec::new(), "implementer-a", "verifier-b", false);
+    let green = evidence_for(&f.artifact);
+    f.rewrite_requirements(green, "implementer-a", "verifier-b");
+    // Pass head_a while HEAD is at head_b
+    let head_a = f.repo.head_a.clone();
+    let out = f.run_verify(&head_a);
+    assert_eq!(code(&out), 3, "stdout: {}", stdout(&out));
+    assert!(
+        stdout(&out).contains("does not match"),
+        "stdout: {}",
+        stdout(&out)
+    );
+}

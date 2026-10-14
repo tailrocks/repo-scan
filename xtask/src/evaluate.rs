@@ -303,28 +303,14 @@ pub fn cmd_evaluate(run_dir: &Path) -> i32 {
                     ));
                 } else if !gate.scenarios.is_empty() {
                     // Multi-scenario gate (PERF-NOREGRESS): evaluate every
-                    // listed scenario the run covers. Declaring the gate for
-                    // a run that covers none of them is invalid evidence; the
-                    // gate never falls back to the run's primary scenario.
-                    let mut per_scenario = Vec::new();
-                    let mut covered = 0usize;
-                    let mut any_invalid = false;
-                    let mut all_pass = true;
-                    for s in &gate.scenarios {
-                        if !ratios.contains_key(s) {
-                            continue;
-                        }
-                        covered += 1;
-                        let o = eval_timing_gate(id, s, &ratios, threshold, &policy, seed);
-                        match o.status {
-                            "pass" => {}
-                            "invalid" => any_invalid = true,
-                            _ => all_pass = false,
-                        }
-                        per_scenario
-                            .push(json!({"scenario": s, "status": o.status, "detail": o.detail}));
-                    }
-                    if covered == 0 {
+                    // listed scenario the run covers using joint bootstrap over the family.
+                    let covered_scenarios: Vec<&str> = gate
+                        .scenarios
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|s| ratios.contains_key(*s))
+                        .collect();
+                    if covered_scenarios.is_empty() {
                         outcomes.push(GateOutcome {
                             id: id.clone(),
                             status: "invalid",
@@ -336,20 +322,68 @@ pub fn cmd_evaluate(run_dir: &Path) -> i32 {
                             }),
                         });
                     } else {
-                        outcomes.push(GateOutcome {
-                            id: id.clone(),
-                            status: if any_invalid {
-                                "invalid"
-                            } else if all_pass {
-                                "pass"
-                            } else {
-                                "fail"
-                            },
-                            detail: json!({
-                                "threshold": threshold,
-                                "scenarios": per_scenario,
-                            }),
-                        });
+                        let mut too_few = None;
+                        for s in &covered_scenarios {
+                            let len = ratios[*s].len();
+                            if len < policy.min_paired_blocks {
+                                too_few = Some((*s, len));
+                                break;
+                            }
+                        }
+                        if let Some((s, len)) = too_few {
+                            outcomes.push(GateOutcome {
+                                id: id.clone(),
+                                status: "invalid",
+                                detail: json!({
+                                    "error": format!(
+                                        "scenario '{s}' has {len} paired blocks, policy minimum is {}",
+                                        policy.min_paired_blocks
+                                    )
+                                }),
+                            });
+                        } else {
+                            let family_slices: Vec<&[f64]> = covered_scenarios
+                                .iter()
+                                .map(|s| ratios[*s].as_slice())
+                                .collect();
+                            let bounds = crate::stats::bootstrap_joint_family_u95(
+                                &family_slices,
+                                policy.bootstrap_resamples,
+                                policy.confidence,
+                                seed,
+                            );
+                            let mut per_scenario = Vec::new();
+                            let mut all_pass = true;
+                            for (idx, &s) in covered_scenarios.iter().enumerate() {
+                                let r = &ratios[s];
+                                let mean = crate::stats::mean(r);
+                                let u95 = bounds[idx];
+                                let pass = u95 <= threshold;
+                                if !pass {
+                                    all_pass = false;
+                                }
+                                per_scenario.push(json!({
+                                    "scenario": s,
+                                    "status": if pass { "pass" } else { "fail" },
+                                    "detail": {
+                                        "scenario": s,
+                                        "blocks": r.len(),
+                                        "mean_ratio": mean,
+                                        "u95": u95,
+                                        "simultaneous": true,
+                                        "threshold": threshold,
+                                    }
+                                }));
+                            }
+                            outcomes.push(GateOutcome {
+                                id: id.clone(),
+                                status: if all_pass { "pass" } else { "fail" },
+                                detail: json!({
+                                    "threshold": threshold,
+                                    "scenarios": per_scenario,
+                                }),
+                            });
+                        }
                     }
                 } else {
                     // Gates without a frozen scenario (PERF-NATIVE-PROMOTION)

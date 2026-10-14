@@ -101,3 +101,72 @@ pub fn bootstrap_geomean_u95(
         seed,
     )
 }
+
+/// Seeded joint bootstrap simultaneous upper confidence bounds across a family
+/// of gate scenarios. For K gates, block ratios are resampled jointly across all
+/// scenarios per iteration, deriving a simultaneous (1 - alpha) bound.
+#[allow(clippy::needless_range_loop)]
+pub fn bootstrap_joint_family_u95(
+    families: &[&[f64]],
+    resamples: usize,
+    confidence: f64,
+    seed: u64,
+) -> Vec<f64> {
+    let k = families.len();
+    if k == 0 {
+        return Vec::new();
+    }
+    if k == 1 {
+        return vec![bootstrap_mean_u95(families[0], resamples, confidence, seed)];
+    }
+
+    let mut rng = SplitMix64::new(seed);
+    // Matrix of resampled means: [gate][resample]
+    let mut means: Vec<Vec<f64>> = vec![Vec::with_capacity(resamples); k];
+    for _ in 0..resamples {
+        for (idx, ratios) in families.iter().enumerate() {
+            let n = ratios.len();
+            let mut sum = 0.0;
+            for _ in 0..n {
+                sum += ratios[rng.below(n)];
+            }
+            means[idx].push(sum / n as f64);
+        }
+    }
+
+    // Sorted copies for each gate to compute empirical percentiles
+    let mut sorted_means: Vec<Vec<f64>> = means.clone();
+    for row in &mut sorted_means {
+        row.sort_by(f64::total_cmp);
+    }
+
+    // Compute empirical percentile rank of each sample in each gate
+    let mut max_ranks = Vec::with_capacity(resamples);
+    for b in 0..resamples {
+        let mut max_r: f64 = 0.0;
+        for (g, s_means) in sorted_means.iter().enumerate().take(k) {
+            let val = means[g][b];
+            let pos = match s_means.binary_search_by(|v| v.total_cmp(&val)) {
+                Ok(p) => p,
+                Err(p) => p,
+            };
+            let rank = (pos + 1) as f64 / resamples as f64;
+            if rank > max_r {
+                max_r = rank;
+            }
+        }
+        max_ranks.push(max_r);
+    }
+    max_ranks.sort_by(f64::total_cmp);
+
+    let idx = ((confidence * resamples as f64).ceil() as usize).clamp(1, resamples) - 1;
+    let gamma = max_ranks[idx];
+
+    // Compute the gamma-percentile for each gate as its simultaneous bound
+    let gamma_idx = ((gamma * resamples as f64).ceil() as usize).clamp(1, resamples) - 1;
+    let mut bounds = Vec::with_capacity(k);
+    for s_means in sorted_means.iter().take(k) {
+        bounds.push(s_means[gamma_idx]);
+    }
+    bounds
+}

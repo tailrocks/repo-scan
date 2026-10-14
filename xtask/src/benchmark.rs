@@ -52,6 +52,19 @@ pub fn cmd_benchmark(
         Err(e) => crate::blocked(format!("cannot hash candidate binary: {e}")),
     };
 
+    let scenarios: Vec<String> = if scenario == "suite" || scenario == "all" {
+        policy.suite_scenarios.clone()
+    } else {
+        scenario
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    if scenarios.is_empty() {
+        crate::invalid("no scenarios selected for evaluation");
+    }
+
     let gate_ids: Vec<String> = match gates {
         Some(g) => g
             .split(',')
@@ -59,11 +72,22 @@ pub fn cmd_benchmark(
             .filter(|s| !s.is_empty())
             .collect(),
         None => {
-            if scenario == policy.primary_scenario {
-                vec!["PERF-PRIMARY".to_string()]
-            } else {
-                vec!["PERF-NOREGRESS".to_string()]
+            let mut ids = Vec::new();
+            for sc in &scenarios {
+                if sc == &policy.primary_scenario {
+                    if !ids.iter().any(|x| x == "PERF-PRIMARY") {
+                        ids.push("PERF-PRIMARY".to_string());
+                    }
+                } else if !ids.iter().any(|x| x == "PERF-NOREGRESS") {
+                    ids.push("PERF-NOREGRESS".to_string());
+                }
             }
+            if policy.suite_scenarios.iter().all(|s| scenarios.contains(s))
+                && !ids.iter().any(|x| x == "PERF-SUITE")
+            {
+                ids.push("PERF-SUITE".to_string());
+            }
+            ids
         }
     };
     if gate_ids.is_empty() {
@@ -111,43 +135,55 @@ pub fn cmd_benchmark(
         baseline_first.push(rng.coin());
     }
 
-    for (block, &bf) in baseline_first.iter().enumerate() {
-        let order: [(&str, &Path); 2] = if bf {
-            [("baseline", baseline_bin), ("candidate", candidate_bin)]
-        } else {
-            [("candidate", candidate_bin), ("baseline", baseline_bin)]
-        };
-        for (role, bin) in order {
-            let start = Instant::now();
-            let out = match Command::new(bin).args(args).output() {
-                Ok(o) => o,
-                Err(e) => crate::blocked(format!("cannot spawn {}: {e}", bin.display())),
+    let multi = scenarios.len() > 1;
+    for sc in &scenarios {
+        for (block, &bf) in baseline_first.iter().enumerate() {
+            let order: [(&str, &Path); 2] = if bf {
+                [("baseline", baseline_bin), ("candidate", candidate_bin)]
+            } else {
+                [("candidate", candidate_bin), ("baseline", baseline_bin)]
             };
-            let elapsed_ns = start.elapsed().as_nanos() as u64;
-            let code = out.status.code().unwrap_or(-1);
-            let stdout_log = format!("block-{block:04}-{role}.stdout.log");
-            let stderr_log = format!("block-{block:04}-{role}.stderr.log");
-            let truncated = out.stdout.len() > LOG_CAP_BYTES || out.stderr.len() > LOG_CAP_BYTES;
-            let _ = fs::write(
-                run.path.join(&stdout_log),
-                &out.stdout[..out.stdout.len().min(LOG_CAP_BYTES)],
-            );
-            let _ = fs::write(
-                run.path.join(&stderr_log),
-                &out.stderr[..out.stderr.len().min(LOG_CAP_BYTES)],
-            );
-            let line = json!({
-                "block": block,
-                "order": if bf { "baseline_first" } else { "candidate_first" },
-                "role": role,
-                "scenario": scenario,
-                "elapsed_ns": elapsed_ns,
-                "exit_code": code,
-                "stdout_log": stdout_log,
-                "stderr_log": stderr_log,
-                "truncated": truncated,
-            });
-            writeln!(samples_file, "{line}").expect("write sample");
+            for (role, bin) in order {
+                let start = Instant::now();
+                let out = match Command::new(bin).args(args).output() {
+                    Ok(o) => o,
+                    Err(e) => crate::blocked(format!("cannot spawn {}: {e}", bin.display())),
+                };
+                let elapsed_ns = start.elapsed().as_nanos() as u64;
+                let code = out.status.code().unwrap_or(-1);
+                let stdout_log = if multi {
+                    format!("{sc}-block-{block:04}-{role}.stdout.log")
+                } else {
+                    format!("block-{block:04}-{role}.stdout.log")
+                };
+                let stderr_log = if multi {
+                    format!("{sc}-block-{block:04}-{role}.stderr.log")
+                } else {
+                    format!("block-{block:04}-{role}.stderr.log")
+                };
+                let truncated =
+                    out.stdout.len() > LOG_CAP_BYTES || out.stderr.len() > LOG_CAP_BYTES;
+                let _ = fs::write(
+                    run.path.join(&stdout_log),
+                    &out.stdout[..out.stdout.len().min(LOG_CAP_BYTES)],
+                );
+                let _ = fs::write(
+                    run.path.join(&stderr_log),
+                    &out.stderr[..out.stderr.len().min(LOG_CAP_BYTES)],
+                );
+                let line = json!({
+                    "block": block,
+                    "order": if bf { "baseline_first" } else { "candidate_first" },
+                    "role": role,
+                    "scenario": sc,
+                    "elapsed_ns": elapsed_ns,
+                    "exit_code": code,
+                    "stdout_log": stdout_log,
+                    "stderr_log": stderr_log,
+                    "truncated": truncated,
+                });
+                writeln!(samples_file, "{line}").expect("write sample");
+            }
         }
     }
     drop(samples_file);

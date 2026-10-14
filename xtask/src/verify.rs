@@ -69,6 +69,35 @@ pub fn cmd_verify_final(
         )),
     }
 
+    let head_sha = match crate::sources::git(&repo, &["rev-parse", "HEAD"]) {
+        Ok(h) => h.trim().to_string(),
+        Err(e) => crate::blocked(format!("cannot resolve HEAD in {}: {e}", repo.display())),
+    };
+    let target_sha = match crate::sources::git(&repo, &["rev-parse", commit]) {
+        Ok(h) => h.trim().to_string(),
+        Err(e) => crate::blocked(format!(
+            "cannot resolve {commit} in {}: {e}",
+            repo.display()
+        )),
+    };
+    if head_sha != target_sha {
+        crate::blocked(format!(
+            "working tree HEAD ({head_sha}) does not match requested commit {commit} ({target_sha}); \
+             evidence reconciliation requires a checkout matching the verified commit"
+        ));
+    }
+    let diff_status =
+        crate::sources::git(&repo, &["status", "--porcelain", "--untracked-files=no"]);
+    if let Ok(ref s) = diff_status {
+        if !s.trim().is_empty() {
+            crate::blocked(format!(
+                "working tree in {} has uncommitted changes to tracked files; \
+                 evidence reconciliation requires a clean checkout",
+                repo.display()
+            ));
+        }
+    }
+
     let reqs = match crate::requirements::load(requirements_path) {
         Ok(r) => r,
         Err(errors) => crate::invalid(format!(

@@ -220,3 +220,95 @@ fn integration_passes_clean_log_with_mandatory_test() {
         assert!(run_dir.join(f).is_file(), "missing {f}");
     }
 }
+
+#[test]
+fn integration_aggregates_multiple_platform_runs() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let m = dir.path().join("matrix.json");
+    let multi_matrix = json!({
+        "schema": "repo-scan/platforms/1",
+        "known_platforms": ["linux", "macos", "windows"],
+        "mandatory_native_jobs": [
+            {"id": "macos-apfs-native", "platform": "macos", "qualification_tests": ["test_mac"]},
+            {"id": "linux-native", "platform": "linux", "qualification_tests": ["test_linux"]},
+        ],
+        "mandatory_tests": ["test_mac", "test_linux"],
+    });
+    write_json(&m, &multi_matrix);
+
+    let cmd_mac = fake_log(
+        dir.path(),
+        "log_mac.txt",
+        &[
+            "     Running tests/native_macos.rs",
+            "test test_mac ... ok",
+            "test result: ok. 1 passed; 0 failed",
+        ],
+    );
+    let cmd_linux = fake_log(
+        dir.path(),
+        "log_linux.txt",
+        &[
+            "     Running tests/native_linux.rs",
+            "test test_linux ... ok",
+            "test result: ok. 1 passed; 0 failed",
+        ],
+    );
+
+    let out1 = run(&[
+        "proof",
+        "integration",
+        "--matrix",
+        m.to_str().unwrap(),
+        "--job",
+        "macos-apfs-native",
+        "--cmd",
+        &cmd_mac,
+        "--out-root",
+        dir.path().join("out1").to_str().unwrap(),
+    ]);
+    assert_eq!(code(&out1), 0, "stdout: {}", stdout(&out1));
+    let col1: serde_json::Value = serde_json::from_str(&stdout(&out1)).unwrap();
+    let run1 = col1["run_dir"].as_str().unwrap();
+
+    let out2 = run(&[
+        "proof",
+        "integration",
+        "--matrix",
+        m.to_str().unwrap(),
+        "--job",
+        "linux-native",
+        "--cmd",
+        &cmd_linux,
+        "--out-root",
+        dir.path().join("out2").to_str().unwrap(),
+    ]);
+    assert_eq!(code(&out2), 0, "stdout: {}", stdout(&out2));
+    let col2: serde_json::Value = serde_json::from_str(&stdout(&out2)).unwrap();
+    let run2 = col2["run_dir"].as_str().unwrap();
+
+    // Partial aggregation (only macos) fails missing linux
+    let agg_fail = run(&[
+        "proof",
+        "integration",
+        "--matrix",
+        m.to_str().unwrap(),
+        "--aggregate",
+        run1,
+    ]);
+    assert_eq!(code(&agg_fail), 1, "stdout: {}", stdout(&agg_fail));
+    assert!(stdout(&agg_fail).contains("linux-native"));
+
+    // Full aggregation (macos + linux) passes
+    let agg_pass = run(&[
+        "proof",
+        "integration",
+        "--matrix",
+        m.to_str().unwrap(),
+        "--aggregate",
+        run1,
+        run2,
+    ]);
+    assert_eq!(code(&agg_pass), 0, "stdout: {}", stdout(&agg_pass));
+    assert!(stdout(&agg_pass).contains("\"PASS\""));
+}
