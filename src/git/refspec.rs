@@ -308,13 +308,16 @@ pub fn excluded_by_negative(negatives: &[FetchRefspec], upstream: &[u8]) -> bool
 /// Freshness verdict for one local tracking ref after a fetch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackingVerdict {
-    /// A kept mapping resolves to an upstream ref that still exists:
-    /// label `current`.
+    /// A kept mapping resolves to an upstream ref whose advertised OID matches
+    /// the local tracking ref: label `current`.
     Current,
     /// A kept mapping resolves to an upstream ref that is gone: label
     /// `stale` and record the name as deleted upstream (the local
     /// tracking ref itself is kept, never pruned).
     DeletedUpstream,
+    /// A kept mapping resolves to an upstream ref whose advertised OID differs
+    /// from the local tracking ref (e.g. upstream moved post-fetch): label `stale`.
+    MismatchedOid,
     /// No mapping covers the ref, or every mapping is excluded: label
     /// `stale` (outside this fetch's coverage).
     Excluded,
@@ -324,16 +327,19 @@ pub enum TrackingVerdict {
 /// observed by `ls-remote --heads --tags` (all exact bytes).
 /// `positive`/`negatives` are the remote's parsed fetch refspecs; a
 /// ref is current when any kept mapping resolves to a live upstream
-/// ref, deleted when a kept mapping resolves to a vanished one, and
-/// excluded otherwise.
+/// ref whose advertised OID matches `tracking_oid`, deleted when a kept mapping
+/// resolves to a vanished one, mismatched when the advertised OID differs,
+/// and excluded otherwise.
 #[must_use]
 pub fn classify_tracking_ref(
     positive: &[FetchRefspec],
     negatives: &[FetchRefspec],
     tracking: &[u8],
-    upstream_refs: &std::collections::HashSet<Vec<u8>>,
+    tracking_oid: &[u8],
+    upstream_map: &std::collections::HashMap<Vec<u8>, Vec<u8>>,
 ) -> TrackingVerdict {
     let mut kept_missing = false;
+    let mut kept_mismatch = false;
     for spec in positive.iter().filter(|s| !s.negative) {
         let Some(dst) = spec.dst.as_deref() else {
             continue;
@@ -354,31 +360,48 @@ pub fn classify_tracking_ref(
         if excluded_by_negative(negatives, &upstream) {
             continue;
         }
-        if upstream_refs.contains(&upstream) {
-            return TrackingVerdict::Current;
+        if let Some(adv_oid) = upstream_map.get(&upstream) {
+            if !tracking_oid.is_empty() && tracking_oid.eq_ignore_ascii_case(adv_oid) {
+                return TrackingVerdict::Current;
+            }
+            kept_mismatch = true;
+        } else {
+            kept_missing = true;
         }
-        kept_missing = true;
     }
-    if kept_missing {
+    if kept_mismatch {
+        TrackingVerdict::MismatchedOid
+    } else if kept_missing {
         TrackingVerdict::DeletedUpstream
     } else {
         TrackingVerdict::Excluded
     }
 }
 
-/// Parse `git ls-remote` stdout into upstream ref names (exact bytes).
+/// One advertised ref parsed from `git ls-remote` stdout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LsRemoteRef {
+    /// Object ID hex bytes (exact 40 hex chars for SHA-1, 64 hex chars for SHA-256).
+    pub oid: Vec<u8>,
+    /// Ref name (`refs/heads/...`, `refs/tags/...`).
+    pub name: Vec<u8>,
+}
+
+/// Parse `git ls-remote` stdout into upstream advertised refs.
 /// Each row is `<hex-oid>\t<ref>`; peeled `^{}` rows and malformed
-/// rows (short/non-hex oid, missing tab, empty or tab-bearing name)
-/// are skipped, never fabricated.
+/// rows (short/wrong-width/non-hex oid, missing tab, empty or tab-bearing name)
+/// are skipped, never fabricated. Validates hash widths (40 hex chars for SHA-1
+/// and 64 hex chars for SHA-256).
 #[must_use]
-pub fn parse_ls_remote_refs(out: &[u8]) -> Vec<Vec<u8>> {
-    let mut names = Vec::new();
+pub fn parse_ls_remote_refs(out: &[u8]) -> Vec<LsRemoteRef> {
+    let mut refs = Vec::new();
     for line in out.split(|b| *b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
         let mut parts = line.splitn(2, |b| *b == b'\t');
         let (Some(oid), Some(name)) = (parts.next(), parts.next()) else {
             continue;
         };
-        if oid.len() < 40 || !oid.iter().all(|b| b.is_ascii_hexdigit()) {
+        if (oid.len() != 40 && oid.len() != 64) || !oid.iter().all(|b| b.is_ascii_hexdigit()) {
             continue;
         }
         if name.is_empty() || name.contains(&b'\t') {
@@ -387,9 +410,12 @@ pub fn parse_ls_remote_refs(out: &[u8]) -> Vec<Vec<u8>> {
         if name.ends_with(b"^{}") {
             continue;
         }
-        names.push(name.to_vec());
+        refs.push(LsRemoteRef {
+            oid: oid.to_vec(),
+            name: name.to_vec(),
+        });
     }
-    names
+    refs
 }
 
 /// True when two distinct remote names have nested remote-tracking
@@ -917,20 +943,78 @@ mod tests {
     }
 
     #[test]
+    fn tag_mappings_rejected() {
+        for spec in [
+            "+refs/tags/*:refs/tags/*",
+            "refs/tags/*:refs/tags/*",
+            "refs/tags/v1.0:refs/tags/v1.0",
+            "+refs/heads/*:refs/tags/*",
+            "+refs/tags/*:refs/tags/sub/*",
+        ] {
+            let verdict = inspect_remote_fetch("origin", &[spec], false);
+            assert!(
+                matches!(verdict, FetchVerdict::Unsupported { .. }),
+                "{spec} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_remote_rejected() {
+        for spec in [
+            "+refs/heads/*:refs/remotes/other/*",
+            "+refs/heads/*:refs/remotes/origin2/*",
+            "+refs/heads/*:refs/remotes/upstream/*",
+            "+refs/heads/*:refs/heads/*",
+            "+refs/heads/*:refs/notes/*",
+        ] {
+            let verdict = inspect_remote_fetch("origin", &[spec], false);
+            assert!(
+                matches!(verdict, FetchVerdict::Unsupported { .. }),
+                "{spec} must be rejected for remote origin"
+            );
+        }
+    }
+
+    #[test]
+    fn mirror_rejected() {
+        assert!(matches!(
+            inspect_remote_fetch("origin", &[], true),
+            FetchVerdict::Unsupported { .. }
+        ));
+        assert!(matches!(
+            inspect_remote_fetch("origin", &["+refs/heads/*:refs/remotes/origin/*"], true),
+            FetchVerdict::Unsupported { .. }
+        ));
+        for spec in ["+refs/*:refs/*", "+*:*", "+refs/*:refs/remotes/origin/*"] {
+            let verdict = inspect_remote_fetch("origin", &[spec], false);
+            assert!(
+                matches!(verdict, FetchVerdict::Unsupported { .. }),
+                "{spec} must be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn classify_current_deleted_excluded() {
-        use std::collections::HashSet;
+        use std::collections::HashMap;
         let positive =
             [parse_fetch_refspec("+refs/heads/*:refs/remotes/origin/*").expect("parses")];
         let negatives: [FetchRefspec; 0] = [];
-        let upstream: HashSet<Vec<u8>> =
-            [b"refs/heads/main".to_vec(), b"refs/heads/feature".to_vec()]
-                .into_iter()
-                .collect();
+        let oid1 = b"0123456789abcdef0123456789abcdef01234567".to_vec();
+        let oid2 = b"123456789abcdef0123456789abcdef012345670".to_vec();
+        let upstream: HashMap<Vec<u8>, Vec<u8>> = [
+            (b"refs/heads/main".to_vec(), oid1.clone()),
+            (b"refs/heads/feature".to_vec(), oid2.clone()),
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(
             classify_tracking_ref(
                 &positive,
                 &negatives,
                 b"refs/remotes/origin/main",
+                &oid1,
                 &upstream
             ),
             TrackingVerdict::Current
@@ -940,6 +1024,7 @@ mod tests {
                 &positive,
                 &negatives,
                 b"refs/remotes/origin/gone",
+                &oid1,
                 &upstream
             ),
             TrackingVerdict::DeletedUpstream
@@ -950,6 +1035,7 @@ mod tests {
                 &positive,
                 &negatives,
                 b"refs/remotes/upstream/main",
+                &oid1,
                 &upstream
             ),
             TrackingVerdict::Excluded
@@ -958,16 +1044,20 @@ mod tests {
 
     #[test]
     fn classify_honors_negative_exclusions() {
-        use std::collections::HashSet;
+        use std::collections::HashMap;
         let positive =
             [parse_fetch_refspec("+refs/heads/*:refs/remotes/origin/*").expect("parses")];
         let negatives = [parse_fetch_refspec("^refs/heads/secret").expect("parses")];
-        let upstream: HashSet<Vec<u8>> = [b"refs/heads/secret".to_vec()].into_iter().collect();
+        let oid = b"0123456789abcdef0123456789abcdef01234567".to_vec();
+        let upstream: HashMap<Vec<u8>, Vec<u8>> = [(b"refs/heads/secret".to_vec(), oid.clone())]
+            .into_iter()
+            .collect();
         assert_eq!(
             classify_tracking_ref(
                 &positive,
                 &negatives,
                 b"refs/remotes/origin/secret",
+                &oid,
                 &upstream
             ),
             TrackingVerdict::Excluded
@@ -976,19 +1066,24 @@ mod tests {
 
     #[test]
     fn classify_single_branch_leftover_is_excluded() {
-        use std::collections::HashSet;
+        use std::collections::HashMap;
         let positive =
             [parse_fetch_refspec("+refs/heads/main:refs/remotes/origin/main").expect("parses")];
         let negatives: [FetchRefspec; 0] = [];
-        let upstream: HashSet<Vec<u8>> =
-            [b"refs/heads/main".to_vec(), b"refs/heads/other".to_vec()]
-                .into_iter()
-                .collect();
+        let oid1 = b"0123456789abcdef0123456789abcdef01234567".to_vec();
+        let oid2 = b"123456789abcdef0123456789abcdef012345670".to_vec();
+        let upstream: HashMap<Vec<u8>, Vec<u8>> = [
+            (b"refs/heads/main".to_vec(), oid1.clone()),
+            (b"refs/heads/other".to_vec(), oid2.clone()),
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(
             classify_tracking_ref(
                 &positive,
                 &negatives,
                 b"refs/remotes/origin/main",
+                &oid1,
                 &upstream
             ),
             TrackingVerdict::Current
@@ -1000,6 +1095,7 @@ mod tests {
                 &positive,
                 &negatives,
                 b"refs/remotes/origin/other",
+                &oid2,
                 &upstream
             ),
             TrackingVerdict::Excluded
@@ -1008,19 +1104,126 @@ mod tests {
 
     #[test]
     fn classify_is_byte_exact_for_non_utf8_names() {
-        use std::collections::HashSet;
+        use std::collections::HashMap;
         let positive =
             [parse_fetch_refspec("+refs/heads/*:refs/remotes/origin/*").expect("parses")];
         let negatives: [FetchRefspec; 0] = [];
-        let upstream: HashSet<Vec<u8>> = [b"refs/heads/\xff".to_vec()].into_iter().collect();
+        let oid = b"0123456789abcdef0123456789abcdef01234567".to_vec();
+        let upstream: HashMap<Vec<u8>, Vec<u8>> = [(b"refs/heads/\xff".to_vec(), oid.clone())]
+            .into_iter()
+            .collect();
         assert_eq!(
             classify_tracking_ref(
                 &positive,
                 &negatives,
                 b"refs/remotes/origin/\xff",
+                &oid,
                 &upstream
             ),
             TrackingVerdict::Current
+        );
+    }
+
+    #[test]
+    fn classify_oid_aware_freshness_matching_and_mismatching() {
+        use std::collections::HashMap;
+        let positive =
+            [parse_fetch_refspec("+refs/heads/*:refs/remotes/origin/*").expect("parses")];
+        let negatives = [parse_fetch_refspec("^refs/heads/secret").expect("parses")];
+        let sha1_advertised = b"0123456789abcdef0123456789abcdef01234567".to_vec();
+        let sha1_mismatched = b"9999999999abcdef0123456789abcdef01234567".to_vec();
+        let sha256_advertised =
+            b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_vec();
+        let sha256_mismatched =
+            b"ffffffffffffffff0123456789abcdef0123456789abcdef0123456789abcdef".to_vec();
+
+        let mut upstream: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        upstream.insert(b"refs/heads/main".to_vec(), sha1_advertised.clone());
+        upstream.insert(b"refs/heads/sha256".to_vec(), sha256_advertised.clone());
+        upstream.insert(b"refs/heads/secret".to_vec(), sha1_advertised.clone());
+
+        // Matching SHA-1
+        assert_eq!(
+            classify_tracking_ref(
+                &positive,
+                &negatives,
+                b"refs/remotes/origin/main",
+                &sha1_advertised,
+                &upstream
+            ),
+            TrackingVerdict::Current
+        );
+
+        // Mismatching SHA-1 (upstream moved post-fetch)
+        assert_eq!(
+            classify_tracking_ref(
+                &positive,
+                &negatives,
+                b"refs/remotes/origin/main",
+                &sha1_mismatched,
+                &upstream
+            ),
+            TrackingVerdict::MismatchedOid
+        );
+
+        // Matching SHA-256 (64 hex chars)
+        assert_eq!(
+            classify_tracking_ref(
+                &positive,
+                &negatives,
+                b"refs/remotes/origin/sha256",
+                &sha256_advertised,
+                &upstream
+            ),
+            TrackingVerdict::Current
+        );
+
+        // Mismatching SHA-256
+        assert_eq!(
+            classify_tracking_ref(
+                &positive,
+                &negatives,
+                b"refs/remotes/origin/sha256",
+                &sha256_mismatched,
+                &upstream
+            ),
+            TrackingVerdict::MismatchedOid
+        );
+
+        // Empty tracking OID
+        assert_eq!(
+            classify_tracking_ref(
+                &positive,
+                &negatives,
+                b"refs/remotes/origin/main",
+                b"",
+                &upstream
+            ),
+            TrackingVerdict::MismatchedOid
+        );
+
+        // Deleted upstream
+        assert_eq!(
+            classify_tracking_ref(
+                &positive,
+                &negatives,
+                b"refs/remotes/origin/deleted",
+                &sha1_advertised,
+                &upstream
+            ),
+            TrackingVerdict::DeletedUpstream
+        );
+
+        // Negative mapping
+        assert_eq!(
+            classify_tracking_ref(
+                &positive,
+                &negatives,
+                b"refs/remotes/origin/secret",
+                &sha1_advertised,
+                &upstream
+            ),
+            TrackingVerdict::Excluded
         );
     }
 
@@ -1033,12 +1236,38 @@ mod tests {
             zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\trefs/heads/nonhex\n\
             no-tab-here\n\
             0123456789abcdef0123456789abcdef01234567\t\n";
-        let names = parse_ls_remote_refs(out);
-        let strs: Vec<String> = names
+        let refs = parse_ls_remote_refs(out);
+        let strs: Vec<String> = refs
             .iter()
-            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .map(|r| String::from_utf8_lossy(&r.name).into_owned())
             .collect();
         assert_eq!(strs, vec!["refs/heads/main", "refs/tags/v1"]);
+        assert_eq!(refs[0].oid, b"0123456789abcdef0123456789abcdef01234567");
+    }
+
+    #[test]
+    fn ls_remote_parse_hash_widths() {
+        let sha1 = "0123456789abcdef0123456789abcdef01234567";
+        let sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let bad39 = "0123456789abcdef0123456789abcdef0123456";
+        let bad41 = "0123456789abcdef0123456789abcdef012345678";
+        let bad63 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde";
+        let bad65 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0";
+
+        let input = format!(
+            "{sha1}\trefs/heads/sha1\n\
+             {sha256}\trefs/heads/sha256\n\
+             {bad39}\trefs/heads/bad39\n\
+             {bad41}\trefs/heads/bad41\n\
+             {bad63}\trefs/heads/bad63\n\
+             {bad65}\trefs/heads/bad65\n"
+        );
+        let refs = parse_ls_remote_refs(input.as_bytes());
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].name, b"refs/heads/sha1");
+        assert_eq!(refs[0].oid, sha1.as_bytes());
+        assert_eq!(refs[1].name, b"refs/heads/sha256");
+        assert_eq!(refs[1].oid, sha256.as_bytes());
     }
 
     #[test]

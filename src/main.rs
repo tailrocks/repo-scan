@@ -13442,12 +13442,12 @@ fn execute_remote_fetch(
         deleted: Vec::new(),
         refs_updated: 0,
     };
-    let upstream_set: HashSet<Vec<u8>> = match git.git_ls_remote_refs(
+    let upstream_map: HashMap<Vec<u8>, Vec<u8>> = match git.git_ls_remote_refs(
         dir,
         std::ffi::OsStr::new(name),
         FETCH_TIMEOUT,
     ) {
-        Ok(names) => names.into_iter().collect(),
+        Ok(advertised) => advertised.into_iter().map(|r| (r.name, r.oid)).collect(),
         Err(e) => {
             attempt.status = "failed";
             attempt.detail = Some(format!(
@@ -13455,7 +13455,7 @@ fn execute_remote_fetch(
                 identity::scrub_text(&e)
             ));
             attempt.label = false;
-            HashSet::new()
+            HashMap::new()
         }
     };
     let known: HashSet<&[u8]> = post.iter().map(|t| t.name.as_slice()).collect();
@@ -13491,7 +13491,8 @@ fn execute_remote_fetch(
                 &parsed,
                 &parsed,
                 &observed.name,
-                &upstream_set,
+                &observed.oid,
+                &upstream_map,
             ) {
                 git::refspec::TrackingVerdict::Current => {
                     attempt.current.push(observed.name.clone());
@@ -13501,6 +13502,7 @@ fn execute_remote_fetch(
                     attempt.deleted.push(observed.name.clone());
                     "stale"
                 }
+                git::refspec::TrackingVerdict::MismatchedOid => "stale",
                 git::refspec::TrackingVerdict::Excluded => "stale",
             }
         };

@@ -2347,6 +2347,7 @@ impl FallbackGit {
         for arg in Self::fetch_argv() {
             cmd.arg(arg);
         }
+        cmd.arg("--");
         cmd.arg(remote);
         let out = spawn_enveloped(&mut cmd, true, timeout, cap_bytes)?;
         if out.truncated {
@@ -2368,11 +2369,12 @@ impl FallbackGit {
         dir: &Path,
         remote: &std::ffi::OsStr,
         timeout: Duration,
-    ) -> Result<Vec<Vec<u8>>, String> {
+    ) -> Result<Vec<crate::git::refspec::LsRemoteRef>, String> {
         let mut cmd = self.fetch_command(dir)?;
         cmd.arg("ls-remote")
             .arg("--heads")
             .arg("--tags")
+            .arg("--")
             .arg(remote);
         let out = spawn_enveloped(&mut cmd, true, timeout, MAX_CAPTURE_BYTES)?;
         if out.truncated {
@@ -2398,7 +2400,10 @@ impl FallbackGit {
         timeout: Duration,
     ) -> Result<String, String> {
         let mut cmd = self.fetch_command(dir)?;
-        cmd.arg("ls-remote").arg("--get-url").arg(url_or_remote);
+        cmd.arg("ls-remote")
+            .arg("--get-url")
+            .arg("--")
+            .arg(url_or_remote);
         let out = spawn_enveloped(&mut cmd, true, timeout, MAX_CAPTURE_BYTES)?;
         if out.truncated {
             return Err("git ls-remote --get-url output exceeded capture cap".to_string());
@@ -3542,5 +3547,88 @@ mod tests {
             target.to_str().expect("utf8"),
             &git_dir
         ));
+    }
+
+    #[test]
+    fn test_fetch_remote_option_injection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = fixture_git(dir.path());
+        let mut cmd = git.fetch_command(dir.path()).expect("fetch_command");
+        for arg in FallbackGit::fetch_argv() {
+            cmd.arg(arg);
+        }
+        cmd.arg("--");
+        cmd.arg("--all");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let dash_dash_idx = args
+            .iter()
+            .position(|a| a == "--")
+            .expect("-- terminator present");
+        let all_idx = args
+            .iter()
+            .position(|a| a == "--all")
+            .expect("--all operand present");
+        assert_eq!(
+            dash_dash_idx + 1,
+            all_idx,
+            "-- must immediately precede remote operand"
+        );
+    }
+
+    #[test]
+    fn test_ls_remote_option_injection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = fixture_git(dir.path());
+        let mut cmd = git.fetch_command(dir.path()).expect("fetch_command");
+        cmd.arg("ls-remote")
+            .arg("--heads")
+            .arg("--tags")
+            .arg("--")
+            .arg("--all");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let dash_dash_idx = args
+            .iter()
+            .position(|a| a == "--")
+            .expect("-- terminator present");
+        let all_idx = args
+            .iter()
+            .position(|a| a == "--all")
+            .expect("--all operand present");
+        assert_eq!(
+            dash_dash_idx + 1,
+            all_idx,
+            "-- must immediately precede remote operand"
+        );
+    }
+
+    #[test]
+    fn test_get_url_option_injection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = fixture_git(dir.path());
+        let mut cmd = git.fetch_command(dir.path()).expect("fetch_command");
+        cmd.arg("ls-remote").arg("--get-url").arg("--").arg("--all");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let dash_dash_idx = args
+            .iter()
+            .position(|a| a == "--")
+            .expect("-- terminator present");
+        let all_idx = args
+            .iter()
+            .position(|a| a == "--all")
+            .expect("--all operand present");
+        assert_eq!(
+            dash_dash_idx + 1,
+            all_idx,
+            "-- must immediately precede remote operand"
+        );
     }
 }

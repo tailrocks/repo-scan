@@ -1075,6 +1075,11 @@ fn fetch06_failed_remote_records_failure_keeps_unknown() {
         stderr_text(&out)
     );
     let report = load_json(&report_path);
+    assert_eq!(
+        report["scan"]["state"].as_str(),
+        Some("incomplete"),
+        "report scan.state is incomplete after fetch failure"
+    );
 
     let refresh = remote(&report, "origin", "fetch");
     assert_eq!(refresh["refresh"]["status"].as_str(), Some("failed"));
@@ -2507,4 +2512,420 @@ fn fetch15_helper_transport_refused_without_execution() {
             b["name"]["value"]
         );
     }
+}
+
+/// R1 (discussion_r4241647234): Remote argument option injection.
+/// Option terminator `--` before untrusted remote in fetch, ls-remote,
+/// and git_ls_remote_get_url. Test a config-defined remote `--all` and
+/// a second remote with unsafe mapping.
+#[test]
+fn test_remote_argument_option_injection_with_config_remote_all() {
+    let tmp = fixture::scratch_root("option-injection-all");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+
+    let (upstream, _c1) = seed_upstream(&root, "upstream");
+    let clone = root.join("clone");
+    repo_scan::privacy::private_dir_0700(&clone).expect("mkdir clone");
+    fixture::git(&clone, &["init"]);
+
+    // Configure remote named `--all`
+    fixture::git(
+        &clone,
+        &[
+            "config",
+            "remote.--all.url",
+            upstream.to_str().expect("utf8"),
+        ],
+    );
+    fixture::git(
+        &clone,
+        &[
+            "config",
+            "remote.--all.fetch",
+            "+refs/heads/*:refs/remotes/--all/*",
+        ],
+    );
+
+    // Configure a second remote named `unsafe-remote` with unsafe mapping
+    let unsafe_upstream = root.join("unsafe-upstream");
+    repo_scan::privacy::private_dir_0700(&unsafe_upstream).expect("mkdir unsafe upstream");
+    fixture::git(&unsafe_upstream, &["init"]);
+    let _c_unsafe = fixture::commit_file(&unsafe_upstream, "unsafe.txt", "unsafe\n", "unsafe init");
+    fixture::git(
+        &clone,
+        &[
+            "config",
+            "remote.unsafe-remote.url",
+            unsafe_upstream.to_str().expect("utf8"),
+        ],
+    );
+    fixture::git(
+        &clone,
+        &[
+            "config",
+            "remote.unsafe-remote.fetch",
+            "+refs/heads/*:refs/heads/*",
+        ],
+    );
+
+    // Initial commit in clone so HEAD exists
+    let c_local = fixture::commit_file(&clone, "local.txt", "local\n", "local commit");
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "scan completes: {}",
+        stderr_text(&out)
+    );
+
+    // The unsafe remote must NOT have executed its unsafe fetch into local heads
+    let head = fixture::git_str(&clone, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        head, c_local,
+        "local HEAD was not overwritten by unsafe remote"
+    );
+
+    // Also verify FallbackGit::git_ls_remote_get_url directly on `--all`
+    let fallback = repo_scan::git::fallback::FallbackGit::discover(&[]).expect("git");
+    let resolved_url = fallback
+        .git_ls_remote_get_url(
+            &clone.join(".git"),
+            std::ffi::OsStr::new("--all"),
+            Duration::from_secs(5),
+        )
+        .expect("get-url on --all succeeds due to option terminator");
+    assert_eq!(resolved_url, upstream.to_str().expect("utf8"));
+}
+
+/// R2 (discussion_r4241647235): Forbidden refspec destinations.
+/// Test explicit tag mappings even with --no-tags, mirror/broad mappings,
+/// and cross-remote destinations.
+#[test]
+fn test_forbidden_refspec_destinations_e2e() {
+    let tmp = fixture::scratch_root("forbidden-destinations");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+
+    let (upstream, _c1) = seed_upstream(&root, "upstream");
+    let clone_tags = clone_from(&root, &upstream, "clone-tags");
+
+    // Create tag on upstream AFTER cloning so it is not in clone initially
+    fixture::git(&upstream, &["tag", "v2.0"]);
+
+    // Test: explicit tag mapping
+    fixture::git(
+        &clone_tags,
+        &["config", "remote.origin.fetch", "+refs/tags/*:refs/tags/*"],
+    );
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "scan completed: {}",
+        stderr_text(&out)
+    );
+    let report = load_json(&report_path);
+    let refresh = remote(&report, "origin", "fetch");
+    assert_eq!(
+        refresh["refresh"]["status"].as_str(),
+        Some("unsupported"),
+        "explicit tag mapping is unsupported"
+    );
+
+    // Verify local tags were NOT fetched into clone_tags
+    let local_tags = fixture::git_str(&clone_tags, &["tag", "-l"]);
+    assert!(
+        !local_tags.contains("v2.0"),
+        "local tags must not be written"
+    );
+}
+
+/// R3 (discussion_r4241647236): Partial multi-ref updates.
+/// Atomic fetch test: unforced multi-ref fetch where one ref succeeds and
+/// another is non-fast-forward; verify no partial update.
+#[test]
+fn test_atomic_multi_ref_fetch_rejects_partial() {
+    let tmp = fixture::scratch_root("atomic-multi-ref");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+
+    let (upstream, c1) = seed_upstream(&root, "upstream");
+    fixture::git(&upstream, &["branch", "alpha"]);
+    fixture::git(&upstream, &["branch", "beta"]);
+
+    let clone = root.join("clone");
+    fixture::git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            upstream.to_str().expect("utf8"),
+            clone.to_str().expect("utf8"),
+        ],
+    );
+
+    // Configure unforced multi-ref fetch (NO leading `+`)
+    fixture::git(&clone, &["config", "--unset-all", "remote.origin.fetch"]);
+    fixture::git(
+        &clone,
+        &[
+            "config",
+            "--add",
+            "remote.origin.fetch",
+            "refs/heads/alpha:refs/remotes/origin/alpha",
+        ],
+    );
+    fixture::git(
+        &clone,
+        &[
+            "config",
+            "--add",
+            "remote.origin.fetch",
+            "refs/heads/beta:refs/remotes/origin/beta",
+        ],
+    );
+
+    // Initial fetch to sync both
+    fixture::git(&clone, &["fetch", "origin"]);
+    assert_eq!(
+        fixture::git_str(&clone, &["rev-parse", "refs/remotes/origin/alpha"]),
+        c1
+    );
+    assert_eq!(
+        fixture::git_str(&clone, &["rev-parse", "refs/remotes/origin/beta"]),
+        c1
+    );
+
+    // Upstream fast-forwards alpha
+    fixture::git(&upstream, &["checkout", "alpha"]);
+    let c_alpha_2 = fixture::commit_file(&upstream, "alpha.txt", "a2\n", "advance alpha");
+    assert_ne!(c1, c_alpha_2);
+
+    // Upstream fast-forwards beta
+    fixture::git(&upstream, &["checkout", "beta"]);
+    let c_beta_2 = fixture::commit_file(&upstream, "beta.txt", "b2\n", "advance beta");
+    assert_ne!(c1, c_beta_2);
+
+    // In clone, divergent commit on local tracking ref for beta to create non-fast-forward conflict
+    fixture::git(&clone, &["checkout", "-b", "local-diverge"]);
+    let c_diverge = fixture::commit_file(&clone, "div.txt", "div\n", "diverge");
+    fixture::git(
+        &clone,
+        &["update-ref", "refs/remotes/origin/beta", &c_diverge],
+    );
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "fetch failed due to non-fast-forward: {}",
+        stderr_text(&out)
+    );
+
+    // Verification of atomic rollback: alpha must NOT have been updated!
+    let alpha_tracking = fixture::git_str(&clone, &["rev-parse", "refs/remotes/origin/alpha"]);
+    assert_eq!(
+        alpha_tracking, c1,
+        "atomic fetch prevented partial update of alpha"
+    );
+
+    let report = load_json(&report_path);
+    assert_eq!(
+        report["scan"]["state"].as_str(),
+        Some("incomplete"),
+        "failed fetch results in incomplete scan state"
+    );
+    let refresh = remote(&report, "origin", "fetch");
+    assert_eq!(refresh["refresh"]["status"].as_str(), Some("failed"));
+}
+
+/// R4 (discussion_r4241647238): Final report state after fetch (`final_state` consistency).
+/// Verify that when fetch fails or is incomplete, scan.state is "incomplete"
+/// across staged JSON reports and machine format lanes.
+#[test]
+fn test_final_report_state_after_fetch_failure() {
+    let tmp = fixture::scratch_root("final-state-consistency");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+
+    let (upstream, _c1) = seed_upstream(&root, "upstream");
+    let clone = clone_from(&root, &upstream, "clone");
+    let unreachable = root.join("nonexistent-upstream");
+    fixture::git(
+        &clone,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            unreachable.to_str().expect("utf8"),
+        ],
+    );
+
+    let report_path = tmp.path().join("rep.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert_eq!(out.status.code(), Some(3));
+    let report = load_json(&report_path);
+    assert_eq!(
+        report["scan"]["state"].as_str(),
+        Some("incomplete"),
+        "staged report reflects final incomplete state"
+    );
+
+    // Also test machine json format output
+    let out_json = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--format",
+            "json",
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert_eq!(out_json.status.code(), Some(3));
+    let stdout_json: serde_json::Value =
+        serde_json::from_slice(&out_json.stdout).expect("valid json stdout");
+    assert_eq!(
+        stdout_json["scan"]["state"].as_str(),
+        Some("incomplete"),
+        "json format stdout reflects final incomplete state"
+    );
+}
+
+/// R5 (discussion_r4241647240): OID-aware freshness.
+/// Verify that tracking refs are only labeled "current" when their post-fetch OID
+/// matches the advertised upstream OID. If upstream moves or OID mismatches,
+/// freshness remains "stale".
+#[test]
+fn test_oid_aware_freshness_upstream_movement_and_mismatch() {
+    let tmp = fixture::scratch_root("oid-aware-freshness");
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+
+    let (upstream, _c1) = seed_upstream(&root, "upstream");
+    let _clone = clone_from(&root, &upstream, "clone");
+
+    // Case A: Upstream advances, fetch syncs, tracking OID matches advertised OID -> current
+    let c2 = fixture::commit_file(&upstream, "adv.txt", "v2\n", "advance upstream");
+    let report_path = tmp.path().join("rep1.json");
+    let out = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            root.to_str().expect("utf8"),
+            "--report",
+            report_path.to_str().expect("utf8"),
+            "--fetch",
+        ],
+        tmp.path(),
+        &state,
+    );
+    assert!(matches!(out.status.code(), Some(0) | Some(3)));
+    let report1 = load_json(&report_path);
+    let tracking1 = branch(&report1, "remote_tracking", "refs/remotes/origin/main");
+    assert_eq!(tracking1["oid"]["hex"].as_str(), Some(c2.as_str()));
+    assert_eq!(
+        tracking1["freshness"].as_str(),
+        Some("current"),
+        "matching OID labels current"
+    );
+
+    // Case B: Verify OID-aware freshness logic directly for upstream movement / mismatch:
+    // If upstream moves post-fetch (advertised OID is c3, but tracking OID is c2):
+    use repo_scan::git::refspec::{classify_tracking_ref, parse_fetch_refspec, TrackingVerdict};
+    use std::collections::HashMap;
+    let spec = parse_fetch_refspec("+refs/heads/*:refs/remotes/origin/*").expect("parses");
+    let c3 = "3333333333333333333333333333333333333333";
+    let mut adv_map: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    adv_map.insert(b"refs/heads/main".to_vec(), c3.as_bytes().to_vec());
+
+    // With older local tracking OID (c2), verdict is MismatchedOid (stale)
+    let verdict = classify_tracking_ref(
+        std::slice::from_ref(&spec),
+        &[],
+        b"refs/remotes/origin/main",
+        c2.as_bytes(),
+        &adv_map,
+    );
+    assert_eq!(
+        verdict,
+        TrackingVerdict::MismatchedOid,
+        "mismatched tracking OID is not current"
+    );
+
+    // With matching local tracking OID (c3), verdict is Current
+    let verdict_match = classify_tracking_ref(
+        std::slice::from_ref(&spec),
+        &[],
+        b"refs/remotes/origin/main",
+        c3.as_bytes(),
+        &adv_map,
+    );
+    assert_eq!(
+        verdict_match,
+        TrackingVerdict::Current,
+        "matching tracking OID is current"
+    );
 }
