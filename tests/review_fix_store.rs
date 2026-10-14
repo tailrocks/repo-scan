@@ -827,4 +827,3 @@ fn dbm1_event_fanout_failure_rolls_back_cursor_and_revisions() {
         store.close().await.expect("close");
     });
 }
-

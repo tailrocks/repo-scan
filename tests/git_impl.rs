@@ -7,8 +7,8 @@
 
 use repo_scan::git::fallback::FallbackGit;
 use repo_scan::git::{
-    CandidateKind, CheckoutKind, GitInspect, GixInspector, HeadState, StatusObservation,
-    WorktreeAvailability, working_state_of,
+    working_state_of, CandidateKind, CheckoutKind, GitInspect, GixInspector, HeadState,
+    StatusObservation, WorktreeAvailability,
 };
 use repo_scan::identity::{
     classify_remote, classify_remotes, github_host_matches, is_github_host, normalize_github_url,
