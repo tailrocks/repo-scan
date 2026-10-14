@@ -374,17 +374,10 @@ fn remove_snapshot_entry(dir_handle: &std::fs::File, entry: &PinnedSnapshotEntry
     unsafe { libc::unlinkat(dir_fd, entry.name.as_ptr(), 0) == 0 }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::unnecessary_cast)]
 fn snapshot_mtime(metadata: &libc::stat) -> Option<std::time::SystemTime> {
-    system_time_from_parts(
-        metadata.st_mtim.tv_sec as i64,
-        metadata.st_mtim.tv_nsec as i64,
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn snapshot_mtime(metadata: &libc::stat) -> Option<std::time::SystemTime> {
-    system_time_from_parts(metadata.st_mtime, metadata.st_mtime_nsec)
+    system_time_from_parts(metadata.st_mtime as i64, metadata.st_mtime_nsec as i64)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

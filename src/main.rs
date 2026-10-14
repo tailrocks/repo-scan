@@ -4220,7 +4220,7 @@ async fn open_event_session(
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (policy, roots, stored);
+        let _ = (policy, roots, stored, root_identities);
         session.degraded.push(String::from("all volumes"));
     }
     Ok(session)
