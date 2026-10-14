@@ -3236,10 +3236,17 @@ fn roots_symlink_alias_reuses_catalog_rows() {
         .expect("repository git path")["value"]
         .as_str()
         .expect("UTF-8 git path");
+    #[cfg(target_os = "macos")]
     assert_eq!(
         git_path,
         alias_a.join("repo/.git").to_str().expect("utf8 path"),
         "alias scope retains the prior alias-A catalog spelling"
+    );
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(
+        git_path,
+        alias_c.join("repo/.git").to_str().expect("utf8 path"),
+        "alias scope reflects the current alias-C catalog spelling on non-macos"
     );
 
     let root_gap_id = "shared-root-gap";
