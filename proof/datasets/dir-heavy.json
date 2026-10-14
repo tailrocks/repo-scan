@@ -1,0 +1,44 @@
+{
+  "expected_graph": {
+    "description": "50k-directory hierarchy averaging 2.4 files per directory with 400 repositories; a few empty permission-denied leaf dirs exercise enumeration-failure evidence (unix). Primary PERF-PRIMARY fixture family; a pure-timing variant sets permission_denied_dirs to 0.",
+    "invariants": [
+      "exact directory count traversed",
+      "exact candidate set equals manifest",
+      "permission-denied dirs yield honest gaps, never absence-by-error"
+    ]
+  },
+  "id": "dir-heavy",
+  "manifest_schema": "repo-scan/dataset-manifest/1",
+  "notes": "scale = final target, still pending baseline-pilot calibration; scale_pilot = M5-Max pilot measurable in seconds; scale_smoke = CI smoke.",
+  "scale": {
+    "avg_files_per_dir": 2.4,
+    "dirs": 50000,
+    "files": 120000,
+    "max_depth": 6,
+    "permission_denied_dirs": 32,
+    "repos": 400,
+    "roots": 1
+  },
+  "scale_pilot": {
+    "avg_files_per_dir": 2.4,
+    "dirs": 2000,
+    "files": 4800,
+    "max_depth": 6,
+    "permission_denied_dirs": 4,
+    "repos": 16,
+    "roots": 1
+  },
+  "scale_smoke": {
+    "avg_files_per_dir": 2.4,
+    "dirs": 64,
+    "files": 154,
+    "max_depth": 4,
+    "permission_denied_dirs": 1,
+    "repos": 2,
+    "roots": 1
+  },
+  "schema": "repo-scan/dataset-recipe/1",
+  "seed": 910002,
+  "status": "pending_baseline_pilot",
+  "title": "Directory-heavy tree"
+}

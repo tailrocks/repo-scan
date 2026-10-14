@@ -19,8 +19,149 @@ use crate::store::owner::{OwnerGuard, StateRootAnchor};
 use crate::store::writer::WriterBatch;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+/// Store-local bounded canonicalizer (DB-M1), a port of B11's
+/// `config::try_canonical_scope_path` with identical semantics: absolute
+/// paths resolve through a bounded identity-I/O worker (`canonicalize`,
+/// so symlink spellings collapse onto the physical path); relative paths
+/// keep their lexical spelling; a missing path falls back to the
+/// normalized lexical spelling (a missing path has no live alias to fan
+/// out). `None` means the identity could not be resolved within the
+/// admission/timeout limits — transactional invalidation callers must
+/// fail closed before writing.
+///
+/// SLICE-1 SHIM: the shared helper belongs to `crate::config` /
+/// `crate::walk::topology::bounded_canonicalize` (B11 shape), owned by
+/// the walk/config slice. Once that lands, delete this block and call
+/// `crate::config::try_canonical_scope_path` at the two marked sites
+/// (`invalidate_scope`, `scope_fanout_keys`). Until then this private
+/// copy keeps the same fail-closed contract without touching files
+/// owned by other slices.
+fn try_canonical_scope_path(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return Some(path.to_path_buf());
+    }
+    let owned = path.to_path_buf();
+    match store_bounded_identity_io(move || {
+        std::fs::canonicalize(&owned).map_err(|error| error.kind())
+    }) {
+        Some(Ok(canonical)) => Some(canonical),
+        // A missing path has no live alias to fan out, so its normalized
+        // lexical spelling is a safe fallback. Other resolution failures
+        // and worker timeouts are unknown identities and fail closed.
+        Some(Err(std::io::ErrorKind::NotFound)) => Some(normalize_scope_path(path)),
+        Some(Err(_)) | None => None,
+    }
+}
+
+/// Normalize a scope path without consulting the filesystem (lexical
+/// `.`/`..` collapse). Deterministic fallback of
+/// [`try_canonical_scope_path`]; symlinks remain distinct under it.
+/// Ported from B11 `config::normalize_scope_path` (see the SLICE-1 SHIM
+/// note above).
+fn normalize_scope_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    let mut rooted = false;
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => {
+                rooted = true;
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    normalized.pop();
+                } else if !rooted {
+                    normalized.push("..");
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        normalized
+    }
+}
+
+/// Store-local identity-I/O budget (mirrors the coordinator's
+/// `IDENTITY_IO_*` bounds in `walk::topology`): at most 2 concurrent
+/// resolves, a 1 s wait for a slot, and a 1 s timeout per resolve. Past
+/// either bound the resolve fails unknown (`None`) and the caller fails
+/// closed — the storage context never blocks indefinitely on a hung path.
+const STORE_IDENTITY_IO_CAP: usize = 2;
+/// How long a resolve waits for an identity-I/O slot before failing unknown.
+const STORE_IDENTITY_IO_SLOT_WAIT: Duration = Duration::from_secs(1);
+/// Timeout for one bounded identity resolve on its worker thread.
+const STORE_IDENTITY_IO_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Live store identity-I/O workers (process-wide).
+static STORE_IDENTITY_IO_LIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// Run blocking identity I/O (`canonicalize`) on a worker thread with
+/// bounded admission plus a timeout. `None` means the slot wait expired,
+/// the worker timed out, or the spawn failed: the caller must treat the
+/// identity as unknown and fail closed. Same contract as the
+/// coordinator's worker in `walk::topology`; duplicated store-locally
+/// only until the shared helper lands (see SLICE-1 SHIM note on
+/// [`try_canonical_scope_path`]).
+fn store_bounded_identity_io<T>(op: impl FnOnce() -> T + Send + 'static) -> Option<T>
+where
+    T: Send + 'static,
+{
+    let start = Instant::now();
+    let admitted = loop {
+        let live = STORE_IDENTITY_IO_LIVE.load(Ordering::Relaxed);
+        if live < STORE_IDENTITY_IO_CAP
+            && STORE_IDENTITY_IO_LIVE
+                .compare_exchange_weak(live, live + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            break true;
+        }
+        if start.elapsed() >= STORE_IDENTITY_IO_SLOT_WAIT {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    if !admitted {
+        return None;
+    }
+    struct SlotGuard;
+    impl Drop for SlotGuard {
+        fn drop(&mut self) {
+            STORE_IDENTITY_IO_LIVE.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    // The permit is owned by the detached worker, not the caller: the
+    // live count covers the worker's full blocked lifetime, and
+    // `recv_timeout` abandons only the wait.
+    let (tx, rx) = std::sync::mpsc::channel();
+    if std::thread::Builder::new()
+        .name(String::from("store-identity-io"))
+        .spawn({
+            let guard = SlotGuard;
+            move || {
+                let _held = guard;
+                let _ = tx.send(op());
+            }
+        })
+        .is_err()
+    {
+        return None;
+    }
+    rx.recv_timeout(STORE_IDENTITY_IO_TIMEOUT).ok()
+}
 
 /// Owner-held catalog handle. Only the owner constructs this.
 ///
@@ -302,17 +443,54 @@ fn v_opt_blob(value: Option<Vec<u8>>) -> turso::Value {
     value.map_or(turso::Value::Null, turso::Value::Blob)
 }
 
+/// Positional parameters for the `refs` observed-column statements
+/// (`INSERT OR IGNORE` + `UPDATE` in [`TursoStore::upsert_ref`] and
+/// [`TursoStore::buffer_upsert_ref`]): `?1..=?11` map to id,
+/// instance_id, checkout_scope_id, kind, name, oid, algo,
+/// symbolic_target, upstream, state, observed_at_ms. The v3
+/// `freshness` label columns are intentionally absent: labeling is a
+/// separate step and re-observation must preserve it.
+fn ref_params(reference: &NewRef<'_>, observed_ms: i64) -> Vec<turso::Value> {
+    vec![
+        v_text(reference.id),
+        v_text(reference.instance_id),
+        v_opt_text(reference.checkout_scope_id.map(str::to_string)),
+        v_text(reference.kind),
+        v_blob(reference.name.to_vec()),
+        v_opt_blob(reference.oid.map(<[u8]>::to_vec)),
+        v_opt_text(reference.algo.map(str::to_string)),
+        v_opt_blob(reference.symbolic_target.map(<[u8]>::to_vec)),
+        v_opt_blob(reference.upstream.map(<[u8]>::to_vec)),
+        v_text(reference.state),
+        v_int(observed_ms),
+    ]
+}
+
 /// Persist-safe scan-target bytes (RETEST-5): the catalog upholds the
 /// no-credential-bytes invariant even when callers bypass CLI sanitization.
 /// Valid UTF-8 targets are normalized with
-/// [`crate::identity::sanitize_target_url`] (scp user → `git`, userinfo and
-/// query/fragment tails stripped); non-UTF-8 targets are refused, never
-/// persisted lossy. The refusal carries no input bytes (they may hold
-/// secrets and may not be UTF-8).
+/// [`crate::identity::sanitize_target_url`] and scrubbed for credential-shaped
+/// free-text values (scp user → `git`, userinfo/query/fragment removed); non-UTF-8
+/// targets are refused, never persisted lossy. The refusal carries no input
+/// bytes (they may hold secrets and may not be UTF-8).
 fn sanitized_target_bytes(url_raw: &[u8], what: &str) -> crate::Result<Vec<u8>> {
     let text = std::str::from_utf8(url_raw)
         .map_err(|_| Error::InvalidArgs(format!("scan {what} URL is not valid UTF-8; refusing")))?;
-    Ok(crate::identity::sanitize_target_url(text).into_bytes())
+    let sanitized = crate::identity::sanitize_target_url(text);
+    let scrubbed = crate::identity::scrub_text(&sanitized);
+    // Free-text scrubbing correctly treats every scp-style username as
+    // untrusted, but `sanitize_target_url` has already normalized that
+    // slot to the safe, fixed `git` login. Preserve that one constant while
+    // keeping credential-shaped values in the host/path scrubbed.
+    let stored = if sanitized.starts_with("git@") {
+        scrubbed
+            .strip_prefix("<redacted>@")
+            .map(|rest| format!("git@{rest}"))
+            .unwrap_or(scrubbed)
+    } else {
+        scrubbed
+    };
+    Ok(stored.into_bytes())
 }
 
 /// Sink-side remote-URL enforcement (FIXREADY4 R): the inspector already
@@ -526,6 +704,59 @@ impl FrontierTask {
 const TASK_COLUMNS: &str = "id, kind, generation, dir_id, scope_key, expected_rev, \
     state, lease_token, lease_epoch, lease_expires_ms, idempotency_key, \
     retry_after_ms, attempts";
+
+/// Process-wide R06 class-skew verdict (Step 9 fast-claim gate): `0` =
+/// unknown (probe inside the first fast-path claim transaction), `1` =
+/// clear, `2` = present. Upgrades only (`0->1`, `0->2`, `1->2`).
+///
+/// Every `frontier_tasks` insert path marks skewed `(kind, id)` pairs via
+/// [`note_task_class`] *before* the row can commit, and the probe runs
+/// inside the claiming transaction, so under the owner-serialized writer
+/// model `clear` implies no claim-relevant skewed row exists. `present`
+/// only costs the legacy window-query fallback, never correctness.
+static TASK_CLASS_SKEW: AtomicU8 = AtomicU8::new(0);
+
+/// ASCII case-insensitive byte-prefix match: the SQL `id LIKE 'probe:%'`
+/// arms are engine-evaluated (SQLite `LIKE` folds ASCII case), so the
+/// Rust mirror must fold too — byte `starts_with` would miss `PROBE:x`.
+fn like_prefix(id: &str, prefix: &[u8]) -> bool {
+    let bytes = id.as_bytes();
+    bytes.len() >= prefix.len() && bytes[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+/// True when a task's R06 class (first-match over kind OR id-prefix, as
+/// in the claim queries) differs from its kind-only class — i.e. the id
+/// prefix pulls the row into an *earlier* class than its kind. All
+/// in-repo enqueue sites use consistent kind/id pairs, so this is dead
+/// defense in practice; the fast claim path still honors it exactly by
+/// falling back to the window query whenever skew may exist.
+fn task_class_skewed(kind: &str, id: &str) -> bool {
+    match kind {
+        "probe_git" => false,
+        "reconcile" => like_prefix(id, b"probe:"),
+        "enumerate_dir" => like_prefix(id, b"probe:") || like_prefix(id, b"reconcile:"),
+        "status" => {
+            like_prefix(id, b"probe:")
+                || like_prefix(id, b"reconcile:")
+                || like_prefix(id, b"enum:")
+        }
+        _ => {
+            like_prefix(id, b"probe:")
+                || like_prefix(id, b"reconcile:")
+                || like_prefix(id, b"enum:")
+                || like_prefix(id, b"status:")
+        }
+    }
+}
+
+/// Mark a to-be-inserted task's class skew (see [`TASK_CLASS_SKEW`]).
+/// Called before the row can commit; upgrade-only, hence race-safe in
+/// the conservative direction (a spurious `present` only falls back).
+fn note_task_class(kind: &str, id: &str) {
+    if task_class_skewed(kind, id) {
+        TASK_CLASS_SKEW.store(2, Ordering::Relaxed);
+    }
+}
 
 /// A task plus the lease just granted for it.
 #[derive(Debug, Clone)]
@@ -750,6 +981,24 @@ impl TursoStore {
         let catalog_id: Option<(u64, u64)> = None;
         Self::apply_pragmas(&conn).await?;
         let schema_version = Self::migrate(&conn).await?;
+        // Step 9 bounded-claim covering index (additive, idempotent): the
+        // per-class fast-claim SELECTs constrain
+        // `(generation, state, kind)` by equality and order by
+        // `(attempts, updated_at_ms, id)`, so each class resolves to one
+        // index range with `LIMIT` short-circuit instead of a whole-queue
+        // window sort. `INTEGER`/`TEXT`-only key per the schema rules. Not
+        // a versioned migration (those live in `schema.rs`, append-only):
+        // `IF NOT EXISTS` converges old and new catalogs without a
+        // version bump, and a first open on a large catalog pays one
+        // index build. Read-only opens never create it (see
+        // `TursoStore::open_read_only`, which does not run this path).
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_claim ON frontier_tasks \
+                (generation, state, kind, attempts, updated_at_ms, id)",
+            (),
+        )
+        .await
+        .map_err(store_err)?;
         let epoch = i64_to_u64(
             Self::with_tx_on(&conn, |tx| async move {
                 let current = Self::read_meta_i64(tx, "epoch").await?.unwrap_or(0);
@@ -1299,6 +1548,9 @@ impl TursoStore {
     /// Returns true when the task was newly inserted.
     pub async fn enqueue_task(&self, task: &NewTask<'_>, now_ms: i64) -> crate::Result<bool> {
         self.forbid_write("enqueue_task")?;
+        // Step 9: mark class skew before the row can commit (conservative
+        // on `OR IGNORE` duplicates — a spurious mark only falls back).
+        note_task_class(task.kind, task.id);
         let rows = self
             .conn
             .execute(
@@ -1466,6 +1718,10 @@ impl TursoStore {
     /// exhausted. Lease expiry for this generation runs first, inside the
     /// same transaction; other generations' leases are untouched.
     /// Leases last `ttl_ms` from `now_ms`. Bounded: at most 1,024 claims.
+    /// Durably claim up to `limit` eligible tasks of one traversal
+    /// `generation` for `epoch`, across all task kinds (legacy
+    /// unfiltered contract; phase gating uses
+    /// [`TursoStore::claim_tasks_in_generation_kinds`]).
     pub async fn claim_tasks_in_generation(
         &self,
         generation: u64,
@@ -1474,59 +1730,327 @@ impl TursoStore {
         ttl_ms: i64,
         now_ms: i64,
     ) -> crate::Result<Vec<ClaimedTask>> {
+        self.claim_tasks_in_generation_inner(generation, epoch, limit, ttl_ms, now_ms, None)
+            .await
+    }
+
+    /// Durably claim up to `limit` eligible tasks of one traversal
+    /// `generation` for `epoch`, restricted to `kinds` (phase gating,
+    /// goal Step 8: the discovery drain claims enumeration/probe/
+    /// reconcile only; analysis kinds wait for the post-`inventory_ready`
+    /// drain). Empty `kinds` claims nothing. Kind strings are matched
+    /// against an allowlist and bound as parameters, never interpolated.
+    pub async fn claim_tasks_in_generation_kinds(
+        &self,
+        generation: u64,
+        epoch: u64,
+        limit: usize,
+        ttl_ms: i64,
+        now_ms: i64,
+        kinds: &[&str],
+    ) -> crate::Result<Vec<ClaimedTask>> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        for kind in kinds {
+            if !matches!(
+                *kind,
+                "enumerate_dir" | "probe_git" | "status" | "reconcile" | "analyze_store"
+            ) {
+                return Err(Error::Store(format!("unknown task kind: {kind}")));
+            }
+        }
+        self.claim_tasks_in_generation_inner(generation, epoch, limit, ttl_ms, now_ms, Some(kinds))
+            .await
+    }
+
+    /// One R06 class stream: top-`limit` rows of one kind over the
+    /// pending + eligible-`retry_wait` union in window-partition order
+    /// (DB-M2: no whole-generation window fallback just because one
+    /// retry turned eligible). Two indexed top-`limit` SELECTs (one per
+    /// state, each a single `idx_tasks_claim` range with `LIMIT`
+    /// short-circuit) merged in Rust by the partition key
+    /// (`attempts, updated_at_ms, id`) — the merge reproduces the
+    /// window's in-class order row for row, since both inputs arrive
+    /// in that order and the union's top-`limit` needs at most
+    /// `limit` rows from either side.
+    async fn claim_class_top_on(
+        conn: &turso::Connection,
+        generation_i64: i64,
+        kind: &str,
+        limit: usize,
+        now_ms: i64,
+    ) -> crate::Result<Vec<FrontierTask>> {
+        // Bound literal is interpolated (numeric, owner-controlled) so
+        // the query needs no bound LIMIT support; kind stays a parameter.
+        // `updated_at_ms` rides along (column 13, past the
+        // `FrontierTask::from_row` shape) as the merge key.
+        let pending_sql = format!(
+            "SELECT {TASK_COLUMNS}, updated_at_ms FROM frontier_tasks WHERE generation = ?1 \
+                AND state = 'pending' AND kind = ?2 \
+                ORDER BY attempts ASC, updated_at_ms ASC, id ASC LIMIT {limit}"
+        );
+        let mut rows = conn
+            .query(
+                pending_sql.as_str(),
+                vec![v_int(generation_i64), v_text(kind)],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut pending: Vec<(FrontierTask, i64)> = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            pending.push((FrontierTask::from_row(&row)?, req_i64(&row, 13)?));
+        }
+        // Eligible-retry arm: exactly the window query's predicate
+        // (`retry_after_ms IS NOT NULL AND retry_after_ms <= now`).
+        let retry_sql = format!(
+            "SELECT {TASK_COLUMNS}, updated_at_ms FROM frontier_tasks WHERE generation = ?1 \
+                AND state = 'retry_wait' AND kind = ?2 \
+                AND retry_after_ms IS NOT NULL AND retry_after_ms <= ?3 \
+                ORDER BY attempts ASC, updated_at_ms ASC, id ASC LIMIT {limit}"
+        );
+        let mut rows = conn
+            .query(
+                retry_sql.as_str(),
+                vec![v_int(generation_i64), v_text(kind), v_int(now_ms)],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut retry: Vec<(FrontierTask, i64)> = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            retry.push((FrontierTask::from_row(&row)?, req_i64(&row, 13)?));
+        }
+        // Sorted-merge the two partition-ordered inputs, keeping the
+        // first `limit` rows of the union.
+        let key = |task: &FrontierTask, updated: i64| (task.attempts, updated);
+        let mut tasks = Vec::new();
+        let (mut i, mut j) = (0usize, 0usize);
+        while tasks.len() < limit && (i < pending.len() || j < retry.len()) {
+            let take_pending = match (pending.get(i), retry.get(j)) {
+                (Some((p, pu)), Some((r, ru))) => {
+                    (key(p, *pu), p.id.as_str()) <= (key(r, *ru), r.id.as_str())
+                }
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            if take_pending {
+                tasks.push(pending[i].0.clone());
+                i += 1;
+            } else {
+                tasks.push(retry[j].0.clone());
+                j += 1;
+            }
+        }
+        Ok(tasks)
+    }
+
+    /// One-time (per process) skew probe over the claimed
+    /// generation's rows: true when a pending/`retry_wait` row's id
+    /// prefix pulls it into an earlier R06 class than its kind (the
+    /// [`task_class_skewed`] mirror in SQL). Scoped to `generation`
+    /// (DB-m1): the verdict only gates this generation's fast claim,
+    /// and the `generation` equality resolves to the claim index
+    /// prefix instead of a whole-DB scan. The once-per-process cache
+    /// stays sound across generations: every insert path marks via
+    /// [`note_task_class`] before its row can commit, and rows
+    /// committed before this process came from the same binary,
+    /// whose enqueue sites never emit skewed pairs — so a later
+    /// generation can only gain skew through a self-marking insert.
+    /// Runs inside the claiming transaction, so it observes a
+    /// consistent snapshot.
+    async fn task_class_skew_present_on(
+        conn: &turso::Connection,
+        generation: u64,
+    ) -> crate::Result<bool> {
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM frontier_tasks WHERE generation = ?1 \
+                    AND (state = 'pending' OR state = 'retry_wait') \
+                    AND ((kind = 'reconcile' AND id LIKE 'probe:%') \
+                    OR (kind = 'enumerate_dir' \
+                        AND (id LIKE 'probe:%' OR id LIKE 'reconcile:%')) \
+                    OR (kind = 'status' \
+                        AND (id LIKE 'probe:%' OR id LIKE 'reconcile:%' OR id LIKE 'enum:%')) \
+                    OR (kind NOT IN ('probe_git', 'reconcile', 'enumerate_dir', 'status') \
+                        AND (id LIKE 'probe:%' OR id LIKE 'reconcile:%' \
+                        OR id LIKE 'enum:%' OR id LIKE 'status:%'))) LIMIT 1",
+                vec![v_int(u64_to_i64(generation, "task generation")?)],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(rows.next().await.map_err(store_err)?.is_some())
+    }
+
+    /// Step 9 bounded claim selection: indexed top-`limit` SELECTs per
+    /// R06 class (pending + eligible-`retry_wait` union streams,
+    /// [`TursoStore::claim_class_top_on`]) plus a Rust round-robin
+    /// merge. Returns `None` when the legacy window query must run
+    /// instead (unfiltered claims, possible kind/id class skew, or a
+    /// multi-kind else-class) — identical sequence either way.
+    ///
+    /// Exactness: with no skew, each class stream holds that class's
+    /// pending + eligible-retry rows in partition order
+    /// (`attempts, updated_at_ms, id`), and the overall `LIMIT` prefix
+    /// of the `(_rn, _cls)` round-robin needs at most `limit` rows
+    /// from any one class — so interleaving per-class top-`limit`
+    /// streams reproduces the window query's sequence row for row.
+    /// (`_rn` is unique within a class, so the window's trailing `id`
+    /// tiebreak never fires.)
+    async fn claim_select_fast(
+        conn: &turso::Connection,
+        generation: u64,
+        kinds: Option<&[&str]>,
+        limit: usize,
+        now_ms: i64,
+    ) -> crate::Result<Option<Vec<FrontierTask>>> {
+        // Unfiltered claims have an unbounded else-class (`kind NOT IN`
+        // over unknown kinds); the window query stays authoritative.
+        // (Production discovery/analysis claims always filter.)
+        let Some(kinds) = kinds else {
+            return Ok(None);
+        };
+        if TASK_CLASS_SKEW.load(Ordering::Relaxed) != 1 {
+            if Self::task_class_skew_present_on(conn, generation).await? {
+                TASK_CLASS_SKEW.store(2, Ordering::Relaxed);
+                return Ok(None);
+            }
+            TASK_CLASS_SKEW.store(1, Ordering::Relaxed);
+        }
+        let generation_i64 = u64_to_i64(generation, "task generation")?;
+        const NAMED: [&str; 4] = ["probe_git", "reconcile", "enumerate_dir", "status"];
+        let mut streams: Vec<Vec<FrontierTask>> = Vec::with_capacity(5);
+        for class_kind in NAMED {
+            if kinds.contains(&class_kind) {
+                streams.push(
+                    Self::claim_class_top_on(conn, generation_i64, class_kind, limit, now_ms)
+                        .await?,
+                );
+            } else {
+                streams.push(Vec::new());
+            }
+        }
+        let else_kinds: Vec<&&str> = kinds.iter().filter(|kind| !NAMED.contains(*kind)).collect();
+        streams.push(match else_kinds.as_slice() {
+            [] => Vec::new(),
+            [only] => Self::claim_class_top_on(conn, generation_i64, only, limit, now_ms).await?,
+            // Multi-kind else-class: the window query stays authoritative.
+            _ => return Ok(None),
+        });
+        let mut tasks = Vec::new();
+        for rn in 0..limit {
+            for stream in &streams {
+                if let Some(task) = stream.get(rn) {
+                    tasks.push(task.clone());
+                    if tasks.len() == limit {
+                        return Ok(Some(tasks));
+                    }
+                }
+            }
+        }
+        Ok(Some(tasks))
+    }
+
+    /// Legacy whole-queue window selection (authoritative fallback for
+    /// [`TursoStore::claim_select_fast`], and the only path for
+    /// unfiltered claims): R06 round-robin interleave over all eligible
+    /// rows of the generation. Unchanged semantics.
+    async fn claim_select_window(
+        conn: &turso::Connection,
+        generation: u64,
+        kinds: Option<&[&str]>,
+        limit: usize,
+        now_ms: i64,
+    ) -> crate::Result<Vec<FrontierTask>> {
+        // Bound literal is interpolated (numeric, owner-controlled) so
+        // the query needs no bound LIMIT support.
+        //
+        // R06: Fair scheduling across task classes (probe, reconcile,
+        // enumerate, status) using round-robin interleaving so discovered
+        // Git repository candidates are scheduled and validated promptly
+        // while directory enumeration continues in parallel/interleaved.
+        let kind_predicate = match kinds {
+            Some(kinds) => {
+                let kind_params: Vec<String> =
+                    (0..kinds.len()).map(|i| format!("?{}", i + 3)).collect();
+                format!("AND kind IN ({})", kind_params.join(", "))
+            }
+            None => String::new(),
+        };
+        let sql = format!(
+            "SELECT {TASK_COLUMNS} FROM ( \
+                SELECT {TASK_COLUMNS}, \
+                    ROW_NUMBER() OVER ( \
+                        PARTITION BY CASE \
+                            WHEN kind = 'probe_git' OR id LIKE 'probe:%' THEN 1 \
+                            WHEN kind = 'reconcile' OR id LIKE 'reconcile:%' THEN 2 \
+                            WHEN kind = 'enumerate_dir' OR id LIKE 'enum:%' THEN 3 \
+                            WHEN kind = 'status' OR id LIKE 'status:%' THEN 4 \
+                            ELSE 5 \
+                        END \
+                        ORDER BY attempts ASC, updated_at_ms ASC, id ASC \
+                    ) AS _rn, \
+                    CASE \
+                        WHEN kind = 'probe_git' OR id LIKE 'probe:%' THEN 1 \
+                        WHEN kind = 'reconcile' OR id LIKE 'reconcile:%' THEN 2 \
+                        WHEN kind = 'enumerate_dir' OR id LIKE 'enum:%' THEN 3 \
+                        WHEN kind = 'status' OR id LIKE 'status:%' THEN 4 \
+                        ELSE 5 \
+                    END AS _cls \
+                FROM frontier_tasks \
+                WHERE generation = ?1 \
+                    AND (state = 'pending' OR (state = 'retry_wait' \
+                    AND retry_after_ms IS NOT NULL AND retry_after_ms <= ?2)) \
+                    {kind_predicate} \
+            ) \
+            ORDER BY _rn ASC, _cls ASC, id ASC LIMIT {limit}",
+        );
+        let generation_i64 = u64_to_i64(generation, "task generation")?;
+        let mut params = vec![v_int(generation_i64), v_int(now_ms)];
+        if let Some(kinds) = kinds {
+            params.extend(kinds.iter().map(|k| v_text((*k).to_string())));
+        }
+        let mut rows = conn.query(sql.as_str(), params).await.map_err(store_err)?;
+        let mut tasks = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            tasks.push(FrontierTask::from_row(&row)?);
+        }
+        Ok(tasks)
+    }
+
+    /// Shared generation-scoped claim body. `Some(kinds)` restricts the
+    /// claim to those (already allowlisted) kinds; `None` applies no
+    /// kind predicate (legacy unfiltered contract).
+    async fn claim_tasks_in_generation_inner(
+        &self,
+        generation: u64,
+        epoch: u64,
+        limit: usize,
+        ttl_ms: i64,
+        now_ms: i64,
+        kinds: Option<&[&str]>,
+    ) -> crate::Result<Vec<ClaimedTask>> {
         // Fix10 probes before the owner gate (see `claim_tasks`).
         u64_to_i64(generation, "task generation")?;
         u64_to_i64(epoch, "lease epoch")?;
         now_ms.checked_add(ttl_ms).ok_or_else(|| {
             Error::Store(format!("lease expiry {now_ms} + {ttl_ms} overflows i64"))
         })?;
-        self.check_owner_epoch(epoch, "claim_tasks_in_generation")?;
+        self.check_owner_epoch(epoch, "claim_tasks_in_generation_kinds")?;
         let limit = limit.clamp(1, 1024);
         self.with_tx(|conn| async move {
             Self::expire_leases_in_generation_on(conn, generation, now_ms).await?;
-            // Bound literal is interpolated (numeric, owner-controlled) so
-            // the query needs no bound LIMIT support.
-            //
-            // R06: Fair scheduling across task classes (probe, reconcile,
-            // enumerate, status) using round-robin interleaving so discovered
-            // Git repository candidates are scheduled and validated promptly
-            // while directory enumeration continues in parallel/interleaved.
-            let sql = format!(
-                "SELECT {TASK_COLUMNS} FROM ( \
-                    SELECT {TASK_COLUMNS}, \
-                        ROW_NUMBER() OVER ( \
-                            PARTITION BY CASE \
-                                WHEN kind = 'probe_git' OR id LIKE 'probe:%' THEN 1 \
-                                WHEN kind = 'reconcile' OR id LIKE 'reconcile:%' THEN 2 \
-                                WHEN kind = 'enumerate_dir' OR id LIKE 'enum:%' THEN 3 \
-                                WHEN kind = 'status' OR id LIKE 'status:%' THEN 4 \
-                                ELSE 5 \
-                            END \
-                            ORDER BY attempts ASC, updated_at_ms ASC, id ASC \
-                        ) AS _rn, \
-                        CASE \
-                            WHEN kind = 'probe_git' OR id LIKE 'probe:%' THEN 1 \
-                            WHEN kind = 'reconcile' OR id LIKE 'reconcile:%' THEN 2 \
-                            WHEN kind = 'enumerate_dir' OR id LIKE 'enum:%' THEN 3 \
-                            WHEN kind = 'status' OR id LIKE 'status:%' THEN 4 \
-                            ELSE 5 \
-                        END AS _cls \
-                    FROM frontier_tasks \
-                    WHERE generation = ?1 \
-                        AND (state = 'pending' OR (state = 'retry_wait' \
-                        AND retry_after_ms IS NOT NULL AND retry_after_ms <= ?2)) \
-                ) \
-                ORDER BY _rn ASC, _cls ASC, id ASC LIMIT {limit}"
-            );
-            let generation_i64 = u64_to_i64(generation, "task generation")?;
-            let mut rows = conn
-                .query(sql.as_str(), vec![v_int(generation_i64), v_int(now_ms)])
-                .await
-                .map_err(store_err)?;
-            let mut tasks = Vec::new();
-            while let Some(row) = rows.next().await.map_err(store_err)? {
-                tasks.push(FrontierTask::from_row(&row)?);
-            }
+            // Step 9: bounded indexed selection first; the window query
+            // stays authoritative whenever the fast path declines
+            // (unfiltered claims, R06 class skew, or a multi-kind
+            // else-class) — identical sequence either way. Lease
+            // issue below is unchanged.
+            let tasks = match Self::claim_select_fast(conn, generation, kinds, limit, now_ms)
+                .await?
+            {
+                Some(tasks) => tasks,
+                None => Self::claim_select_window(conn, generation, kinds, limit, now_ms).await?,
+            };
             let mut claimed = Vec::with_capacity(tasks.len());
             for task in &tasks {
                 let token = fresh_token();
@@ -1611,6 +2135,79 @@ impl TursoStore {
         Ok(rows == 1)
     }
 
+    /// Read-only twin of the [`TursoStore::renew_lease`] match: true when
+    /// the row still carries this exact lease (state, token, epoch). A
+    /// SELECT commits nothing, so fresh-lease gates verify here instead
+    /// of paying a sync commit to rewrite an expiry that is already far
+    /// out; aged leases still renew (and extend) as before.
+    pub async fn verify_lease(&self, task_id: &str, token: i64, epoch: u64) -> crate::Result<bool> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM frontier_tasks WHERE id = ?1 AND state = 'leased' \
+                    AND lease_token = ?2 AND lease_epoch = ?3",
+                vec![
+                    v_text(task_id),
+                    v_int(token),
+                    v_int(u64_to_i64(epoch, "lease epoch")?),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(rows.next().await.map_err(store_err)?.is_some())
+    }
+
+    /// Extend several live leases in ONE transaction (Step 9 scheduled
+    /// renewal for the worker pool: the coordinator renews every in-flight
+    /// task on a tick instead of each worker renewing inline). Returns the
+    /// ids whose lease is gone — expired into another incarnation, or held
+    /// under a different token/epoch — so the caller stops touching those
+    /// scopes; never touches another owner's lease. Empty input commits
+    /// nothing and returns empty.
+    pub async fn renew_leases_batch(
+        &self,
+        leases: &[(&str, i64, u64)],
+        ttl_ms: i64,
+        now_ms: i64,
+    ) -> crate::Result<Vec<String>> {
+        if leases.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.forbid_write("renew_leases_batch")?;
+        let expires = now_ms.checked_add(ttl_ms).ok_or_else(|| {
+            Error::Store(format!("lease expiry {now_ms} + {ttl_ms} overflows i64"))
+        })?;
+        for (_, _, epoch) in leases {
+            u64_to_i64(*epoch, "lease epoch")?;
+            self.check_owner_epoch(*epoch, "renew_leases_batch")?;
+        }
+        self.with_tx(|conn| async move {
+            let mut lost = Vec::new();
+            for (task_id, token, epoch) in leases {
+                let rows = conn
+                    .execute(
+                        "UPDATE frontier_tasks SET lease_expires_ms = ?1, updated_at_ms = ?2 \
+                        WHERE id = ?3 AND state = 'leased' AND lease_token = ?4 \
+                        AND lease_epoch = ?5",
+                        vec![
+                            v_int(expires),
+                            v_int(now_ms),
+                            v_text(*task_id),
+                            v_int(*token),
+                            v_int(u64_to_i64(*epoch, "lease epoch")?),
+                        ],
+                    )
+                    .await
+                    .map_err(store_err)?;
+                if rows != 1 {
+                    lost.push((*task_id).to_string());
+                }
+            }
+            Ok(lost)
+        })
+        .await
+    }
+
     /// Return expired leases to `pending`; reports how many moved.
     pub async fn expire_leases(&self, now_ms: i64) -> crate::Result<u64> {
         self.with_tx(|conn| async move { Self::expire_leases_on(conn, now_ms).await })
@@ -1676,6 +2273,49 @@ impl TursoStore {
         self.complete_task_report_gap(task_id, token, epoch, outcome, now_ms)
             .await
             .map(|_| ())
+    }
+
+    /// Release a claim that never ran (breaker/admission denial, R4):
+    /// the task returns to `pending` immediately instead of leaking
+    /// until lease TTL. Compensates the claim's `attempts + 1` — a
+    /// denied claim did no work, so it must not burn the retry budget
+    /// (`fail_task` exhausts and backs off on attempts). Token/epoch
+    /// mismatch releases nothing. Returns whether a lease was held.
+    ///
+    /// Deliberate per-task-transaction exception to the D5 batching
+    /// rule (DB-m3): releases fire only on the rare denial path (a
+    /// closed breaker or a full admission gate), never per completed
+    /// task — batching them would hold denied leases (and their
+    /// attempts compensation) until the next flush for no measurable
+    /// gain. Production counts each release as its own transaction.
+    pub async fn release_claim(
+        &self,
+        task_id: &str,
+        token: i64,
+        epoch: u64,
+        now_ms: i64,
+    ) -> crate::Result<bool> {
+        self.forbid_write("release_claim")?;
+        let epoch_i64 = u64_to_i64(epoch, "lease epoch")?;
+        self.check_owner_epoch(epoch, "release_claim")?;
+        let rows = self
+            .connection()
+            .execute(
+                "UPDATE frontier_tasks SET state = 'pending', lease_token = NULL, \
+                 lease_epoch = NULL, lease_expires_ms = NULL, updated_at_ms = ?1, \
+                 attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END \
+                 WHERE id = ?2 AND state = 'leased' AND lease_token = ?3 \
+                 AND lease_epoch = ?4",
+                vec![
+                    v_int(now_ms),
+                    v_text(task_id),
+                    v_int(token),
+                    v_int(epoch_i64),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(rows == 1)
     }
 
     /// Complete one claimed task. Returns the gap delta the outcome
@@ -1987,8 +2627,35 @@ impl TursoStore {
         generation: u64,
         now_ms: i64,
     ) -> crate::Result<u64> {
+        self.invalidate_scope_with_canonicalizer(
+            scope_key,
+            generation,
+            now_ms,
+            // SLICE-1 SHIM: B11 passes `crate::config::try_canonical_scope_path`
+            // (owned by the config/walk slice); the store-local port has
+            // identical semantics.
+            try_canonical_scope_path,
+        )
+        .await
+    }
+
+    async fn invalidate_scope_with_canonicalizer(
+        &self,
+        scope_key: &str,
+        generation: u64,
+        now_ms: i64,
+        mut canonicalize: impl FnMut(&Path) -> Option<PathBuf>,
+    ) -> crate::Result<u64> {
+        // Resolve spelling aliases before `BEGIN IMMEDIATE`: the lookup
+        // uses bounded identity I/O and must not hold the writer lock.
+        // Unknown identity fails closed without bumping a revision or
+        // enqueuing any work.
+        let fan_keys =
+            Self::scope_fanout_keys_with(&self.conn, &[scope_key.to_string()], &mut canonicalize)
+                .await?;
+        let fan_keys = fan_keys.into_iter().next().unwrap_or_default();
         self.with_tx(|conn| async move {
-            Self::invalidate_scope_on(conn, scope_key, generation, now_ms).await
+            Self::invalidate_scope_on(conn, scope_key, generation, now_ms, &fan_keys).await
         })
         .await
     }
@@ -1998,11 +2665,21 @@ impl TursoStore {
     /// [`TursoStore::invalidate_scope`] and the atomic event ingest
     /// [`TursoStore::ingest_event_batch`] so both paths schedule identical
     /// work. Returns the new revision.
+    ///
+    /// Spelling fan-out (DB-M1): scope keys keep observed spellings
+    /// (execution derives task paths from keys), so the same object
+    /// may hold keys under several spellings. After the literal bump,
+    /// every live-task key denoting the same object (compared through
+    /// the shared [`try_canonical_scope_path`]) is bumped
+    /// from its own revision too — otherwise an invalidate issued
+    /// under one spelling silently misses live tasks scheduled under
+    /// another. One reconcile task still suffices (same object).
     async fn invalidate_scope_on(
         conn: &turso::Connection,
         scope_key: &str,
         generation: u64,
         now_ms: i64,
+        fan_keys: &[String],
     ) -> crate::Result<u64> {
         let next = Self::scope_rev_on(conn, scope_key)
             .await?
@@ -2023,8 +2700,32 @@ impl TursoStore {
         // (§11): `dir:` keys carry hex-encoded path bytes, never row ids,
         // so the directory rows are looked up by path, not parsed.
         Self::mirror_dir_invalidation(conn, scope_key, next).await?;
+        // Cross-spelling fan-out (DB-M1): live tasks under another
+        // spelling of this object requeue like directly-invalidated
+        // ones. Each key bumps from its own revision with its own
+        // mirror; failures are loud (caller's transaction rolls back).
+        for fan_key in fan_keys {
+            let fan_next = Self::scope_rev_on(conn, fan_key)
+                .await?
+                .checked_add(1)
+                .ok_or_else(|| Error::Store("scope revision overflow".to_string()))?;
+            let fan_next_i64 = i64::try_from(fan_next).map_err(|_| {
+                Error::Store(format!("scope revision {fan_next} exceeds i64 range"))
+            })?;
+            conn.execute(
+                "INSERT OR REPLACE INTO scope_revisions (scope_key, rev, updated_at_ms) \
+                    VALUES (?1, ?2, ?3)",
+                vec![v_text(fan_key.as_str()), v_int(fan_next_i64), v_int(now_ms)],
+            )
+            .await
+            .map_err(store_err)?;
+            Self::mirror_dir_invalidation(conn, fan_key, fan_next).await?;
+        }
         let task_id = format!("reconcile:{scope_key}:{next}");
         let idempotency = format!("idem:{task_id}");
+        // Step 9: class-skew mark (no-op for this consistent pair; kept
+        // so every `frontier_tasks` insert path is covered by construction).
+        note_task_class("reconcile", &task_id);
         conn.execute(
             "INSERT OR IGNORE INTO frontier_tasks (id, kind, generation, dir_id, \
                 scope_key, expected_rev, state, idempotency_key, attempts, \
@@ -2042,6 +2743,78 @@ impl TursoStore {
         .await
         .map_err(store_err)?;
         Ok(next)
+    }
+
+    /// Snapshot the live path-scope keys that share a physical path with
+    /// each requested scope (DB-M1). This runs before the write transaction:
+    /// bounded scope identity resolution performs filesystem I/O. Only `dir:` and
+    /// `git:` keys participate; completed work needs no requeue, and future
+    /// tasks read the bumped revision when they are created. The resulting
+    /// keys are applied atomically with the invalidation by
+    /// `invalidate_scope_on`.
+    async fn scope_fanout_keys(
+        conn: &turso::Connection,
+        scopes: &[String],
+    ) -> crate::Result<Vec<Vec<String>>> {
+        Self::scope_fanout_keys_with(conn, scopes, try_canonical_scope_path).await
+    }
+
+    async fn scope_fanout_keys_with(
+        conn: &turso::Connection,
+        scopes: &[String],
+        mut canonicalize: impl FnMut(&Path) -> Option<PathBuf>,
+    ) -> crate::Result<Vec<Vec<String>>> {
+        use crate::config::ScopeRef;
+        let mut targets: Vec<Option<PathBuf>> = Vec::with_capacity(scopes.len());
+        for scope_key in scopes {
+            let target = match crate::config::parse_scope_key(scope_key) {
+                Some(ScopeRef::Dir(path)) | Some(ScopeRef::Git(path)) => {
+                    Some(canonicalize(&path).ok_or_else(|| {
+                        Error::Store(
+                            "scope path identity did not resolve within the bounded I/O limit; \
+                             event invalidation was not committed and can be retried"
+                                .to_string(),
+                        )
+                    })?)
+                }
+                Some(ScopeRef::Status(_)) | None => None,
+            };
+            targets.push(target);
+        }
+        if targets.iter().all(Option::is_none) {
+            return Ok(vec![Vec::new(); scopes.len()]);
+        }
+        let mut fanouts = vec![Vec::new(); scopes.len()];
+        let mut rows = conn
+            .query(
+                "SELECT DISTINCT scope_key FROM frontier_tasks \
+                    WHERE state IN ('pending', 'leased', 'retry_wait') \
+                    AND (scope_key LIKE 'dir:%' OR scope_key LIKE 'git:%')",
+                (),
+            )
+            .await
+            .map_err(store_err)?;
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            let key = req_text(&row, 0)?;
+            let path = match crate::config::parse_scope_key(&key) {
+                Some(ScopeRef::Dir(path)) | Some(ScopeRef::Git(path)) => {
+                    canonicalize(&path).ok_or_else(|| {
+                        Error::Store(
+                            "pending task path identity did not resolve within the bounded I/O limit; \
+                             event invalidation was not committed and can be retried"
+                                .to_string(),
+                        )
+                    })?
+                }
+                Some(ScopeRef::Status(_)) | None => continue,
+            };
+            for (index, (scope_key, target)) in scopes.iter().zip(&targets).enumerate() {
+                if key != *scope_key && target.as_ref().is_some_and(|target| target == &path) {
+                    fanouts[index].push(key.clone());
+                }
+            }
+        }
+        Ok(fanouts)
     }
 
     /// Mirror a `dir:` scope invalidation into every matching
@@ -2160,13 +2933,39 @@ impl TursoStore {
     /// Tasks in `generation` that still need scheduler action (any
     /// non-terminal state), for run-boundary accounting.
     pub async fn pending_count(&self, generation: u64) -> crate::Result<u64> {
+        self.pending_count_kinds(
+            generation,
+            &[
+                "enumerate_dir",
+                "probe_git",
+                "status",
+                "reconcile",
+                "analyze_store",
+            ],
+        )
+        .await
+    }
+
+    /// Incomplete-task count for one generation restricted to `kinds`
+    /// (phase gating, goal Step 8: the discovery boundary counts
+    /// enumeration/probe/reconcile only — analysis kinds have not
+    /// started yet, so counting them would poison the verdict).
+    pub async fn pending_count_kinds(&self, generation: u64, kinds: &[&str]) -> crate::Result<u64> {
+        if kinds.is_empty() {
+            return Ok(0);
+        }
+        let kind_params: Vec<String> = (0..kinds.len()).map(|i| format!("?{}", i + 2)).collect();
+        let sql = format!(
+            "SELECT COUNT(*) FROM frontier_tasks WHERE generation = ?1 \
+                AND state NOT IN ('complete', 'unsupported', 'cancelled', 'superseded') \
+                AND kind IN ({})",
+            kind_params.join(", ")
+        );
+        let mut params = vec![v_int(u64_to_i64(generation, "task generation")?)];
+        params.extend(kinds.iter().map(|k| v_text((*k).to_string())));
         let mut rows = self
             .conn
-            .query(
-                "SELECT COUNT(*) FROM frontier_tasks WHERE generation = ?1 \
-                    AND state NOT IN ('complete', 'unsupported', 'cancelled', 'superseded')",
-                vec![v_int(u64_to_i64(generation, "task generation")?)],
-            )
+            .query(sql.as_str(), params)
             .await
             .map_err(store_err)?;
         match rows.next().await.map_err(store_err)? {
@@ -2463,10 +3262,25 @@ pub struct RefRow {
     pub state: String,
     /// Observation time.
     pub observed_at_ms: i64,
+    /// v3: remote freshness (`current`|`stale`|`unknown`); `None` =
+    /// legacy/unlabeled row or a non-remote-tracking ref, read as
+    /// `unknown`. Only `kind = 'remote_tracking'` rows are labeled.
+    pub freshness: Option<String>,
+    /// v3: when the freshness label was assigned.
+    pub freshness_at_ms: Option<i64>,
+    /// v6: branch comparison state (D7 vocabulary); `None` = legacy
+    /// pre-v6 row, a ref kind that is never compared, or a catalog
+    /// whose v6 columns are absent — all read as `pending`.
+    pub comparison_state: Option<String>,
+    /// v6: ahead count; `None` = unknown (never zero-by-default).
+    pub ahead: Option<i64>,
+    /// v6: behind count; `None` = unknown (never zero-by-default).
+    pub behind: Option<i64>,
 }
 
 impl RefRow {
-    fn from_row(row: &turso::Row) -> crate::Result<Self> {
+    /// v5 column shape (indices 0–12); comparison fields read `None`.
+    fn from_row_v5(row: &turso::Row) -> crate::Result<Self> {
         Ok(Self {
             id: req_text(row, 0)?,
             instance_id: req_text(row, 1)?,
@@ -2479,8 +3293,126 @@ impl RefRow {
             upstream: opt_blob(row, 8)?,
             state: req_text(row, 9)?,
             observed_at_ms: req_i64(row, 10)?,
+            freshness: opt_text(row, 11)?,
+            freshness_at_ms: opt_i64(row, 12)?,
+            comparison_state: None,
+            ahead: None,
+            behind: None,
         })
     }
+
+    /// v6 column shape (indices 0–15): v5 columns plus
+    /// `comparison_state`, `ahead`, `behind`.
+    fn from_row_v6(row: &turso::Row) -> crate::Result<Self> {
+        Ok(Self {
+            id: req_text(row, 0)?,
+            instance_id: req_text(row, 1)?,
+            checkout_scope_id: opt_text(row, 2)?,
+            kind: req_text(row, 3)?,
+            name: req_blob(row, 4)?,
+            oid: opt_blob(row, 5)?,
+            algo: opt_text(row, 6)?,
+            symbolic_target: opt_blob(row, 7)?,
+            upstream: opt_blob(row, 8)?,
+            state: req_text(row, 9)?,
+            observed_at_ms: req_i64(row, 10)?,
+            freshness: opt_text(row, 11)?,
+            freshness_at_ms: opt_i64(row, 12)?,
+            comparison_state: opt_text(row, 13)?,
+            ahead: opt_i64(row, 14)?,
+            behind: opt_i64(row, 15)?,
+        })
+    }
+}
+
+/// True when the `refs` table physically carries the v6 comparison
+/// columns (`comparison_state`, `ahead`, `behind`). Gates every
+/// comparison read/write until the coordinator wires migration v6:
+/// v5 catalogs take the legacy path (reads `pending`/null, writes
+/// skipped) instead of failing on missing columns. Plain
+/// `sqlite_master` SELECT — no exotic syntax.
+pub async fn refs_has_comparison(conn: &turso::Connection) -> crate::Result<bool> {
+    let mut rows = conn
+        .query(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'refs'",
+            (),
+        )
+        .await
+        .map_err(store_err)?;
+    let Some(row) = rows.next().await.map_err(store_err)? else {
+        return Ok(false);
+    };
+    let sql = match row.get_value(0).map_err(store_err)? {
+        turso::Value::Text(sql) => sql,
+        _ => return Ok(false),
+    };
+    Ok(sql.contains("comparison_state") && sql.contains("ahead") && sql.contains("behind"))
+}
+
+/// One row of the v3 `remote_refreshes` table: the last `--fetch`
+/// attempt for one local store + remote name. Only the remote NAME is
+/// stored — never the URL (raw URLs may embed credentials; canonical
+/// URLs already live in `remotes`).
+#[derive(Debug, Clone)]
+pub struct RemoteRefreshRow {
+    /// Local-store (git instance) id.
+    pub store_id: String,
+    /// Remote name bytes (`origin`, ...).
+    pub remote_name: Vec<u8>,
+    /// Attempt status: `success`|`failed`|`unsupported`.
+    pub status: String,
+    /// Attempt observation (end) time.
+    pub observed_at_ms: i64,
+    /// Attempt duration; `None` when not measured.
+    pub duration_ms: Option<i64>,
+    /// Tracking refs the fetch updated.
+    pub refs_updated: i64,
+    /// JSON names observed current; `None` when none/unknown.
+    pub refs_current_json: Option<String>,
+    /// JSON names found deleted upstream (local tracking refs are
+    /// KEPT, never pruned); `None` when none/unknown.
+    pub refs_deleted_json: Option<String>,
+    /// Scrubbed detail; `None` on clean success.
+    pub detail: Option<String>,
+}
+
+impl RemoteRefreshRow {
+    fn from_row(row: &turso::Row) -> crate::Result<Self> {
+        Ok(Self {
+            store_id: req_text(row, 0)?,
+            remote_name: req_blob(row, 1)?,
+            status: req_text(row, 2)?,
+            observed_at_ms: req_i64(row, 3)?,
+            duration_ms: opt_i64(row, 4)?,
+            refs_updated: req_i64(row, 5)?,
+            refs_current_json: opt_text(row, 6)?,
+            refs_deleted_json: opt_text(row, 7)?,
+            detail: opt_text(row, 8)?,
+        })
+    }
+}
+
+/// Insert shape for a v3 `remote_refreshes` row.
+#[derive(Debug, Clone, Copy)]
+pub struct NewRemoteRefresh<'a> {
+    /// Local-store (git instance) id.
+    pub store_id: &'a str,
+    /// Remote name bytes.
+    pub remote_name: &'a [u8],
+    /// Attempt status: `success`|`failed`|`unsupported`.
+    pub status: &'a str,
+    /// Attempt observation (end) time.
+    pub observed_at_ms: i64,
+    /// Attempt duration; `None` when not measured.
+    pub duration_ms: Option<i64>,
+    /// Tracking refs the fetch updated.
+    pub refs_updated: i64,
+    /// JSON names observed current; `None` when none/unknown.
+    pub refs_current_json: Option<&'a str>,
+    /// JSON names found deleted upstream; `None` when none/unknown.
+    pub refs_deleted_json: Option<&'a str>,
+    /// Scrubbed detail; `None` on clean success.
+    pub detail: Option<&'a str>,
 }
 
 /// New ref for [`TursoStore::upsert_ref`].
@@ -2529,6 +3461,11 @@ pub struct StatusRow {
     pub unstaged: Option<i64>,
     /// Untracked entries, when known.
     pub untracked: Option<i64>,
+    /// Distinct unmerged paths, when known (v5; `None` also covers
+    /// legacy rows and metadata mode).
+    pub conflicts: Option<i64>,
+    /// Step 10 working-state vocabulary (v5; `None` on legacy rows).
+    pub working_state: Option<String>,
     /// Untracked count units.
     pub untracked_units: String,
     /// Submodule coverage.
@@ -2555,6 +3492,8 @@ impl StatusRow {
             staged: opt_i64(row, 6)?,
             unstaged: opt_i64(row, 7)?,
             untracked: opt_i64(row, 8)?,
+            conflicts: opt_i64(row, 15)?,
+            working_state: opt_text(row, 16)?,
             untracked_units: req_text(row, 9)?,
             submodules: req_text(row, 10)?,
             unknown_fields: req_text(row, 11)?,
@@ -2566,6 +3505,13 @@ impl StatusRow {
 }
 
 /// New status observation for [`TursoStore::record_status`].
+///
+/// COMPAT (slice 1): this struct keeps main's v2-era field set so
+/// unmodified callers (`main.rs`, existing tests) still compile. The v5
+/// `conflicts`/`working_state` columns are written through
+/// [`TursoStore::record_status_full`] /
+/// [`TursoStore::buffer_record_status_full`]; the plain entry points
+/// persist `NULL` (the v5 legacy/"unknown" reading) for both.
 #[derive(Debug, Clone)]
 pub struct NewStatus<'a> {
     /// Observed checkout id.
@@ -2630,6 +3576,15 @@ pub struct ScanRow {
     pub format: Option<String>,
     /// v2: `--all` filesystem-discovery scan; `None` = legacy row.
     pub all_targets: Option<bool>,
+    /// v3: `--fetch` remote refresh requested; `None` = legacy row, no
+    /// fetch. Resume restores this.
+    pub fetch: Option<bool>,
+    /// v4: explicit `--workers` request; `None` = legacy row or flag
+    /// absent, resolved at runtime. Resume restores this.
+    pub workers: Option<u64>,
+    /// v7: authoritative `inventory_ready` event sequence, retained even
+    /// after the event row ages out of the bounded journal.
+    pub inventory_ready_seq: Option<u64>,
 }
 
 impl ScanRow {
@@ -2649,11 +3604,25 @@ impl ScanRow {
             targets_json: opt_text(row, 11)?,
             format: opt_text(row, 12)?,
             all_targets: opt_i64(row, 13)?.map(|v| v != 0),
+            fetch: opt_i64(row, 14)?.map(|v| v != 0),
+            // A corrupt negative resolves to `None` (runtime default via
+            // `restore_workers`) instead of failing the whole read —
+            // resume stays resilient to a bad stored value.
+            workers: opt_i64(row, 15)?.and_then(|v| u64::try_from(v).ok()),
+            inventory_ready_seq: opt_i64(row, 16)?
+                .map(|v| i64_to_u64(v, "inventory_ready sequence"))
+                .transpose()?,
         })
     }
 }
 
 /// New scan request for [`TursoStore::create_scan_request`].
+///
+/// COMPAT (slice 1): this struct keeps main's v2-era field set so
+/// unmodified callers (`main.rs`, existing tests, benches) still
+/// compile. The v3 `fetch` and v4 `workers` columns are written through
+/// [`TursoStore::create_scan_request_full`]; the plain entry point
+/// persists `NULL` (the v3/v4 legacy reading) for both.
 #[derive(Debug, Clone)]
 pub struct NewScan<'a> {
     /// Scan id.
@@ -2991,6 +3960,18 @@ impl GroupMemberRow {
     }
 }
 
+/// Re-observe one ref's oid (v3 fetch phase): single source for
+/// [`TursoStore::update_ref_oid`] and
+/// [`TursoStore::buffer_update_ref_oid`], so the direct round-trip
+/// test covers the buffered statement text too.
+const UPDATE_REF_OID_SQL: &str = "UPDATE refs SET oid = ?2, observed_at_ms = ?3 WHERE id = ?1";
+
+/// Label one ref's branch comparison (v6 analysis phase): single
+/// source for [`TursoStore::update_ref_comparison`] and
+/// [`TursoStore::buffer_update_ref_comparison`].
+const UPDATE_REF_COMPARISON_SQL: &str =
+    "UPDATE refs SET comparison_state = ?2, ahead = ?3, behind = ?4 WHERE id = ?1";
+
 impl TursoStore {
     /// Idempotent directory upsert keyed by physical identity
     /// (`volume_id`, `object_id`, `incarnation`). Returns the row id.
@@ -3113,6 +4094,7 @@ impl TursoStore {
         observed_ms: i64,
     ) -> crate::Result<()> {
         self.forbid_write("record_dir_observation")?;
+        let error = error.map(crate::identity::scrub_text);
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO dir_observations (dir_id, generation, completed, \
@@ -3124,7 +4106,7 @@ impl TursoStore {
                     v_int(i64::from(completed)),
                     v_int(u64_to_i64(entry_generation, "dir entry_generation")?),
                     v_int(u64_to_i64(entries_seen, "dir entries_seen")?),
-                    v_opt_text(error.map(str::to_string)),
+                    v_opt_text(error),
                     v_int(observed_ms),
                 ],
             )
@@ -3342,26 +4324,183 @@ impl TursoStore {
         Ok(out)
     }
 
-    /// Idempotent ref upsert keyed by stable id.
+    /// Idempotent ref upsert keyed by stable id. v3: `INSERT OR
+    /// IGNORE` plus an unconditional `UPDATE` of the observed columns
+    /// only, so re-observation preserves the `freshness` label columns
+    /// (`INSERT OR REPLACE` would null them). Insert-first order is
+    /// race-safe: concurrent same-id upserts converge on
+    /// last-writer-wins, never a lost insert. (`ON CONFLICT DO UPDATE`
+    /// with `excluded.*` is avoided: turso 0.8.1 accepts the statement
+    /// but mis-evaluates the `excluded` references.)
     pub async fn upsert_ref(&self, reference: &NewRef<'_>, observed_ms: i64) -> crate::Result<()> {
         self.forbid_write("upsert_ref")?;
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO refs (id, instance_id, checkout_scope_id, kind, \
+                "INSERT OR IGNORE INTO refs (id, instance_id, checkout_scope_id, kind, \
                     name, oid, algo, symbolic_target, upstream, state, observed_at_ms) \
                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                ref_params(reference, observed_ms),
+            )
+            .await
+            .map_err(store_err)?;
+        self.conn
+            .execute(
+                "UPDATE refs SET instance_id = ?2, checkout_scope_id = ?3, kind = ?4, \
+                    name = ?5, oid = ?6, algo = ?7, symbolic_target = ?8, \
+                    upstream = ?9, state = ?10, observed_at_ms = ?11 WHERE id = ?1",
+                ref_params(reference, observed_ms),
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// List refs for one instance, ordered by id. Reads the v6
+    /// comparison columns when physically present; on v5 catalogs
+    /// the comparison fields read `None` (`pending`/null).
+    pub async fn list_refs(&self, instance_id: &str) -> crate::Result<Vec<RefRow>> {
+        let v6 = self.supports_ref_comparison().await?;
+        let sql = if v6 {
+            "SELECT id, instance_id, checkout_scope_id, kind, name, oid, algo, \
+                symbolic_target, upstream, state, observed_at_ms, freshness, \
+                freshness_at_ms, comparison_state, ahead, behind FROM refs \
+                WHERE instance_id = ?1 ORDER BY id ASC"
+        } else {
+            "SELECT id, instance_id, checkout_scope_id, kind, name, oid, algo, \
+                symbolic_target, upstream, state, observed_at_ms, freshness, \
+                freshness_at_ms FROM refs \
+                WHERE instance_id = ?1 ORDER BY id ASC"
+        };
+        let mut rows = self
+            .conn
+            .query(sql, vec![v_text(instance_id)])
+            .await
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            if v6 {
+                out.push(RefRow::from_row_v6(&row)?);
+            } else {
+                out.push(RefRow::from_row_v5(&row)?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// True when this catalog's `refs` table carries the v6
+    /// comparison columns. Gates comparison writes until the
+    /// coordinator wires migration v6.
+    pub async fn supports_ref_comparison(&self) -> crate::Result<bool> {
+        refs_has_comparison(&self.conn).await
+    }
+
+    /// Label one ref's branch comparison (v6): updates
+    /// `comparison_state` + `ahead`/`behind` only, leaving
+    /// attribution, oid, upstream, state, and freshness untouched.
+    /// Counts past `i64::MAX` fail loudly (caller defect), like
+    /// every other catalog `u64` write. Returns true when a row was
+    /// updated; on a pre-v6 catalog returns false WITHOUT executing
+    /// (the columns do not exist yet) — callers treat false as
+    /// "comparison not persisted", never as an error.
+    pub async fn update_ref_comparison(
+        &self,
+        ref_id: &str,
+        state: &str,
+        ahead: Option<u64>,
+        behind: Option<u64>,
+    ) -> crate::Result<bool> {
+        self.forbid_write("update_ref_comparison")?;
+        if !self.supports_ref_comparison().await? {
+            return Ok(false);
+        }
+        let ahead = ahead.map(|v| u64_to_i64(v, "ref ahead")).transpose()?;
+        let behind = behind.map(|v| u64_to_i64(v, "ref behind")).transpose()?;
+        let changed = self
+            .conn
+            .execute(
+                UPDATE_REF_COMPARISON_SQL,
                 vec![
-                    v_text(reference.id),
-                    v_text(reference.instance_id),
-                    v_opt_text(reference.checkout_scope_id.map(str::to_string)),
-                    v_text(reference.kind),
-                    v_blob(reference.name.to_vec()),
-                    v_opt_blob(reference.oid.map(<[u8]>::to_vec)),
-                    v_opt_text(reference.algo.map(str::to_string)),
-                    v_opt_blob(reference.symbolic_target.map(<[u8]>::to_vec)),
-                    v_opt_blob(reference.upstream.map(<[u8]>::to_vec)),
-                    v_text(reference.state),
-                    v_int(observed_ms),
+                    v_text(ref_id),
+                    v_text(state),
+                    v_opt_int(ahead),
+                    v_opt_int(behind),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(changed > 0)
+    }
+
+    /// Re-observe one persisted ref's object id after a `--fetch`
+    /// (v3): updates `oid` + `observed_at_ms` only, leaving
+    /// instance attribution, kind, upstream, state, and any freshness
+    /// label untouched. The fetch phase pairs this with
+    /// [`TursoStore::label_ref_freshness`] (existing row) or
+    /// [`TursoStore::upsert_ref`] (fetch-created tracking branch).
+    /// Returns true when a row was updated. `UPDATE_REF_OID_SQL`
+    /// is the single source shared with
+    /// [`TursoStore::buffer_update_ref_oid`].
+    pub async fn update_ref_oid(
+        &self,
+        ref_id: &str,
+        oid: &[u8],
+        at_ms: i64,
+    ) -> crate::Result<bool> {
+        self.forbid_write("update_ref_oid")?;
+        let changed = self
+            .conn
+            .execute(
+                UPDATE_REF_OID_SQL,
+                vec![v_text(ref_id), v_blob(oid.to_vec()), v_int(at_ms)],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(changed > 0)
+    }
+
+    /// Label the freshness of one persisted ref (v3). Only used for
+    /// `kind = 'remote_tracking'` rows after a `--fetch` attempt;
+    /// `freshness` is `current`|`stale`|`unknown`. Returns true when a
+    /// row was updated.
+    pub async fn label_ref_freshness(
+        &self,
+        ref_id: &str,
+        freshness: &str,
+        at_ms: i64,
+    ) -> crate::Result<bool> {
+        self.forbid_write("label_ref_freshness")?;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE refs SET freshness = ?2, freshness_at_ms = ?3 WHERE id = ?1",
+                vec![v_text(ref_id), v_text(freshness), v_int(at_ms)],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(changed > 0)
+    }
+
+    /// Record the last `--fetch` attempt for one store + remote (v3).
+    /// `INSERT OR REPLACE` keyed by (`store_id`, `remote_name`): the
+    /// row always reflects the latest attempt.
+    pub async fn record_remote_refresh(&self, refresh: &NewRemoteRefresh<'_>) -> crate::Result<()> {
+        self.forbid_write("record_remote_refresh")?;
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO remote_refreshes (store_id, remote_name, remote_name_key, \
+                    status, observed_at_ms, duration_ms, refs_updated, \
+                    refs_current_json, refs_deleted_json, detail) \
+                    VALUES (?1, ?2, hex(?2), ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                vec![
+                    v_text(refresh.store_id),
+                    v_blob(refresh.remote_name.to_vec()),
+                    v_text(refresh.status),
+                    v_int(refresh.observed_at_ms),
+                    v_opt_int(refresh.duration_ms),
+                    v_int(refresh.refs_updated),
+                    v_opt_text(refresh.refs_current_json.map(str::to_string)),
+                    v_opt_text(refresh.refs_deleted_json.map(str::to_string)),
+                    v_opt_text(refresh.detail.map(str::to_string)),
                 ],
             )
             .await
@@ -3369,30 +4508,78 @@ impl TursoStore {
         Ok(())
     }
 
-    /// List refs for one instance, ordered by id.
-    pub async fn list_refs(&self, instance_id: &str) -> crate::Result<Vec<RefRow>> {
+    /// Read the last `--fetch` attempt for one store + remote (v3),
+    /// or `None` when never attempted.
+    pub async fn get_remote_refresh(
+        &self,
+        store_id: &str,
+        remote_name: &[u8],
+    ) -> crate::Result<Option<RemoteRefreshRow>> {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, instance_id, checkout_scope_id, kind, name, oid, algo, \
-                    symbolic_target, upstream, state, observed_at_ms FROM refs \
-                    WHERE instance_id = ?1 ORDER BY id ASC",
-                vec![v_text(instance_id)],
+                "SELECT store_id, remote_name, status, observed_at_ms, \
+                    duration_ms, refs_updated, refs_current_json, \
+                    refs_deleted_json, detail \
+                    FROM remote_refreshes WHERE store_id = ?1 AND remote_name_key = hex(?2)",
+                vec![v_text(store_id), v_blob(remote_name.to_vec())],
+            )
+            .await
+            .map_err(store_err)?;
+        match rows.next().await.map_err(store_err)? {
+            Some(row) => Ok(Some(RemoteRefreshRow::from_row(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List all recorded `--fetch` attempts for one store (v3).
+    pub async fn list_remote_refreshes(
+        &self,
+        store_id: &str,
+    ) -> crate::Result<Vec<RemoteRefreshRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT store_id, remote_name, status, observed_at_ms, \
+                    duration_ms, refs_updated, refs_current_json, \
+                    refs_deleted_json, detail \
+                    FROM remote_refreshes WHERE store_id = ?1 ORDER BY remote_name ASC",
+                vec![v_text(store_id)],
             )
             .await
             .map_err(store_err)?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await.map_err(store_err)? {
-            out.push(RefRow::from_row(&row)?);
+            out.push(RemoteRefreshRow::from_row(&row)?);
         }
         Ok(out)
     }
 
     /// Idempotent status observation keyed by (`checkout_id`, `observed_rev`).
     /// Returns true when newly inserted.
+    ///
+    /// COMPAT (slice 1): keeps main's two-argument shape; the v5
+    /// `conflicts`/`working_state` columns persist `NULL` (legacy,
+    /// read as unknown/undetermined). Callers that determined the Step 10
+    /// working-state vocabulary use [`TursoStore::record_status_full`].
     pub async fn record_status(
         &self,
         status: &NewStatus<'_>,
+        observed_ms: i64,
+    ) -> crate::Result<bool> {
+        self.record_status_full(status, None, None, observed_ms)
+            .await
+    }
+
+    /// Idempotent status observation with the v5 columns: `conflicts`
+    /// counts distinct unmerged paths (`None` = could not determine) and
+    /// `working_state` carries the Step 10 vocabulary (`None` = legacy
+    /// row, read as unknown). Returns true when newly inserted.
+    pub async fn record_status_full(
+        &self,
+        status: &NewStatus<'_>,
+        conflicts: Option<i64>,
+        working_state: Option<&str>,
         observed_ms: i64,
     ) -> crate::Result<bool> {
         self.forbid_write("record_status")?;
@@ -3402,8 +4589,9 @@ impl TursoStore {
                 "INSERT OR IGNORE INTO status_observations (checkout_id, mode, state, \
                     started_ms, finished_ms, staged, unstaged, untracked, \
                     untracked_units, submodules, unknown_fields, input_fingerprint, \
-                    observed_rev, observed_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, \
-                    ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    observed_rev, observed_at_ms, conflicts, working_state) \
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, \
+                    ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 vec![
                     v_text(status.checkout_id),
                     v_text(status.mode),
@@ -3419,6 +4607,8 @@ impl TursoStore {
                     v_opt_blob(status.input_fingerprint.map(<[u8]>::to_vec)),
                     v_int(u64_to_i64(status.observed_rev, "status observed_rev")?),
                     v_int(observed_ms),
+                    v_opt_int(conflicts),
+                    v_opt_text(working_state.map(str::to_string)),
                 ],
             )
             .await
@@ -3433,7 +4623,8 @@ impl TursoStore {
             .query(
                 "SELECT id, checkout_id, mode, state, started_ms, finished_ms, staged, \
                     unstaged, untracked, untracked_units, submodules, unknown_fields, \
-                    input_fingerprint, observed_rev, observed_at_ms \
+                    input_fingerprint, observed_rev, observed_at_ms, conflicts, \
+                    working_state \
                     FROM status_observations WHERE checkout_id = ?1 \
                     ORDER BY observed_rev DESC",
                 vec![v_text(checkout_id)],
@@ -3455,9 +4646,29 @@ impl TursoStore {
     /// credential bytes. The CLI rejects credential forms loudly before
     /// calling; this layer normalizes silently (defense-in-depth) and only
     /// refuses non-UTF-8 targets.
+    ///
+    /// COMPAT (slice 1): keeps main's two-argument shape; the v3 `fetch`
+    /// and v4 `workers` columns persist `NULL` (legacy). Callers with an
+    /// explicit `--fetch`/`--workers` request use
+    /// [`TursoStore::create_scan_request_full`].
     pub async fn create_scan_request(
         &self,
         scan: &NewScan<'_>,
+        now_ms: i64,
+    ) -> crate::Result<bool> {
+        self.create_scan_request_full(scan, None, None, now_ms)
+            .await
+    }
+
+    /// Create a scan request idempotently, persisting the v3 `fetch` and
+    /// v4 `workers` request columns (`None` = legacy row / flag absent).
+    /// Returns true when newly inserted. Same sanitization contract as
+    /// [`TursoStore::create_scan_request`].
+    pub async fn create_scan_request_full(
+        &self,
+        scan: &NewScan<'_>,
+        fetch: Option<bool>,
+        workers: Option<u64>,
         now_ms: i64,
     ) -> crate::Result<bool> {
         self.forbid_write("create_scan_request")?;
@@ -3466,13 +4677,14 @@ impl TursoStore {
             .url_canonical
             .map(|bytes| sanitized_target_bytes(bytes, "canonical"))
             .transpose()?;
+        let workers = workers.map(|w| u64_to_i64(w, "scan workers")).transpose()?;
         let rows = self
             .conn
             .execute(
                 "INSERT OR IGNORE INTO scan_requests (id, url_raw, url_canonical, scope, \
                     status_mode, report_dest, state, created_at_ms, updated_at_ms, \
-                    targets_json, format, all_targets) \
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?7, ?8, ?9, ?10)",
+                    targets_json, format, all_targets, fetch, workers) \
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?7, ?8, ?9, ?10, ?11, ?12)",
                 vec![
                     v_text(scan.id),
                     v_blob(url_raw),
@@ -3481,9 +4693,11 @@ impl TursoStore {
                     v_text(scan.status_mode),
                     v_opt_blob(scan.report_dest.map(<[u8]>::to_vec)),
                     v_int(now_ms),
-                    v_opt_text(scan.targets_json.map(str::to_string)),
+                    v_opt_text(scan.targets_json.map(crate::identity::scrub_text)),
                     v_opt_text(scan.format.map(str::to_string)),
                     v_opt_int(scan.all_targets.map(i64::from)),
+                    v_opt_int(fetch.map(i64::from)),
+                    v_opt_int(workers),
                 ],
             )
             .await
@@ -3518,6 +4732,26 @@ impl TursoStore {
         Ok(())
     }
 
+    /// Persist the authoritative `inventory_ready` sequence independently
+    /// of the retained event rows. Called after the event insert and before
+    /// retention pruning; a crash before this write leaves the event row
+    /// available for replay, while pruning cannot remove both copies.
+    pub async fn mark_scan_inventory_ready(&self, id: &str, seq: u64) -> crate::Result<()> {
+        self.forbid_write("mark_scan_inventory_ready")?;
+        self.conn
+            .execute(
+                "UPDATE scan_requests SET inventory_ready_seq = ?1 \
+                    WHERE id = ?2 AND inventory_ready_seq IS NULL",
+                vec![
+                    v_int(u64_to_i64(seq, "inventory_ready sequence")?),
+                    v_text(id),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
     /// Fetch one scan request by id.
     pub async fn get_scan(&self, id: &str) -> crate::Result<Option<ScanRow>> {
         let mut rows = self
@@ -3525,7 +4759,7 @@ impl TursoStore {
             .query(
                 "SELECT id, url_raw, url_canonical, scope, status_mode, report_dest, \
                     state, outcome, successor_id, created_at_ms, updated_at_ms, \
-                    targets_json, format, all_targets \
+                    targets_json, format, all_targets, fetch, workers, inventory_ready_seq \
                     FROM scan_requests WHERE id = ?1",
                 vec![v_text(id)],
             )
@@ -3636,12 +4870,13 @@ impl TursoStore {
         next_retry_ms: Option<i64>,
         now_ms: i64,
     ) -> crate::Result<()> {
+        let detail = crate::identity::scrub_text(detail);
         let rows = conn
             .execute(
                 "UPDATE errors SET attempts = attempts + 1, detail = ?1, \
                     last_seen_ms = ?2, next_retry_ms = ?3, open = 1 WHERE id = ?4",
                 vec![
-                    v_text(detail),
+                    v_text(&detail),
                     v_int(now_ms),
                     v_opt_int(next_retry_ms),
                     v_text(id),
@@ -3658,7 +4893,7 @@ impl TursoStore {
                     v_text(id),
                     v_text(scope_key),
                     v_text(category),
-                    v_text(detail),
+                    v_text(&detail),
                     v_int(now_ms),
                     v_opt_int(next_retry_ms),
                 ],
@@ -3753,6 +4988,32 @@ impl TursoStore {
         let mut out = Vec::new();
         while let Some(row) = rows.next().await.map_err(store_err)? {
             out.push(req_text(&row, 0)?);
+        }
+        Ok(out)
+    }
+
+    /// Open task-completion gaps owned by `generation` (DB-m5): open
+    /// `errors` rows whose id names a task of that generation
+    /// (`gap:<task id>` joined to `frontier_tasks`, so volume/batch
+    /// gaps — journaled inline, never post-commit — are excluded).
+    /// The runner diffs this against the scan journal on resume and
+    /// re-buffers `error` events for rows a crash left unjournaled.
+    pub async fn list_open_task_gaps(&self, generation: u64) -> crate::Result<Vec<ErrorRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT e.id, e.scope_key, e.category, e.detail, e.attempts, \
+                    e.first_seen_ms, e.last_seen_ms, e.next_retry_ms, e.open \
+                    FROM errors e JOIN frontier_tasks t ON t.id = substr(e.id, 5) \
+                    WHERE e.open = 1 AND e.id LIKE 'gap:%' AND t.generation = ?1 \
+                    ORDER BY e.id ASC",
+                vec![v_int(u64_to_i64(generation, "task generation")?)],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            out.push(ErrorRow::from_row(&row)?);
         }
         Ok(out)
     }
@@ -3852,6 +5113,10 @@ impl TursoStore {
         let uuid = history_uuid.to_string();
         let cursor = cursor.to_string();
         let scopes = scopes.to_vec();
+        // Canonicalize all candidate spellings before opening the write
+        // transaction. Cursor insertion and every resulting revision/task
+        // update still commit or roll back together below.
+        let fanouts = Self::scope_fanout_keys(&self.conn, &scopes).await?;
         self.with_tx(move |conn| async move {
             let inserted = conn
                 .execute(
@@ -3876,8 +5141,10 @@ impl TursoStore {
                 });
             }
             let mut revs = Vec::with_capacity(scopes.len());
-            for scope in &scopes {
-                revs.push(Self::invalidate_scope_on(conn, scope, generation, now_ms).await?);
+            for (scope, fan_keys) in scopes.iter().zip(&fanouts) {
+                revs.push(
+                    Self::invalidate_scope_on(conn, scope, generation, now_ms, fan_keys).await?,
+                );
             }
             Ok::<IngestedBatch, Error>(IngestedBatch {
                 inserted: true,
@@ -4031,6 +5298,64 @@ impl TursoStore {
         Ok(rows == 1)
     }
 
+    /// Append a terminal scan event and delete that scan's dedupe markers
+    /// in one transaction. A committed terminal is replay-once and blocks
+    /// later event emission, so its per-record dedupe keys are no longer
+    /// needed. If either statement fails, both changes roll back.
+    pub async fn append_terminal_scan_event(
+        &self,
+        event: &NewScanEvent<'_>,
+    ) -> crate::Result<bool> {
+        self.forbid_write("append_terminal_scan_event")?;
+        if !crate::scan_events::is_terminal_name(event.event_type) {
+            return Err(Error::InvalidArgs(format!(
+                "{} is not a terminal scan event",
+                event.event_type
+            )));
+        }
+        let scan_id = event.scan_id.to_string();
+        let insert_scan_id = scan_id.clone();
+        let seq = v_int(u64_to_i64(event.seq, "event seq")?);
+        let catalog_rev = v_int(u64_to_i64(event.catalog_rev, "event catalog_rev")?);
+        let event_offset = v_int(u64_to_i64(event.event_offset, "event offset")?);
+        let event_type = event.event_type.to_string();
+        let op = event.op.to_string();
+        let reset = v_int(i64::from(event.reset));
+        let records = v_blob(event.records.to_vec());
+
+        self.with_tx(move |conn| async move {
+            let inserted = conn
+                .execute(
+                    "INSERT OR IGNORE INTO scan_events (scan_id, seq, catalog_rev, event_offset, \
+                        event_type, op, reset, records) \
+                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    vec![
+                        v_text(insert_scan_id),
+                        seq,
+                        catalog_rev,
+                        event_offset,
+                        v_text(event_type),
+                        v_text(op),
+                        reset,
+                        records,
+                    ],
+                )
+                .await
+                .map_err(store_err)?
+                == 1;
+            if inserted {
+                conn.execute(
+                    "DELETE FROM scan_event_dedupe WHERE scan_id = ?1",
+                    vec![v_text(scan_id)],
+                )
+                .await
+                .map_err(store_err)?;
+            }
+            Ok(inserted)
+        })
+        .await
+    }
+
     /// v2: buffer one scan-event journal row into a writer batch (D4),
     /// committing atomically with the instance/checkout rows that caused
     /// it. Same `INSERT OR IGNORE` by `(scan_id, seq)` as
@@ -4149,8 +5474,9 @@ impl TursoStore {
         let rows = self
             .conn
             .execute(
-                "INSERT OR IGNORE INTO group_members (group_id, instance_id, remote_name, role, \
-                    observed_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT OR IGNORE INTO group_members (group_id, instance_id, remote_name, \
+                    remote_name_key, role, observed_at_ms) \
+                    VALUES (?1, ?2, ?3, hex(?3), ?4, ?5)",
                 vec![
                     v_text(group_id),
                     v_text(instance_id),
@@ -4420,6 +5746,10 @@ impl TursoStore {
         // `INTEGER` reads, so they always fit `i64` here; out-of-range
         // input is a caller defect and panics loudly (release builds must
         // fail too, so a `debug_assert`-only guard is not enough).
+        // Step 9: mark class skew at buffer time — strictly before the
+        // flush can commit the row (conservative on `OR IGNORE`
+        // duplicates — a spurious mark only falls back).
+        note_task_class(task.kind, task.id);
         let generation_i64 = u64_to_i64_buf(task.generation, "task generation");
         let expected_rev_i64 = u64_to_i64_buf(task.expected_rev, "task expected_rev");
         batch.push(
@@ -4508,6 +5838,7 @@ impl TursoStore {
         let generation_i64 = u64_to_i64_buf(generation, "dir observation generation");
         let entry_generation_i64 = u64_to_i64_buf(entry_generation, "dir entry_generation");
         let entries_seen_i64 = u64_to_i64_buf(entries_seen, "dir entries_seen");
+        let error = error.map(crate::identity::scrub_text);
         batch.push(
             "INSERT OR REPLACE INTO dir_observations (dir_id, generation, completed, \
                 entry_generation, entries_seen, error, observed_at_ms) \
@@ -4518,7 +5849,7 @@ impl TursoStore {
                 v_int(i64::from(completed)),
                 v_int(entry_generation_i64),
                 v_int(entries_seen_i64),
-                v_opt_text(error.map(str::to_string)),
+                v_opt_text(error),
                 v_int(observed_ms),
             ],
         )
@@ -4546,6 +5877,7 @@ impl TursoStore {
     ) -> bool {
         let generation_i64 = u64_to_i64_buf(generation, "dir observation generation");
         let entries_seen_i64 = u64_to_i64_buf(entries_seen, "dir entries_seen");
+        let error = error.map(crate::identity::scrub_text);
         batch.push(
             "UPDATE dir_observations SET entry_generation = entry_generation + 1, \
                 completed = ?1, entries_seen = ?2, error = ?3, observed_at_ms = ?4 \
@@ -4553,7 +5885,7 @@ impl TursoStore {
             vec![
                 v_int(i64::from(completed)),
                 v_int(entries_seen_i64),
-                v_opt_text(error.map(str::to_string)),
+                v_opt_text(error.clone()),
                 v_int(observed_ms),
                 v_int(dir_id),
                 v_int(generation_i64),
@@ -4568,7 +5900,7 @@ impl TursoStore {
                 v_int(generation_i64),
                 v_int(i64::from(completed)),
                 v_int(entries_seen_i64),
-                v_opt_text(error.map(str::to_string)),
+                v_opt_text(error),
                 v_int(observed_ms),
             ],
         );
@@ -4720,8 +6052,9 @@ impl TursoStore {
         observed_ms: i64,
     ) -> bool {
         batch.push(
-            "INSERT OR IGNORE INTO group_members (group_id, instance_id, remote_name, role, \
-                observed_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR IGNORE INTO group_members (group_id, instance_id, remote_name, \
+                remote_name_key, role, observed_at_ms) \
+                VALUES (?1, ?2, ?3, hex(?3), ?4, ?5)",
             vec![
                 v_text(group_id),
                 v_text(instance_id),
@@ -4733,28 +6066,116 @@ impl TursoStore {
     }
 
     /// Buffer a ref upsert; see [`TursoStore::buffer_enqueue_task`] for the
-    /// flush contract. Returns `WriterBatch::should_flush`.
+    /// flush contract. Two statements (`INSERT OR IGNORE` + `UPDATE`),
+    /// mirroring [`TursoStore::upsert_ref`]: the pair preserves the v3
+    /// `freshness` label columns and is race-safe. Returns
+    /// `WriterBatch::should_flush` (true when either push trips it).
     pub fn buffer_upsert_ref(
         batch: &mut WriterBatch,
         reference: &NewRef<'_>,
         observed_ms: i64,
     ) -> bool {
-        batch.push(
-            "INSERT OR REPLACE INTO refs (id, instance_id, checkout_scope_id, kind, \
+        let insert = batch.push(
+            "INSERT OR IGNORE INTO refs (id, instance_id, checkout_scope_id, kind, \
                 name, oid, algo, symbolic_target, upstream, state, observed_at_ms) \
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            ref_params(reference, observed_ms),
+        );
+        let update = batch.push(
+            "UPDATE refs SET instance_id = ?2, checkout_scope_id = ?3, kind = ?4, \
+                name = ?5, oid = ?6, algo = ?7, symbolic_target = ?8, \
+                upstream = ?9, state = ?10, observed_at_ms = ?11 WHERE id = ?1",
+            ref_params(reference, observed_ms),
+        );
+        insert || update
+    }
+
+    /// Buffer a `--fetch` attempt record (v3); see
+    /// [`TursoStore::buffer_enqueue_task`] for the flush contract.
+    /// Same `INSERT OR REPLACE` semantics as
+    /// [`TursoStore::record_remote_refresh`]. Returns
+    /// `WriterBatch::should_flush`.
+    pub fn buffer_record_remote_refresh(
+        batch: &mut WriterBatch,
+        refresh: &NewRemoteRefresh<'_>,
+    ) -> bool {
+        batch.push(
+            "INSERT OR REPLACE INTO remote_refreshes (store_id, remote_name, remote_name_key, \
+                status, observed_at_ms, duration_ms, refs_updated, \
+                refs_current_json, refs_deleted_json, detail) \
+                VALUES (?1, ?2, hex(?2), ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             vec![
-                v_text(reference.id),
-                v_text(reference.instance_id),
-                v_opt_text(reference.checkout_scope_id.map(str::to_string)),
-                v_text(reference.kind),
-                v_blob(reference.name.to_vec()),
-                v_opt_blob(reference.oid.map(<[u8]>::to_vec)),
-                v_opt_text(reference.algo.map(str::to_string)),
-                v_opt_blob(reference.symbolic_target.map(<[u8]>::to_vec)),
-                v_opt_blob(reference.upstream.map(<[u8]>::to_vec)),
-                v_text(reference.state),
-                v_int(observed_ms),
+                v_text(refresh.store_id),
+                v_blob(refresh.remote_name.to_vec()),
+                v_text(refresh.status),
+                v_int(refresh.observed_at_ms),
+                v_opt_int(refresh.duration_ms),
+                v_int(refresh.refs_updated),
+                v_opt_text(refresh.refs_current_json.map(str::to_string)),
+                v_opt_text(refresh.refs_deleted_json.map(str::to_string)),
+                v_opt_text(refresh.detail.map(str::to_string)),
+            ],
+        )
+    }
+
+    /// Buffer a ref oid re-observation (v3); see
+    /// [`TursoStore::buffer_enqueue_task`] for the flush contract.
+    /// Same `UPDATE` semantics as [`TursoStore::update_ref_oid`]
+    /// (shared `UPDATE_REF_OID_SQL`). Returns
+    /// `WriterBatch::should_flush`.
+    pub fn buffer_update_ref_oid(
+        batch: &mut WriterBatch,
+        ref_id: &str,
+        oid: &[u8],
+        at_ms: i64,
+    ) -> bool {
+        batch.push(
+            UPDATE_REF_OID_SQL,
+            vec![v_text(ref_id), v_blob(oid.to_vec()), v_int(at_ms)],
+        )
+    }
+
+    /// Buffer a ref freshness label (v3); see
+    /// [`TursoStore::buffer_enqueue_task`] for the flush contract.
+    /// Same `UPDATE` semantics as [`TursoStore::label_ref_freshness`].
+    /// Returns `WriterBatch::should_flush`.
+    pub fn buffer_label_ref_freshness(
+        batch: &mut WriterBatch,
+        ref_id: &str,
+        freshness: &str,
+        at_ms: i64,
+    ) -> bool {
+        batch.push(
+            "UPDATE refs SET freshness = ?2, freshness_at_ms = ?3 WHERE id = ?1",
+            vec![v_text(ref_id), v_text(freshness), v_int(at_ms)],
+        )
+    }
+
+    /// Buffer a ref comparison label (v6); see
+    /// [`TursoStore::buffer_enqueue_task`] for the flush contract.
+    /// Same `UPDATE` semantics as
+    /// [`TursoStore::update_ref_comparison`] (shared
+    /// `UPDATE_REF_COMPARISON_SQL`). Returns
+    /// `WriterBatch::should_flush`. The caller MUST have verified
+    /// [`TursoStore::supports_ref_comparison`] first: on a pre-v6
+    /// catalog this statement would fail at flush, so pre-v6
+    /// callers skip buffering entirely.
+    pub fn buffer_update_ref_comparison(
+        batch: &mut WriterBatch,
+        ref_id: &str,
+        state: &str,
+        ahead: Option<u64>,
+        behind: Option<u64>,
+    ) -> bool {
+        let ahead = ahead.map(|v| u64_to_i64_buf(v, "ref ahead"));
+        let behind = behind.map(|v| u64_to_i64_buf(v, "ref behind"));
+        batch.push(
+            UPDATE_REF_COMPARISON_SQL,
+            vec![
+                v_text(ref_id),
+                v_text(state),
+                v_opt_int(ahead),
+                v_opt_int(behind),
             ],
         )
     }
@@ -4763,9 +6184,26 @@ impl TursoStore {
     /// for the flush contract. Unlike [`TursoStore::record_status`] the
     /// inserted-or-ignored outcome is only knowable after flush (by
     /// re-reading); the return value is `WriterBatch::should_flush`.
+    ///
+    /// COMPAT (slice 1): keeps main's shape; the v5
+    /// `conflicts`/`working_state` columns buffer as `NULL` (legacy).
+    /// Use [`TursoStore::buffer_record_status_full`] to persist them.
     pub fn buffer_record_status(
         batch: &mut WriterBatch,
         status: &NewStatus<'_>,
+        observed_ms: i64,
+    ) -> bool {
+        Self::buffer_record_status_full(batch, status, None, None, observed_ms)
+    }
+
+    /// Buffer a status observation including the v5 `conflicts` and
+    /// `working_state` columns (`None` = legacy/unknown). Same flush
+    /// contract and return value as [`TursoStore::buffer_record_status`].
+    pub fn buffer_record_status_full(
+        batch: &mut WriterBatch,
+        status: &NewStatus<'_>,
+        conflicts: Option<i64>,
+        working_state: Option<&str>,
         observed_ms: i64,
     ) -> bool {
         let observed_rev_i64 = u64_to_i64_buf(status.observed_rev, "status observed_rev");
@@ -4773,8 +6211,9 @@ impl TursoStore {
             "INSERT OR IGNORE INTO status_observations (checkout_id, mode, state, \
                 started_ms, finished_ms, staged, unstaged, untracked, \
                 untracked_units, submodules, unknown_fields, input_fingerprint, \
-                observed_rev, observed_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, \
-                ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                observed_rev, observed_at_ms, conflicts, working_state) \
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, \
+                ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             vec![
                 v_text(status.checkout_id),
                 v_text(status.mode),
@@ -4790,6 +6229,8 @@ impl TursoStore {
                 v_opt_blob(status.input_fingerprint.map(<[u8]>::to_vec)),
                 v_int(observed_rev_i64),
                 v_int(observed_ms),
+                v_opt_int(conflicts),
+                v_opt_text(working_state.map(str::to_string)),
             ],
         )
     }
@@ -4833,13 +6274,18 @@ impl TursoStore {
         // turso reports only `busy` when the checkpoint cannot proceed
         // (busy=1, NULL counters), unlike SQLite which reports counts. The
         // counters surface as 0 there; callers key off `busy`.
+        let busy = req_i64(&row, 0)?;
+        let log_frames = opt_i64(&row, 1)?.unwrap_or(0);
+        let checkpointed_frames = opt_i64(&row, 2)?.unwrap_or(0);
+        drop(row);
+        // Drive the PRAGMA statement to completion before dropping it:
+        // the checkpoint guard counts active statements, so a later
+        // probe must never observe this one still in flight.
+        while rows.next().await.map_err(store_err)?.is_some() {}
         Ok((
-            i64_to_u64(req_i64(&row, 0)?, "wal_checkpoint busy")?,
-            i64_to_u64(opt_i64(&row, 1)?.unwrap_or(0), "wal_checkpoint log frames")?,
-            i64_to_u64(
-                opt_i64(&row, 2)?.unwrap_or(0),
-                "wal_checkpoint checkpointed frames",
-            )?,
+            i64_to_u64(busy, "wal_checkpoint busy")?,
+            i64_to_u64(log_frames, "wal_checkpoint log frames")?,
+            i64_to_u64(checkpointed_frames, "wal_checkpoint checkpointed frames")?,
         ))
     }
 
@@ -4894,5 +6340,138 @@ impl crate::store::Store for TursoStore {
 
     async fn durability_proof(&self) -> crate::Result<crate::store::DurabilityProof> {
         Self::proof_on(&self.conn).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+    }
+
+    /// DB-m1: the skew probe is scoped to the claimed generation — a
+    /// skewed pair in another generation neither forces this claim's
+    /// fallback nor hides from its own generation's probe.
+    #[test]
+    fn skew_probe_ignores_other_generations() {
+        let rt = runtime();
+        rt.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db = dir.path().join("payload").join("catalog.db");
+            let store = TursoStore::open(&db).await.expect("open");
+            let now = crate::store::now_ms();
+            // Skewed pair (kind/status pulled into the probe class by
+            // its id) in generation 2 only.
+            let idem = "idem:probe:2:skew".to_string();
+            store
+                .enqueue_task(
+                    &NewTask {
+                        id: "probe:2:skew",
+                        kind: "status",
+                        generation: 2,
+                        dir_id: None,
+                        scope_key: "status:skew",
+                        expected_rev: 0,
+                        idempotency_key: &idem,
+                    },
+                    now,
+                )
+                .await
+                .expect("enqueue");
+            assert!(
+                !TursoStore::task_class_skew_present_on(store.connection(), 1)
+                    .await
+                    .expect("probe gen 1"),
+                "other-generation skew must not gate this claim"
+            );
+            assert!(
+                TursoStore::task_class_skew_present_on(store.connection(), 2)
+                    .await
+                    .expect("probe gen 2"),
+                "own-generation skew must still be found"
+            );
+            store.close().await.expect("close");
+        });
+    }
+
+    #[test]
+    fn unresolved_scope_identity_aborts_before_invalidation() {
+        let rt = runtime();
+        rt.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db = dir.path().join("payload").join("catalog.db");
+            let store = TursoStore::open(&db).await.expect("open");
+            let scope = crate::config::scope_key_for_git(&dir.path().join("repo"));
+
+            let err = store
+                .invalidate_scope_with_canonicalizer(&scope, 1, 123, |_| None)
+                .await
+                .expect_err("unknown identity must fail closed");
+
+            assert!(
+                err.to_string().contains("bounded I/O limit"),
+                "unexpected error: {err}"
+            );
+            assert_eq!(store.scope_rev(&scope).await.expect("scope rev"), 0);
+            store.close().await.expect("close");
+        });
+    }
+
+    /// Wave8d: an active statement on the writer connection turns the
+    /// checkpoint probe into a counted skip, never a scan failure — and
+    /// the classifier recognizes exactly the engine's contention text.
+    #[test]
+    fn checkpoint_contention_skips_and_retries() {
+        use crate::store::checkpoint::{
+            is_checkpoint_contention, CheckpointCoordinator, CheckpointPolicy,
+        };
+        // Classifier contract first (no I/O).
+        assert!(is_checkpoint_contention(&Error::Store(
+            "cannot checkpoint while another statement is active - SQL statements in progress"
+                .to_string()
+        )));
+        assert!(!is_checkpoint_contention(&Error::Store(
+            "disk I/O error".to_string()
+        )));
+        assert!(!is_checkpoint_contention(&Error::Io("boom".to_string())));
+        let rt = runtime();
+        rt.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db = dir.path().join("payload").join("catalog.db");
+            let store = TursoStore::open(&db).await.expect("open");
+            // Hold a statement active on the writer connection: one row
+            // read, cursor never driven to completion.
+            let mut held = store
+                .connection()
+                .query("SELECT value FROM meta LIMIT 2", ())
+                .await
+                .expect("held query");
+            assert!(held.next().await.expect("held row").is_some());
+            let err = store
+                .checkpoint_truncate()
+                .await
+                .expect_err("held statement must block truncate");
+            assert!(is_checkpoint_contention(&err), "unexpected: {err:?}");
+            let mut coordinator = CheckpointCoordinator::new(CheckpointPolicy::default());
+            let outcome = coordinator
+                .maybe_checkpoint(&store)
+                .await
+                .expect("probe contention must skip, not fail");
+            assert!(outcome.is_none());
+            assert_eq!(coordinator.stats().contention_skips, 1);
+            drop(held);
+            // Retry after release proceeds normally (fresh coordinator:
+            // the skipped probe still rate-limits the first one).
+            let mut retry = CheckpointCoordinator::new(CheckpointPolicy::default());
+            let outcome = retry.maybe_checkpoint(&store).await.expect("retry");
+            assert!(outcome.is_some());
+            assert_eq!(retry.stats().contention_skips, 0);
+            store.close().await.expect("close");
+        });
     }
 }

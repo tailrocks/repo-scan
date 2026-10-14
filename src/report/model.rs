@@ -8,14 +8,27 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Report schema version. Must equal `schemas/report-v1.1.schema.json`.
-pub const SCHEMA_VERSION: &str = "1.1.0";
+/// Report schema version. Must equal `schemas/report-v1.5.schema.json`.
+pub const SCHEMA_VERSION: &str = "1.5.0";
+
+/// Previous report schema version, still accepted by
+/// [`crate::report::validate`] (additive 1.4.0 → 1.5.0: groups and totals).
+pub const PREVIOUS_SCHEMA_VERSION: &str = "1.4.0";
+
+/// Report schemas emitted by supported repo-scan releases. This provenance
+/// allowlist is used only to recognize a prior report for safe replacement;
+/// it does not imply that every old version can be parsed as the current
+/// [`Report`] type.
+pub const SUPPORTED_PRIOR_SCHEMA_VERSIONS: &[&str] =
+    &["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", SCHEMA_VERSION];
 
 /// Tool name recorded in every envelope.
 pub const TOOL_NAME: &str = "repo-scan";
 
 /// Deserialize an explicit JSON null while still requiring the field to be
-/// present. Every nullable field in the v1 report schema is required.
+/// present. Every nullable field carried by the 1.1.0 envelope is required
+/// (present, possibly null); fields introduced by 1.2.0-1.5.0 use
+/// `#[serde(default)]` instead so older snapshots keep parsing.
 fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -28,7 +41,7 @@ where
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Report {
-    /// Must be [`SCHEMA_VERSION`].
+    /// Must be [`SCHEMA_VERSION`] for newly built reports.
     pub schema_version: String,
     /// Immutable snapshot/report ID.
     pub report_id: String,
@@ -41,6 +54,9 @@ pub struct Report {
     pub volumes: Vec<Volume>,
     pub paths: Vec<PathRecord>,
     pub roots: Vec<Root>,
+    /// Normalized GitHub identities observed through emitted stores.
+    #[serde(default)]
+    pub groups: Vec<Group>,
     pub repositories: Vec<Repository>,
     pub checkouts: Vec<Checkout>,
     pub branches: Vec<Branch>,
@@ -50,6 +66,51 @@ pub struct Report {
     pub candidates: Vec<Candidate>,
     pub errors: Vec<ErrorRecord>,
     pub generated_artifacts: Vec<GeneratedArtifact>,
+    /// Compact counts derived from the records above.
+    #[serde(default)]
+    pub totals: Totals,
+}
+
+/// One normalized GitHub account/repository identity (D1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Group {
+    /// `lower(host)/lower(account)/lower(repo)`.
+    pub id: String,
+    pub host: String,
+    pub account: String,
+    pub repo: String,
+}
+
+/// Compact report counts. All values describe the records in this report;
+/// `bare_stores` is null if at least one emitted store has unknown bare state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Totals {
+    pub accounts: u64,
+    pub groups: u64,
+    pub stores: u64,
+    pub bare_stores: Option<u64>,
+    pub present_checkouts: u64,
+    pub linked_worktrees: u64,
+    pub observed_paths: u64,
+    pub aliases: u64,
+    pub local_branches: u64,
+    pub remote_tracking_refs: u64,
+    pub analysis: AnalysisTotals,
+    pub unresolved_candidates: u64,
+    pub gaps: u64,
+}
+
+/// Checkout analysis counts. `not_requested` is included in `pending`;
+/// `unsupported` is unavailable; partial, unstable, and error states failed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnalysisTotals {
+    pub completed: u64,
+    pub pending: u64,
+    pub failed: u64,
+    pub unavailable: u64,
 }
 
 /// Tool record.
@@ -81,8 +142,10 @@ pub struct Scan {
     #[serde(deserialize_with = "deserialize_required_option")]
     pub canonical_url: Option<String>,
     /// Full requested target set in request order (report 1.1.0). Empty for
-    /// `--all` (no target filter). `target_url`/`canonical_url` above repeat
+    /// `--all` (no target filter) and in 1.0.0 envelopes, which predate the
+    /// field. `target_url`/`canonical_url` above repeat
     /// the primary target for older consumers.
+    #[serde(default)]
     pub targets: Vec<ScanTarget>,
     /// Matching-policy version.
     pub matching_policy: String,
@@ -103,11 +166,11 @@ pub struct Scan {
 
 /// One requested scan target (report 1.1.0).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScanTarget {
     /// Target exactly as supplied (credentials redacted, never secret bytes).
     pub raw: String,
     /// Normalized canonical form, when the shape is supported.
-    #[serde(deserialize_with = "deserialize_required_option")]
     pub canonical: Option<String>,
     /// Repositories `confirmed` for this target in this report.
     pub matched_repositories: u64,
@@ -305,6 +368,50 @@ pub struct Branch {
     pub state: String,
     pub observed_at: String,
     pub error_ids: Vec<String>,
+    /// Remote freshness (report 1.2.0, Step 11): `current` (observed
+    /// by this scan's `--fetch`), `stale` (fetch ran but did not
+    /// cover this ref, or an older observation), or `unknown` (no
+    /// successful fetch covered it). Only `remote_tracking` rows are
+    /// ever labeled; local branches always read `unknown`. Missing in
+    /// pre-1.2 snapshots, which deserialize as `unknown`.
+    #[serde(default = "default_branch_freshness")]
+    pub freshness: String,
+    /// When the freshness label was assigned (report 1.2.0); `None`
+    /// for `unknown`/legacy rows.
+    #[serde(default)]
+    pub freshness_at: Option<String>,
+    /// Branch-vs-upstream comparison state (report 1.4.0, Step 10):
+    /// `equal`, `ahead`, `behind`, `diverged`, `no_upstream`,
+    /// `upstream_missing`, `pending`, `incomplete_history`, or
+    /// `error`. Missing in pre-1.4 snapshots, which deserialize as
+    /// `pending`.
+    #[serde(default = "default_branch_comparison")]
+    pub comparison: String,
+    /// Commits the branch has that the upstream lacks (report 1.4.0);
+    /// `Some` only for the four counted states, `None` otherwise and
+    /// in pre-1.4 snapshots. Unknown is never zero.
+    #[serde(default)]
+    pub ahead: Option<u64>,
+    /// Commits the upstream has that the branch lacks (report 1.4.0);
+    /// `Some` only for the four counted states, `None` otherwise and
+    /// in pre-1.4 snapshots. Unknown is never zero.
+    #[serde(default)]
+    pub behind: Option<u64>,
+}
+
+/// Default branch comparison for pre-1.4 snapshots.
+fn default_branch_comparison() -> String {
+    String::from("pending")
+}
+
+/// Default branch freshness for pre-1.2 snapshots.
+fn default_branch_freshness() -> String {
+    String::from("unknown")
+}
+
+/// Default working state for pre-1.3 snapshots.
+fn default_working_state() -> String {
+    String::from("unknown")
 }
 
 /// Working-state observation. Cross-field rules: `metadata` mode has null
@@ -330,6 +437,16 @@ pub struct Status {
     pub unstaged: Option<u64>,
     #[serde(deserialize_with = "deserialize_required_option")]
     pub untracked: Option<u64>,
+    /// Distinct unmerged paths (report 1.3.0, Step 10); `None` when
+    /// unknown and in pre-1.3 snapshots.
+    #[serde(default)]
+    pub conflicts: Option<u64>,
+    /// Step 10 working-state vocabulary (report 1.3.0): `clean`,
+    /// `dirty`, `conflicted`, `pending`, `partial`, `unstable`,
+    /// `unknown`, `error`, or `not_applicable`. Pre-1.3 snapshots
+    /// default to `unknown`.
+    #[serde(default = "default_working_state")]
+    pub working_state: String,
     /// `collapsed_entries`, `files`, or `not_requested`.
     pub untracked_units: String,
     /// `checked`, `not_requested`, or `unknown`.
@@ -353,6 +470,28 @@ pub struct Remote {
     #[serde(deserialize_with = "deserialize_required_option")]
     pub canonical_url: Option<String>,
     pub observed_at: String,
+    /// Latest `--fetch` attempt for this store + remote name (report
+    /// 1.2.0, Step 11); `None` when never attempted and in pre-1.2
+    /// snapshots. Keyed by remote NAME, so `fetch` and `push` rows
+    /// for one remote share the same attempt (only fetch-role
+    /// remotes trigger a fetch, but the attempt refreshed the name).
+    #[serde(default)]
+    pub refresh: Option<RemoteRefresh>,
+}
+
+/// Latest remote-refresh attempt summary (report 1.2.0, Step 11).
+/// Names observed current / deleted upstream travel on the
+/// `remote_updated` event and branch freshness labels, not here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteRefresh {
+    /// `success`, `failed`, or `unsupported`.
+    pub status: String,
+    pub observed_at: String,
+    /// Attempt duration in milliseconds, when measured.
+    pub duration_ms: Option<i64>,
+    /// Tracking refs the fetch updated (new or changed oid).
+    pub refs_updated: u64,
 }
 
 /// Shared-storage relationship edge. A dependency edge, not a merged clone.

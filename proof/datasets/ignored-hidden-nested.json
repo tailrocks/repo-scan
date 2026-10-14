@@ -1,0 +1,45 @@
+{
+  "expected_graph": {
+    "description": "Repositories hidden under dot-directories, ignored by a host repo's .gitignore/.ignore, nested inside other working trees (plus one twice-nested case), placed under cache/tmp/build/node_modules directories, and nested under a host's conventional .git/objects/<fanout>/ paths. The three host repositories (ignored_host, nested_host, admin_host) and the twice-nested innermost repo are additional to the category counts.",
+    "invariants": [
+      "exhaustive policy finds every repository",
+      "no blanket pruning of node_modules/target/cache/tmp",
+      "finding a repository never silently prunes its working tree",
+      "repositories under .git/objects paths are not confused with object-store internals"
+    ]
+  },
+  "id": "ignored-hidden-nested",
+  "manifest_schema": "repo-scan/dataset-manifest/1",
+  "notes": "scale = final target, still pending baseline-pilot calibration; scale_pilot = M5-Max pilot measurable in seconds; scale_smoke = CI smoke. repos must equal the sum of the five category counts.",
+  "scale": {
+    "administrative_nesting_repos": 20,
+    "cache_tmp_build_package_dirs": 20,
+    "hidden_repos": 30,
+    "ignored_repos": 30,
+    "nested_repos": 20,
+    "repos": 120,
+    "roots": 1
+  },
+  "scale_pilot": {
+    "administrative_nesting_repos": 2,
+    "cache_tmp_build_package_dirs": 4,
+    "hidden_repos": 4,
+    "ignored_repos": 4,
+    "nested_repos": 3,
+    "repos": 17,
+    "roots": 1
+  },
+  "scale_smoke": {
+    "administrative_nesting_repos": 1,
+    "cache_tmp_build_package_dirs": 1,
+    "hidden_repos": 1,
+    "ignored_repos": 1,
+    "nested_repos": 1,
+    "repos": 5,
+    "roots": 1
+  },
+  "schema": "repo-scan/dataset-recipe/1",
+  "seed": 910009,
+  "status": "pending_baseline_pilot",
+  "title": "Ignored/hidden nested repositories"
+}

@@ -1,0 +1,356 @@
+{
+  "schema": "repo-scan/sources-lock/1",
+  "frozen_at": "2026-10-12T18:16:27.887172+00:00",
+  "collector": "coordinator (local git fetch + gh api)",
+  "seed_file_sha256": "fbf57b2b2454ad20c1171de5e163daceef49d3333dcd1e91fa24c7084d07678e",
+  "seed_branch_count": 21,
+  "collection": {
+    "branch_pages": "refs fetched via git ls-remote/fetch, 21 heads, complete",
+    "errors": [],
+    "truncation": false
+  },
+  "target": {
+    "ref": "main",
+    "head": "1772d70822397f7bb02a6b6e6acb0739e9472aa3"
+  },
+  "protection": {
+    "ruleset_id": 24877074,
+    "name": "protect-main",
+    "enforcement": "active",
+    "rules": [
+      "deletion",
+      "required_linear_history",
+      "pull_request",
+      "required_status_checks",
+      "non_fast_forward"
+    ],
+    "bypass_actors": []
+  },
+  "pull_requests": [
+    {
+      "baseRefName": "main",
+      "headRefName": "merge/g2-fetch-phase",
+      "headRefOid": "da4e3c20e9bc72c67a1a551d5094a034dafa7544",
+      "isDraft": false,
+      "number": 7,
+      "state": "OPEN",
+      "title": "feat: post-inventory fetch phase with per-ref freshness (report 1.2.0, catalog v3)"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "merge/g1-scan-events",
+      "headRefOid": "2d4cb5471cadf956d7d7c7729bb2166e3054468d",
+      "isDraft": false,
+      "number": 6,
+      "state": "MERGED",
+      "title": "feat: multi-target scan with journaled scan events and catalog v2"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "codex/machine-scan-streaming",
+      "headRefOid": "29b4110c3140859edb0f209cc9cbb15f0544b3f9",
+      "isDraft": false,
+      "number": 5,
+      "state": "MERGED",
+      "title": "feat(report): stream large staged report validation"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "docs/repo-scan-pr-template-ci-alignment",
+      "headRefOid": "989305679e7a24dd7b98a6a2abc246c83f2c3348",
+      "isDraft": false,
+      "number": 4,
+      "state": "MERGED",
+      "title": "docs: align PR template with repo-scan CI"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "chore/repo-scan-pr-template",
+      "headRefOid": "0502919d0013de78b3f10566736c56fc4d5ef39f",
+      "isDraft": true,
+      "number": 3,
+      "state": "OPEN",
+      "title": "docs: add canonical pull request template"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "chore/velnor-0.1.4-generated-workflows",
+      "headRefOid": "8fc5d1870baa63949e0ccce546b5fc5169ff2bd5",
+      "isDraft": false,
+      "number": 2,
+      "state": "MERGED",
+      "title": "ci: generate workflows with Velnor Actions 0.1.4"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "work/fast-complete-scan",
+      "headRefOid": "8289a839d26a44f4820441349ac040a62348ef50",
+      "isDraft": true,
+      "number": 1,
+      "state": "OPEN",
+      "title": "Fast, complete scan: parallel discovery, firm boundary, live outputs"
+    }
+  ],
+  "sources": [
+    {
+      "id": "B01",
+      "ref": "chore/repo-scan-pr-template",
+      "frozen_ref": "refs/goal/sources/chore/repo-scan-pr-template",
+      "head": "0502919d0013de78b3f10566736c56fc4d5ef39f",
+      "tree": "82dc07b59f4baa74e67488569b9fd409c0d64e15",
+      "parents": [
+        "80e6512f1d80cf753fc856d0d45a49ff8c29d1de"
+      ],
+      "object_type": "commit"
+    },
+    {
+      "id": "B02",
+      "ref": "chore/velnor-0.1.4-generated-workflows",
+      "frozen_ref": "refs/goal/sources/chore/velnor-0.1.4-generated-workflows",
+      "head": "8fc5d1870baa63949e0ccce546b5fc5169ff2bd5",
+      "tree": "f5f382232339c5e14bff035156a992a4e8b409a1",
+      "parents": [
+        "60576d264800ee0b078c27a610cd59e15d1aa8f7"
+      ],
+      "object_type": "commit"
+    },
+    {
+      "id": "B03",
+      "ref": "codex/machine-scan-streaming",
+      "frozen_ref": "refs/goal/sources/codex/machine-scan-streaming",
+      "head": "29b4110c3140859edb0f209cc9cbb15f0544b3f9",
+      "tree": "995fe9da3837383b826e8a803132a75138b63e42",
+      "parents": [
+        "6eda7f43dfcfc854f85ac6bcd6e1aba5f4e033e7"
+      ],
+      "object_type": "commit"
+    },
+    {
+      "id": "B04",
+      "ref": "docs/repo-scan-pr-template-ci-alignment",
+      "frozen_ref": "refs/goal/sources/docs/repo-scan-pr-template-ci-alignment",
+      "head": "989305679e7a24dd7b98a6a2abc246c83f2c3348",
+      "tree": "b66d7aca3b1198380bb225819e616b9ae760fcdb",
+      "parents": [
+        "8b56267d00f939e411befa848500ac912b2b2f3e"
+      ],
+      "object_type": "commit"
+    },
+    {
+      "id": "B05",
+      "ref": "main",
+      "frozen_ref": "refs/goal/sources/main",
+      "head": "1772d70822397f7bb02a6b6e6acb0739e9472aa3",
+      "tree": "c9c35006e674654bde167e7fd4db9bcb8f6bb702",
+      "parents": [
+        "e12f250e9415d7194b9d9a37591d69880ba1860e"
+      ],
+      "object_type": "commit"
+    },
+    {
+      "id": "B06",
+      "ref": "merge/g2-fetch-phase",
+      "frozen_ref": "refs/goal/sources/merge/g2-fetch-phase",
+      "head": "da4e3c20e9bc72c67a1a551d5094a034dafa7544",
+      "tree": "aa5d2eb57d9c2ce88cd591a2dc78f28a1deb4d09",
+      "parents": [
+        "b17735e5205b6cc68a960a9a831996410ecae95c"
+      ],
+      "object_type": "commit"
+    },
+    {
+      "id": "B07",
+      "ref": "rescue/local/937c9c5f-a870-43c7-aa58-36a3f5c1b9cf/aa5d68fd149c33e3bcc5642b/detached-head-4d6c7360",
+      "frozen_ref": "refs/goal/sources/rescue/local/937c9c5f-a870-43c7-aa58-36a3f5c1b9cf/aa5d68fd149c33e3bcc5642b/detached-head-4d6c7360",
+      "head": "4d6c73603dcd5046efe4af9ce166c07fe8b99f90",
+      "tree": "7fb87a4f3241d3f0ca8b623863a06758f3ea22a2",
+      "parents": [
+        "6a6fbfe01eeff498b7d787f6e937509d854f9d9a"
+      ],
+      "object_type": "commit"
+    },
+    {
+      "id": "B08",
+      "ref": "rescue/local/937c9c5f-a870-43c7-aa58-36a3f5c1b9cf/d66e98b8bf37376fc3e7dace/detached-head-537e7fd1",
+      "frozen_ref": "refs/goal/sources/rescue/local/937c9c5f-a870-43c7-aa58-36a3f5c1b9cf/d66e98b8bf37376fc3e7dace/detached-head-537e7fd1",
+      "head": "537e7fd12a40567c06070d6a10c72332225a0132",
+      "tree": "7c6e4b863354b9def40fca59eb5920f489e42b69",
+      "parents": [
+        "071e988206493617c3edea4a4d62a2b879e4459d"
+      ],
+      "object_type": "commit"
+    },
+    {
+      "id": "B09",
+      "ref": "rescue/local/937c9c5f-a870-43c7-aa58-36a3f5c1b9cf/e07435d043183d1115056ccb/branch-work-fast-complete-scan",
+      "frozen_ref": "refs/goal/sources/rescue/local/937c9c5f-a870-43c7-aa58-36a3f5c1b9cf/e07435d043183d1115056ccb/branch-work-fast-complete-scan",
+      "head": "4015c9cea7b1bdc363d2c8c3522f8fd21078048b",
+      "tree": "a08ef22b7d52baae7c89e19e7c84752dc849149d",
+      "parents": [
+        "036e95b99e46389d8c5f7e6bafe119062e10b483",
+        "f1ba2d60e86feaf7e77b974a41ed3976512e9850"
+      ],
+      "object_type": "commit"
+    },
+    {
+      "id": "B10",
+      "ref": "rescue/local/937c9c5f-a870-43c7-aa58-36a3f5c1b9cf/e07435d043183d1115056ccb/detached-head-13e534",
+      "frozen_ref": "refs/goal/sources/rescue/local/937c9c5f-a870-43c7-aa58-36a3f5c1b9cf/e07435d043183d1115056ccb/detached-head-13e534",
+      "head": "13e534b5d2ad688a4d05901d36d5afc95bc454ce",
+      "tree": "6578d881dd9acd737562f7b8b8964d4c85518267",
+      "parents": [
+        "3ad025dd6f406d09a252bcce05088d61cb9ff675"
+      ],
+      "object_type": "commit"
+    },
+    {
+      "id": "B11",
+      "ref": "rescue/local/937c9c5f-a870-43c7-aa58-36a3f5c1b9cf/e07435d043183d1115056ccb/dirty-worktree",
+      "frozen_ref": "refs/goal/sources/rescue/local/937c9c5f-a870-43c7-aa58-36a3f5c1b9cf/e07435d043183d1115056ccb/dirty-worktree",
+      "head": "7c864ad5d57796ccf02be44324aa515a611bb4e2",
+      "tree": "83cbd8fca68be88ed79b84c28b38893a9624130b",
+      "parents": [
+        "4015c9cea7b1bdc363d2c8c3522f8fd21078048b"
+      ],
+      "object_type": "commit"
+    },
+    {
+      "id": "B12",
+      "ref": "rescue/local/937c9c5f-a870-43c7-aa58-36a3f5c1b9cf/e07435d043183d1115056ccb/observe-pr1-20261008",
+      "frozen_ref": "refs/goal/sources/rescue/local/937c9c5f-a870-43c7-aa58-36a3f5c1b9cf/e07435d043183d1115056ccb/observe-pr1-20261008",
+      "head": "06b1e54dd62a68c9c9e682b896b391d3c5e6d002",
+      "tree": "914d10519abee678a738f8a6546eb1053269c451",
+      "parents": [
+        "115c89b22fc510779d99671d051e5481ec050511"
+      ],
+      "object_type": "commit"
+    },
+    {
+      "id": "B13",
+      "ref": "rescue/local/937c9c5f-a870-43c7-aa58-36a3f5c1b9cf/e07435d043183d1115056ccb/orphan-0b4329d1e609",
+      "frozen_ref": "refs/goal/sources/rescue/local/937c9c5f-a870-43c7-aa58-36a3f5c1b9cf/e07435d043183d1115056ccb/orphan-0b4329d1e609",
+      "head": "0b4329d1e6097f1e422043f370b549dd924920ae",
+      "tree": "fcd98089ca9f5cedb2e5c62d3d04b9ae2e2e9edb",
+      "parents": [
+        "06b7bb7547521780de8805aea988ebf34b901504"
+      ],
+      "object_type": "commit"
+    },
+    {
+      "id": "B14",
+      "ref": "rescue/local/937c9c5f-a870-43c7-aa58-36a3f5c1b9cf/e07435d043183d1115056ccb/orphan-0b9494136a89",
+      "frozen_ref": "refs/goal/sources/rescue/local/937c9c5f-a870-43c7-aa58-36a3f5c1b9cf/e07435d043183d1115056ccb/orphan-0b9494136a89",
+      "head": "0b9494136a896a0727dd563087f35ef0045c1c5c",
+      "tree": "7143f61b50def527f86f317a1aa5337a61eef56e",
+      "parents": [
+        "036e95b99e46389d8c5f7e6bafe119062e10b483",
+        "e988167003ccf3ebf74f1948ee4772d4c9cd98ed"
+      ],
+      "object_type": "commit"
+    },
+    {
+      "id": "B15",
+      "ref": "rescue/local/937c9c5f-a870-43c7-aa58-36a3f5c1b9cf/e07435d043183d1115056ccb/orphan-tree-0b793f4cff16",
+      "frozen_ref": "refs/goal/sources/rescue/local/937c9c5f-a870-43c7-aa58-36a3f5c1b9cf/e07435d043183d1115056ccb/orphan-tree-0b793f4cff16",
+      "head": "1a0c688743a3bd330b4a931c786f09c49f5ac9e4",
+      "tree": "0b793f4cff169f61fd96288c1dcc1540f1b58355",
+      "parents": [],
+      "object_type": "commit"
+    },
+    {
+      "id": "B16",
+      "ref": "rescue/local/937c9c5f-a870-43c7-aa58-36a3f5c1b9cf/e07435d043183d1115056ccb/stash-bb449b934cc8",
+      "frozen_ref": "refs/goal/sources/rescue/local/937c9c5f-a870-43c7-aa58-36a3f5c1b9cf/e07435d043183d1115056ccb/stash-bb449b934cc8",
+      "head": "bb449b934cc86c2ff0b629bfdcefe03f621c5717",
+      "tree": "94a773d37e40cad743b1ca827cd40752085d8869",
+      "parents": [
+        "fa0bbc8fd577509b938f2ed999bcca4878ccf930",
+        "8d99a1aaefe7be0a4388c00a0678e9d736c7331e",
+        "9e6ed3179cd7ee14c8dda35afd4600a704a157a6"
+      ],
+      "object_type": "commit"
+    },
+    {
+      "id": "B17",
+      "ref": "rescue/local/20261011-110605-42b7822b/a9d1a306be3806e8d39a99a8/main-7340e8934ee9",
+      "frozen_ref": "refs/goal/sources/rescue/local/20261011-110605-42b7822b/a9d1a306be3806e8d39a99a8/main-7340e8934ee9",
+      "head": "7340e8934ee9b22b79b5a4aeb496df9416a2ac6d",
+      "tree": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+      "parents": [],
+      "object_type": "commit"
+    },
+    {
+      "id": "B18",
+      "ref": "rescue/local/20261011-110605-42b7822b/dirty/repo-scan-7d16f0e8fc",
+      "frozen_ref": "refs/goal/sources/rescue/local/20261011-110605-42b7822b/dirty/repo-scan-7d16f0e8fc",
+      "head": "dfbbde874ef95167ca4a2282e872a2991b0dd29c",
+      "tree": "c7ae307bc10cadbb5bc7774f19b14dc21d1b6d6e",
+      "parents": [
+        "8289a839d26a44f4820441349ac040a62348ef50"
+      ],
+      "object_type": "commit"
+    },
+    {
+      "id": "B19",
+      "ref": "rescue/local/20261011-110605-42b7822b/006c39ce3de444bcb4036101/main-b3b5f807ca9c",
+      "frozen_ref": "refs/goal/sources/rescue/local/20261011-110605-42b7822b/006c39ce3de444bcb4036101/main-b3b5f807ca9c",
+      "head": "b3b5f807ca9c9939bacf4bdf46e3263e3f8fab5f",
+      "tree": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+      "parents": [],
+      "object_type": "commit"
+    },
+    {
+      "id": "B20",
+      "ref": "rescue/local/20261011-110605-42b7822b/7c67eeeeb991d046e3ae5c21/main-602e1b60cadd",
+      "frozen_ref": "refs/goal/sources/rescue/local/20261011-110605-42b7822b/7c67eeeeb991d046e3ae5c21/main-602e1b60cadd",
+      "head": "602e1b60caddf1a2071d97ac863395b0c1cabcb6",
+      "tree": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+      "parents": [],
+      "object_type": "commit"
+    },
+    {
+      "id": "B21",
+      "ref": "work/fast-complete-scan",
+      "frozen_ref": "refs/goal/sources/work/fast-complete-scan",
+      "head": "8289a839d26a44f4820441349ac040a62348ef50",
+      "tree": "deed95901effa4f439f75f45633b7dbb91a30ee4",
+      "parents": [
+        "1b866df49bada90ca12d64a8a1189dfdcfd53fe8"
+      ],
+      "object_type": "commit"
+    }
+  ],
+  "seed_mismatches": [],
+  "frozen_pull_heads": {
+    "1": {
+      "head": "8289a839d26a44f4820441349ac040a62348ef50",
+      "tree": "deed95901effa4f439f75f45633b7dbb91a30ee4"
+    },
+    "2": {
+      "head": "8fc5d1870baa63949e0ccce546b5fc5169ff2bd5",
+      "tree": "f5f382232339c5e14bff035156a992a4e8b409a1"
+    },
+    "3": {
+      "head": "0502919d0013de78b3f10566736c56fc4d5ef39f",
+      "tree": "82dc07b59f4baa74e67488569b9fd409c0d64e15"
+    },
+    "4": {
+      "head": "989305679e7a24dd7b98a6a2abc246c83f2c3348",
+      "tree": "b66d7aca3b1198380bb225819e616b9ae760fcdb"
+    },
+    "5": {
+      "head": "29b4110c3140859edb0f209cc9cbb15f0544b3f9",
+      "tree": "995fe9da3837383b826e8a803132a75138b63e42"
+    },
+    "6": {
+      "head": "2d4cb5471cadf956d7d7c7729bb2166e3054468d",
+      "tree": "c9c35006e674654bde167e7fd4db9bcb8f6bb702"
+    },
+    "7": {
+      "head": "da4e3c20e9bc72c67a1a551d5094a034dafa7544",
+      "tree": "aa5d2eb57d9c2ce88cd591a2dc78f28a1deb4d09"
+    }
+  },
+  "frozen_pull_heads_note": "refs/pull/*/head frozen 2026-10-13; PR6 head tree == main tip tree (provenance-only, verified locally)",
+  "updated_at": "2026-10-12T18:32:02.924814+00:00"
+}

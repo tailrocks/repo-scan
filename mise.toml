@@ -1,0 +1,11 @@
+# Repository-local Mise tasks. Intended as PR gates once the pinned workflow
+# generator supports repository-defined tasks; see docs/CI.md ("Proof-task CI
+# wiring state") for why they are not yet wired into .github/workflows/ci.yml.
+
+[tasks.proof-inventory]
+description = "Validate proof/sources.lock.json against the live repository (xtask proof inventory)."
+run = "cargo run --locked -p xtask -- proof inventory"
+
+[tasks.proof-selftest]
+description = "Run the xtask black-box integration tests, including the corrupt-bundle negative controls."
+run = "cargo test --locked -p xtask"

@@ -10,10 +10,15 @@
 
 mod common;
 
+#[path = "../src/main.rs"]
+#[allow(dead_code)]
+mod main_under_test;
+
 use clap::Parser;
 use common::fixture;
 use repo_scan::cli::{CacheAction, Cli, Command};
 use repo_scan::model::{Scope, StatusMode};
+use repo_scan::store::Store;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcCommand;
 
@@ -91,7 +96,16 @@ impl Env {
     }
 
     fn scan(&self, extra: &[&str], cwd: &Path) -> std::process::Output {
-        let mut args = vec!["scan", URL, "--root", self.fixture_str.as_str()];
+        // Wave6: explicit human keeps the footer lines these tests parse
+        // (the redirected default is now the JSONL journal replay).
+        let mut args = vec![
+            "scan",
+            URL,
+            "--root",
+            self.fixture_str.as_str(),
+            "--format",
+            "human",
+        ];
         args.extend(extra.iter().copied());
         run(&args, cwd, &self.state)
     }
@@ -214,7 +228,7 @@ fn cli01_command_table_end_to_end() {
     let report_path = env.cwd_a.join("rep.json");
     assert!(report_path.exists(), "report published");
     let report = read_report(&report_path);
-    assert_eq!(report["schema_version"].as_str(), Some("1.1.0"));
+    assert_eq!(report["schema_version"].as_str(), Some("1.5.0"));
     assert_eq!(report["tool"]["name"].as_str(), Some("repo-scan"));
     assert_eq!(report["scan"]["id"].as_str(), Some(scan_id.as_str()));
     assert_eq!(report["scan"]["scope"].as_str(), Some("roots"));
@@ -247,7 +261,13 @@ fn cli01_command_table_end_to_end() {
     assert!(stdout.contains("matches: 1"), "{stdout}");
 
     // resume of a completed scan: idempotent terminal replay (exit 0).
-    let out = run(&["resume", scan_id.as_str()], &env.cwd_b, &env.state);
+    // Wave6: explicit human keeps the footer lines (the redirected
+    // default is now the JSONL journal replay).
+    let out = run(
+        &["resume", scan_id.as_str(), "--format", "human"],
+        &env.cwd_b,
+        &env.state,
+    );
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
     let stdout = stdout_text(&out);
     assert!(stdout.contains("replayed"), "{stdout}");
@@ -457,7 +477,13 @@ fn cli03_completed_resume_idempotent_across_cwd() {
     let report_bytes = std::fs::read(env.cwd_a.join("rep.json")).expect("report");
     // Resume twice from the other cwd: same terminal result, no fresh scan.
     for _ in 0..2 {
-        let out = run(&["resume", scan_id.as_str()], &env.cwd_b, &env.state);
+        // Wave6: explicit human keeps the footer lines (the redirected
+        // default is now the JSONL journal replay).
+        let out = run(
+            &["resume", scan_id.as_str(), "--format", "human"],
+            &env.cwd_b,
+            &env.state,
+        );
         assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
         let stdout = stdout_text(&out);
         assert!(stdout.contains("replayed"), "{stdout}");
@@ -522,7 +548,11 @@ fn cli03_failed_publication_retries_to_absolute_dest() {
             .expect("chmod restore");
     }
     // Resume from the other cwd: no rescan, original absolute dest honored.
-    let out = run(&["resume", scan_id.as_str()], &env.cwd_b, &env.state);
+    let out = run(
+        &["resume", scan_id.as_str(), "--format", "human"],
+        &env.cwd_b,
+        &env.state,
+    );
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
     let stdout = stdout_text(&out);
     assert!(stdout.contains("publication retried"), "{stdout}");
@@ -553,8 +583,13 @@ fn cli03_failed_terminal_delivery_retries_saved_snapshot() {
     );
     let scan_id = stdout_line(&initial, "scan_id");
     let report_id = stdout_line(&initial, "report_id");
+    // Wave6: the explicit-human lane renders the retained snapshot as
+    // stable plain text (render_plain), not the legacy terminal header.
     let initial_stdout = stdout_text(&initial);
-    assert!(initial_stdout.contains("repo-scan 0.1.0 report"));
+    assert!(
+        initial_stdout.contains("state=complete"),
+        "{initial_stdout}"
+    );
 
     let db = env.state.join("payload").join("catalog.db");
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -596,7 +631,11 @@ fn cli03_failed_terminal_delivery_retries_saved_snapshot() {
         store.close().await.expect("close catalog");
     });
 
-    let resumed = run(&["resume", scan_id.as_str()], &env.cwd_b, &env.state);
+    let resumed = run(
+        &["resume", scan_id.as_str(), "--format", "human"],
+        &env.cwd_b,
+        &env.state,
+    );
     assert_eq!(
         resumed.status.code(),
         Some(0),
@@ -615,7 +654,11 @@ fn cli03_failed_terminal_delivery_retries_saved_snapshot() {
     assert_eq!(stdout_line(&resumed, "scan_id"), scan_id);
     assert_eq!(stdout_line(&resumed, "report_id"), report_id);
 
-    let replay = run(&["resume", scan_id.as_str()], &env.cwd_b, &env.state);
+    let replay = run(
+        &["resume", scan_id.as_str(), "--format", "human"],
+        &env.cwd_b,
+        &env.state,
+    );
     assert_eq!(
         replay.status.code(),
         Some(0),
@@ -729,7 +772,11 @@ fn cli03_superseded_resume_names_successor() {
     let successor = stdout_line(&out, "scan_id");
     assert_ne!(successor, stale_id);
     // Resume of the superseded request: exit 3 with a usable result.
-    let out = run(&["resume", stale_id], &env.cwd_b, &env.state);
+    let out = run(
+        &["resume", stale_id, "--format", "human"],
+        &env.cwd_b,
+        &env.state,
+    );
     assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr_text(&out));
     let stdout = stdout_text(&out);
     assert!(stdout.contains("superseded"), "{stdout}");
@@ -781,7 +828,7 @@ fn step6_multi_target_union_single_pass() {
     );
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
     let report = read_report(&env.cwd_a.join("rep.json"));
-    assert_eq!(report["schema_version"], "1.1.0");
+    assert_eq!(report["schema_version"], "1.5.0");
     // Full target set in request order with per-target match counts.
     let targets = report["scan"]["targets"].as_array().expect("targets array");
     assert_eq!(targets.len(), 2);
@@ -857,72 +904,6 @@ fn step6_all_finds_without_target_filter() {
     // No filter: every discovered store is in scope and confirmed.
     assert_eq!(confirmed_repos(&report).len(), 2);
     assert_eq!(report["scan"]["state"], "complete");
-}
-
-/// The `json`/`jsonl` lanes are pre-staged in the CLI but not wired for
-/// `scan` yet: refuse loudly (exit 1, "not yet implemented") before any
-/// state mutation instead of silently running the human lane. `human`
-/// stays today's behavior.
-#[test]
-fn step6_format_lanes_refuse_loudly_until_wired() {
-    let env = Env::new();
-    for lane in ["json", "jsonl"] {
-        let out = env.scan(&["--format", lane], &env.cwd_a);
-        assert_eq!(
-            out.status.code(),
-            Some(1),
-            "--format {lane} refuses loudly: {}",
-            stderr_text(&out)
-        );
-        assert!(
-            stderr_text(&out).contains("not yet implemented"),
-            "--format {lane} stderr: {}",
-            stderr_text(&out)
-        );
-    }
-    assert!(
-        !env.state.join("payload").join("catalog.db").exists(),
-        "refusal happens before any state mutation"
-    );
-    let out = env.scan(&["--format", "human", "--report", "rep.json"], &env.cwd_a);
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "human lane unchanged: {}",
-        stderr_text(&out)
-    );
-}
-
-/// `--fetch` is pre-staged for the fetch-phase slice: refuse loudly (exit
-/// 1, "not yet implemented") before any state mutation instead of
-/// completing with stale remote state presented as current. Scans without
-/// `--fetch` are unaffected.
-#[test]
-fn step6_fetch_refuses_loudly_until_wired() {
-    let env = Env::new();
-    let out = env.scan(&["--fetch"], &env.cwd_a);
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "--fetch refuses loudly: {}",
-        stderr_text(&out)
-    );
-    assert!(
-        stderr_text(&out).contains("not yet implemented"),
-        "--fetch stderr: {}",
-        stderr_text(&out)
-    );
-    assert!(
-        !env.state.join("payload").join("catalog.db").exists(),
-        "refusal happens before any state mutation"
-    );
-    let out = env.scan(&["--report", "rep.json"], &env.cwd_a);
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "scan without --fetch unaffected: {}",
-        stderr_text(&out)
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1030,6 +1011,8 @@ fn journal_lifecycle_events_span_started_ready_terminal() {
             root.to_str().expect("utf8"),
             "--report",
             "rep.json",
+            "--format",
+            "human",
         ],
         &cwd,
         &state,
@@ -1121,7 +1104,8 @@ fn journal_lifecycle_events_span_started_ready_terminal() {
 /// JSONL envelopes; `--after` resumes after a cursor; unknown scans exit 2.
 #[test]
 fn query_scan_replays_journaled_lifecycle_as_jsonl() {
-    use repo_scan::scan_events::Cursor;
+    use repo_scan::scan_events::ScanCursor as Cursor;
+    use repo_scan::store::{NewScanEvent, Store, TursoStore};
 
     let dir = tempfile::tempdir().expect("tempdir");
     let state = dir.path().join("state");
@@ -1138,6 +1122,8 @@ fn query_scan_replays_journaled_lifecycle_as_jsonl() {
             root.to_str().expect("utf8"),
             "--report",
             "rep.json",
+            "--format",
+            "human",
         ],
         &cwd,
         &state,
@@ -1188,13 +1174,58 @@ fn query_scan_replays_journaled_lifecycle_as_jsonl() {
         serde_json::Value::String("scan_completed".to_string())
     );
 
+    // A post-terminal row is outside the completed event stream. Readers
+    // stop at the first terminal even if a malformed/legacy journal has a
+    // later row.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        let terminal_seq = lines.last().expect("terminal")["seq"]
+            .as_u64()
+            .expect("terminal seq");
+        let rev = store.next_revision().await.expect("revision");
+        assert!(store
+            .append_scan_event(&NewScanEvent {
+                scan_id: &scan_id,
+                seq: terminal_seq + 1,
+                catalog_rev: rev,
+                event_offset: 0,
+                event_type: "location_updated",
+                op: "replace",
+                reset: false,
+                records: b"{}",
+            })
+            .await
+            .expect("append post-terminal row"));
+        store.close().await.expect("close");
+    });
+    let after_terminal = run(
+        &["query", "--scan", &scan_id, "--format", "jsonl"],
+        &cwd,
+        &state,
+    );
+    assert_eq!(after_terminal.status.code(), Some(0));
+    let after_terminal_lines: Vec<serde_json::Value> = stdout_text(&after_terminal)
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each line is valid JSON"))
+        .collect();
+    assert_eq!(after_terminal_lines.len(), lines.len());
+    assert_eq!(
+        after_terminal_lines.last().expect("terminal")["type"],
+        "scan_completed"
+    );
+
     // `--after` resumes strictly after the cursor: from the first envelope,
     // replay restarts at seq 2 and still ends at the terminal event.
-    let cursor = Cursor {
-        seq: lines[0]["seq"].as_u64().expect("seq u64"),
-        catalog_rev: lines[0]["catalog_rev"].as_u64().expect("rev u64"),
-        event_offset: lines[0]["event_offset"].as_u64().expect("off u64"),
-    }
+    let cursor = Cursor::for_scan(
+        &scan_id,
+        lines[0]["seq"].as_u64().expect("seq u64"),
+        lines[0]["catalog_rev"].as_u64().expect("rev u64"),
+        lines[0]["event_offset"].as_u64().expect("off u64"),
+    )
     .encode();
     let resumed = run(
         &[
@@ -1219,6 +1250,61 @@ fn query_scan_replays_journaled_lifecycle_as_jsonl() {
         tail.last().expect("tail last")["type"],
         serde_json::Value::String("scan_completed".to_string())
     );
+
+    // A cursor on the terminal event closes replay. The malformed row we
+    // appended after terminal above must never be treated as a live tail.
+    let terminal = lines.last().expect("terminal");
+    let terminal_cursor = Cursor::for_scan(
+        &scan_id,
+        terminal["seq"].as_u64().expect("terminal seq"),
+        terminal["catalog_rev"].as_u64().expect("terminal rev"),
+        terminal["event_offset"].as_u64().expect("terminal offset"),
+    )
+    .encode();
+    let terminal_tail = run(
+        &[
+            "query",
+            "--scan",
+            &scan_id,
+            "--follow",
+            "--format",
+            "jsonl",
+            "--after",
+            &terminal_cursor,
+        ],
+        &cwd,
+        &state,
+    );
+    assert_eq!(
+        terminal_tail.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&terminal_tail)
+    );
+    assert!(stdout_text(&terminal_tail).is_empty());
+
+    // A validly encoded seq beyond SQLite's signed range cannot exist in
+    // this journal. Treat it as an expired cursor and explicitly reset.
+    let overflow = Cursor::for_scan(&scan_id, u64::MAX, u64::MAX, u64::MAX).encode();
+    let reset = run(
+        &[
+            "query", "--scan", &scan_id, "--follow", "--format", "jsonl", "--after", &overflow,
+        ],
+        &cwd,
+        &state,
+    );
+    assert_eq!(
+        reset.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&reset)
+    );
+    let reset_lines: Vec<serde_json::Value> = stdout_text(&reset)
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("reset line is valid JSON"))
+        .collect();
+    assert_eq!(reset_lines[0]["reset"], true);
+    assert_eq!(reset_lines[0]["type"], "scan_started");
 
     // Unknown scan IDs follow the resume convention: exit 2, clear error.
     let missing = run(
@@ -1260,6 +1346,10 @@ fn query_scan_follow_drains_terminal_event_committed_after_row_state() {
             root.to_str().expect("utf8"),
             "--report",
             "rep.json",
+            // Wave6: explicit human keeps the footer lines (the redirected
+            // default is now the JSONL journal replay).
+            "--format",
+            "human",
         ],
         &cwd,
         &state,
@@ -1373,11 +1463,15 @@ fn query_scan_follow_drains_terminal_event_committed_after_row_state() {
     let mut rest = String::new();
     reader.read_to_string(&mut rest).expect("read to EOF");
     followed.push_str(&rest);
+    let mut err_text = String::new();
+    if let Some(mut err_reader) = child.stderr.take() {
+        let _ = err_reader.read_to_string(&mut err_text);
+    }
     let status = child.wait().expect("wait");
     assert_eq!(
         status.code(),
         Some(0),
-        "follower exits 0 at the terminal event"
+        "follower exits 0 at the terminal event; stderr: {err_text}"
     );
     let last = followed
         .lines()
@@ -1416,6 +1510,8 @@ fn found_events_cover_each_store_and_checkout_once() {
             root.to_str().expect("utf8"),
             "--report",
             "rep.json",
+            "--format",
+            "human",
         ],
         &cwd,
         &state,
@@ -1582,6 +1678,8 @@ fn github_groups_link_stores_to_canonical_identities() {
             root.to_str().expect("utf8"),
             "--report",
             "rep.json",
+            "--format",
+            "human",
         ],
         &cwd,
         &state,
@@ -1613,8 +1711,22 @@ fn github_groups_link_stores_to_canonical_identities() {
             assert!(g.observed_at_ms > 0, "observation time kept");
         }
 
-        // Store -> clone mapping from location_found paths (lossy display
-        // keeps our ASCII dir names intact).
+        // Event IDs are opaque projections of the owner-local catalog IDs.
+        // Build the expected projection from each fixture's common dir so
+        // the stream can be joined without exposing path encodings.
+        let event_store_id = |path: &Path| {
+            let common = std::fs::canonicalize(path.join(".git")).expect("canonical .git");
+            let catalog_id = format!(
+                "git:{}",
+                repo_scan::config::encode_hex(&repo_scan::config::path_as_bytes(&common))
+            );
+            main_under_test::test_event_opaque_id(&catalog_id)
+        };
+        let fixture_names = HashMap::from([
+            (event_store_id(&clone_a), String::from("clone-a")),
+            (event_store_id(&clone_b), String::from("clone-b")),
+            (event_store_id(&clone_c), String::from("clone-c")),
+        ]);
         let rows = store
             .read_scan_events(&scan_id, 0, 1_000)
             .await
@@ -1624,15 +1736,12 @@ fn github_groups_link_stores_to_canonical_identities() {
         for row in &rows {
             let v: serde_json::Value = serde_json::from_slice(&row.records).expect("json");
             if row.event_type == "location_found" {
-                let path = v["path"].as_str().expect("path").to_string();
-                let name = ["clone-a", "clone-b", "clone-c"]
-                    .into_iter()
-                    .find(|n| path.contains(n))
-                    .expect("fixture clone path");
-                store_clone.insert(
-                    v["store_id"].as_str().expect("store").to_string(),
-                    name.into(),
-                );
+                let store_id = v["store_id"].as_str().expect("store id").to_string();
+                let name = fixture_names
+                    .get(&store_id)
+                    .expect("fixture store id")
+                    .clone();
+                store_clone.insert(store_id, name);
             } else if row.event_type == "repository_found" {
                 let found: Vec<String> = v["github_groups"]
                     .as_array()
@@ -1654,7 +1763,7 @@ fn github_groups_link_stores_to_canonical_identities() {
         for m in &main_members {
             assert!(m.observed_at_ms > 0, "member observation time kept");
             main_by_store
-                .entry(m.instance_id.clone())
+                .entry(main_under_test::test_event_opaque_id(&m.instance_id))
                 .or_default()
                 .insert((
                     String::from_utf8_lossy(&m.remote_name).into_owned(),
@@ -1672,12 +1781,15 @@ fn github_groups_link_stores_to_canonical_identities() {
             assert_eq!(pairs, &expect, "{clone} origin edges match git");
         }
         assert_eq!(up_members.len(), 2, "upstream edges: fetch + push");
-        let up_store = &up_members[0].instance_id;
+        let up_store = up_members[0].instance_id.clone();
+        let up_event_store = main_under_test::test_event_opaque_id(&up_store);
         assert_eq!(
-            store_clone.get(up_store).map(String::as_str),
+            store_clone.get(&up_event_store).map(String::as_str),
             Some("clone-c")
         );
-        assert!(up_members.iter().all(|m| &m.instance_id == up_store));
+        assert!(up_members
+            .iter()
+            .all(|m| main_under_test::test_event_opaque_id(&m.instance_id) == up_event_store));
         let up_pairs: HashSet<(String, String)> = up_members
             .iter()
             .map(|m| {
@@ -1694,10 +1806,10 @@ fn github_groups_link_stores_to_canonical_identities() {
             .collect();
         assert_eq!(up_pairs, expect_up, "clone-c upstream edges match git");
         assert!(
-            main_by_store.contains_key(up_store),
+            main_by_store.contains_key(&up_event_store),
             "one store belongs to both groups"
         );
-        let both = store.groups_for_instance(up_store).await.expect("groups");
+        let both = store.groups_for_instance(&up_store).await.expect("groups");
         let both_ids: HashSet<&str> = both.iter().map(|m| m.group_id.as_str()).collect();
         assert_eq!(both_ids, HashSet::from([GROUP_MAIN, GROUP_UP]));
 
@@ -1760,6 +1872,8 @@ fn location_updated_marks_status_completion() {
             "summary",
             "--report",
             "rep.json",
+            "--format",
+            "human",
         ],
         &cwd,
         &state,
@@ -1870,7 +1984,7 @@ fn error_events_journal_completion_gaps() {
             assert_eq!(row.op, "add", "D4 op for error");
             let v: serde_json::Value = serde_json::from_slice(&row.records).expect("json");
             let id = v["id"].as_str().expect("event id");
-            assert!(id.starts_with("gap:"), "gap id: {id}");
+            assert!(id.starts_with("evt:"), "opaque gap id: {id}");
             assert!(
                 v["category"].as_str().is_some_and(|c| !c.is_empty()),
                 "category carried"
@@ -1881,7 +1995,18 @@ fn error_events_journal_completion_gaps() {
             );
             // Join: the payload names a real open catalog row; attempts and
             // open state are read there, never from the event.
-            let gap = store.get_error(id).await.expect("get").expect("gap row");
+            let raw_id = store
+                .list_open_error_ids()
+                .await
+                .expect("open gap ids")
+                .into_iter()
+                .find(|raw| main_under_test::test_event_opaque_id(raw).as_str() == id)
+                .expect("opaque event id maps to an open catalog gap");
+            let gap = store
+                .get_error(&raw_id)
+                .await
+                .expect("get")
+                .expect("gap row");
             assert!(gap.open, "gap row is open");
             assert!(gap.attempts >= 1, "recorded at least once");
             assert_eq!(gap.category, v["category"].as_str().expect("category"));
@@ -1894,33 +2019,12 @@ fn error_events_journal_completion_gaps() {
 /// per store (chunked at 500), carrying every ref the installed `git`
 /// reports with matching oids, ordered after the store's
 /// `repository_found`.
-///
-/// Regression (double discovery): enumeration schedules two probes per
-/// store — the worktree root (its `.git` child) and the `.git` dir itself
-/// (HEAD+objects+refs markers). With a symlink-free scan root both probes
-/// resolve to the same spelling; the second must not re-persist the store
-/// or re-journal its events. CI (Linux, real `/tmp`) caught the
-/// re-persist; this test canonicalizes the root so the same-spelling path
-/// is exercised everywhere.
 #[test]
 fn branch_batch_journals_persisted_refs() {
     use repo_scan::store::{Store, TursoStore};
     use std::collections::{HashMap, HashSet};
 
     let env = Env::new();
-    let canonical_fixture = std::fs::canonicalize(&env.fixture)
-        .expect("canonical fixture")
-        .to_str()
-        .expect("utf8")
-        .to_string();
-    assert_eq!(
-        std::fs::canonicalize(&canonical_fixture)
-            .expect("canonical")
-            .to_str()
-            .expect("utf8"),
-        canonical_fixture,
-        "root is symlink-free"
-    );
     let repo = env.fixture.join("repo");
     // Three local branches on distinct commits plus a tag; `git` is the
     // independent reference for the expected ref set.
@@ -1948,18 +2052,7 @@ fn branch_batch_journals_persisted_refs() {
     }
     assert_eq!(expected.len(), 4, "main + side-a + side-b + v1");
 
-    let out = run(
-        &[
-            "scan",
-            URL,
-            "--root",
-            canonical_fixture.as_str(),
-            "--report",
-            "rep.json",
-        ],
-        &env.cwd_a,
-        &env.state,
-    );
+    let out = env.scan(&["--report", "rep.json"], &env.cwd_a);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
     let scan_id = stdout_line(&out, "scan_id");
 
@@ -1986,6 +2079,8 @@ fn branch_batch_journals_persisted_refs() {
         assert_eq!(v["batch_count"].as_u64(), Some(1));
         let branches = v["branches"].as_array().expect("branches array");
         assert_eq!(branches.len(), expected.len(), "every ref journaled");
+        let common = std::fs::canonicalize(repo.join(".git")).expect("canonical common dir");
+        let common_hex = repo_scan::config::encode_hex(&repo_scan::config::path_as_bytes(&common));
         let mut seen = HashSet::new();
         for b in branches {
             let name = b["name"].as_str().expect("name");
@@ -2009,10 +2104,11 @@ fn branch_batch_journals_persisted_refs() {
                 "state of {name}"
             );
             assert!(seen.insert(name.to_string()), "no duplicate {name}");
+            let catalog_id = format!("ref:{common_hex}:{}", hex_of(name.as_bytes()));
             assert_eq!(
-                b["id"].as_str().expect("id").split(':').count(),
-                3,
-                "ref id"
+                b["id"],
+                main_under_test::test_event_opaque_id(&catalog_id),
+                "opaque event id for catalog ref {name}"
             );
         }
         // Ordering: the batch lands after its store's repository_found.
@@ -2045,10 +2141,6 @@ fn hex_of(bytes: &[u8]) -> String {
 /// opens exactly once (re-records are not transitions), unconditional
 /// closes of never-open rows stay silent, and a remote-less clone joins
 /// as an unresolvable candidate.
-///
-/// The scan root is canonicalized (see branch_batch_journals_persisted_refs):
-/// with a symlink-free root the store's double discovery resolves to one
-/// spelling, exercising the same-spelling re-probe dedupe on every platform.
 #[test]
 fn coverage_updated_reports_gap_deltas() {
     use repo_scan::store::{Store, TursoStore};
@@ -2082,21 +2174,7 @@ fn coverage_updated_reports_gap_deltas() {
         return;
     }
 
-    let out = run(
-        &[
-            "scan",
-            URL,
-            "--root",
-            std::fs::canonicalize(&env.fixture)
-                .expect("canonical fixture")
-                .to_str()
-                .expect("utf8"),
-            "--report",
-            "rep.json",
-        ],
-        &env.cwd_a,
-        &env.state,
-    );
+    let out = env.scan(&["--report", "rep.json"], &env.cwd_a);
     assert_eq!(
         out.status.code(),
         Some(3),
@@ -2155,22 +2233,1292 @@ fn coverage_updated_reports_gap_deltas() {
         // retry/re-record count; every probe's unconditional close of a
         // never-open row stays silent.
         assert_eq!(opened.len(), 1, "one open transition: {opened:?}");
-        assert!(opened[0].starts_with("gap:"), "gap id: {}", opened[0]);
+        assert!(
+            opened[0].starts_with("evt:"),
+            "opaque gap id: {}",
+            opened[0]
+        );
         assert!(closed.is_empty(), "no genuine closes: {closed:?}");
+        let raw_gap_id = store
+            .list_open_error_ids()
+            .await
+            .expect("open gap ids")
+            .into_iter()
+            .find(|raw| main_under_test::test_event_opaque_id(raw).as_str() == opened[0].as_str())
+            .expect("event id maps to open catalog gap");
         let gap = store
-            .get_error(&opened[0])
+            .get_error(&raw_gap_id)
             .await
             .expect("get")
             .expect("gap row");
         assert!(gap.open, "opened id names an open row");
         // The remote-less clone joined as an unresolvable candidate.
         assert_eq!(unresolvable.len(), 1, "{unresolvable:?}");
+        let common = std::fs::canonicalize(noremote.join(".git")).expect("canonical common dir");
+        let instance_id = format!(
+            "git:{}",
+            repo_scan::config::encode_hex(&repo_scan::config::path_as_bytes(&common))
+        );
+        assert_eq!(
+            unresolvable[0],
+            main_under_test::test_event_opaque_id(&instance_id)
+        );
         let instance = store
-            .get_git_instance(&unresolvable[0])
+            .get_git_instance(&instance_id)
             .await
             .expect("get")
             .expect("instance row");
         assert_eq!(instance.disposition, "unresolvable_identity");
         store.close().await.expect("close");
     });
+}
+
+// ---------------------------------------------------------------------------
+// Step 15 case 12: no branch, status, or graph analysis starts before
+// inventory_ready (the instrumented production proof for the Step 8 phase
+// boundary: analysis journals branch_batch/location_updated/remote_updated,
+// and every one must sort after the boundary event).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn case12_no_analysis_before_inventory_ready() {
+    case12_body(&[]);
+}
+
+/// Case 12 under explicit high concurrency: analysis tasks enqueue
+/// during discovery and pend while probes still run — the pooled
+/// drain must still hold every analysis claim behind the boundary.
+#[test]
+fn case12_no_analysis_before_inventory_ready_workers8() {
+    case12_body(&["--workers", "8"]);
+}
+
+fn case12_body(extra: &[&str]) {
+    use repo_scan::store::{Store, TursoStore};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let cwd = dir.path().join("cwd");
+    repo_scan::privacy::private_dir_0700(&cwd).expect("mkdir");
+    let root = dir.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    // Two stores (a plain clone plus a main+worktree pair) so both the
+    // branch leg (branch_batch) and the status leg (location_updated)
+    // of analysis observably run.
+    fixture::normal_clone(&root, "repo");
+    fixture::linked_worktree(&root);
+    let mut args = vec![
+        "scan",
+        URL,
+        "--root",
+        root.to_str().expect("utf8"),
+        "--status",
+        "summary",
+        "--report",
+        "rep.json",
+        "--format",
+        "human",
+    ];
+    args.extend(extra.iter().copied());
+    let out = run(&args, &cwd, &state);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let scan_id = stdout_line(&out, "scan_id");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        let rows = store
+            .read_scan_events(&scan_id, 0, 1_000)
+            .await
+            .expect("read");
+        let ready: Vec<_> = rows
+            .iter()
+            .filter(|r| r.event_type == "inventory_ready")
+            .collect();
+        assert_eq!(ready.len(), 1, "exactly one boundary event");
+        let boundary = ready[0].seq;
+        // Discovery precedes the boundary: at least one found event lands
+        // before it (non-vacuous discovery leg).
+        assert!(
+            rows.iter().any(|r| (r.event_type == "repository_found"
+                || r.event_type == "location_found")
+                && r.seq < boundary),
+            "a found event precedes inventory_ready"
+        );
+        // Analysis follows the boundary: every branch/status/remote event
+        // sorts strictly after it, and both legs observably ran.
+        let mut saw_batch = false;
+        let mut saw_updated = false;
+        for row in &rows {
+            match row.event_type.as_str() {
+                "branch_batch" => saw_batch = true,
+                "location_updated" => saw_updated = true,
+                _ => {}
+            }
+            assert!(
+                !matches!(
+                    row.event_type.as_str(),
+                    "branch_batch" | "location_updated" | "remote_updated"
+                ) || row.seq > boundary,
+                "analysis event {} at seq {} sorts after inventory_ready at {boundary}",
+                row.event_type,
+                row.seq
+            );
+        }
+        assert!(saw_batch, "branch analysis journaled branch_batch");
+        assert!(saw_updated, "status analysis journaled location_updated");
+        // Read-entry order proof (D3): the terminal payload carries the
+        // audited pre-boundary analysis read starts — zero, because
+        // every analysis read runs behind the Analysis drain gate.
+        // Journal order alone cannot prove this (reads could run early
+        // and persist late).
+        let terminal = rows
+            .iter()
+            .find(|r| {
+                matches!(
+                    r.event_type.as_str(),
+                    "scan_completed" | "scan_incomplete" | "scan_interrupted" | "scan_failed"
+                )
+            })
+            .expect("terminal event journaled");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&terminal.records).expect("terminal json");
+        assert_eq!(
+            payload["boundary_audit"]["pre_boundary_analysis_reads"].as_u64(),
+            Some(0),
+            "zero analysis reads started before inventory_ready"
+        );
+        store.close().await.expect("close");
+    });
+}
+
+/// Case 12 with `--fetch`: the remote leg (`remote_updated`) is
+/// non-vacuous here — a file-remote clone really fetches — and the
+/// fetch-phase events sort after the boundary with zero pre-boundary
+/// analysis read starts.
+#[test]
+fn case12_no_analysis_before_inventory_ready_fetch() {
+    use repo_scan::store::{Store, TursoStore};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let cwd = dir.path().join("cwd");
+    repo_scan::privacy::private_dir_0700(&cwd).expect("mkdir");
+    let root = dir.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("mkdir");
+    // File-remote world (never network): the clone's fetch really runs.
+    let upstream = fixture::normal_clone(&root, "upstream");
+    let clone = root.join("clone");
+    fixture::git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            upstream.to_str().expect("utf8"),
+            clone.to_str().expect("utf8"),
+        ],
+    );
+    fixture::linked_worktree(&root);
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            root.to_str().expect("utf8"),
+            "--status",
+            "summary",
+            "--report",
+            "rep.json",
+            "--format",
+            "human",
+            "--fetch",
+        ],
+        &cwd,
+        &state,
+    );
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(3)),
+        "usable scan result: {}",
+        stderr_text(&out)
+    );
+    let scan_id = stdout_line(&out, "scan_id");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        let rows = store
+            .read_scan_events(&scan_id, 0, 1_000)
+            .await
+            .expect("read");
+        let ready: Vec<_> = rows
+            .iter()
+            .filter(|r| r.event_type == "inventory_ready")
+            .collect();
+        assert_eq!(ready.len(), 1, "exactly one boundary event");
+        let boundary = ready[0].seq;
+        let mut saw_remote = false;
+        for row in &rows {
+            if row.event_type == "remote_updated" {
+                saw_remote = true;
+            }
+            assert!(
+                row.event_type != "remote_updated" || row.seq > boundary,
+                "remote_updated at seq {} sorts after inventory_ready at {boundary}",
+                row.seq
+            );
+        }
+        assert!(saw_remote, "fetch phase journaled remote_updated");
+        let terminal = rows
+            .iter()
+            .find(|r| {
+                matches!(
+                    r.event_type.as_str(),
+                    "scan_completed" | "scan_incomplete" | "scan_interrupted" | "scan_failed"
+                )
+            })
+            .expect("terminal event journaled");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&terminal.records).expect("terminal json");
+        assert_eq!(
+            payload["boundary_audit"]["pre_boundary_analysis_reads"].as_u64(),
+            Some(0),
+            "zero analysis reads started before inventory_ready"
+        );
+        store.close().await.expect("close");
+    });
+}
+
+/// Actual retained report snapshots stay within the configured bound even
+/// after completed scan outcomes accumulate in `scan_requests`.
+#[test]
+fn completed_scan_outcomes_do_not_pin_snapshots_past_retention() {
+    let env = Env::new();
+    let mut latest_report_id = None;
+    for _ in 0..=repo_scan::report::output::MAX_RETAINED_SNAPSHOTS {
+        let out = run(
+            &[
+                "scan",
+                "--all",
+                "--root",
+                env.fixture_str.as_str(),
+                "--force-rescan",
+                "--format",
+                "jsonl",
+            ],
+            &env.cwd_a,
+            &env.state,
+        );
+        assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+        let events: Vec<serde_json::Value> = stdout_text(&out)
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("event is JSON"))
+            .collect();
+        latest_report_id = events
+            .last()
+            .and_then(|event| event["records"]["report_id"].as_str())
+            .map(str::to_string);
+    }
+    let latest_report_id = latest_report_id.expect("latest report id");
+    let snapshots = env
+        .state
+        .join("payload")
+        .join(repo_scan::config::SNAPSHOTS_DIR_NAME);
+    let retained: Vec<PathBuf> = std::fs::read_dir(&snapshots)
+        .expect("snapshots directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    assert_eq!(
+        retained.len(),
+        repo_scan::report::output::MAX_RETAINED_SNAPSHOTS,
+        "only the configured newest snapshots remain"
+    );
+    assert!(
+        snapshots.join(format!("{latest_report_id}.json")).is_file(),
+        "the current report survives pruning"
+    );
+}
+
+/// DB-M1: invalidating a symlinked root by either spelling schedules
+/// reconciliation (the invalidate path resolves both spellings onto
+/// the same object). Keys keep observed spellings; the cross-spelling
+/// live-task fan-out is pinned at the store level by
+/// `dbm1_cross_spelling_invalidate_hits_live_task`.
+#[cfg(unix)]
+#[test]
+fn dbm1_symlink_root_invalidate_schedules_reconcile() {
+    let env = Env::new();
+    let link = env._dir.path().join("fixture-link");
+    std::os::unix::fs::symlink(&env.fixture, &link).expect("symlink");
+    let link_str = link.to_str().expect("utf8").to_string();
+    let out = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            link_str.as_str(),
+            "--format",
+            "human",
+        ],
+        &env.cwd_a,
+        &env.state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    // Invalidate via the physical path: durable, with no completion
+    // claim (exit 0), exactly like a same-spelling invalidate.
+    let out = run(
+        &["cache", "invalidate", "--root", env.fixture_str.as_str()],
+        &env.cwd_b,
+        &env.state,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    assert!(
+        stdout_text(&out).contains("not complete"),
+        "no completion claim"
+    );
+}
+
+/// A failed publication remains retryable after more than 32 newer reports
+/// are staged. Resume must publish the exact saved snapshot bytes.
+#[test]
+fn failed_unpublished_snapshot_survives_retention_and_resume_retries_bytes() {
+    use repo_scan::store::{now_ms, NewScan, TursoStore};
+
+    let env = Env::new();
+    let seed_dest = env.cwd_a.join("seed.json");
+    let seed_dest_s = seed_dest.to_str().expect("seed path");
+    let seed = env.scan(&["--report", seed_dest_s], &env.cwd_a);
+    assert_eq!(
+        seed.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&seed)
+    );
+    let mut failed_report = read_report(&seed_dest);
+
+    let scan_id = "failed-retention-retry";
+    let report_id = repo_scan::config::report_id_for_scan(scan_id);
+    failed_report["report_id"] = report_id.clone().into();
+    failed_report["scan"]["id"] = scan_id.into();
+    let saved_bytes = serde_json::to_vec(&failed_report).expect("saved report JSON");
+    let snapshot =
+        repo_scan::config::snapshot_path(&env.state, &report_id).expect("failed snapshot path");
+    std::fs::write(&snapshot, &saved_bytes).expect("write failed snapshot");
+
+    let destination = env.cwd_a.join("retry.json");
+    let destination_bytes = repo_scan::config::path_as_bytes(&destination);
+    let canonical = repo_scan::identity::normalize_github_url(URL).expect("canonical URL");
+    let catalog_rev = failed_report["scan"]["catalog_revision"]
+        .as_u64()
+        .expect("catalog revision");
+    let generation = failed_report["scan"]["generation"]
+        .as_u64()
+        .expect("generation");
+    let schema_version = failed_report["schema_version"]
+        .as_str()
+        .expect("schema version")
+        .to_string();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let store = TursoStore::open(&env.state.join("payload").join("catalog.db"))
+            .await
+            .expect("open catalog");
+        assert!(store
+            .create_scan_request(
+                &NewScan {
+                    id: scan_id,
+                    url_raw: URL.as_bytes(),
+                    url_canonical: Some(canonical.as_bytes()),
+                    scope: "roots",
+                    status_mode: "summary",
+                    report_dest: Some(&destination_bytes),
+                    targets_json: None,
+                    format: Some("json"),
+                    all_targets: Some(false),
+                },
+                now_ms(),
+            )
+            .await
+            .expect("create failed scan"));
+        store
+            .update_scan_state(
+                scan_id,
+                "failed",
+                Some(&repo_scan::config::encode_outcome(
+                    1,
+                    Some(0),
+                    &report_id,
+                    false,
+                    Some(generation),
+                )),
+                None,
+                now_ms(),
+            )
+            .await
+            .expect("record failed publication");
+        // Consolidation checksum binding: the catalog row carries the
+        // staged bytes' checksum, which the retry verifies before publish.
+        let checksum = repo_scan::report::publish::sha256_hex(&saved_bytes);
+        assert!(store
+            .save_report_snapshot(
+                &report_id,
+                &schema_version,
+                catalog_rev,
+                generation,
+                "failed",
+                Some(checksum.as_bytes()),
+                now_ms(),
+            )
+            .await
+            .expect("catalog failed snapshot"));
+        store.close().await.expect("close catalog");
+    });
+
+    // Make the unpublished snapshot older than the ordinary 32-file window.
+    for n in 0..=repo_scan::report::output::MAX_RETAINED_SNAPSHOTS {
+        let id = format!("retry-filler-{n:03}");
+        let path = repo_scan::config::snapshot_path(&env.state, &id).expect("filler path");
+        std::fs::write(path, &saved_bytes).expect("write filler snapshot");
+    }
+
+    let active = env.scan(&["--force-rescan"], &env.cwd_a);
+    assert_eq!(
+        active.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&active)
+    );
+    assert!(
+        snapshot.is_file(),
+        "failed unpublished snapshot survives pruning"
+    );
+
+    let retry = run(
+        &["resume", scan_id, "--format", "json"],
+        &env.cwd_b,
+        &env.state,
+    );
+    assert_eq!(
+        retry.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&retry)
+    );
+    let output: serde_json::Value = serde_json::from_slice(&retry.stdout).expect("JSON output");
+    assert_eq!(output["report_id"], report_id);
+    assert_eq!(
+        std::fs::read(&destination).expect("published bytes"),
+        saved_bytes
+    );
+    rt.block_on(async {
+        let store = TursoStore::open(&env.state.join("payload").join("catalog.db"))
+            .await
+            .expect("reopen catalog");
+        let row = store
+            .get_scan(scan_id)
+            .await
+            .expect("get scan")
+            .expect("row");
+        assert_eq!(row.state, "complete");
+        assert!(row
+            .outcome
+            .as_deref()
+            .and_then(repo_scan::config::parse_outcome)
+            .is_some_and(|outcome| outcome.published));
+        store.close().await.expect("close catalog");
+    });
+}
+
+/// Boundary B1: a gappy no-fetch scan journals COMPLETELY and IN ORDER.
+/// Lifecycle emits (`inventory_ready`, terminal) commit immediately,
+/// so the writer batch must drain before each — otherwise lower-seq
+/// gap events commit after the terminal event (or drop at Runner
+/// drop). Asserts contiguous seqs, the terminal event last and alone,
+/// every buffered event ordered before it, and every open catalog gap
+/// row joined from a journaled error event (nothing dropped).
+#[test]
+fn gappy_scan_journal_complete_and_ordered() {
+    use repo_scan::store::{Store, TursoStore};
+    use std::collections::HashSet;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct Restore<'a> {
+        path: &'a Path,
+    }
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.path, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let env = Env::new();
+    let blocked = env.fixture.join("blocked");
+    repo_scan::privacy::private_dir_0700(&blocked).expect("mkdir");
+    repo_scan::privacy::private_write_0600(&blocked.join("secret.txt"), b"x").expect("write");
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o0)).expect("chmod 000");
+    let _restore = Restore { path: &blocked };
+    if std::fs::read_dir(&blocked).is_ok() {
+        eprintln!("gappy_scan_journal_complete_and_ordered: chmod 000 ineffective; skipping");
+        return;
+    }
+
+    let out = env.scan(&["--report", "rep.json"], &env.cwd_a);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "permission gap is usable-but-incomplete; stderr: {}",
+        stderr_text(&out)
+    );
+    let scan_id = stdout_line(&out, "scan_id");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let db = env.state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open");
+        let rows = store
+            .read_scan_events(&scan_id, 0, 10_000)
+            .await
+            .expect("read");
+        assert!(!rows.is_empty(), "journal is non-empty");
+        // Completeness: seqs contiguous from 1 (no dropped tail).
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row.seq, (i + 1) as u64, "seqs contiguous from 1");
+        }
+        // Order agreement: exactly one terminal, committed last; the
+        // boundary precedes it; every gap event precedes the terminal.
+        let is_terminal = |t: &str| {
+            matches!(
+                t,
+                "scan_completed" | "scan_incomplete" | "scan_interrupted" | "scan_failed"
+            )
+        };
+        let terminals: Vec<u64> = rows
+            .iter()
+            .filter(|r| is_terminal(r.event_type.as_str()))
+            .map(|r| r.seq)
+            .collect();
+        assert_eq!(terminals.len(), 1, "exactly one terminal event");
+        assert_eq!(
+            rows.last().expect("last").seq,
+            terminals[0],
+            "terminal event committed last"
+        );
+        let ready = rows
+            .iter()
+            .find(|r| r.event_type == "inventory_ready")
+            .expect("inventory_ready journaled");
+        assert!(
+            ready.seq < terminals[0],
+            "boundary commits before the terminal"
+        );
+        let errors: Vec<_> = rows.iter().filter(|r| r.event_type == "error").collect();
+        assert!(!errors.is_empty(), "gap journaled at least one error event");
+        for row in &errors {
+            assert!(
+                row.seq < terminals[0],
+                "gap event seq {} commits before the terminal",
+                row.seq
+            );
+        }
+        // Join the other way: every open gap row has a journaled error
+        // event (no committed gap silently missing its event).
+        let journaled: HashSet<String> = errors
+            .iter()
+            .map(|r| {
+                let v: serde_json::Value = serde_json::from_slice(&r.records).expect("error json");
+                v["id"].as_str().expect("event id").to_string()
+            })
+            .collect();
+        let open_rows = store.list_open_error_ids().await.expect("open ids");
+        assert!(!open_rows.is_empty(), "world holds open gaps");
+        for id in &open_rows {
+            assert!(
+                journaled.contains(&main_under_test::test_event_opaque_id(id)),
+                "open gap {id} has a journaled error event"
+            );
+        }
+        store.close().await.expect("close");
+    });
+}
+
+#[test]
+fn human_footers_and_destination_errors_scrub_local_paths() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("password=STATEPATHCANARY");
+    let cwd = dir.path().join("cwd");
+    repo_scan::privacy::private_dir_0700(&cwd).expect("cwd");
+    let root = dir.path().join("root");
+    repo_scan::privacy::private_dir_0700(&root).expect("root");
+    fixture::normal_clone(&root, "repo");
+    let report_dir = cwd.join("password=REPORTPATHCANARY");
+    repo_scan::privacy::private_dir_0700(&report_dir).expect("report dir");
+    let report = report_dir.join("report.json");
+    let successful = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            root.to_str().expect("root UTF-8"),
+            "--report",
+            report.to_str().expect("report UTF-8"),
+            "--format",
+            "human",
+        ],
+        &cwd,
+        &state,
+    );
+    assert_eq!(
+        successful.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&successful)
+    );
+    assert!(!stdout_text(&successful).contains("STATEPATHCANARY"));
+    assert!(!stdout_text(&successful).contains("REPORTPATHCANARY"));
+
+    let rejected_dest = state.join("password=ERRORPATHCANARY").join("report.json");
+    let rejected = run(
+        &[
+            "scan",
+            URL,
+            "--root",
+            root.to_str().expect("root UTF-8"),
+            "--report",
+            rejected_dest.to_str().expect("rejected path UTF-8"),
+            "--format",
+            "human",
+        ],
+        &cwd,
+        &state,
+    );
+    assert_ne!(rejected.status.code(), Some(0));
+    let diagnostic = stderr_text(&rejected);
+    assert!(!diagnostic.contains("STATEPATHCANARY"));
+    assert!(!diagnostic.contains("ERRORPATHCANARY"));
+}
+
+#[test]
+fn local_target_credentials_are_scrubbed_from_persistence_and_report() {
+    use repo_scan::store::{Store, TursoStore};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let cwd = dir.path().join("cwd");
+    repo_scan::privacy::private_dir_0700(&cwd).expect("cwd");
+    // Synthetic credential-shaped path component, used only as a canary.
+    let root = dir
+        .path()
+        .join("password=ghp_TESTTARGETCANARY00000000000000000000");
+    repo_scan::privacy::private_dir_0700(&root).expect("root");
+    let repo = fixture::normal_clone(&root, "repo");
+    let target = repo.to_str().expect("UTF-8 target");
+    let root_arg = root.to_str().expect("UTF-8 root");
+    let output = run(
+        &[
+            "scan",
+            target,
+            "--root",
+            root_arg,
+            "--report",
+            "report.json",
+            "--format",
+            "human",
+        ],
+        &cwd,
+        &state,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&output)
+    );
+    let report = read_report(&cwd.join("report.json"));
+    let scan_id = report["scan"]["id"].as_str().expect("scan id");
+    let scan_json = serde_json::to_string(&report["scan"]).expect("scan JSON");
+    assert!(
+        !scan_json.contains("TESTTARGETCANARY"),
+        "report scan target fields must not retain the synthetic credential"
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = TursoStore::open(&db).await.expect("open catalog");
+        let saved = store
+            .get_scan(scan_id)
+            .await
+            .expect("get scan")
+            .expect("scan row");
+        assert!(
+            !String::from_utf8_lossy(&saved.url_raw).contains("TESTTARGETCANARY"),
+            "scan url_raw must be scrubbed"
+        );
+        assert!(
+            !saved
+                .url_canonical
+                .as_deref()
+                .is_some_and(|bytes| String::from_utf8_lossy(bytes).contains("TESTTARGETCANARY")),
+            "scan url_canonical must be scrubbed"
+        );
+        assert!(
+            !saved
+                .targets_json
+                .as_deref()
+                .is_some_and(|text| text.contains("TESTTARGETCANARY")),
+            "targets_json must be scrubbed"
+        );
+        let rows = store
+            .read_scan_events(scan_id, 0, 10_000)
+            .await
+            .expect("read scan events");
+        let started = rows
+            .iter()
+            .find(|row| row.event_type == "scan_started")
+            .expect("scan_started event");
+        let records = String::from_utf8_lossy(&started.records);
+        assert!(
+            !records.contains("TESTTARGETCANARY"),
+            "scan_started target and root fields must be scrubbed"
+        );
+        store.close().await.expect("close catalog");
+    });
+}
+
+/// The active scan's recovery report is pinned separately from the newest
+/// window. Pruning must also keep the newest earlier running scan's
+/// snapshot when that snapshot falls outside the window.
+#[test]
+fn prior_running_scan_recovery_snapshot_survives_retention() {
+    use repo_scan::store::{NewScan, Store, TursoStore};
+    use std::collections::HashSet;
+
+    let env = Env::new();
+    let seed = env.scan(&["--report", "seed.json"], &env.cwd_a);
+    assert_eq!(
+        seed.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&seed)
+    );
+    let seed_scan_id = stdout_line(&seed, "scan_id");
+    let seed_report_id = repo_scan::config::report_id_for_scan(&seed_scan_id);
+    let seed_snapshot =
+        repo_scan::config::snapshot_path(&env.state, &seed_report_id).expect("seed snapshot path");
+    let mut recovery_report = read_report(&seed_snapshot);
+
+    let crashed_scan_id = "crashed-retention-prior";
+    let recovery_report_id = repo_scan::config::report_id_for_scan(crashed_scan_id);
+    let crashed_url = "https://github.com/OWNER/CRASHED";
+    let crashed_canonical =
+        repo_scan::identity::normalize_github_url(crashed_url).expect("crashed target");
+    recovery_report["report_id"] = recovery_report_id.clone().into();
+    recovery_report["scan"]["id"] = crashed_scan_id.into();
+    recovery_report["scan"]["target_url"] = crashed_url.into();
+    recovery_report["scan"]["canonical_url"] = crashed_canonical.clone().into();
+    let recovery_bytes = serde_json::to_vec(&recovery_report).expect("recovery report JSON");
+    let recovery_snapshot = repo_scan::config::snapshot_path(&env.state, &recovery_report_id)
+        .expect("recovery snapshot path");
+    std::fs::write(&recovery_snapshot, &recovery_bytes).expect("write recovery snapshot");
+
+    let recovery_outcome =
+        repo_scan::config::encode_outcome(-1, None, &recovery_report_id, false, Some(1));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let store = TursoStore::open(&env.state.join("payload").join("catalog.db"))
+            .await
+            .expect("open catalog");
+        let inserted = store
+            .create_scan_request(
+                &NewScan {
+                    id: crashed_scan_id,
+                    url_raw: crashed_url.as_bytes(),
+                    url_canonical: Some(crashed_canonical.as_bytes()),
+                    scope: "roots",
+                    status_mode: "summary",
+                    report_dest: None,
+                    targets_json: None,
+                    format: None,
+                    all_targets: None,
+                },
+                1,
+            )
+            .await
+            .expect("insert crashed scan");
+        assert!(inserted);
+        store
+            .update_scan_state(
+                crashed_scan_id,
+                "running:roots",
+                Some(&recovery_outcome),
+                None,
+                1,
+            )
+            .await
+            .expect("mark crashed scan running");
+        assert!(store
+            .save_report_snapshot(&recovery_report_id, "1.5.0", 1, 1, "staged", None, 1,)
+            .await
+            .expect("save recovery snapshot row"));
+        store.close().await.expect("close catalog");
+    });
+
+    // Place 33 newer, unreferenced snapshots behind the recovery snapshot.
+    // The recovery ID sorts before these if the filesystem has coarse mtime
+    // resolution, and its earlier creation time sorts it first otherwise.
+    for n in 0..=repo_scan::report::output::MAX_RETAINED_SNAPSHOTS {
+        let id = format!("retained-{n:03}");
+        let path = repo_scan::config::snapshot_path(&env.state, &id).expect("filler path");
+        std::fs::write(path, &recovery_bytes).expect("write filler snapshot");
+    }
+    let snapshots_dir = recovery_snapshot.parent().expect("snapshot directory");
+    let ordinary_victims = repo_scan::report::output::select_snapshot_victims(
+        repo_scan::report::output::list_snapshot_entries(snapshots_dir),
+        &HashSet::new(),
+        repo_scan::report::output::MAX_RETAINED_SNAPSHOTS,
+    );
+    assert!(
+        ordinary_victims
+            .iter()
+            .any(|entry| entry.id == recovery_report_id),
+        "setup puts the prior recovery snapshot outside normal retention"
+    );
+
+    let active = env.scan(&["--report", "active.json"], &env.cwd_a);
+    assert_eq!(
+        active.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_text(&active)
+    );
+    let active_scan_id = stdout_line(&active, "scan_id");
+    let active_report_id = repo_scan::config::report_id_for_scan(&active_scan_id);
+    let active_snapshot = repo_scan::config::snapshot_path(&env.state, &active_report_id)
+        .expect("active snapshot path");
+    assert!(active_snapshot.is_file(), "current scan report is retained");
+    assert!(
+        recovery_snapshot.is_file(),
+        "the latest prior running scan recovery report survives pruning"
+    );
+
+    let retained_files = repo_scan::report::output::list_snapshot_entries(snapshots_dir);
+    assert!(
+        (repo_scan::report::output::MAX_RETAINED_SNAPSHOTS + 1
+            ..=repo_scan::report::output::MAX_RETAINED_SNAPSHOTS + 2)
+            .contains(&retained_files.len()),
+        "only the current report and prior recovery report may extend the normal window"
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let store = TursoStore::open(&env.state.join("payload").join("catalog.db"))
+            .await
+            .expect("open catalog");
+        assert!(store
+            .get_report_snapshot(&recovery_report_id)
+            .await
+            .expect("recovery snapshot row")
+            .is_some());
+        store.close().await.expect("close catalog");
+    });
+}
+
+/// Sibling symlink spellings share one generation and refresh catalog rows
+/// persisted through the first alias.
+#[cfg(unix)]
+#[test]
+fn roots_symlink_alias_reuses_catalog_rows() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let cwd = dir.path().join("cwd");
+    let physical_lexical = dir.path().join("physical");
+    let alias_a = dir.path().join("alias-a");
+    let alias_c = dir.path().join("alias-c");
+    for path in [&cwd, &physical_lexical] {
+        repo_scan::privacy::private_dir_0700(path).expect("mkdir");
+    }
+    fixture::normal_clone(&physical_lexical, "repo");
+    let physical = std::fs::canonicalize(&physical_lexical).expect("canonical physical root");
+    symlink(&physical, &alias_a).expect("first symlink root alias");
+    symlink(&physical, &alias_c).expect("second symlink root alias");
+
+    let scan = |root: &Path, report_name: &str| {
+        let out = run(
+            &[
+                "scan",
+                "--all",
+                "--root",
+                root.to_str().expect("utf8 root"),
+                "--report",
+                report_name,
+            ],
+            &cwd,
+            &state,
+        );
+        assert!(
+            matches!(out.status.code(), Some(0) | Some(3)),
+            "usable report: {}",
+            stderr_text(&out)
+        );
+        read_report(&cwd.join(report_name))
+    };
+
+    let alias_a_root = alias_a.join("repo");
+    let alias_c_root = alias_c.join("repo");
+    let alias_a_report = scan(&alias_a_root, "alias-a.json");
+    let updated_commit = fixture::commit_file(
+        &physical.join("repo"),
+        "README.md",
+        "# fixture after alias A scan\n",
+        "advance before alias C scan",
+    );
+    repo_scan::privacy::private_write_0600(
+        &physical.join("repo/alias-refresh-untracked"),
+        b"untracked after alias A scan",
+    )
+    .expect("write dirty status marker");
+    let alias_report = scan(&alias_c_root, "alias-c.json");
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        alias_report["scan"]["generation"], alias_a_report["scan"]["generation"],
+        "sibling root spellings share the canonical generation"
+    );
+    #[cfg(not(target_os = "macos"))]
+    assert_ne!(
+        alias_report["scan"]["generation"], alias_a_report["scan"]["generation"],
+        "fresh generation when events unsupported"
+    );
+    assert_eq!(
+        alias_report["repositories"].as_array().unwrap().len(),
+        1,
+        "alias report must retain physical catalog rows: {alias_report}"
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(alias_report["checkouts"].as_array().unwrap().len(), 1);
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(alias_report["checkouts"].as_array().unwrap().len(), 2);
+    assert!(!alias_report["branches"].as_array().unwrap().is_empty());
+    assert!(
+        alias_report["checkouts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["status"]["working_state"] == "dirty"),
+        "status is refreshed for the checkout"
+    );
+    assert_eq!(
+        alias_report["branches"][0]["oid"]["hex"], updated_commit,
+        "branch analysis refreshes the prior alias-A store"
+    );
+
+    let git_path_id = alias_report["repositories"][0]["git_path_id"]
+        .as_str()
+        .expect("repository git path id");
+    let git_path = alias_report["paths"]
+        .as_array()
+        .expect("paths")
+        .iter()
+        .find(|path| path["id"].as_str() == Some(git_path_id))
+        .expect("repository git path")["value"]
+        .as_str()
+        .expect("UTF-8 git path");
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        git_path,
+        alias_a.join("repo/.git").to_str().expect("utf8 path"),
+        "alias scope retains the prior alias-A catalog spelling"
+    );
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(
+        git_path,
+        alias_c.join("repo/.git").to_str().expect("utf8 path"),
+        "alias scope reflects the current alias-C catalog spelling on non-macos"
+    );
+
+    let root_gap_id = "shared-root-gap";
+    let physical_repo = physical.join("repo");
+    let alias_a_repo = alias_a.join("repo");
+    let root_scope_key = repo_scan::config::scope_key_for_dir(&physical_repo);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = repo_scan::store::TursoStore::open(&db)
+            .await
+            .expect("open catalog");
+        store
+            .record_error(
+                root_gap_id,
+                &root_scope_key,
+                "permission-denied",
+                "synthetic shared-root gap",
+                None,
+                repo_scan::store::now_ms(),
+            )
+            .await
+            .expect("seed root gap");
+        store.close().await.expect("close catalog");
+    });
+
+    let both = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            physical_repo.to_str().expect("utf8 physical repo root"),
+            "--root",
+            alias_a_repo.to_str().expect("utf8 alias A repo root"),
+            "--report",
+            "both.json",
+        ],
+        &cwd,
+        &state,
+    );
+    assert!(
+        matches!(both.status.code(), Some(0) | Some(3)),
+        "usable paired-root report: {}",
+        stderr_text(&both)
+    );
+    let both_report = read_report(&cwd.join("both.json"));
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        both_report["scan"]["generation"],
+        alias_a_report["scan"]["generation"]
+    );
+    #[cfg(not(target_os = "macos"))]
+    assert_ne!(
+        both_report["scan"]["generation"],
+        alias_a_report["scan"]["generation"]
+    );
+    assert_eq!(both_report["roots"].as_array().unwrap().len(), 2);
+    assert_eq!(both_report["repositories"].as_array().unwrap().len(), 1);
+    assert!(both_report["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|error| error["id"].as_str() == Some(root_gap_id)));
+    assert!(both_report["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|root| root["error_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id.as_str() == Some(root_gap_id))));
+
+    let reversed = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            alias_a_repo.to_str().expect("utf8 alias A repo root"),
+            "--root",
+            physical_repo.to_str().expect("utf8 physical repo root"),
+            "--report",
+            "both-reversed.json",
+        ],
+        &cwd,
+        &state,
+    );
+    assert!(
+        matches!(reversed.status.code(), Some(0) | Some(3)),
+        "usable reversed paired-root report: {}",
+        stderr_text(&reversed)
+    );
+    let reversed_report = read_report(&cwd.join("both-reversed.json"));
+    assert_eq!(reversed_report["roots"].as_array().unwrap().len(), 2);
+    assert_eq!(reversed_report["repositories"].as_array().unwrap().len(), 1);
+    assert!(reversed_report["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|root| root["error_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id.as_str() == Some(root_gap_id))));
+
+    // Start with an alias-only root and a lexically keyed identity gap.
+    // Both its own rows and the safety gap must survive report filtering.
+    let fresh_lexical = dir.path().join("fresh-physical");
+    let fresh_alias = dir.path().join("fresh-alias");
+    repo_scan::privacy::private_dir_0700(&fresh_lexical).expect("mkdir fresh root");
+    fixture::normal_clone(&fresh_lexical, "repo");
+    let fresh_physical = std::fs::canonicalize(&fresh_lexical).expect("canonical fresh root");
+    symlink(&fresh_physical, &fresh_alias).expect("fresh symlink root");
+    let fresh_gap_id = "fresh-alias-identity-gap";
+    let fresh_scope = repo_scan::config::scope_key_for_dir(&fresh_alias);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = repo_scan::store::TursoStore::open(&db)
+            .await
+            .expect("open catalog");
+        store
+            .record_error(
+                fresh_gap_id,
+                &fresh_scope,
+                "fence-identity-unknown",
+                "synthetic unresolved alias identity",
+                None,
+                repo_scan::store::now_ms(),
+            )
+            .await
+            .expect("seed fresh alias gap");
+        store.close().await.expect("close catalog");
+    });
+    let fresh = run(
+        &[
+            "scan",
+            "--all",
+            "--root",
+            fresh_alias.to_str().expect("utf8 fresh alias"),
+            "--report",
+            "fresh-alias.json",
+        ],
+        &cwd,
+        &state,
+    );
+    assert!(
+        matches!(fresh.status.code(), Some(0) | Some(3)),
+        "usable fresh alias report: {}",
+        stderr_text(&fresh)
+    );
+    let fresh_report = read_report(&cwd.join("fresh-alias.json"));
+    assert!(fresh_report["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|error| error["id"].as_str() == Some(fresh_gap_id)));
+    assert!(fresh_report["roots"][0]["error_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|id| id.as_str() == Some(fresh_gap_id)));
+}
+
+/// Explicit roots are report boundaries even when the catalog already has
+/// matching records from an earlier `--all` run at a different root.
+#[test]
+fn sequential_all_root_scans_exclude_prior_out_of_scope_records() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let cwd = dir.path().join("cwd");
+    let root_a = dir.path().join("root-a");
+    let root_b = dir.path().join("root-b");
+    for path in [&cwd, &root_a, &root_b] {
+        repo_scan::privacy::private_dir_0700(path).expect("mkdir");
+    }
+    fixture::normal_clone(&root_a, "repo");
+    fixture::normal_clone(&root_b, "repo");
+
+    let scan = |root: &Path, report_name: &str| {
+        let out = run(
+            &[
+                "scan",
+                "--all",
+                "--root",
+                root.to_str().expect("utf8 root"),
+                "--report",
+                report_name,
+                "--format",
+                "human",
+            ],
+            &cwd,
+            &state,
+        );
+        assert!(
+            matches!(out.status.code(), Some(0) | Some(3)),
+            "usable report: {}",
+            stderr_text(&out)
+        );
+        read_report(&cwd.join(report_name))
+    };
+
+    let first = scan(&root_a, "root-a.json");
+    assert_eq!(first["repositories"].as_array().unwrap().len(), 1);
+
+    // Model a persisted root-A report-derivation gap. Root B must not
+    // surface it when both scopes share the same catalog.
+    let root_a_set = [root_a.clone()];
+    let old_gap_id = repo_scan::config::report_derivation_gap_id("errors", Some(&root_a_set));
+    let old_gap_scope = repo_scan::config::report_derivation_gap_scope_key(Some(&root_a_set));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let db = state.join("payload").join("catalog.db");
+        let store = repo_scan::store::TursoStore::open(&db)
+            .await
+            .expect("open catalog");
+        store
+            .record_error(
+                &old_gap_id,
+                &old_gap_scope,
+                "report-derivation-truncated",
+                "root A derivation budget reached",
+                None,
+                repo_scan::store::now_ms(),
+            )
+            .await
+            .expect("seed root A gap");
+        store.close().await.expect("close catalog");
+    });
+
+    let second = scan(&root_b, "root-b.json");
+    assert_eq!(second["repositories"].as_array().unwrap().len(), 1);
+    assert_eq!(second["checkouts"].as_array().unwrap().len(), 1);
+    assert_eq!(second["repositories"][0]["match"], "confirmed");
+    assert!(
+        second["errors"]
+            .as_array()
+            .expect("errors array")
+            .iter()
+            .all(|error| error["id"].as_str() != Some(old_gap_id.as_str())),
+        "root B report must exclude root A's persisted derivation gap: {}",
+        second["errors"]
+    );
+
+    let paths = second["paths"].as_array().expect("paths array");
+    for record in paths {
+        let value = record["value"].as_str().unwrap_or_default();
+        assert!(
+            !value.contains(root_a.to_str().expect("root A UTF-8")),
+            "out-of-scope path was persisted in the second report: {value}"
+        );
+    }
+    let checkout = &second["checkouts"][0];
+    let path_id = checkout["root_path_id"].as_str().expect("root path id");
+    let checkout_path = paths
+        .iter()
+        .find(|path| path["id"] == path_id)
+        .expect("checkout path record")["value"]
+        .as_str()
+        .expect("UTF-8 checkout path");
+    assert!(
+        checkout_path.starts_with(root_b.to_str().expect("root B UTF-8")),
+        "second report checkout belongs to root B: {checkout_path}"
+    );
 }

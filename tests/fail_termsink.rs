@@ -184,6 +184,10 @@ fn termsink_lower_layer_remote_never_emits_raw() {
 /// Secret-pair path components redact on the terminal display channel
 /// only: stdout/stderr stay clean while the report keeps the lossless
 /// `value` bytes (display/value split, mirroring the query path display).
+/// (SLICE-5: the TTY-only terminal renderer is pinned without a PTY by
+/// rendering the parsed report directly — Wave6 redirected scans stream
+/// the JSONL journal, whose projection `termsink_secret_pair_omitted_
+/// from_jsonl_event_projection` pins below.)
 #[test]
 fn termsink_secret_pair_path_redacted_on_terminal_only() {
     let dir = tempfile::tempdir_in("/tmp").expect("tmpdir under /tmp");
@@ -196,44 +200,9 @@ fn termsink_secret_pair_path_redacted_on_terminal_only() {
     );
     let root_str = root.to_str().expect("utf8").to_string();
 
-    // Terminal mode (spec §3: no --report renders the readable report):
-    // the repository renders with the secret pair scrubbed on stdout.
-    // File mode prints only the summary lines, never the render.
-    let state = dir.path().join("state-term");
-    let cwd = dir.path().join("cwd-term");
-    repo_scan::privacy::private_dir_0700(&cwd).expect("mkdir");
-    let out = run(
-        &[
-            "scan",
-            "https://github.com/o/r",
-            "--root",
-            root_str.as_str(),
-        ],
-        &cwd,
-        &state,
-    );
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("repositories: 1"),
-        "repo rendered: {stdout}"
-    );
-    assert!(
-        stdout.contains("token=<redacted>"),
-        "scrubbed pair rendered: {stdout}"
-    );
-    assert!(
-        !contains_bytes(&out.stdout, canary.as_bytes()),
-        "canary on terminal stdout: {stdout}"
-    );
-    assert!(!contains_bytes(&out.stderr, canary.as_bytes()));
-
-    // File mode: the report keeps the lossless path value bytes.
+    // File mode: the report keeps the lossless path value bytes, and the
+    // same report renders scrubbed through the terminal renderer (the
+    // TTY-only lane, pinned here without a PTY).
     let state_f = dir.path().join("state-file");
     let cwd_f = dir.path().join("cwd-file");
     repo_scan::privacy::private_dir_0700(&cwd_f).expect("mkdir");
@@ -262,6 +231,20 @@ fn termsink_secret_pair_path_redacted_on_terminal_only() {
         contains_bytes(&report, canary.as_bytes()),
         "lossless path value retained in report"
     );
+    let parsed: repo_scan::report::model::Report =
+        serde_json::from_slice(&report).expect("report parses");
+    let mut rendered: Vec<u8> = Vec::new();
+    repo_scan::report::render::render_terminal(&parsed, &mut rendered).expect("render");
+    let text = String::from_utf8(rendered.clone()).expect("utf8");
+    assert!(text.contains("repositories: 1"), "repo rendered: {text}");
+    assert!(
+        text.contains("token=<redacted>"),
+        "scrubbed pair rendered: {text}"
+    );
+    assert!(
+        !contains_bytes(&rendered, canary.as_bytes()),
+        "canary on terminal render: {text}"
+    );
 }
 
 /// The terminal `target ...` line passes the same prose scrubber as every
@@ -281,4 +264,119 @@ fn termsink_target_line_scrubs_secret_pairs() {
         !contains_bytes(&out, canary.as_bytes()),
         "canary on terminal output: {text}"
     );
+}
+
+/// ADJ-03 pivot (consolidation slice 3): secret-pair path components are
+/// OMITTED from the JSONL event projection — neither the raw path nor its
+/// reversible hex/base64 encodings survive `event_safe_records`, while
+/// stable opaque join IDs (`evt:`/`root:`) are retained. This pins the
+/// projection seam owned by `scan_events.rs`; the binary-level assertion
+/// (redirected scan JSONL replay omits the same bytes, B11's rewritten
+/// `termsink_secret_pair_path_omitted_from_jsonl_and_redacted_on_terminal`)
+/// lands when slice 5 wires the emit/replay paths to this projection.
+/// The terminal-redaction lane stays pinned by
+/// `termsink_secret_pair_path_redacted_on_terminal_only` above.
+#[test]
+fn termsink_secret_pair_omitted_from_jsonl_event_projection() {
+    use repo_scan::scan_events::{envelope_for_row, event_safe_records, EventType};
+
+    let canary = "TERMSINKPATH04";
+    let path = format!("/tmp/probe-root/proj-token={canary}");
+    let git_path = format!("{path}/.git");
+    let path_hex = repo_scan::config::encode_hex(path.as_bytes());
+    let path_b64 = std_base64(path.as_bytes());
+
+    let records = event_safe_records(
+        EventType::LocationFound,
+        serde_json::json!({
+            "checkout_id": format!("co:{path_hex}"),
+            "store_id": format!("git:{path_hex}"),
+            "path": path,
+            "path_hex": path_hex,
+            "git_path": git_path,
+            "git_path_hex": repo_scan::config::encode_hex(git_path.as_bytes()),
+        }),
+    );
+    for key in ["path", "path_hex", "git_path", "git_path_hex"] {
+        assert!(
+            records.get(key).is_none(),
+            "{key} omitted from location event"
+        );
+    }
+    assert!(
+        records["checkout_id"]
+            .as_str()
+            .expect("checkout id")
+            .starts_with("evt:"),
+        "checkout id retained as an opaque join key"
+    );
+    assert!(
+        records["store_id"]
+            .as_str()
+            .expect("store id")
+            .starts_with("evt:"),
+        "store id retained as an opaque join key"
+    );
+
+    // The same omission holds through the replay boundary (envelope build).
+    let row = repo_scan::store::ScanEventRow {
+        scan_id: "scan-termsink".to_string(),
+        seq: 1,
+        catalog_rev: 1,
+        event_offset: 0,
+        event_type: "location_found".to_string(),
+        op: "add".to_string(),
+        reset: false,
+        records: serde_json::to_vec(&serde_json::json!({
+            "checkout_id": format!("co:{path_hex}"),
+            "store_id": format!("git:{path_hex}"),
+            "path": path,
+            "path_hex": path_hex,
+        }))
+        .expect("records"),
+    };
+    let env = envelope_for_row(&row).expect("envelope");
+    let jsonl = serde_json::to_string(&env).expect("JSONL line");
+
+    for text in [
+        serde_json::to_string(&records).expect("records JSON"),
+        jsonl,
+    ] {
+        assert!(!text.contains(canary), "canary in projection: {text}");
+        assert!(!text.contains(&path), "raw local path in projection");
+        assert!(
+            !text.contains(&path_hex),
+            "reversible hex path in projection"
+        );
+        assert!(
+            !text.contains(&path_b64),
+            "reversible base64 path in projection"
+        );
+    }
+}
+
+/// Standard base64 (RFC 4648 §4, padded) for the reversible-encoding
+/// canary sweep.
+fn std_base64(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(n >> 18 & 63) as usize] as char);
+        out.push(ALPHABET[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }

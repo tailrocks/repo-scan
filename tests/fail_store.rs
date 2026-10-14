@@ -373,3 +373,54 @@ fn privacy_catalog_private_modes() {
         s.close().await.unwrap();
     });
 }
+#[test]
+fn p3b_batch_renewal_reports_lost_and_skips_empty() {
+    rt().block_on(async {
+        let t = tempfile::tempdir().unwrap();
+        let s = TursoStore::open(&t.path().join("c.db")).await.unwrap();
+        let n = now_ms();
+        enq(&s, "b1", 1, n).await;
+        enq(&s, "b2", 1, n).await;
+        enq(&s, "b3", 1, n).await;
+        let e = s.epoch();
+        let claimed = s
+            .claim_tasks_in_generation(1, e, 10, 1_000, n)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 3);
+        // b3 completes, so its lease is gone at batch-renewal time.
+        s.complete_task("b3", claimed[2].token, e, &TaskOutcome::Complete, n)
+            .await
+            .unwrap();
+        let tx_before = s.stats().transactions;
+        let leases: Vec<(&str, i64, u64)> = claimed
+            .iter()
+            .map(|c| {
+                (
+                    c.task.id.as_str(),
+                    c.token,
+                    c.task.lease_epoch.unwrap_or(u64::MAX),
+                )
+            })
+            .collect();
+        let lost = s
+            .renew_leases_batch(&leases, 60_000, n + 500)
+            .await
+            .unwrap();
+        assert_eq!(lost, vec![String::from("b3")]);
+        assert_eq!(s.stats().transactions, tx_before + 1);
+        for c in &claimed[..2] {
+            let row = s.get_task(&c.task.id).await.unwrap().unwrap();
+            assert_eq!(row.lease_expires_ms, Some(n + 500 + 60_000));
+        }
+        let tx_empty = s.stats().transactions;
+        let none: Vec<(&str, i64, u64)> = Vec::new();
+        assert!(s
+            .renew_leases_batch(&none, 60_000, n)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(s.stats().transactions, tx_empty);
+        s.close().await.unwrap();
+    });
+}

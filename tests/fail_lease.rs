@@ -353,3 +353,185 @@ fn r04_slow_mount_renewal_before_ttl_lapses() {
         store.close().await.expect("close");
     });
 }
+
+/// R4 pre-persist gate: an enumeration whose lease a rival reclaimed
+/// between claim and execution retries under `lease-lost` and persists
+/// nothing — the stale collection never reaches the catalog. The
+/// `lease-lost` category (not the in-loop `enumerate-error`) proves the
+/// pre-persist gate tripped; exactly one incomplete task (the still-leased
+/// self) proves no child rows were enqueued.
+#[test]
+fn store_stale_enum_lease_retries_before_persist() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = db_in(&dir);
+        let store = TursoStore::open(&db).await.expect("open");
+        let generation = store
+            .create_generation("roots", "running", None, now_ms())
+            .await
+            .expect("generation");
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("child")).unwrap();
+        let outcome = main_under_test::test_enumerate_stale_outcome(
+            &store,
+            std::slice::from_ref(&root),
+            generation,
+            &root,
+        )
+        .await
+        .expect("stale enum");
+        match outcome {
+            StoreOutcome::Retry {
+                category, detail, ..
+            } => {
+                assert_eq!(category, "lease-lost");
+                assert!(detail.contains("before persisting enumeration"), "{detail}");
+            }
+            other => panic!("stale enum must retry, got {other:?}"),
+        }
+        assert_eq!(store.pending_count(generation).await.expect("pending"), 1);
+        store.close().await.unwrap();
+    });
+}
+
+/// R4: releasing a denied claim returns the task to `pending` AND
+/// compensates the claim's `attempts + 1` — a claim that never ran
+/// must not burn the retry budget `fail_task` exhausts on. A
+/// token/epoch mismatch releases nothing.
+#[test]
+fn release_claim_compensates_unrun_attempt() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = db_in(&dir);
+        let store = TursoStore::open(&db).await.expect("open");
+        let epoch = store.epoch();
+        let t0 = now_ms();
+        store
+            .enqueue_task(
+                &NewTask {
+                    id: "t-denied",
+                    kind: "probe_git",
+                    generation: 1,
+                    dir_id: None,
+                    scope_key: "s",
+                    expected_rev: 0,
+                    idempotency_key: "idem-denied",
+                },
+                t0,
+            )
+            .await
+            .expect("enqueue");
+        let claimed = store
+            .claim_tasks(epoch, 10, 60_000, t0)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1);
+        let token = claimed[0].token;
+        let row = store.get_task("t-denied").await.expect("get").expect("row");
+        assert_eq!(row.attempts, 1);
+        assert!(store
+            .release_claim("t-denied", token, epoch, t0 + 1)
+            .await
+            .expect("release"));
+        let row = store.get_task("t-denied").await.expect("get").expect("row");
+        assert_eq!(row.state, TaskState::Pending);
+        assert_eq!(row.attempts, 0, "denied claim burns no attempt");
+        assert!(row.lease_token.is_none());
+        // Mismatch releases nothing and reports false.
+        let claimed = store
+            .claim_tasks(epoch, 10, 60_000, t0 + 2)
+            .await
+            .expect("reclaim");
+        assert!(!store
+            .release_claim("t-denied", claimed[0].token + 1, epoch, t0 + 3)
+            .await
+            .expect("mismatch release"));
+        let row = store.get_task("t-denied").await.expect("get").expect("row");
+        assert_ne!(row.state, TaskState::Pending);
+        store.close().await.unwrap();
+    });
+}
+
+/// A handle that outlives its owner guard must not release work claimed by
+/// the next owner incarnation, even if it supplies that owner's epoch and
+/// token. Lease mutations are fenced by both the row lease and this
+/// handle's immutable epoch.
+#[test]
+fn stale_owner_cannot_release_new_owner_claim() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (old_guard, old_store) = TursoStore::open_owned(dir.path()).await.expect("old owner");
+        let old_epoch = old_store.epoch();
+        let t0 = now_ms();
+        old_store
+            .enqueue_task(
+                &NewTask {
+                    id: "t-owner-fence",
+                    kind: "probe_git",
+                    generation: 1,
+                    dir_id: None,
+                    scope_key: "s",
+                    expected_rev: 0,
+                    idempotency_key: "idem-owner-fence",
+                },
+                t0,
+            )
+            .await
+            .expect("enqueue");
+        let old_claim = old_store
+            .claim_tasks(old_epoch, 1, 60_000, t0)
+            .await
+            .expect("old claim");
+        assert_eq!(old_claim.len(), 1);
+
+        // Simulate owner replacement while a stale store handle remains.
+        drop(old_guard);
+        let (new_guard, new_store) = TursoStore::open_owned(dir.path()).await.expect("new owner");
+        let new_epoch = new_store.epoch();
+        assert_eq!(new_epoch, old_epoch + 1);
+        let takeover_at = t0 + 60_001;
+        let new_claim = new_store
+            .claim_tasks(new_epoch, 1, 60_000, takeover_at)
+            .await
+            .expect("new claim");
+        assert_eq!(new_claim.len(), 1);
+
+        // The old handle can see the current row, but cannot use the new
+        // owner's credentials to mutate it.
+        let err = old_store
+            .release_claim(
+                &new_claim[0].task.id,
+                new_claim[0].token,
+                new_epoch,
+                takeover_at,
+            )
+            .await
+            .expect_err("stale handle must be fenced");
+        assert!(err.to_string().contains("not this owner"), "{err}");
+        let row = new_store
+            .get_task("t-owner-fence")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.state, TaskState::Leased);
+        assert_eq!(row.lease_token, Some(new_claim[0].token));
+        assert_eq!(row.lease_epoch, Some(new_epoch));
+
+        new_store
+            .complete_task(
+                "t-owner-fence",
+                new_claim[0].token,
+                new_epoch,
+                &StoreOutcome::Complete,
+                takeover_at,
+            )
+            .await
+            .expect("new owner completes");
+        old_store.close().await.expect("close old handle");
+        new_store.close().await.expect("close new handle");
+        drop(new_guard);
+    });
+}

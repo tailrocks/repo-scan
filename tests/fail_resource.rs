@@ -249,15 +249,37 @@ fn state03_error_derivations_cap_and_gap() {
             Some(1),
             "truncation must record an open gap row"
         );
-        // The gap row itself is not a probe candidate, so generous caps
-        // still derive exactly the ten fixtures with no truncation.
+        // A resumed pass derives only the suffix after its stored cursor.
+        // It must keep the gap open because this report still lacks the
+        // first three candidates from the prior pass.
         let wide = main_under_test::DerivationCaps::default_caps();
-        let second = main_under_test::scan_error_derivations(&store, &[scope], &wide)
+        let second =
+            main_under_test::scan_error_derivations(&store, std::slice::from_ref(&scope), &wide)
+                .await
+                .expect("scan");
+        assert!(second.truncated, "the resumed suffix is not a full report");
+        assert_eq!(second.candidates.len(), 7, "remaining suffix only");
+        assert_eq!(second.scanned, 8, "seven fixtures plus the gap row");
+        assert_eq!(
+            error_open_flag(&store, "gap:report-derivation:errors").await,
+            Some(1),
+            "the gap stays open until a full pass emits every candidate"
+        );
+
+        // The resumed pass reached the end and reset its cursor. A pass
+        // from the beginning can now emit all ten candidates and resolve
+        // the gap without truncation.
+        let third = main_under_test::scan_error_derivations(&store, &[scope], &wide)
             .await
             .expect("scan");
-        assert!(!second.truncated);
-        assert_eq!(second.candidates.len(), 10);
-        assert_eq!(second.scanned, 11, "ten fixtures plus the gap row");
+        assert!(!third.truncated);
+        assert_eq!(third.candidates.len(), 10);
+        assert_eq!(third.scanned, 11, "ten fixtures plus the gap row");
+        assert_eq!(
+            error_open_flag(&store, "gap:report-derivation:errors").await,
+            Some(0),
+            "the full derivation pass resolves the gap"
+        );
     });
 }
 
@@ -316,13 +338,32 @@ fn state03_instance_derivations_cap_and_gap() {
             Some(1),
             "truncation must record an open gap row"
         );
+        // The resumed pass derives only the suffix; keep the gap open
+        // until a from-start report contains the initial three records too.
         let wide = main_under_test::DerivationCaps::default_caps();
         let second = main_under_test::scan_instance_derivations(&store, &wide)
             .await
             .expect("scan");
-        assert!(!second.truncated);
-        assert_eq!(second.candidates.len(), 10);
-        assert_eq!(second.storage_links.len(), 10, "one common-dir edge each");
+        assert!(second.truncated, "the resumed suffix is not a full report");
+        assert_eq!(second.candidates.len(), 7, "remaining suffix only");
+        assert_eq!(second.storage_links.len(), 7, "one edge per suffix row");
+        assert_eq!(
+            error_open_flag(&store, "gap:report-derivation:instances").await,
+            Some(1),
+            "the gap stays open until a full pass emits every instance"
+        );
+
+        let third = main_under_test::scan_instance_derivations(&store, &wide)
+            .await
+            .expect("scan");
+        assert!(!third.truncated);
+        assert_eq!(third.candidates.len(), 10);
+        assert_eq!(third.storage_links.len(), 10, "one common-dir edge each");
+        assert_eq!(
+            error_open_flag(&store, "gap:report-derivation:instances").await,
+            Some(0),
+            "the full derivation pass resolves the gap"
+        );
     });
 }
 

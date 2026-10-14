@@ -1,0 +1,2507 @@
+{
+  "count": 100,
+  "notes": [
+    "rfc_sections cite repo-scan-fast-discovery-rfc.md headings; goal-prefixed",
+    "entries cite repo-scan-consolidate-and-optimize-goal.md sections because the",
+    "checklist IDs originate in goal section 8 governance, not in the RFC.",
+    "tests[] entries are placeholders to be replaced by contract authors with",
+    "real integration test names; *_contract_tbd marks an unfilled mapping."
+  ],
+  "requirements": [
+    {
+      "claim": "Full RFC and all-branch audit read, source hashes recorded, actual main/source snapshots and drift documented.",
+      "green_evidence": [],
+      "id": "GOV-01",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-manifest-review-plus-machine-verifier",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "2. Source baseline",
+        "goal section 1.2"
+      ],
+      "status": "pending",
+      "tests": [
+        "governance::gov_01_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Every normative RFC and accepted source contribution has an implementation/test/evidence mapping; experiments, conditionals and provenance-only sources are explicitly classified.",
+      "green_evidence": [],
+      "id": "GOV-02",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-manifest-review-plus-machine-verifier",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1.2",
+        "goal section 8"
+      ],
+      "status": "pending",
+      "tests": [
+        "governance::gov_02_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Real subagent launches, assignments, separate ownership, red/green handoffs, and independent reviews are recorded.",
+      "green_evidence": [],
+      "id": "GOV-03",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-manifest-review-plus-machine-verifier",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 2"
+      ],
+      "status": "pending",
+      "tests": [
+        "governance::gov_03_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Frozen baseline, policy, datasets, native matrix, build settings, and trusted verification mechanism are intact.",
+      "green_evidence": [],
+      "id": "GOV-04",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-manifest-review-plus-machine-verifier",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "10. Benchmark and test contract",
+        "goal section 7"
+      ],
+      "status": "pending",
+      "tests": [
+        "governance::gov_04_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Proof-runner corruption/negative-control integration tests reject false greens.",
+      "green_evidence": [],
+      "id": "GOV-05",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-manifest-review-plus-machine-verifier",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 3.3"
+      ],
+      "status": "pending",
+      "tests": [
+        "governance::gov_05_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Final evidence references assembled and actual landed clean revisions and rebuilt release binaries, not stale branch results.",
+      "green_evidence": [],
+      "id": "GOV-06",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-manifest-review-plus-machine-verifier",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 3.2",
+        "goal step 21"
+      ],
+      "status": "pending",
+      "tests": [
+        "governance::gov_06_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Every new requirement has intended red-to-green integration evidence; baseline-correct requirements have mutation/negative-control evidence.",
+      "green_evidence": [],
+      "id": "TDD-01",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "red-green-history-reconciliation",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 4"
+      ],
+      "status": "pending",
+      "tests": [
+        "tdd_protocol::tdd_01_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "No newly authored unit tests; recovered legacy tests are inventoried, meaningful unit coverage has integration replacements, and any remaining temporary exceptions are minimal and excluded from acceptance.",
+      "green_evidence": [],
+      "id": "TDD-02",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "red-green-history-reconciliation",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1 (1)",
+        "goal section 4"
+      ],
+      "status": "pending",
+      "tests": [
+        "tdd_protocol::tdd_02_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Existing security/correctness protections were neither deleted nor weakened for performance.",
+      "green_evidence": [],
+      "id": "TDD-03",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "red-green-history-reconciliation",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1 (2)"
+      ],
+      "status": "pending",
+      "tests": [
+        "tdd_protocol::tdd_03_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Fixtures and normalized expected graphs are independent of the production discovery/parser implementation.",
+      "green_evidence": [],
+      "id": "TDD-04",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "red-green-history-reconciliation",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "10. Benchmark and test contract",
+        "goal section 4"
+      ],
+      "status": "pending",
+      "tests": [
+        "tdd_protocol::tdd_04_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "All/single/multi-target, roots, details, cached queries, resume, invalidation, follow, JSON/JSONL, and reports pass public contract tests.",
+      "green_evidence": [],
+      "id": "CLI-01",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "public-cli-contract-fixture",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1.3 Outputs and CLI"
+      ],
+      "status": "pending",
+      "tests": [
+        "cli_contract::cli_01_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Metadata-first behavior and old-summary migration are explicit and versioned/profiled; unknown/not-requested/zero remain distinct.",
+      "green_evidence": [],
+      "id": "CLI-02",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "public-cli-contract-fixture",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "6. Git enrichment and storage",
+        "goal section 1.3 Outputs and CLI"
+      ],
+      "status": "pending",
+      "tests": [
+        "cli_contract::cli_02_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "`.git` directories/files, separate Git directories, relative pointers, arbitrary bare names, and HEAD candidate false positives are handled.",
+      "green_evidence": [],
+      "id": "DISC-01",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "fixture-truth-manifest-vs-cli-result",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "3. Discovery and identity contract",
+        "Required Git shapes"
+      ],
+      "status": "pending",
+      "tests": [
+        "discovery::disc_01_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Hidden/ignored/nested/build/cache/tmp/package repositories are found under exhaustive policy.",
+      "green_evidence": [],
+      "id": "DISC-02",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "fixture-truth-manifest-vs-cli-result",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "3. Discovery and identity contract"
+      ],
+      "status": "pending",
+      "tests": [
+        "discovery::disc_02_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Strict arbitrary placement versus administrative pruning is explicit and tested; finding a repo never silently prunes its working tree.",
+      "green_evidence": [],
+      "id": "DISC-03",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "fixture-truth-manifest-vs-cli-result",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "3. Discovery and identity contract"
+      ],
+      "status": "pending",
+      "tests": [
+        "discovery::disc_03_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Native path bytes, case policy, aliases, cycles, root/mount boundaries, and replacement/incarnation are preserved.",
+      "green_evidence": [],
+      "id": "DISC-04",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "fixture-truth-manifest-vs-cli-result",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "3. Discovery and identity contract"
+      ],
+      "status": "pending",
+      "tests": [
+        "discovery::disc_04_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Names/types fast path avoids ordinary content reads and unnecessary metadata/path work while handling unknown types/errors.",
+      "green_evidence": [],
+      "id": "DISC-05",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "fixture-truth-manifest-vs-cli-result",
+      "performance_gate_ids": [
+        "PERF-MECHANISM"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "4.2 Portable directory enumeration"
+      ],
+      "status": "pending",
+      "tests": [
+        "discovery::disc_05_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Early catalog/registry/root candidates improve prioritization without certifying that all independent copies have been found.",
+      "green_evidence": [],
+      "id": "DISC-06",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "fixture-truth-manifest-vs-cli-result",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "4.1 Existing catalog and registries"
+      ],
+      "status": "pending",
+      "tests": [
+        "discovery::disc_06_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Exact validation prevents upward-discovery false repositories.",
+      "green_evidence": [],
+      "id": "GIT-01",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "fixture-truth-manifest-vs-cli-result",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "3. Discovery and identity contract",
+        "Required Git shapes"
+      ],
+      "status": "pending",
+      "tests": [
+        "git_graph::git_01_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Independent clones remain distinct; common stores/worktrees/physical aliases are correctly related.",
+      "green_evidence": [],
+      "id": "GIT-02",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "fixture-truth-manifest-vs-cli-result",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "3. Discovery and identity contract"
+      ],
+      "status": "pending",
+      "tests": [
+        "git_graph::git_02_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Submodules, broken/missing/locked/prunable/out-of-scope registrations have correct evidence/availability.",
+      "green_evidence": [],
+      "id": "GIT-03",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "fixture-truth-manifest-vs-cli-result",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "3. Discovery and identity contract",
+        "Required Git shapes"
+      ],
+      "status": "pending",
+      "tests": [
+        "git_graph::git_03_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Loose/packed/reftable refs, detached/unborn/symbolic HEAD, and SHA-256 pass independent oracles.",
+      "green_evidence": [],
+      "id": "GIT-04",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "fixture-truth-manifest-vs-cli-result",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "6. Git enrichment and storage",
+        "Stages"
+      ],
+      "status": "pending",
+      "tests": [
+        "git_graph::git_04_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Common-ref work is shared; per-worktree HEAD and config evaluation remain separate.",
+      "green_evidence": [],
+      "id": "GIT-05",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "fixture-truth-manifest-vs-cli-result",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "6. Git enrichment and storage",
+        "Stages"
+      ],
+      "status": "pending",
+      "tests": [
+        "git_graph::git_05_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Multiple remotes/roles, normalization, Enterprise configuration, includes/rewrites, and unknown identities are correct and redacted.",
+      "green_evidence": [],
+      "id": "GIT-06",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "fixture-truth-manifest-vs-cli-result",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "3. Discovery and identity contract",
+        "Remote matching"
+      ],
+      "status": "pending",
+      "tests": [
+        "git_graph::git_06_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Identity-only work excludes unnecessary status/history/object/untracked analysis and uncontrolled subprocesses.",
+      "green_evidence": [],
+      "id": "GIT-07",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "fixture-truth-manifest-vs-cli-result",
+      "performance_gate_ids": [
+        "PERF-MECHANISM"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "6. Git enrichment and storage",
+        "Stages"
+      ],
+      "status": "pending",
+      "tests": [
+        "git_graph::git_07_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Parent completion and discovered child work/evidence obey crash-safe ordering at every tested commit boundary.",
+      "green_evidence": [],
+      "id": "DUR-01",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "crash-fixture-resumed-graph-equality",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "5. Execution architecture",
+        "Transaction batching"
+      ],
+      "status": "pending",
+      "tests": [
+        "durability::dur_01_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Resume, intermediate huge-directory batches, duplicate discovery, and stale leases/revisions preserve exact results.",
+      "green_evidence": [],
+      "id": "DUR-02",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "crash-fixture-resumed-graph-equality",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "5. Execution architecture",
+        "Transaction batching"
+      ],
+      "status": "pending",
+      "tests": [
+        "durability::dur_02_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Claims/writes are actually batched without disabling synchronization or publication safety.",
+      "green_evidence": [],
+      "id": "DUR-03",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "crash-fixture-resumed-graph-equality",
+      "performance_gate_ids": [
+        "PERF-MECHANISM"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "5. Execution architecture",
+        "Transaction batching"
+      ],
+      "status": "pending",
+      "tests": [
+        "durability::dur_03_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Barrier-based tests prove real bounded concurrency; recursion remains scheduler-owned.",
+      "green_evidence": [],
+      "id": "EXEC-01",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "barrier-synchronized-integration-observation",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "5. Execution architecture",
+        "Worker model"
+      ],
+      "status": "pending",
+      "tests": [
+        "executor::exec_01_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Byte/item/FD/frontier/alias/queue/helper limits and pressure handling hold under saturation.",
+      "green_evidence": [],
+      "id": "EXEC-02",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "barrier-synchronized-integration-observation",
+      "performance_gate_ids": [
+        "PERF-RESOURCE"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "5. Execution architecture",
+        "Worker model"
+      ],
+      "status": "pending",
+      "tests": [
+        "executor::exec_02_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Result drainage avoids deadlock; root priorities remain fair; slow/network sources cannot monopolize local progress.",
+      "green_evidence": [],
+      "id": "EXEC-03",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "barrier-synchronized-integration-observation",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "5. Execution architecture",
+        "Worker model"
+      ],
+      "status": "pending",
+      "tests": [
+        "executor::exec_03_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Cooperative cancellation and any helper isolation are honest about blocking syscalls; production cannot activate test failpoints.",
+      "green_evidence": [],
+      "id": "EXEC-04",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "barrier-synchronized-integration-observation",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "5. Execution architecture",
+        "Worker model"
+      ],
+      "status": "pending",
+      "tests": [
+        "executor::exec_04_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Only committed events advance durable follow cursors; report staging/publication/recovery remain atomic and safe.",
+      "green_evidence": [],
+      "id": "PUB-01",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "event-state-fold-vs-lifecycle-truth-table",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "6. Git enrichment and storage",
+        "goal section 1.3 Event lifecycle"
+      ],
+      "status": "pending",
+      "tests": [
+        "publication::pub_01_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Existing macOS bulk reader is measured and qualified with retained scope fencing.",
+      "green_evidence": [],
+      "id": "MAC-01",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "native-host-qualification-vs-independent-manifest",
+      "performance_gate_ids": [],
+      "platforms": [
+        "macos"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "4.4 macOS: bulk directory enumeration"
+      ],
+      "status": "pending",
+      "tests": [
+        "native_macos::mac_01_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Concrete searchfs source handles `.git`/HEAD, continuation/restarts/dedup, path failures, access, and scoped coverage.",
+      "green_evidence": [],
+      "id": "MAC-02",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "native-host-qualification-vs-independent-manifest",
+      "performance_gate_ids": [],
+      "platforms": [
+        "macos"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "4.3 macOS: searchfs catalog search"
+      ],
+      "status": "pending",
+      "tests": [
+        "native_macos::mac_02_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Real APFS qualification and promotion/rejection evidence exist; unsupported/unqualified cases fall back honestly.",
+      "green_evidence": [],
+      "id": "MAC-03",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "native-host-qualification-vs-independent-manifest",
+      "performance_gate_ids": [
+        "PERF-NATIVE-PROMOTION"
+      ],
+      "platforms": [
+        "macos"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "4.3 macOS: searchfs catalog search",
+        "goal step 15"
+      ],
+      "status": "pending",
+      "tests": [
+        "native_macos::mac_03_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Native Linux traversal/type handling and inotify new-directory/overflow/downtime behavior pass.",
+      "green_evidence": [],
+      "id": "LNX-01",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "native-host-qualification-vs-independent-manifest",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "4.5 Linux"
+      ],
+      "status": "pending",
+      "tests": [
+        "native_linux::lnx_01_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Concrete NTFS baseline enumeration and distinct USN change replay pass native Windows qualification.",
+      "green_evidence": [],
+      "id": "WIN-01",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "native-host-qualification-vs-independent-manifest",
+      "performance_gate_ids": [
+        "PERF-NATIVE-PROMOTION"
+      ],
+      "platforms": [
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "4.6 Windows"
+      ],
+      "status": "pending",
+      "tests": [
+        "native_windows::win_01_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Ordinary-permission fallback, reparse points, volume/path identities, and access-denied handling pass without automatic elevation.",
+      "green_evidence": [],
+      "id": "WIN-02",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "native-host-qualification-vs-independent-manifest",
+      "performance_gate_ids": [],
+      "platforms": [
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "4.6 Windows"
+      ],
+      "status": "pending",
+      "tests": [
+        "native_windows::win_02_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Watcher-before-crawl bootstrap and ingested/reconciled cursor separation survive concurrent mutations and crashes.",
+      "green_evidence": [],
+      "id": "INC-01",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "mutation-sequence-vs-reconciled-state-oracle",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "7. Incremental correctness"
+      ],
+      "status": "pending",
+      "tests": [
+        "incremental::inc_01_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Event loss/history reset/root change/remount/downtime never creates a false fresh negative.",
+      "green_evidence": [],
+      "id": "INC-02",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "mutation-sequence-vs-reconciled-state-oracle",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "7. Incremental correctness"
+      ],
+      "status": "pending",
+      "tests": [
+        "incremental::inc_02_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Dirty-scope coalescing and config/ref/HEAD/registry dependency invalidation do only required work, with justified broad fallback.",
+      "green_evidence": [],
+      "id": "INC-03",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "mutation-sequence-vs-reconciled-state-oracle",
+      "performance_gate_ids": [
+        "PERF-MECHANISM"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "7. Incremental correctness"
+      ],
+      "status": "pending",
+      "tests": [
+        "incremental::inc_03_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Indexed catalog queries return every matching physical copy and valid target-independent inventory is reused.",
+      "green_evidence": [],
+      "id": "CAT-01",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "mutation-sequence-vs-reconciled-state-oracle",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "6. Git enrichment and storage",
+        "Catalog design"
+      ],
+      "status": "pending",
+      "tests": [
+        "catalog::cat_01_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Cached queries perform no live discovery and distinguish cached/reconciled/incomplete coverage; ordinary files are not catalog rows.",
+      "green_evidence": [],
+      "id": "CAT-02",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "mutation-sequence-vs-reconciled-state-oracle",
+      "performance_gate_ids": [
+        "PERF-MECHANISM"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "6. Git enrichment and storage",
+        "Catalog design"
+      ],
+      "status": "pending",
+      "tests": [
+        "catalog::cat_02_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Malicious pointers/config/aliases/commands, oversized metadata, and symlink/rename races cause no outside-scope access or execution.",
+      "green_evidence": [],
+      "id": "SEC-01",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "hostile-fixture-negative-control",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "3. Discovery and identity contract",
+        "goal section 1 (9)"
+      ],
+      "status": "pending",
+      "tests": [
+        "security::sec_01_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Discovery/cached paths remain read-only/no-network/no-index-write; explicit fetch passes its separate narrow mutation policy; redaction and failure-to-gap semantics pass.",
+      "green_evidence": [],
+      "id": "SEC-02",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "hostile-fixture-negative-control",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1 (9)",
+        "goal step 18"
+      ],
+      "status": "pending",
+      "tests": [
+        "security::sec_02_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Correct result graph and equivalent coverage are checked for every accepted measured run.",
+      "green_evidence": [],
+      "id": "PERF-01",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-policy-statistical-evaluation",
+      "performance_gate_ids": [
+        "PERF-MECHANISM"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "10. Benchmark and test contract",
+        "goal section 7.2"
+      ],
+      "status": "pending",
+      "tests": [
+        "performance::perf_01_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Cold-application, controlled-cold filesystem, warm scan, cached process/CLI, incremental, and detail modes are truthfully separated.",
+      "green_evidence": [],
+      "id": "PERF-02",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-policy-statistical-evaluation",
+      "performance_gate_ids": [
+        "PERF-PRIMARY",
+        "PERF-SUITE",
+        "PERF-NOREGRESS"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "10. Benchmark and test contract",
+        "Separate measurements"
+      ],
+      "status": "pending",
+      "tests": [
+        "performance::perf_02_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Required experiments, native comparisons, and worker sweeps have all raw repeated-run results and fixed analysis.",
+      "green_evidence": [],
+      "id": "PERF-03",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-policy-statistical-evaluation",
+      "performance_gate_ids": [
+        "PERF-PRIMARY",
+        "PERF-SUITE",
+        "PERF-NOREGRESS",
+        "PERF-NATIVE-PROMOTION"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "10. Benchmark and test contract",
+        "goal section 7.3"
+      ],
+      "status": "pending",
+      "tests": [
+        "performance::perf_03_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Frozen primary and suite elapsed-time reduction gates pass against B-unified without changing scope, work, inherited optimizations, baseline selection or judge.",
+      "green_evidence": [],
+      "id": "PERF-04",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-policy-statistical-evaluation",
+      "performance_gate_ids": [
+        "PERF-PRIMARY",
+        "PERF-SUITE"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "10. Benchmark and test contract",
+        "goal section 7.4"
+      ],
+      "status": "pending",
+      "tests": [
+        "performance::perf_04_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Critical nonregression, resource, and mechanical work-budget gates pass on the required native matrix.",
+      "green_evidence": [],
+      "id": "PERF-05",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-policy-statistical-evaluation",
+      "performance_gate_ids": [
+        "PERF-NOREGRESS",
+        "PERF-RESOURCE",
+        "PERF-MECHANISM"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 7.4",
+        "goal section 7.2"
+      ],
+      "status": "pending",
+      "tests": [
+        "performance::perf_05_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Conditional experiments have measured adopted/rejected/not-triggered dispositions; no unsupported stub is counted complete.",
+      "green_evidence": [],
+      "id": "PERF-06",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-policy-statistical-evaluation",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal step 19"
+      ],
+      "status": "pending",
+      "tests": [
+        "performance::perf_06_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "No mandatory skip, missing platform, inconclusive confidence bound, invalid bundle, or stale binary is hidden in green.",
+      "green_evidence": [],
+      "id": "PERF-07",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-policy-statistical-evaluation",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 3.2",
+        "goal section 7.3"
+      ],
+      "status": "pending",
+      "tests": [
+        "performance::perf_07_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Independent clean-checkout verification returns zero for the actual landed revision and all required source/implementation IDs.",
+      "green_evidence": [],
+      "id": "FINAL-01",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "independent-clean-checkout-verifier",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal step 20",
+        "goal step 21"
+      ],
+      "status": "pending",
+      "tests": [
+        "final_verification::final_01_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Documentation, migration guidance, actual benchmark commands, supported capability classes, and evidence index match what shipped.",
+      "green_evidence": [],
+      "id": "FINAL-02",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "independent-clean-checkout-verifier",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal step 20"
+      ],
+      "status": "pending",
+      "tests": [
+        "final_verification::final_02_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "All kickoff source heads and relevant PRs are enumerated without truncation, pinned and preserved; source/main drift is recorded and reviewed.",
+      "green_evidence": [],
+      "id": "BRN-01",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-source-graph-vs-contribution-ledger",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "2. Source baseline",
+        "goal section 1.1"
+      ],
+      "status": "pending",
+      "tests": [
+        "branch_closure::brn_01_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Every source commit/component has an independently reviewed contribution disposition; no desired behavior or unique regression protection is silently dropped.",
+      "green_evidence": [],
+      "id": "BRN-02",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-source-graph-vs-contribution-ledger",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1.1",
+        "goal section 1.2"
+      ],
+      "status": "pending",
+      "tests": [
+        "branch_closure::brn_02_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Ancestor, squash-tree and template-blob equivalences are verified correctly; patch IDs alone do not certify behavioral equivalence.",
+      "green_evidence": [],
+      "id": "BRN-03",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-source-graph-vs-contribution-ledger",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1.1",
+        "goal section 1.2"
+      ],
+      "status": "pending",
+      "tests": [
+        "branch_closure::brn_03_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "B09 is recovered through B11 and overlapping feature/fetch changes are not applied twice.",
+      "green_evidence": [],
+      "id": "BRN-04",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-source-graph-vs-contribution-ledger",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1.1"
+      ],
+      "status": "pending",
+      "tests": [
+        "branch_closure::brn_04_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "B13/B14 alternate variants are compared by actual hunks and tests; branch names and timestamps never substitute for supersession proof.",
+      "green_evidence": [],
+      "id": "BRN-05",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-source-graph-vs-contribution-ledger",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1.1"
+      ],
+      "status": "pending",
+      "tests": [
+        "branch_closure::brn_05_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "B15 parentless nonempty tree is compared and its unique useful content recovered without whole-tree replacement or invented ancestry.",
+      "green_evidence": [],
+      "id": "BRN-06",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-source-graph-vs-contribution-ledger",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1.1"
+      ],
+      "status": "pending",
+      "tests": [
+        "branch_closure::brn_06_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "B16 base/index/tracked/untracked components are all inventoried; third-parent schema_v7.rs is explicitly recovered or proved identical to its retained replacement.",
+      "green_evidence": [],
+      "id": "BRN-07",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-source-graph-vs-contribution-ledger",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1.1"
+      ],
+      "status": "pending",
+      "tests": [
+        "branch_closure::brn_07_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "B17/B19/B20 empty trees and B18 documentary-only delta have verified provenance-only dispositions, not pretend feature merges.",
+      "green_evidence": [],
+      "id": "BRN-08",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-source-graph-vs-contribution-ledger",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1.1"
+      ],
+      "status": "pending",
+      "tests": [
+        "branch_closure::brn_08_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Actual advancing-target merge/conflict evidence is recorded; textual success does not bypass union-of-behavior integration tests.",
+      "green_evidence": [],
+      "id": "BRN-09",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-source-graph-vs-contribution-ledger",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1.2"
+      ],
+      "status": "pending",
+      "tests": [
+        "branch_closure::brn_09_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Every source-side test deletion/weakening has an independently justified replacement; topology, privacy, validation and durability protections survive.",
+      "green_evidence": [],
+      "id": "BRN-10",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-source-graph-vs-contribution-ledger",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1.1",
+        "goal section 1.2"
+      ],
+      "status": "pending",
+      "tests": [
+        "branch_closure::brn_10_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Closure tooling rejects omitted branches, stash components, false equivalences, stale refs and self-authored PASS records through integration negative controls.",
+      "green_evidence": [],
+      "id": "BRN-11",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-source-graph-vs-contribution-ledger",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 3.3",
+        "goal step 1"
+      ],
+      "status": "pending",
+      "tests": [
+        "branch_closure::brn_11_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "No user changes or source refs were destroyed; no force push, blanket ours/theirs, unrelated-history wholesale merge or fake ancestry-only completion occurred.",
+      "green_evidence": [],
+      "id": "BRN-12",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-source-graph-vs-contribution-ledger",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 0",
+        "goal section 1 (11)"
+      ],
+      "status": "pending",
+      "tests": [
+        "branch_closure::brn_12_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Catalog producer commit, version and structural fingerprint matrix covers supported v1-v9 and observed same-number variants.",
+      "green_evidence": [],
+      "id": "MIG-01",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "producer-matrix-upgrade-roundtrip",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "6. Git enrichment and storage",
+        "Catalog design",
+        "goal section 1.3 Schema lineage"
+      ],
+      "status": "pending",
+      "tests": [
+        "migration::mig_01_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Real historical-layout databases upgrade/query/resume correctly; unknown layouts fail closed without clearing user data.",
+      "green_evidence": [],
+      "id": "MIG-02",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "producer-matrix-upgrade-roundtrip",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "Catalog design",
+        "goal section 1.3 Schema lineage"
+      ],
+      "status": "pending",
+      "tests": [
+        "migration::mig_02_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "v7 inventory-ready milestone and v8 atomic durable dedupe survive pruning, abrupt crashes and valid continuation.",
+      "green_evidence": [],
+      "id": "MIG-03",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "producer-matrix-upgrade-roundtrip",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1.3 Schema lineage",
+        "goal step 6"
+      ],
+      "status": "pending",
+      "tests": [
+        "migration::mig_03_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "v9 remote-name key migration preserves distinct raw bytes and all memberships/refresh rows, with no collisions or missing indexes.",
+      "green_evidence": [],
+      "id": "MIG-04",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "producer-matrix-upgrade-roundtrip",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1.3 Schema lineage",
+        "goal step 6"
+      ],
+      "status": "pending",
+      "tests": [
+        "migration::mig_04_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Fresh and upgraded catalogs converge on a canonical tested shape; migration crash/rollback and read-only no-upgrade paths pass.",
+      "green_evidence": [],
+      "id": "MIG-05",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "producer-matrix-upgrade-roundtrip",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "Catalog design",
+        "goal step 6"
+      ],
+      "status": "pending",
+      "tests": [
+        "migration::mig_05_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Executable lifecycle table separates attempt termination from scan-final closure and specifies all valid resume/cleanup transitions.",
+      "green_evidence": [],
+      "id": "EVT-01",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "event-state-fold-vs-lifecycle-truth-table",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1.3 Event lifecycle"
+      ],
+      "status": "pending",
+      "tests": [
+        "events::evt_01_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Legacy and new event/cursor contracts are explicitly versioned/adapted; foreign, corrupt, expired and beyond-tip cursors behave as documented.",
+      "green_evidence": [],
+      "id": "EVT-02",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "event-state-fold-vs-lifecycle-truth-table",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1.3 Event lifecycle"
+      ],
+      "status": "pending",
+      "tests": [
+        "events::evt_02_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Pruned journals never masquerade as a complete replay; prefix check and page read are atomic and read transactions end before slow output/waits.",
+      "green_evidence": [],
+      "id": "EVT-03",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "event-state-fold-vs-lifecycle-truth-table",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1.3 Event lifecycle",
+        "goal step 6"
+      ],
+      "status": "pending",
+      "tests": [
+        "events::evt_03_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Progress coalescing preserves cursor-advancing visibility, and duplicate delivery/resume preserves identity idempotence.",
+      "green_evidence": [],
+      "id": "EVT-04",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "event-state-fold-vs-lifecycle-truth-table",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1.3 Event lifecycle"
+      ],
+      "status": "pending",
+      "tests": [
+        "events::evt_04_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Dedupe/backfill remains valid for resumable interrupted/failed states; insufficient legacy retained history fails closed or resets explicitly.",
+      "green_evidence": [],
+      "id": "EVT-05",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "event-state-fold-vs-lifecycle-truth-table",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1.3 Event lifecycle",
+        "goal step 6"
+      ],
+      "status": "pending",
+      "tests": [
+        "events::evt_05_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "JSONL privacy canaries and ID projection joins pass independently; private report/explicit JSON disclosure is distinguished from path-free event output.",
+      "green_evidence": [],
+      "id": "EVT-06",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "event-state-fold-vs-lifecycle-truth-table",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1.3 Streaming/privacy"
+      ],
+      "status": "pending",
+      "tests": [
+        "events::evt_06_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "The real opt-in fetch CLI/resume path works; default/metadata discovery has no implicit fetch or network activity.",
+      "green_evidence": [],
+      "id": "FETCH-01",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "local-transport-before-after-ref-oracle",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1.3 Phases",
+        "goal step 4"
+      ],
+      "status": "pending",
+      "tests": [
+        "fetch::fetch_01_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Refspec and transport/config validation prevent repository-controlled execution and forbidden writes to local heads, HEAD, index or checkout files.",
+      "green_evidence": [],
+      "id": "FETCH-02",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "local-transport-before-after-ref-oracle",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal step 4"
+      ],
+      "status": "pending",
+      "tests": [
+        "fetch::fetch_02_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Atomic tracking-ref updates and failed/timed-out/cancelled refresh reconciliation preserve actual observed state without false current labels.",
+      "green_evidence": [],
+      "id": "FETCH-03",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "local-transport-before-after-ref-oracle",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal step 4"
+      ],
+      "status": "pending",
+      "tests": [
+        "fetch::fetch_03_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Multiple remotes, custom/negative/excluded/deleted mappings, absent Git and worktree-shared stores pass controlled local-upstream integration fixtures.",
+      "green_evidence": [],
+      "id": "FETCH-04",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "local-transport-before-after-ref-oracle",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal step 4"
+      ],
+      "status": "pending",
+      "tests": [
+        "fetch::fetch_04_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Fetch/helper byte/time/process/resource limits and per-phase timing are measured separately from discovery.",
+      "green_evidence": [],
+      "id": "FETCH-05",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "local-transport-before-after-ref-oracle",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal step 4",
+        "goal section 7.6"
+      ],
+      "status": "pending",
+      "tests": [
+        "fetch::fetch_05_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Independent Git oracles verify equal/ahead/behind/diverged/no-upstream/missing-upstream/unknown/error comparisons without default-main assumptions.",
+      "green_evidence": [],
+      "id": "GRAPH-01",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "independent-git-history-oracle",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "6. Git enrichment and storage",
+        "Stages",
+        "goal step 5"
+      ],
+      "status": "pending",
+      "tests": [
+        "graph::graph_01_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Shallow, graft/replacement, missing-object and upstream-context cases produce exact counts or honest incomplete history; caches remain bounded.",
+      "green_evidence": [],
+      "id": "GRAPH-02",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "independent-git-history-oracle",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "6. Git enrichment and storage",
+        "Stages"
+      ],
+      "status": "pending",
+      "tests": [
+        "graph::graph_02_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Requested post-fetch comparisons update only with valid fresh upstream evidence; identity-only paths never perform history traversal.",
+      "green_evidence": [],
+      "id": "GRAPH-03",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "independent-git-history-oracle",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "6. Git enrichment and storage",
+        "Stages"
+      ],
+      "status": "pending",
+      "tests": [
+        "graph::graph_03_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "One hardened streaming pipeline accepts supported legacy/new report versions and union-of-source checks; unknown fields, IDs, groups/totals and diagnostics stay safe.",
+      "green_evidence": [],
+      "id": "OUT-01",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "projection-equality-fold",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1.3 Streaming/privacy",
+        "goal step 7"
+      ],
+      "status": "pending",
+      "tests": [
+        "output::out_01_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "All actual CLI output lanes work and normalized JSONL/private-report/terminal records agree under the declared projection; parsed-but-refused feature stubs are gone.",
+      "green_evidence": [],
+      "id": "OUT-02",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "projection-equality-fold",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1.3 Outputs and CLI",
+        "goal step 7"
+      ],
+      "status": "pending",
+      "tests": [
+        "output::out_02_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Atomic live report, final retention/pruning and publication retry preserve coherent revisions, recovery pins and retained-versus-published truth.",
+      "green_evidence": [],
+      "id": "OUT-03",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "projection-equality-fold",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 1.3 Streaming/privacy",
+        "goal step 7"
+      ],
+      "status": "pending",
+      "tests": [
+        "output::out_03_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Real PTY and slow/broken-pipe tests prove terminal restoration, no control injection, bounded output and no coordinator starvation.",
+      "green_evidence": [],
+      "id": "OUT-04",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "projection-equality-fold",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal step 7"
+      ],
+      "status": "pending",
+      "tests": [
+        "output::out_04_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "B-main, predeclared eligible B-source, B-unified and final binary identities/roles are frozen and auditable; baseline selection cannot cherry-pick a slow denominator.",
+      "green_evidence": [],
+      "id": "BASE-01",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-reference-attribution-audit",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 7.0"
+      ],
+      "status": "pending",
+      "tests": [
+        "baseline_attribution::base_01_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "B-unified includes inherited working optimizations; baseline-vs-baseline fails improvement gates and source gains are not mislabeled new.",
+      "green_evidence": [],
+      "id": "BASE-02",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-reference-attribution-audit",
+      "performance_gate_ids": [
+        "PERF-PRIMARY",
+        "PERF-SUITE",
+        "PERF-NOREGRESS"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 7.0",
+        "goal step 9"
+      ],
+      "status": "pending",
+      "tests": [
+        "baseline_attribution::base_02_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Every accepted ratio has equivalent graph/coverage/detail/output/durability/resource conditions; new incomparable capabilities use predeclared correct references.",
+      "green_evidence": [],
+      "id": "BASE-03",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-reference-attribution-audit",
+      "performance_gate_ids": [
+        "PERF-PRIMARY",
+        "PERF-SUITE",
+        "PERF-NOREGRESS"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 7.0",
+        "goal section 7.4"
+      ],
+      "status": "pending",
+      "tests": [
+        "baseline_attribution::base_03_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Per-stage and matched-resource measurements distinguish consolidation gains, new optimization, optional enrichment and higher concurrency.",
+      "green_evidence": [],
+      "id": "BASE-04",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "frozen-reference-attribution-audit",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "10. Benchmark and test contract",
+        "goal section 7.5"
+      ],
+      "status": "pending",
+      "tests": [
+        "baseline_attribution::base_04_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Current generator-owned workflows, templates and build provenance are reconciled without restoring stale or inert CI.",
+      "green_evidence": [],
+      "id": "CI-01",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "executed-check-vs-required-gate",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal step 8"
+      ],
+      "status": "pending",
+      "tests": [
+        "ci::ci_01_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Required proof/native jobs actually execute and feed the trusted fail-closed verdict; mandatory skips/missing artifacts cannot produce green.",
+      "green_evidence": [],
+      "id": "CI-02",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "executed-check-vs-required-gate",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal step 8",
+        "goal section 3.2"
+      ],
+      "status": "pending",
+      "tests": [
+        "ci::ci_02_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Goal-owned reviewed PRs use allowed protected squash integration, Required checks and resolved threads; no protection bypass or source cleanup.",
+      "green_evidence": [],
+      "id": "LAND-01",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "protected-squash-landed-revision-proof",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal step 21"
+      ],
+      "status": "pending",
+      "tests": [
+        "landing::land_01_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Source/base/head drift is checked before integration; changed trees trigger appropriate conflict and evidence reruns.",
+      "green_evidence": [],
+      "id": "LAND-02",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "protected-squash-landed-revision-proof",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal step 21"
+      ],
+      "status": "pending",
+      "tests": [
+        "landing::land_02_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "Contribution ledger maps to actual landed commits; final release binaries are rebuilt and fully reverified after squash, not inferred from tree equality.",
+      "green_evidence": [],
+      "id": "LAND-03",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "protected-squash-landed-revision-proof",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal step 21"
+      ],
+      "status": "pending",
+      "tests": [
+        "landing::land_03_contract_tbd"
+      ],
+      "verifier": null
+    },
+    {
+      "claim": "One trusted final verifier reports PASS only when every source and implementation gate is satisfied on the tested landed revision; failures/blockers remain explicit.",
+      "green_evidence": [],
+      "id": "LAND-04",
+      "implementer": null,
+      "kind": "required",
+      "negative_controls": [],
+      "oracle": "protected-squash-landed-revision-proof",
+      "performance_gate_ids": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "red_evidence": [],
+      "rfc_sections": [
+        "goal section 9",
+        "goal step 21"
+      ],
+      "status": "pending",
+      "tests": [
+        "landing::land_04_contract_tbd"
+      ],
+      "verifier": null
+    }
+  ],
+  "schema": "repo-scan/requirements/1",
+  "source_seed": "repo-scan-requirements-seed.json",
+  "source_seed_sha256": "23a3c70e44147e6529a83e5e62af64f8ea1eed8147e251be725d7c1f420cd6dc"
+}

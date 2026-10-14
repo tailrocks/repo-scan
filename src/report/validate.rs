@@ -7,6 +7,14 @@
 //! Relationship counts must agree with emitted records; traversal counters
 //! (`directories_complete`, `tasks_pending`) summarize work including
 //! nonmatching scope and are therefore exempt from agreement.
+//!
+//! Envelope versions 1.0.0–1.5.0
+//! ([`crate::report::model::SUPPORTED_PRIOR_SCHEMA_VERSIONS`]) are
+//! accepted; fields introduced after a report's version deserialize to
+//! their documented defaults, and only 1.5.0 carries the version-gated
+//! required-field and totals-recomputation rules. The streaming staged
+//! validator (`validate_stream`) is the same truth over raw bytes and
+//! shares these per-record checks.
 
 use crate::error::Error;
 use crate::report::encode::{base64_is_valid, is_rfc3339_shape, object_id_error};
@@ -34,11 +42,19 @@ pub fn validate_report(report: &Report) -> crate::Result<()> {
 }
 
 fn check_envelope(report: &Report, problems: &mut Vec<String>) {
-    if report.schema_version != crate::report::model::SCHEMA_VERSION {
+    // Multi-version acceptance (contract C4): every envelope a supported
+    // repo-scan release emitted validates; fields added by later schemas
+    // carry serde defaults that read honestly (unknown/pending/null), and
+    // the 1.5.0-only required-field checks run in the streaming validator
+    // over the raw bytes (a typed Report cannot distinguish "missing"
+    // from "defaulted").
+    if !crate::report::model::SUPPORTED_PRIOR_SCHEMA_VERSIONS
+        .contains(&report.schema_version.as_str())
+    {
         problems.push(format!(
-            "schema_version is {:?}, want {:?}",
-            report.schema_version,
-            crate::report::model::SCHEMA_VERSION
+            "schema_version is {}, want one of {:?}",
+            bounded_debug(&report.schema_version),
+            crate::report::model::SUPPORTED_PRIOR_SCHEMA_VERSIONS
         ));
     }
     if report.report_id.is_empty() {
@@ -227,6 +243,7 @@ fn check_envelope(report: &Report, problems: &mut Vec<String>) {
             &["valid", "unborn", "invalid", "unsupported"],
             problems,
         );
+        check_branch_freshness_comparison(branch, problems);
         if let Some(oid) = &branch.oid {
             if let Some(reason) = object_id_error(oid) {
                 problems.push(format!("branch {} oid: {reason}", branch.id));
@@ -252,6 +269,7 @@ fn check_envelope(report: &Report, problems: &mut Vec<String>) {
                 remote.id, remote.observed_at
             ));
         }
+        check_remote_refresh(remote, problems);
     }
     for link in &report.storage_links {
         check_enum(
@@ -327,6 +345,142 @@ fn check_envelope(report: &Report, problems: &mut Vec<String>) {
     }
 }
 
+/// Branch freshness (report 1.2.0) and comparison (report 1.4.0)
+/// cross-field rules. Shared by the typed and streaming validators so both
+/// enforce one vocabulary. `id` is the caller-formatted record label (the
+/// streaming validator passes its 128-byte-bounded `short_id`).
+/// Pre-1.2/1.4 snapshots deserialize `unknown`/`pending`/null, which
+/// validates. Counts are `Some` only for the four counted states, with
+/// the exact zero/nonzero shape each state derives from; every other
+/// state carries null counts — unknown is never zero.
+pub(crate) fn check_branch_freshness_comparison(
+    branch: &crate::report::model::Branch,
+    problems: &mut Vec<String>,
+) {
+    let id = &branch.id;
+    check_enum(
+        &format!("branch {id} freshness"),
+        &branch.freshness,
+        &["current", "stale", "unknown"],
+        problems,
+    );
+    if branch.freshness == "unknown" && branch.freshness_at.is_some() {
+        problems.push(format!(
+            "branch {id} freshness is unknown but freshness_at is set"
+        ));
+    }
+    if branch.freshness != "unknown" && branch.freshness_at.is_none() {
+        problems.push(format!(
+            "branch {id} freshness is {} but freshness_at is missing",
+            bounded_debug(&branch.freshness)
+        ));
+    }
+    if branch.kind != "remote_tracking"
+        && (branch.freshness != "unknown" || branch.freshness_at.is_some())
+    {
+        problems.push(format!(
+            "branch {id} kind {} must have unknown freshness and null freshness_at",
+            bounded_debug(&branch.kind)
+        ));
+    }
+    check_opt_time(
+        &format!("branch {id} freshness_at"),
+        &branch.freshness_at,
+        problems,
+    );
+    check_enum(
+        &format!("branch {id} comparison"),
+        &branch.comparison,
+        &[
+            "equal",
+            "ahead",
+            "behind",
+            "diverged",
+            "no_upstream",
+            "upstream_missing",
+            "pending",
+            "incomplete_history",
+            "error",
+        ],
+        problems,
+    );
+    let counts_ok = match branch.comparison.as_str() {
+        "equal" => branch.ahead == Some(0) && branch.behind == Some(0),
+        "ahead" => branch.ahead.is_some_and(|n| n > 0) && branch.behind == Some(0),
+        "behind" => branch.ahead == Some(0) && branch.behind.is_some_and(|n| n > 0),
+        "diverged" => branch.ahead.is_some_and(|n| n > 0) && branch.behind.is_some_and(|n| n > 0),
+        _ => branch.ahead.is_none() && branch.behind.is_none(),
+    };
+    if !counts_ok {
+        problems.push(format!(
+            "branch {id} comparison {} carries ahead={:?} behind={:?}: \
+             counted states need exact counts, other states need nulls",
+            bounded_debug(&branch.comparison),
+            branch.ahead,
+            branch.behind
+        ));
+    }
+    if branch.kind != "local"
+        && (branch.comparison != "pending" || branch.ahead.is_some() || branch.behind.is_some())
+    {
+        problems.push(format!(
+            "branch {id} kind {} must have pending comparison and null counts",
+            bounded_debug(&branch.kind)
+        ));
+    }
+}
+
+/// Latest `--fetch` attempt summary rules (report 1.2.0). Shared by the
+/// typed and streaming validators.
+pub(crate) fn check_remote_refresh(
+    remote: &crate::report::model::Remote,
+    problems: &mut Vec<String>,
+) {
+    let id = &remote.id;
+    if let Some(refresh) = &remote.refresh {
+        check_enum(
+            &format!("remote {id} refresh status"),
+            &refresh.status,
+            &["success", "failed", "unsupported"],
+            problems,
+        );
+        if !is_rfc3339_shape(&refresh.observed_at) {
+            problems.push(format!(
+                "remote {id} refresh observed_at {} is not RFC 3339",
+                bounded_debug(&refresh.observed_at)
+            ));
+        }
+        if refresh.duration_ms.is_some_and(|v| v < 0) {
+            problems.push(format!("remote {id} refresh duration_ms is negative"));
+        }
+    }
+}
+
+/// Group identity rules (report 1.5.0): the ID is
+/// `lower(host)/lower(account)/lower(repo)` and every part is nonempty.
+/// Shared by the typed and streaming validators.
+pub(crate) fn check_group(group: &crate::report::model::Group, problems: &mut Vec<String>) {
+    let expected = format!(
+        "{}/{}/{}",
+        group.host.to_ascii_lowercase(),
+        group.account.to_ascii_lowercase(),
+        group.repo.to_ascii_lowercase()
+    );
+    if group.id != expected {
+        problems.push(format!(
+            "group {} id does not match lower(host)/lower(account)/lower(repo) {}",
+            bounded_debug(&group.id),
+            bounded_debug(&expected)
+        ));
+    }
+    if group.host.is_empty() || group.account.is_empty() || group.repo.is_empty() {
+        problems.push(format!(
+            "group {} host/account/repo must be nonempty",
+            bounded_debug(&group.id)
+        ));
+    }
+}
+
 pub(crate) fn check_enum(context: &str, value: &str, allowed: &[&str], problems: &mut Vec<String>) {
     if !allowed.contains(&value) {
         problems.push(format!(
@@ -390,6 +544,10 @@ fn check_ids(report: &Report, problems: &mut Vec<String>) {
     }
     for root in &report.roots {
         collect_id(&mut seen, "root", &root.id, problems);
+    }
+    for group in &report.groups {
+        collect_id(&mut seen, "group", &group.id, problems);
+        check_group(group, problems);
     }
     for repo in &report.repositories {
         collect_id(&mut seen, "repository", &repo.id, problems);
@@ -625,6 +783,85 @@ fn check_counts(report: &Report, problems: &mut Vec<String>) {
             report.coverage.unresolvable_candidates
         ));
     }
+    if report.schema_version == crate::report::model::SCHEMA_VERSION {
+        check_totals(report, problems);
+    }
+}
+
+/// Totals recomputation (report 1.5.0): the declared `totals` block must
+/// equal the counts derived from the emitted records. Gated on the 1.5.0
+/// envelope; earlier envelopes may omit or carry the block unchecked.
+fn check_totals(report: &Report, problems: &mut Vec<String>) {
+    let total = &report.totals;
+    let accounts: HashSet<(&str, &str)> = report
+        .groups
+        .iter()
+        .map(|group| (group.host.as_str(), group.account.as_str()))
+        .collect();
+    let bare_unknown = report.repositories.iter().any(|repo| repo.bare.is_none());
+    let bare_stores = if bare_unknown {
+        None
+    } else {
+        Some(
+            report
+                .repositories
+                .iter()
+                .filter(|repo| repo.bare == Some(true))
+                .count() as u64,
+        )
+    };
+    let mut analysis = crate::report::model::AnalysisTotals::default();
+    for checkout in &report.checkouts {
+        match checkout.status.state.as_str() {
+            "complete" => analysis.completed += 1,
+            "pending" | "not_requested" => analysis.pending += 1,
+            "unsupported" => analysis.unavailable += 1,
+            "partial" | "unstable" | "error" => analysis.failed += 1,
+            _ => analysis.pending += 1,
+        }
+    }
+    let expected = crate::report::model::Totals {
+        accounts: accounts.len() as u64,
+        groups: report.groups.len() as u64,
+        stores: report.repositories.len() as u64,
+        bare_stores,
+        present_checkouts: report
+            .checkouts
+            .iter()
+            .filter(|checkout| checkout.availability == "present")
+            .count() as u64,
+        linked_worktrees: report
+            .checkouts
+            .iter()
+            .filter(|checkout| checkout.availability == "present" && checkout.kind == "linked")
+            .count() as u64,
+        observed_paths: report.paths.len() as u64,
+        aliases: report.aliases.len() as u64,
+        local_branches: report
+            .branches
+            .iter()
+            .filter(|branch| branch.kind == "local")
+            .count() as u64,
+        remote_tracking_refs: report
+            .branches
+            .iter()
+            .filter(|branch| branch.kind == "remote_tracking")
+            .count() as u64,
+        analysis,
+        unresolved_candidates: unresolvable_candidate_count(report),
+        gaps: report.errors.len() as u64,
+    };
+    if *total != expected {
+        problems.push("totals do not agree with report records".to_string());
+    }
+}
+
+fn unresolvable_candidate_count(report: &Report) -> u64 {
+    report
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.disposition == "unresolvable_identity")
+        .count() as u64
 }
 
 /// Coverage honesty: completeness claims must agree with the emitted
@@ -732,6 +969,24 @@ pub fn validate_status(status: &Status, context: &str, problems: &mut Vec<String
         &["checked", "not_requested", "unknown"],
         problems,
     );
+    // Report 1.3.0 Step 10 vocabulary. Pre-1.3 snapshots deserialize
+    // `working_state` as `unknown` (model default), which validates.
+    check_enum(
+        &format!("{context} working_state"),
+        &status.working_state,
+        &[
+            "clean",
+            "dirty",
+            "conflicted",
+            "pending",
+            "partial",
+            "unstable",
+            "unknown",
+            "error",
+            "not_applicable",
+        ],
+        problems,
+    );
     check_opt_time(
         &format!("{context} started_at"),
         &status.started_at,
@@ -744,7 +999,11 @@ pub fn validate_status(status: &Status, context: &str, problems: &mut Vec<String
     );
     match status.mode.as_str() {
         "metadata" => {
-            if status.staged.is_some() || status.unstaged.is_some() || status.untracked.is_some() {
+            if status.staged.is_some()
+                || status.unstaged.is_some()
+                || status.untracked.is_some()
+                || status.conflicts.is_some()
+            {
                 problems.push(format!("{context}: metadata mode must have null counts"));
             }
             if status.untracked_units != "not_requested" {
@@ -766,6 +1025,12 @@ pub fn validate_status(status: &Status, context: &str, problems: &mut Vec<String
             ));
         }
         _ => {}
+    }
+    if status.working_state == "clean" && (status.mode == "metadata" || status.state != "complete")
+    {
+        problems.push(format!(
+            "{context}: working_state clean requires complete status in summary or full mode"
+        ));
     }
 }
 
