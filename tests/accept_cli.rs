@@ -3192,9 +3192,15 @@ fn roots_symlink_alias_reuses_catalog_rows() {
     )
     .expect("write dirty status marker");
     let alias_report = scan(&alias_c_root, "alias-c.json");
+    #[cfg(target_os = "macos")]
     assert_eq!(
         alias_report["scan"]["generation"], alias_a_report["scan"]["generation"],
         "sibling root spellings share the canonical generation"
+    );
+    #[cfg(not(target_os = "macos"))]
+    assert_ne!(
+        alias_report["scan"]["generation"], alias_a_report["scan"]["generation"],
+        "fresh generation when events unsupported"
     );
     assert_eq!(
         alias_report["repositories"].as_array().unwrap().len(),
@@ -3275,7 +3281,13 @@ fn roots_symlink_alias_reuses_catalog_rows() {
         stderr_text(&both)
     );
     let both_report = read_report(&cwd.join("both.json"));
+    #[cfg(target_os = "macos")]
     assert_eq!(
+        both_report["scan"]["generation"],
+        alias_a_report["scan"]["generation"]
+    );
+    #[cfg(not(target_os = "macos"))]
+    assert_ne!(
         both_report["scan"]["generation"],
         alias_a_report["scan"]["generation"]
     );
